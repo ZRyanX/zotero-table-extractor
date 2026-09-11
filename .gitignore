@@ -1,0 +1,30 @@
+# Sensitive configurations with API keys
+config.json
+config.backup.json
+*.local.json
+*.backup.json
+*.bak
+
+# Browser user data and login profiles (contains real cookies & passwords)
+profiles/
+.zotero_chrome_debug_profile/
+.zotero_playwright_profile/
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# macOS system files & AppleDouble metadata
+.DS_Store
+._*
+.AppleDouble
+.Spotlight-V100
+.Trashes
+
+# Temporary files & local databases
+scratch/
+*.db
+*.log
+baked_rotated_pdf_*
+ppstruct_subset_*
