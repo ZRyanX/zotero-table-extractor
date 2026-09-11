@@ -132,36 +132,34 @@
 ```mermaid
 flowchart TD
     subgraph S1["1. 任务入口与调度层"]
-        IN["用户输入<br/>• Zotero 条目 / 本地 PDF<br/>• 批量目录 / 清单 .txt<br/>• 在线 URL / DOI"] --> CLI["主 CLI 调度器<br/>(extract_zotero_table.py)"]
-        BATCH["全库批量总控<br/>(batch_run.py)"] -->|子进程隔离并发| CLI
-        PLAN["批量规划器<br/>(batch_planner.py)"] -->|预分析元数据| BATCH
+        IN["用户输入<br/>• Zotero 条目 / 本地 PDF<br/>• 批量目录 / 清单 .txt<br/>• 在线 URL / DOI"] --> CLI["主 CLI 调度器<br/>extract_zotero_table.py"]
+        BATCH["全库批量总控<br/>batch_run.py"] -->|进程隔离并发| CLI
+        PLAN["批量规划器<br/>batch_planner.py"] -->|预分析元数据| BATCH
     end
 
     subgraph S2["2. 在线 HTML 提取管线 (优先尝试)"]
-        CLI -->|解析 DOI/URL| DOI["元数据探针<br/>(doi_resolver.py)"]
-        DOI --> ROUTE{"在线路由与竞速<br/>(graph.py)"}
-        ROUTE -->|Elsevier DOI| ELS["Elsevier XOCS XML 专线<br/>(100% 零误差 XML)"]
-        ROUTE -->|知网 URL| CNKI["CNKI 提取引擎<br/>(Scrapling / Playwright)"]
-        ROUTE -->|通用期刊| GEN["通用 HTML 提取<br/>(Springer / Wiley / MDPI)"]
-        ROUTE -->|Firecrawl/API| FC["Firecrawl / Scrapling 备用"]
+        CLI -->|解析元数据| DOI["元数据探针<br/>doi_resolver.py"]
+        DOI --> ROUTE{"在线路由分流<br/>graph.py"}
+        ROUTE -->|Elsevier专线| ELS["Elsevier XOCS XML 专线<br/>100% 零误差 XML"]
+        ROUTE -->|知网专线| CNKI["CNKI 提取引擎<br/>Scrapling / Playwright"]
+        ROUTE -->|通用期刊| GEN["通用 HTML 提取<br/>Springer / Wiley / MDPI"]
+        ROUTE -->|备用通道| FC["Firecrawl / Scrapling 备用"]
     end
 
     subgraph S3["3. 本地 PDF 提取管线 (深度兜底)"]
-        CLI -->|无在线源 / 漏表降级| PTE["本地 PDF 提取总控<br/>(pdf_table_extractor.py)"]
-        PTE --> INSP["PDF 预审 (~80ms)<br/>pdf-inspector / PyMuPDF"]
+        CLI -->|无在线源或漏表| PTE["本地 PDF 提取总控<br/>pdf_table_extractor.py"]
+        PTE --> INSP["PDF 预审 约80ms<br/>pdf-inspector / PyMuPDF"]
         INSP --> TYPE{"PDF 类型判别"}
         
-        TYPE -->|Native 文本版| VOTE["5 引擎多方投票体系<br/>• pdf-inspector (Markdown)<br/>• PyMuPDF find_tables()<br/>• text_alignment (坐标对齐)<br/>• pdfplumber (线框分析)<br/>• Camelot (Lattice/Stream)"]
-        VOTE --> CHECK{"双向相似度核验<br/>Similarity >= 0.75 ?"}
+        TYPE -->|文本版| VOTE["5 引擎多方投票体系<br/>• pdf-inspector<br/>• PyMuPDF find_tables<br/>• text_alignment 坐标对齐<br/>• pdfplumber 线框分析<br/>• Camelot 双策略"]
+        VOTE --> CHECK{"双向相似度核验"}
         
-        CHECK -->|共识通过 (置信度高)| IR["Table IR 领域模型<br/>(ExtractedTable)"]
-        CHECK -->|置信度 < 0.90 / 存在争议| VLM_TAKEOVER
+        CHECK -->|高置信度共识| IR["Table IR 领域模型<br/>ExtractedTable"]
+        CHECK -->|低置信度争议| PP["版面粗定位与切图<br/>PP-StructureV3 / DocLayout-YOLO"]
         
-        TYPE -->|Scanned / Mixed 扫描件| VLM_TAKEOVER["两阶段视觉 AI 接管"]
-        subgraph VLM_TAKEOVER["视觉多模态接管"]
-            PP["版面粗定位 & 切图<br/>PP-StructureV3 / DocLayout-YOLO"] --> VL["多模态结构化解析<br/>PaddleOCR-VL-1.6"]
-        end
-        VLM_TAKEOVER --> IR
+        TYPE -->|扫描版或复杂排版| PP
+        PP --> VL["多模态大模型精细解析<br/>PaddleOCR-VL-1.6"]
+        VL --> IR
     end
 
     ELS --> IR
@@ -170,21 +168,17 @@ flowchart TD
     FC --> IR
 
     subgraph S4["4. 质量门禁与自愈闭环"]
-        IR --> VAL{"表格质检门禁<br/>(table_validator.py)"}
-        VAL -->|行列 >= 2 且无碎列| POST
-        VAL -->|校验失败 / 结构坍塌| HEAL["自愈挽救闭环<br/>(agent_bridge / llm_reasoner)"]
+        IR --> VAL{"表格质检门禁<br/>table_validator.py"}
+        VAL -->|质检通过| POST["7 阶轻量安全后处理 (table_postprocess.py)<br/>① VLM直通清洗  ② 碎片表过滤<br/>③ 复合表头重塑  ④ 多数值/多行展开<br/>⑤ 类别标签填充  ⑥ 公式转义与类型推断<br/>⑦ 噪声/付费墙清除"]
+        VAL -->|质检异常| HEAL["自愈挽救闭环<br/>agent_bridge / llm_reasoner"]
         HEAL --> POST
     end
 
-    subgraph S5["5. 7 阶流水线后处理与跨页拼接"]
-        POST["7 阶轻量安全后处理 (table_postprocess.py)<br/>① VLM 直通清洗  ② 碎片表过滤<br/>③ 复合表头重塑  ④ 多数值/多行展开<br/>⑤ 类别标签填充  ⑥ 公式转义与类型推断<br/>⑦ 噪声/付费墙清除"]
-        POST --> MERGE["跨页续表合并引擎<br/>• 纵向跨页拼接 (Table (cont.))<br/>• 横向分块合并 (Part 1 + Part 2)"]
-    end
-
-    subgraph S6["6. 导出持久化与质量审计"]
+    subgraph S5["5. 跨页续表与成果导出"]
+        POST --> MERGE["跨页续表合并引擎<br/>• 纵向跨页拼接<br/>• 横向分块合并"]
         MERGE --> EXP["规范化 Excel 导出 (excel_export.py)<br/>• 自适应列宽采样<br/>• 注入 Dublin Core 预览元数据<br/>• 主题配色与斑马纹排版"]
-        EXP --> OUT["🎯 最终出版级 Excel 产物 (.xlsx)<br/>附带标准表号、完整中英文表题"]
-        EXP --> AUDIT["全周期质量审计<br/>(verify_tables.py / audit_reporter.py)"]
+        EXP --> OUT["🎯 最终出版级 Excel 产物 (.xlsx)<br/>附带标准表号与完整中英文表题"]
+        EXP --> AUDIT["全周期质量审计<br/>verify_tables.py / audit_reporter.py"]
     end
 
     style S1 fill:#eff6ff,stroke:#3b82f6,stroke-width:1px
@@ -192,7 +186,6 @@ flowchart TD
     style S3 fill:#fffbeb,stroke:#f59e0b,stroke-width:1px
     style S4 fill:#fef2f2,stroke:#ef4444,stroke-width:1px
     style S5 fill:#f0fdf4,stroke:#14b8a6,stroke-width:1px
-    style S6 fill:#faf5ff,stroke:#8b5cf6,stroke-width:1px
     style OUT fill:#dcfce7,stroke:#22c55e,stroke-width:2px
 ```
 
