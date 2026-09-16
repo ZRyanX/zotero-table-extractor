@@ -15,9 +15,9 @@ except ImportError:
 
 # Shared helpers (text cleaning, table filtering, config)
 try:
-    from ..common import clean_text, escape_formula, is_supplementary, clean_table_filename, load_config, is_metadata_table
+    from ..common import clean_text, escape_formula, is_supplementary, clean_table_filename, load_config, is_metadata_table, df_map
 except ImportError:
-    from common import clean_text, escape_formula, is_supplementary, clean_table_filename, load_config, is_metadata_table
+    from common import clean_text, escape_formula, is_supplementary, clean_table_filename, load_config, is_metadata_table, df_map
 
 
 def get_table_number(title):
@@ -270,10 +270,7 @@ def extract_tables_from_element(element, table_idx="all", default_title=None):
             continue
 
         df.columns = [escape_formula(clean_text(c)) for c in df.columns]
-        if hasattr(df, 'map'):
-            df = df.map(lambda v: escape_formula(clean_text(v)))
-        else:
-            df = df.applymap(lambda v: escape_formula(clean_text(v)))
+        df = df_map(df, lambda v: escape_formula(clean_text(v)))
 
         cleaned_title = clean_table_filename(raw_title, t_idx + 1)
         df.attrs['table_title'] = cleaned_title
@@ -484,10 +481,7 @@ def _extract_anchor_table(page, fragment: str, target_table_num: int):
             return []
 
         df.columns = [escape_formula(c) for c in df.columns]
-        if hasattr(df, 'map'):
-            df = df.map(escape_formula)
-        else:
-            df = df.applymap(escape_formula)
+        df = df_map(df, escape_formula)
 
         cleaned_title = clean_table_filename(caption, target_table_num)
         df.attrs['table_title'] = cleaned_title
@@ -759,10 +753,7 @@ def _extract_local_heuristic_grids(page, table_idx="all"):
                     continue
                     
                 df.columns = [escape_formula(c) for c in df.columns]
-                if hasattr(df, 'map'):
-                    df = df.map(escape_formula)
-                else:
-                    df = df.applymap(escape_formula)
+                df = df_map(df, escape_formula)
                     
                 cleaned_title = clean_table_filename(title, t_idx + 1)
                 df.attrs['table_title'] = cleaned_title
@@ -884,10 +875,7 @@ def _extract_custom_grid_tables(page, url, api_key=None):
                                 
                         df = pd.DataFrame(data_rows, columns=unique_header)
                         df.columns = [escape_formula(c) for c in df.columns]
-                        if hasattr(df, 'map'):
-                            df = df.map(escape_formula)
-                        else:
-                            df = df.applymap(escape_formula)
+                        df = df_map(df, escape_formula)
                             
                         cleaned_title = clean_table_filename(label, s_idx + 1)
                         df.attrs['table_title'] = cleaned_title

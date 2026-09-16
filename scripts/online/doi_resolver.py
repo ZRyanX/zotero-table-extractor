@@ -34,9 +34,17 @@ def get_doi_from_zotero_db(pdf_path, db_path=None):
     Attempts to query Zotero SQLite database to retrieve the DOI, Title, and URL of a PDF.
     """
     if db_path is None:
-        home = os.path.expanduser('~')
-        db_path = os.path.join(home, 'Zotero', 'zotero.sqlite')
-        
+        try:
+            from system_detector import get_zotero_db_path
+            db_path = get_zotero_db_path()
+        except ImportError:
+            try:
+                from ..system_detector import get_zotero_db_path
+                db_path = get_zotero_db_path()
+            except ImportError:
+                cfg = load_config() if callable(load_config) else {}
+                db_path = cfg.get("ZOTERO_DB_PATH") or os.path.join(os.path.expanduser('~'), 'Zotero', 'zotero.sqlite')
+
     if not os.path.exists(db_path):
         print(f"Zotero DB not found at: {db_path}")
         return None, None, None

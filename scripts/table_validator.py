@@ -35,6 +35,9 @@ except ImportError:
         is_supplementary,
     )
 
+AXIS_KEYWORDS = ['watson et al', 'tomkins et al', 'δ34s (‰) vs']
+axis_keywords = AXIS_KEYWORDS
+
 
 def scan_pdf_table_declarations(pdf_path: str) -> Dict[int, List[Dict[str, Any]]]:
     """
@@ -180,7 +183,7 @@ def validate_native_table_dataframe(df: pd.DataFrame, page_idx: int) -> Tuple[bo
 
     # 5. 图表坐标轴/散点图残片深度检测
     all_text = " ".join(str(v) for v in df.values.flatten() if v is not None and str(v) != 'nan').lower()
-    axis_keywords = ['watson et al', 'tomkins et al', 'kbar', 't , °c', 't (°c)', 'wt% tio2', 'wt% sio2', 'wt% al2o3', 'δ34s (‰) vs']
+    axis_keywords = AXIS_KEYWORDS
     if any(kw in all_text for kw in axis_keywords) and df.shape[0] <= 15:
         return False, "检测到图表/坐标轴刻度残留特征 (散点图/相图误识别)"
 
@@ -191,6 +194,8 @@ def validate_native_table_dataframe(df: pd.DataFrame, page_idx: int) -> Tuple[bo
         return False, "表头完全未识别且行数过少，属于残片"
 
     return True, "合格"
+
+validate_table_structure = validate_native_table_dataframe
 
 
 def validate_native_extraction_pipeline(

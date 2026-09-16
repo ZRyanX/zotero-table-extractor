@@ -72,7 +72,8 @@ def extract_table_crops_from_pdf(
     dpi: int = 200,
     conf_threshold: float = 0.25,
     enable_filter: bool = True,
-    cancel_event = None
+    cancel_event = None,
+    pages: Optional[List[int]] = None
 ) -> List[Dict[str, Any]]:
     """
     从本地 PDF 文件中提取所有表格及相关上下文（Caption/Footnote）的图像区域 Crop。
@@ -101,7 +102,7 @@ def extract_table_crops_from_pdf(
     if config.get("USE_PP_STRUCTURE", True) and extract_pp_structure_table_crops is not None:
         try:
             print("[PDF-Tables] 正在使用 PP-StructureV3 进行在线版面定位与表格切图...")
-            pp_crops = extract_pp_structure_table_crops(pdf_path, config=config, cancel_event=cancel_event)
+            pp_crops = extract_pp_structure_table_crops(pdf_path, config=config, cancel_event=cancel_event, pages=pages)
             if pp_crops:
                 return pp_crops
         except Exception as e:
@@ -120,7 +121,9 @@ def extract_table_crops_from_pdf(
     zoom = dpi / 72.0
     mat = fitz.Matrix(zoom, zoom)
 
-    for page_idx in range(total_pages):
+    target_pages = [p for p in pages if 0 <= p < total_pages] if pages is not None else list(range(total_pages))
+
+    for page_idx in target_pages:
         if cancel_event is not None and cancel_event.is_set():
             break
         page = doc[page_idx]
@@ -319,7 +322,12 @@ def crop_to_dataframe(pdf_path: str, crop_info: Dict[str, Any], dpi: int = 200) 
     return df, caption, footnote
 
 
-def export_crops_to_excel(pdf_path: str, output_excel_path: str, crops: Optional[List[Dict[str, Any]]] = None) -> bool:
+def export_crops_to_excel(
+    pdf_path: str,
+    output_excel_path: str,
+    crops: Optional[List[Dict[str, Any]]] = None,
+    pages: Optional[List[int]] = None
+) -> bool:
     """
     将 DocLayout-YOLO 检测到的所有表格 Crop 重建并保存至 Excel 文件中。
 
@@ -331,7 +339,7 @@ def export_crops_to_excel(pdf_path: str, output_excel_path: str, crops: Optional
         return False
 
     if crops is None:
-        crops = extract_table_crops_from_pdf(pdf_path)
+        crops = extract_table_crops_from_pdf(pdf_path, pages=pages)
 
     if not crops:
         print("[PDF-Tables] 未提取到有效的表格 Crop。")

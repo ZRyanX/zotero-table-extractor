@@ -89,14 +89,16 @@ def load_config():
                 if os_type == "windows":
                     if data.get("PLAYWRIGHT_USER_DATA_DIR_WINDOWS"):
                         data["PLAYWRIGHT_USER_DATA_DIR"] = data["PLAYWRIGHT_USER_DATA_DIR_WINDOWS"]
-                    if not data.get("PAPER_TABLES_DIR"):
-                        data["PAPER_TABLES_DIR"] = get_paper_tables_dir()
-                    if not data.get("ZOTERO_DB_PATH"):
-                        data["ZOTERO_DB_PATH"] = get_zotero_db_path()
                 elif os_type == "darwin" and data.get("PLAYWRIGHT_USER_DATA_DIR_MAC"):
                     data["PLAYWRIGHT_USER_DATA_DIR"] = data["PLAYWRIGHT_USER_DATA_DIR_MAC"]
         except Exception as e:
             print(f"Warning: Failed to load config from {config_path}: {e}")
+
+    # 跨平台路径回退（macOS, Linux, Windows 统一生效）
+    if not data.get("PAPER_TABLES_DIR"):
+        data["PAPER_TABLES_DIR"] = get_paper_tables_dir()
+    if not data.get("ZOTERO_DB_PATH"):
+        data["ZOTERO_DB_PATH"] = get_zotero_db_path()
 
     # 环境变量覆盖敏感配置
     env_overrides = {
@@ -288,12 +290,37 @@ def clean_latex_and_ocr(val):
     """Clean raw LaTeX math markup, OCR typos, and garbled symbols."""
     if not isinstance(val, str) or not val:
         return val
-    
-    val = re.sub(r'\\text\{([^}]+)\}', r'\1', val)
-    val = re.sub(r'\\math[a-z]+\{([^}]+)\}', r'\1', val)
-    val = val.replace(r'\pm', '±').replace(r'\cdot', '·').replace(r'^\circ', '°').replace(r'\circ', '°')
-    val = re.sub(r'\$\s*([^$]+?)\s*\$', r'\1', val)
-    
+
+    # 0. Remove HTML tags if present
+    val = re.sub(r'<[^>]+>', ' ', val)
+    val = re.sub(r'\\n', ' ', val)
+
+    # 1. Clean LaTeX cases environments
+    val = re.sub(r'\\begin\{[^}]*\}|\\end\{[^}]*\}', '', val)
+    val = re.sub(r'\\\\', ' ', val)
+    val = re.sub(r'&amp;|&', ' ', val)
+
+    # 2. Remove \text{...}, \mathrm{...}, \mathbf{...}
+    val = re.sub(r'\\(text|mathrm|mathbf|mathit|boldsymbol)\{([^}]*)\}', r'\2', val)
+    val = re.sub(r'\\math[a-z]+\{([^}]*)\}', r'\1', val)
+
+    # 3. Standardize math symbols & superscripts
+    val = val.replace(r'\times', '×').replace(r'\pm', '±').replace(r'\cdot', '·').replace(r'^\circ', '°').replace(r'\circ', '°').replace(r'^{\circ}', '°')
+    val = val.replace(r'\approx', '≈').replace(r'\leq', '≤').replace(r'\geq', '≥').replace(r'\neq', '≠')
+    val = val.replace(r'\Delta', 'Δ').replace(r'\delta', 'δ').replace(r'\mu', 'μ').replace(r'\omega', 'ω').replace(r'\phi', 'φ').replace(r'\beta', 'β').replace(r'\gamma', 'γ')
+
+    # Superscripts / subscripts cleanup: ^{206} -> 206, _{...} -> ...
+    val = re.sub(r'\^\{+([0-9a-zA-Z\+\-\*\s]+)\}+', r'^\1', val)
+    val = re.sub(r'_\{+([0-9a-zA-Z\+\-\*\s]+)\}+', r'_\1', val)
+    val = re.sub(r'(?<=\d)\s*times\s*(?=\d)', ' × ', val)
+
+    # Strip LaTeX $ delimiters and braces
+    val = val.replace('$', '').replace('\\', '').replace('{', '').replace('}', '')
+    val = re.sub(r'([A-Za-z])_([0-9]+)', r'\1\2', val)
+    val = re.sub(r'\s*±\s*', ' ± ', val)
+    val = re.sub(r'\s*\^\s*([0-9+-]+)\s*', r'^\1', val)
+
+    # 4. Fix common OCR typos in chemical formulas & mineral terms
     val = re.sub(r'\bNaC1\b', 'NaCl', val)
     val = re.sub(r'\bCaC12\b', 'CaCl2', val)
     val = re.sub(r'\bH20\b', 'H2O', val)
@@ -301,19 +328,36 @@ def clean_latex_and_ocr(val):
     val = re.sub(r'\bCtL\b', 'CH4', val)
     val = re.sub(r'\bTin-\b', 'Tm -', val)
     val = re.sub(r'\bTin\b', 'Tm', val)
-    
+    val = re.sub(r'\bcastiterite\b', 'cassiterite', val, flags=re.I)
+    val = re.sub(r'\bberthlerite\b', 'berthierite', val, flags=re.I)
+    val = re.sub(r'\bFable\b', 'Table', val, flags=re.I)
+
+    # Fix common OCR garbled text in mineral paragenesis
     val = val.replace('(_+qz)', '(± qz)').replace('(_+ qz)', '(± qz)')
     val = re.sub(r'\b200o\b', '200°', val)
     val = val.replace("'-", "-")
-    
-    val = re.sub(r'[ \t]+', ' ', val)
-    return val.strip()
+
+    # Normalize space line-by-line while preserving \n for subrow expansion
+    lines = [re.sub(r'[ \t]+', ' ', l).strip() for l in re.split(r'\n|\\n', val)]
+    return '\n'.join([l for l in lines if l])
 
 
 def escape_formula(val):
     if isinstance(val, str) and str(val).startswith(('=', '+', '-', '@')):
         return "'" + str(val)
     return val
+
+
+def df_map(df, func):
+    """
+    Pandas 2.x / 3.x 兼容的 DataFrame 逐元素映射函数。
+    在 Pandas 2.1+ / 3.0+ 优先使用 df.map()，旧版本兼容回退到 df.applymap()。
+    """
+    if df is None:
+        return None
+    if hasattr(df, 'map'):
+        return df.map(func)
+    return df.applymap(func)
 
 
 def clean_table_filename(raw_title, index):

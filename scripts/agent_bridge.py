@@ -121,30 +121,70 @@ class AgentReasoningBridge:
             print(f"  • 表格切图路径: {saved_crop_path}")
         return task_id
 
-    def check_resolved_task(self, task_id: str, timeout_seconds: float = 0.0, poll_interval: float = 0.5) -> Optional[pd.DataFrame]:
+    def _read_resolved_df(self, resolved_file: str, task_id: str) -> Optional[pd.DataFrame]:
+        try:
+            with open(resolved_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            cols = data.get("columns", [])
+            rows = data.get("data", [])
+            if cols and rows:
+                df = pd.DataFrame(rows, columns=cols)
+                print(f"[Agent Bridge] 成功加载 AI Agent 推理结果: {df.shape[0]}行 × {df.shape[1]}列")
+                # 清理已完成的任务待办标记
+                pending_file = os.path.join(self.pending_dir, f"{task_id}.json")
+                if os.path.exists(pending_file):
+                    try:
+                        os.remove(pending_file)
+                    except Exception:
+                        pass
+                return df
+        except Exception as e:
+            print(f"[Agent Bridge] 读取解析结果失败: {e}")
+        return None
+
+    def check_resolved_task(
+        self, 
+        task_id: str, 
+        timeout_seconds: float = 0.0, 
+        poll_interval: float = 0.5,
+        cancel_event = None
+    ) -> Optional[pd.DataFrame]:
         """
         检查 AI Agent 是否已完成推理并回写响应。
         若指定 timeout_seconds > 0，则按 poll_interval 轮询等待直到完成或超时。
-        若已完成，读取并转换为标准 pd.DataFrame 返回。
+        针对非交互式环境自动防止死等；若已完成，读取并转换为标准 pd.DataFrame 返回。
         """
         resolved_file = os.path.join(self.resolved_dir, f"{task_id}.json")
-        start_t = time.time()
-        while True:
+
+        if timeout_seconds <= 0:
             if os.path.exists(resolved_file):
-                try:
-                    with open(resolved_file, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                    cols = data.get("columns", [])
-                    rows = data.get("data", [])
-                    if cols and rows:
-                        df = pd.DataFrame(rows, columns=cols)
-                        print(f"[Agent Bridge] 成功加载 AI Agent 推理结果: {df.shape[0]}行 × {df.shape[1]}列")
-                        return df
-                except Exception as e:
-                    print(f"[Agent Bridge] 读取解析结果失败: {e}")
-                return None
-            if timeout_seconds <= 0 or (time.time() - start_t) >= timeout_seconds:
+                return self._read_resolved_df(resolved_file, task_id)
+            return None
+
+        # 检查是否为无外部智能体监听的静默无头环境，避免盲目阻塞死等
+        is_interactive = bool(sys.stdin.isatty() or os.getenv("AGENT_INTERACTIVE") or os.getenv("AGENT_BRIDGE_WAIT"))
+        effective_timeout = timeout_seconds if is_interactive else min(timeout_seconds, 10.0)
+
+        start_t = time.time()
+        last_log_t = start_t
+        while True:
+            if cancel_event is not None and getattr(cancel_event, 'is_set', lambda: False)():
+                print(f"[Agent Bridge] 任务 {task_id} 等待被取消")
                 break
+
+            if os.path.exists(resolved_file):
+                return self._read_resolved_df(resolved_file, task_id)
+
+            elapsed = time.time() - start_t
+            if elapsed >= effective_timeout:
+                if not is_interactive and timeout_seconds > effective_timeout:
+                    print(f"[Agent Bridge] 检测到无头运行环境，任务 {task_id} 快速释放等待 ({effective_timeout}s)，优雅回退")
+                break
+
+            if time.time() - last_log_t >= 5.0:
+                print(f"[Agent Bridge] 等待 AI Agent 推理任务 {task_id} ({elapsed:.1f}s / {effective_timeout}s)...")
+                last_log_t = time.time()
+
             time.sleep(poll_interval)
         return None
 

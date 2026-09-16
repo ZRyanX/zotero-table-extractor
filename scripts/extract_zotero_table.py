@@ -246,31 +246,30 @@ def _do_process_single_pdf(pdf_path, orig_pdf_path, args, is_batch=False, plan=N
     output_path = args.output
     filename_base = os.path.splitext(os.path.basename(orig_pdf_path))[0]
     safe_base = make_safe_filename(filename_base)
+    user_single_file = getattr(args, 'single_file', False)
 
     if output_path.endswith(".xlsx"):
-        # 用户显式指定了 .xlsx 文件路径 -> 在同级目录创建同名子文件夹存放各表
-        out_dir = os.path.dirname(output_path) or "."
-        base_name = os.path.splitext(os.path.basename(output_path))[0]
-        target_output = os.path.join(out_dir, base_name)
-        os.makedirs(target_output, exist_ok=True)
-        single_file = False
+        target_output = output_path
+        single_file = True
     else:
-        # output_path 是目录
-        # 若目录名本身已是论文文件夹（batch 模式下 batch_run 传入的 paper_tables 根目录），
-        # 则直接在其中按 PDF 名创建子文件夹；若 output_path 已是子文件夹则直接使用。
         parent_name = os.path.basename(os.path.normpath(output_path))
-        # 判断 output_path 是否已经是按论文名命名的子文件夹：
-        # 比较父目录名与 safe_base 的相似度
         from difflib import SequenceMatcher
         sim = SequenceMatcher(None, parent_name.lower(), safe_base.lower()).ratio()
         if sim > 0.5:
-            # output_path 已是论文子文件夹，直接使用
-            target_output = output_path
+            target_dir = output_path
         else:
-            # output_path 是根目录，在其下创建子文件夹
-            target_output = os.path.join(output_path, safe_base)
-        os.makedirs(target_output, exist_ok=True)
-        single_file = False
+            target_dir = os.path.join(output_path, safe_base)
+        os.makedirs(target_dir, exist_ok=True)
+
+        if user_single_file:
+            target_output = os.path.join(target_dir, f"{safe_base}.xlsx")
+            single_file = True
+        else:
+            target_output = target_dir
+            single_file = False
+
+    if getattr(args, 'enable_llm', False):
+        os.environ["LLM_TABLE_REASONER_ENABLED"] = "1"
 
     extracted_online = False
     online_only = getattr(args, 'online_only', False)
@@ -296,17 +295,29 @@ def _do_process_single_pdf(pdf_path, orig_pdf_path, args, is_batch=False, plan=N
                 cancel_event=None,
             )
             if online_dfs:
-                # 检测 PDF 中预期的表数量（轻量级 caption 扫描）
+                extracted_online = True
                 expected_count = _count_pdf_table_captions(orig_pdf_path)
                 if expected_count > len(online_dfs):
-                    print(f"[Online] 在线提取仅获得 {len(online_dfs)} 个表，而 PDF 完整文档中检测到 {expected_count} 个表 caption → 放弃部分网页预览，直接执行完整本地 PDF 提取")
+                    print(f"[Online Warning] 在线提取获得 {len(online_dfs)} 个表，而 PDF 完整文档中检测到约 {expected_count} 个表 caption。")
                 else:
                     print(f"[Online] Got {len(online_dfs)} tables via online HTML source. Saving...")
-                    if save_tables_to_excel(online_dfs, target_output,
-                                            getattr(args, 'headers', None), single_file,
-                                            skip_supplementary=getattr(args, 'skip_supplementary', False)):
-                        print(f"[Online] Successfully extracted tables via online HTML source -> {target_output}")
+
+                # 始终保存已成功抓取的在线高保真表格
+                save_ok = save_tables_to_excel(online_dfs, target_output,
+                                              getattr(args, 'headers', None), single_file,
+                                              skip_supplementary=getattr(args, 'skip_supplementary', False))
+                if save_ok:
+                    print(f"[Online] Successfully extracted tables via online HTML source -> {target_output}")
+                    if online_only or expected_count <= len(online_dfs):
                         return True
+                    # 收集已保存的 online 标签，让后续本地 PDF 提取仅补充缺失表格
+                    online_skip_labels = set()
+                    for o_df in online_dfs:
+                        lbl = o_df.attrs.get('label') or o_df.attrs.get('table_title')
+                        if lbl:
+                            check_lbl = format_table_label(lbl)
+                            online_skip_labels.add(make_safe_filename(check_lbl))
+                    print(f"[Online -> PDF Supplement] 已保留 {len(online_dfs)} 个在线表格，将由本地 PDF 管线补充剩余缺失表格...")
             else:
                 print("[Online] Online extraction returned no tables; falling back to PDF.")
         except Exception as e:
@@ -334,7 +345,8 @@ def _do_process_single_pdf(pdf_path, orig_pdf_path, args, is_batch=False, plan=N
         except Exception as e:
             print(f"[PDF -> Structured Warning] Failed to parse structured file: {e}")
 
-    # 使用新的结构化提取管线
+    # 使用结构化提取管线
+    pdf_extracted = False
     if extract_tables_from_pdf is not None:
         try:
             results, logs = extract_tables_from_pdf(pdf_path, use_ocr_fallback=True)
@@ -349,21 +361,23 @@ def _do_process_single_pdf(pdf_path, orig_pdf_path, args, is_batch=False, plan=N
                                         skip_labels=online_skip_labels,
                                         skip_supplementary=getattr(args, 'skip_supplementary', False)):
                     print(f"[PDF] Successfully exported tables to: {target_output}")
+                    pdf_extracted = True
                     return True
             else:
-                print("[PDF] 结构化管线未提取到表格")
+                print("[PDF] 结构化管线未提取到表格，尝试 OCR/切图备用管线...")
         except Exception as e:
-            print(f"[PDF] 管线异常: {e}")
-    else:
-        # 回退到旧管线（pdf_table_extractor 不可用时）
-        print("[PDF] pdf_table_extractor 不可用，回退到旧管线...")
+            print(f"[PDF] 管线异常: {e}，尝试 OCR/切图备用管线...")
 
+    # 当原生结构化管线不可用、未提取到表格或异常失败时，触发 OCR / 切图兜底回退
+    if not pdf_extracted:
+        print("[PDF] 正在进入 PaddleOCR / PP-StructureV3 兜底切图回退管线...")
         if ocr_client:
             try:
                 full_md = ocr_client.run_paddleocr_vl(pdf_path, pages=None, cancel_event=None)
                 if full_md:
                     vlm_dfs = parse_structured_vlm_content(full_md)
                     if vlm_dfs and save_tables_to_excel(vlm_dfs, target_output, getattr(args, 'headers', None), single_file,
+                                                        skip_labels=online_skip_labels,
                                                         skip_supplementary=getattr(args, 'skip_supplementary', False)):
                         print(f"[PDF -> PaddleOCR-VL-1.6] Successfully exported tables to: {target_output}")
                         return True
@@ -377,6 +391,10 @@ def _do_process_single_pdf(pdf_path, orig_pdf_path, args, is_batch=False, plan=N
                 return True
         except Exception as e:
             print(f"[PDF -> PP-StructureV3 Notice] Export notice: {e}")
+
+    # 如果在线已经提取并保存了部分表格，即使本地补充未抓取到更多表格，也视为任务成功
+    if extracted_online:
+        return True
 
     return False
 
@@ -393,6 +411,8 @@ def main():
     parser.add_argument("--online-only", action="store_true", help="Extract online only, do not fall back to PDF")
     parser.add_argument("--pdf-only", action="store_true", help="Skip online extraction and extract from PDF directly")
     parser.add_argument("--skip-supplementary", action="store_true", help="Skip extraction of supplementary/appendix tables")
+    parser.add_argument("--single-file", action="store_true", help="Save all extracted tables into a single Excel file with multiple sheets")
+    parser.add_argument("--enable-llm", action="store_true", help="Enable LLM table reasoner for complex hierarchical headers and recovery")
     
     parser.add_argument("--cnki-strategy", choices=["auto", "scrapling", "playwright"], default="auto",
                         help="CNKI extraction strategy: 'auto' (try both), 'scrapling', 'playwright'")

@@ -84,7 +84,7 @@ zotero-table-extractor/
     ├── excel_export.py              # Excel 规范化导出（格式居中/自适应列宽/元数据拦截）
     ├── models.py                    # 统一领域模型 (Table IR: ExtractedTable & TableCell)
     ├── system_detector.py           # 跨平台系统环境探测与路径自适应（macOS/Windows）
-    ├── env_detector.py              # 运行环境依赖与 MCP/GPU 服务检测
+    ├── env_detector.py              # 环境探测兼容包装层（system_detector 的向后兼容别名）
     ├── common.py                    # 共享工具函数与 Markdown 表格语法判定
     ├── batch_planner.py             # 批量元数据与年份预分析（生成执行计划）
     ├── batch_run.py                 # 批量并发提取总控（并行调度/断点续传）
@@ -96,12 +96,14 @@ zotero-table-extractor/
     ├── pdf_page_filter.py           # 页面轻量启发式预过滤（跳过纯正文无表页）
     ├── playwright_utils.py          # 浏览器环境自适应探测与启动辅助
     ├── table_validator.py           # 表格结构完整性与列数/填充率校验器
-    ├── audit_reporter.py            # 8小时全面审查诊断报告生成器
+    ├── export_drawio_diagram.py     # 原生 draw.io 矢量架构图自动化渲染与导出
+    ├── audit/                       # 质量审查与诊断工具包统一导出命名空间
+    │   └── __init__.py              # 审查诊断子包导出
+    ├── audit_reporter.py            # 全面审查诊断报告生成器
     ├── targeted_audit_reporter.py   # 针对性异常排查报告生成器
     ├── exhaustive_audit_runner.py   # 全库地毯式提取质检执行器
     ├── targeted_audit_runner.py     # 针对特定异常样例文献的专项回归测试器
     ├── deep_8h_iterative_healer.py  # 深度迭代自愈与异常自动修复执行器
-    ├── export_drawio_diagram.py     # 原生 draw.io 矢量架构图自动化渲染与导出
     ├── compat/                      # 跨版本兼容性包装层
     └── online/                      # 在线 HTML 提取子包
         ├── __init__.py
@@ -111,6 +113,62 @@ zotero-table-extractor/
         ├── cnki_html_extractor.py   # 中国知网 (CNKI) 自动化滑块绕过与 HTML 阅读提取器
         └── graph.py                 # LangGraph / DAG 多策略并发竞速流水线
 ```
+
+## CLI 使用说明
+
+### 1. 单篇论文表格提取 (`extract_zotero_table.py`)
+
+```bash
+# 基础用法：提取指定 PDF 并保存到指定目录或 Excel 文件
+python scripts/extract_zotero_table.py --pdf /path/to/paper.pdf --output /path/to/output_dir
+
+# 保存为单文件多 Sheet 格式，并开启 LLM 复杂表头语义修复
+python scripts/extract_zotero_table.py --pdf /path/to/paper.pdf --output /path/to/tables.xlsx --single-file --enable-llm
+
+# 仅走本地 PDF 提取，跳过在线 HTML 抓取
+python scripts/extract_zotero_table.py --pdf /path/to/paper.pdf --output /path/to/output_dir --pdf-only
+
+# 仅走在线 HTML 抓取，不回退本地 PDF
+python scripts/extract_zotero_table.py --pdf /path/to/paper.pdf --output /path/to/output_dir --online-only
+
+# 批量提取目录中的所有 PDF 或 .txt 清单
+python scripts/extract_zotero_table.py --pdf /path/to/pdfs_dir --output /path/to/all_tables --workers 4
+```
+
+| 参数 | 类型 | 默认值 | 作用说明 |
+| :--- | :--- | :--- | :--- |
+| `--pdf` | 字符串 | 必须 | 待提取 PDF 文件路径、PDF 目录或包含 PDF 路径的 `.txt` 清单 |
+| `--output` | 字符串 | 必须 | 导出结果目录路径；当 `--single-file` 时可为目标 `.xlsx` 文件路径 |
+| `--single-file` | 标志 | `False` | 将提取到的所有表格汇聚写入单个 Excel 文件（多个 Sheet） |
+| `--enable-llm` | 标志 | `False` | 启用大模型语义分析，纠正断裂列名与深层多级复合表头 |
+| `--table-idx` | 字符串 | `"all"` | 提取指定索引表格：`"all"`, `"first"`, 或具体 0-based 整数序号 |
+| `--pdf-only` | 标志 | `False` | 跳过在线抓取竞速，直接从本地 PDF 运行多方投票提取 |
+| `--online-only` | 标志 | `False` | 仅抓取在线 HTML/XML 表格，不执行本地 PDF 提取回退 |
+| `--skip-supplementary` | 标志 | `False` | 跳过 Supplementary Material 附录表格 |
+| `--workers` | 整数 | `4` | 目录批量提取时的并发工作线程数 |
+| `--headers` | 字符串 | `None` | 自定义强制表头列名（逗号分隔） |
+
+### 2. 批量并发总控 (`batch_run.py`)
+
+```bash
+# 断点续传处理未完成的任务
+python scripts/batch_run.py --resume --workers 4
+
+# 重新复检已有产物文件夹，补齐遗漏表格
+python scripts/batch_run.py --recheck --workers 2
+
+# 纯离线纯 PDF 批量提取
+python scripts/batch_run.py --pdf-only --workers 4
+```
+
+| 参数 | 类型 | 默认值 | 作用说明 |
+| :--- | :--- | :--- | :--- |
+| `--resume` | 标志 | `False` | 断点续跑：跳过已有产物目录中提取成功的论文任务 |
+| `--recheck` | 标志 | `False` | 复检模式：针对已有产物重新校验并补齐缺失表格 |
+| `--workers` | 整数 | `4` | 并发处理线程数 |
+| `--pdf-only` | 标志 | `False` | 批量运行时跳过在线网络抓取，纯本地 PDF 提取 |
+| `--timeout` | 整数 | `300` | 单篇文献处理超时上限（秒） |
+| `--limit` | 整数 | `0` | 限制处理文献篇数（0 表示全量执行） |
 
 ## 配置项（config.json）
 

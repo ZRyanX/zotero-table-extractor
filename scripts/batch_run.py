@@ -176,6 +176,76 @@ def run_task(idx, total, folder, pdf_path, plan=None, online=False, sequential=F
         return folder, False, 0, str(e)
 
 
+def generate_batch_tasks(paper_tables_dir, pdf_records, resume=False, recheck=False, ignore_folders=None):
+    """
+    根据 Zotero 数据库检索到的 pdf_records 生成批处理任务列表。
+    自动根据文献标题和已有 paper_tables 子目录进行相似度模糊匹配，并支持 --resume 和 --recheck 模式。
+    """
+    paper_tables_str = str(paper_tables_dir)
+    if ignore_folders is None:
+        ignore_folders = {
+            "MDPI_test", "__pycache__", "temp_albitization_ocr_targeted", "temp_test_auto", "temp_ocr_debug",
+            "temp_test_online", "temp_test_xujiashan", "temp_test_xujiashan_ocr", "test_output",
+            "test_output_online", "test_output_verification", "test_output_verification_pdf", "test_paiting",
+            "test_supp_download_costerfield", "test_yakutia"
+        }
+
+    existing_folders = []
+    if os.path.exists(paper_tables_str):
+        existing_folders = [
+            d for d in os.listdir(paper_tables_str)
+            if os.path.isdir(os.path.join(paper_tables_str, d)) and not d.startswith(".") and d not in ignore_folders
+        ]
+
+    try:
+        from excel_export import make_safe_filename
+    except ImportError:
+        make_safe_filename = lambda s: re.sub(r'[\\/*?:"<>|]', '_', s)[:100].strip()
+
+    tasks = []
+    for r in (pdf_records or []):
+        fname = r.get('filename') or os.path.basename(r.get('pdf_path', ''))
+        fname_base = os.path.splitext(fname)[0]
+        safe_folder = make_safe_filename(fname_base)
+
+        matched_folder = safe_folder
+        best_score = 0.0
+        parent_title = r.get('parent_title', '')
+        for ef in existing_folders:
+            score = get_similarity_score(ef, parent_title, fname)
+            if score > best_score:
+                best_score = score
+                if score >= 0.7:
+                    matched_folder = ef
+
+        folder_path = os.path.join(paper_tables_str, matched_folder)
+        has_xlsx = False
+        if os.path.exists(folder_path) and os.path.isdir(folder_path):
+            try:
+                has_xlsx = any(f.lower().endswith(".xlsx") and not f.startswith("~$") for f in os.listdir(folder_path))
+            except Exception:
+                has_xlsx = False
+
+        # --resume: 若已存在提取好的 Excel 产物，跳过该文献
+        if resume and has_xlsx:
+            continue
+
+        # --recheck: 仅重新检查已有目录但结果为空/未完成的文献
+        if recheck:
+            if not os.path.exists(folder_path) or has_xlsx:
+                continue
+
+        tasks.append({
+            "folder": matched_folder,
+            "pdf_path": r.get('pdf_path', ''),
+            "pdf_record": r,
+        })
+    return tasks
+
+
+get_paper_tasks = generate_batch_tasks
+
+
 def main():
     parser = argparse.ArgumentParser(description="Batch extraction of Zotero library tables (parallel).")
     parser.add_argument("--workers", type=int, default=4,
@@ -192,6 +262,10 @@ def main():
                         help="禁用在线提取，仅用 PaddleOCR 本地识别")
     parser.add_argument("--sequential", action="store_true",
                         help="传递给提取脚本：禁用竞速，走旧版串行管线")
+    parser.add_argument("--resume", action="store_true", default=False,
+                        help="断点续传：跳过已经提取完成（包含有效 .xlsx 文件）的文献")
+    parser.add_argument("--recheck", action="store_true", default=False,
+                        help="重新核验：仅对已有子目录重新检查并尝试补充提取（如之前失败或结果为空）")
     parser.add_argument("--timeout", type=int, default=300, help="单篇超时秒数（默认 300）")
     parser.add_argument("--limit", type=int, default=0, help="仅处理前 N 篇（调试用，0 表示全部）")
     parser.add_argument("--paper-tables", default=None,
@@ -266,28 +340,16 @@ def main():
             
     log(f"Found {len(pdf_records)} PDFs in Zotero library.")
     
-    # 2. Get folders to process
-    folders = sorted([d for d in os.listdir(paper_tables) if os.path.isdir(os.path.join(paper_tables, d)) and not d.startswith(".")])
-    ignore_folders = ["MDPI_test", "__pycache__", "temp_albitization_ocr_targeted", "temp_test_auto", "temp_ocr_debug",
-                      "temp_test_online", "temp_test_xujiashan", "temp_test_xujiashan_ocr", "test_output",
-                      "test_output_online", "test_output_verification", "test_output_verification_pdf", "test_paiting",
-                      "test_supp_download_costerfield", "test_yakutia"]
-    
-    tasks = []
-    for folder in folders:
-        if folder in ignore_folders:
-            continue
-        best_match = None
-        best_score = 0
-        for r in pdf_records:
-            score = get_similarity_score(folder, r['parent_title'], r['filename'])
-            if score > best_score:
-                best_score = score
-                best_match = r
-        if best_score >= 0.7:
-            tasks.append((folder, best_match['pdf_path']))
+    # 2. 从 Zotero 数据库检索到的 pdf_records 生成提取任务
+    raw_tasks = generate_batch_tasks(
+        paper_tables_dir=paper_tables,
+        pdf_records=pdf_records,
+        resume=args.resume,
+        recheck=args.recheck
+    )
+    tasks = [(t["folder"], t["pdf_path"]) for t in raw_tasks]
             
-    log(f"Matched {len(tasks)} papers out of {len(folders)} folders for processing.")
+    log(f"Generated {len(tasks)} tasks from {len(pdf_records)} Zotero records for processing (resume={args.resume}, recheck={args.recheck}).")
 
     if args.limit and args.limit > 0:
         tasks = tasks[:args.limit]

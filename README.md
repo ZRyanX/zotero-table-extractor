@@ -366,6 +366,8 @@ python scripts/extract_zotero_table.py \
 ```
 
 **高级选项参数**：
+- `--single-file`：启用单文件汇总模式，将整篇论文所有表格输出至单个 `.xlsx` 文件的多个 Sheet 中（也可直接将 `--output` 指定为以 `.xlsx` 结尾的文件路径）；
+- `--enable-llm`：开启 LLM 复杂语义推断与表格残损自愈（需在 `config.json` 或环境变量中配置 `OPENAI_API_KEY` 或兼容服务）；
 - `--headers "Col1,Col2,Col3"`：手动指定或修正表头列名；
 - `--table-idx 0`（或 `all`）：仅提取第 1 张表（从 0 开始），或提取全部表格；
 - `--pdf-only`：跳过任何在线探测，强制走本地 PDF 深度提取流水线；

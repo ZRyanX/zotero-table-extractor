@@ -15,9 +15,9 @@ except ImportError:
 
 # Shared helpers (text cleaning, table filtering, cookie parsing)
 try:
-    from ..common import clean_text, escape_formula, is_metadata_table, clean_table_filename, load_cookies_from_file
+    from ..common import clean_text, escape_formula, is_metadata_table, clean_table_filename, load_cookies_from_file, df_map
 except ImportError:
-    from common import clean_text, escape_formula, is_metadata_table, clean_table_filename, load_cookies_from_file
+    from common import clean_text, escape_formula, is_metadata_table, clean_table_filename, load_cookies_from_file, df_map
 
 def simulate_human_drag(page, handler_selector, distance):
     handler = page.wait_for_selector(handler_selector, timeout=15000)
@@ -139,10 +139,7 @@ def extract_tables_from_page(page, table_idx="all"):
                 
             # Escape formulas
             df.columns = [escape_formula(c) for c in df.columns]
-            if hasattr(df, 'map'):
-                df = df.map(escape_formula)
-            else:
-                df = df.applymap(escape_formula)
+            df = df_map(df, escape_formula)
                 
             # Set custom title attribute
             cleaned_title = clean_table_filename(raw_title, t_idx + 1)

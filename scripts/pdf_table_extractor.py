@@ -55,9 +55,9 @@ except ImportError:
     pd = None
 
 try:
-    from .common import format_table_label, TABLE_LABEL_PATTERN, TABLE_LABEL_RE, is_table_squeezed, is_table_low_quality, is_markdown_separator
+    from .common import format_table_label, TABLE_LABEL_PATTERN, TABLE_LABEL_RE, is_table_squeezed, is_table_low_quality, is_markdown_separator, df_map
 except ImportError:
-    from common import format_table_label, TABLE_LABEL_PATTERN, TABLE_LABEL_RE, is_table_squeezed, is_table_low_quality, is_markdown_separator
+    from common import format_table_label, TABLE_LABEL_PATTERN, TABLE_LABEL_RE, is_table_squeezed, is_table_low_quality, is_markdown_separator, df_map
 
 logger = logging.getLogger(__name__)
 
@@ -97,30 +97,64 @@ def classify_and_extract_via_inspector(pdf_path: str, caption_page_map: Optional
     try:
         import pdf_inspector
 
-        pi_result = pdf_inspector.process_pdf(pdf_path)
-        result['pdf_type'] = pi_result.pdf_type
-        result['confidence'] = pi_result.confidence
-        result['pages_with_tables'] = list(pi_result.pages_with_tables) if hasattr(pi_result, 'pages_with_tables') else []
-        result['pages_needing_ocr'] = list(pi_result.pages_needing_ocr) if hasattr(pi_result, 'pages_needing_ocr') else []
-        result['markdown'] = pi_result.markdown
+        # 优先使用 extract_pages_markdown 获取逐页 Markdown，精准绑定表格与页码
+        if hasattr(pdf_inspector, 'extract_pages_markdown'):
+            try:
+                pages_res = pdf_inspector.extract_pages_markdown(pdf_path)
+                result['pdf_type'] = 'text_based'
+                result['confidence'] = 0.95
+                result['pages_with_tables'] = list(getattr(pages_res, 'pages_with_tables', []))
+                result['pages_needing_ocr'] = list(getattr(pages_res, 'pages_needing_ocr', []))
+                
+                full_md_list = []
+                for p_item in pages_res.pages:
+                    p_idx = p_item.page
+                    p_md = p_item.markdown or ""
+                    full_md_list.append(f"<!-- Page {p_idx+1} -->\n{p_md}")
+                    if p_md:
+                        p_tables = _parse_markdown_tables(p_md, caption_page_map, default_page=p_idx)
+                        for tbl_df, p_hint in p_tables:
+                            actual_page = p_hint if p_hint is not None else p_idx
+                            tbl_df.attrs['extractor'] = 'pdf_inspector'
+                            tbl_df.attrs['page_idx'] = actual_page
+                            if not tbl_df.attrs.get('label'):
+                                tbl_df.attrs['label'] = f"Table {len(result['tables'])+1}"
+                            result['tables'].append({
+                                'df': tbl_df,
+                                'page_idx': actual_page,
+                                'table_idx': len(result['tables']),
+                                'bbox': None,
+                            })
+                result['markdown'] = "\n\n".join(full_md_list)
+            except Exception as e_epm:
+                print(f"[pdf-inspector] extract_pages_markdown 提示: {e_epm}，回退到 process_pdf")
 
-        # 从 Markdown 中解析表格
-        if pi_result.markdown:
-            tables = _parse_markdown_tables(pi_result.markdown, caption_page_map)
-            for i, (df, page_hint) in enumerate(tables):
-                df.attrs['extractor'] = 'pdf_inspector'
-                if not df.attrs.get('label'):
-                    df.attrs['label'] = f"Table {i+1}"
-                result['tables'].append({
-                    'df': df,
-                    'page_idx': page_hint,
-                    'table_idx': i,
-                    'bbox': None,
-                })
+        if not result['tables']:
+            pi_result = pdf_inspector.process_pdf(pdf_path)
+            result['pdf_type'] = pi_result.pdf_type
+            result['confidence'] = pi_result.confidence
+            result['pages_with_tables'] = list(pi_result.pages_with_tables) if hasattr(pi_result, 'pages_with_tables') else []
+            result['pages_needing_ocr'] = list(pi_result.pages_needing_ocr) if hasattr(pi_result, 'pages_needing_ocr') else []
+            result['markdown'] = pi_result.markdown
+
+            # 从 Markdown 中解析表格
+            if pi_result.markdown:
+                tables = _parse_markdown_tables(pi_result.markdown, caption_page_map)
+                for i, (df, page_hint) in enumerate(tables):
+                    df.attrs['extractor'] = 'pdf_inspector'
+                    if page_hint is not None:
+                        df.attrs['page_idx'] = page_hint
+                    if not df.attrs.get('label'):
+                        df.attrs['label'] = f"Table {i+1}"
+                    result['tables'].append({
+                        'df': df,
+                        'page_idx': page_hint,
+                        'table_idx': i,
+                        'bbox': None,
+                    })
 
         print(f"[pdf-inspector] type={result['pdf_type']}, confidence={result['confidence']:.2f}, "
-              f"pages_with_tables={result['pages_with_tables']}, tables_parsed={len(result['tables'])}, "
-              f"time={pi_result.processing_time_ms}ms")
+              f"pages_with_tables={result['pages_with_tables']}, tables_parsed={len(result['tables'])}")
 
     except ImportError:
         result['error'] = 'pdf_inspector not installed'
@@ -128,7 +162,6 @@ def classify_and_extract_via_inspector(pdf_path: str, caption_page_map: Optional
     except Exception as e:
         result['error'] = str(e)
         # pdf-inspector 解析失败时，回退到 PyMuPDF 文本层判断
-        # （不能直接判定为 scanned —— 很多 CNKI/中文期刊 PDF 有文本层但 trailer 格式不规范）
         has_text = has_text_layer(pdf_path)
         if has_text:
             result['pdf_type'] = 'text_based'
@@ -141,10 +174,10 @@ def classify_and_extract_via_inspector(pdf_path: str, caption_page_map: Optional
     return result
 
 
-def _parse_markdown_tables(markdown: str, caption_page_map: Optional[Dict[str, int]] = None) -> List[Tuple[Any, Optional[int]]]:
+def _parse_markdown_tables(markdown: str, caption_page_map: Optional[Dict[str, int]] = None, default_page: Optional[int] = None) -> List[Tuple[Any, Optional[int]]]:
     """
     从 pdf-inspector 输出的 Markdown 中解析表格。
-    结合 caption_page_map 精准映射每张表格对应的 PDF 页码。
+    结合 caption_page_map 或 default_page 精准映射每张表格对应的 PDF 页码。
     返回 [(DataFrame, page_hint), ...]
     """
     if pd is None:
@@ -153,7 +186,7 @@ def _parse_markdown_tables(markdown: str, caption_page_map: Optional[Dict[str, i
     tables = []
     lines = markdown.split('\n')
     i = 0
-    page_hint = None
+    page_hint = default_page
     curr_caption = ""
     curr_label = ""
 
@@ -188,10 +221,14 @@ def _parse_markdown_tables(markdown: str, caption_page_map: Optional[Dict[str, i
                 resolved_page = page_hint
                 if resolved_page is None and curr_label and caption_page_map and curr_label in caption_page_map:
                     resolved_page = caption_page_map[curr_label]
+                if resolved_page is None:
+                    resolved_page = default_page
                 if curr_label:
                     df.attrs['label'] = curr_label
                 if curr_caption:
                     df.attrs['table_title'] = curr_caption
+                if resolved_page is not None:
+                    df.attrs['page_idx'] = resolved_page
                 tables.append((df, resolved_page))
             curr_caption = ""
             curr_label = ""
@@ -528,7 +565,7 @@ def extract_via_camelot(pdf_path: str, pages: Optional[List[int]] = None) -> Lis
                         df = table.df
                         if df is None or df.empty or len(df) < 2:
                             continue
-                        df = df.applymap(lambda x: str(x).strip() if x is not None else "")
+                        df = df_map(df, lambda x: str(x).strip() if x is not None else "")
                         df.attrs['extractor'] = f'camelot_{flavor}'
                         page_idx = table.page - 1 if hasattr(table, 'page') else tbl_idx
                         df.attrs['page_idx'] = page_idx
@@ -624,6 +661,73 @@ def _table_similarity(df1, df2) -> float:
     return 0.3 * shape_sim + 0.5 * best_content_sim + 0.2 * jaccard
 
 
+def _align_page_tables(
+    page_tables: Dict[str, List[Dict[str, Any]]], 
+    priority: List[str]
+) -> List[Dict[str, Dict[str, Any]]]:
+    """
+    将同一页面上由不同提取器提取的表格进行空间位置与内容对齐。
+    避免简单的 raw zip 索引错位对比（如一方少提取了一个表导致后续所有表偏移错位）。
+    返回一组对齐后的候选簇列表: [{'pdf_inspector': t1, 'find_tables': t2}, ...]
+    """
+    clusters: List[Dict[str, Dict[str, Any]]] = []
+
+    for src in priority:
+        src_tbls = page_tables.get(src, [])
+        if not src_tbls:
+            continue
+
+        for tbl in src_tbls:
+            tbl_df = tbl.get('df')
+            tbl_bbox = tbl.get('bbox')
+            best_cluster_idx = -1
+            best_score = 0.0
+
+            for c_idx, cluster in enumerate(clusters):
+                if src in cluster:
+                    continue  # 该簇已包含该来源表格，不放入同一簇
+
+                cluster_scores = []
+                for existing_src, existing_tbl in cluster.items():
+                    existing_df = existing_tbl.get('df')
+                    existing_bbox = existing_tbl.get('bbox')
+                    score = 0.0
+
+                    # 1. 空间垂直重叠判定 (若两者均有有效 bbox)
+                    if tbl_bbox and existing_bbox:
+                        try:
+                            v_overlap = max(0.0, min(tbl_bbox[3], existing_bbox[3]) - max(tbl_bbox[1], existing_bbox[1]))
+                            h1 = max(1.0, tbl_bbox[3] - tbl_bbox[1])
+                            h2 = max(1.0, existing_bbox[3] - existing_bbox[1])
+                            v_ratio = v_overlap / max(h1, h2)
+                            if v_ratio >= 0.4:
+                                score = max(score, 0.7 + 0.3 * v_ratio)
+                        except Exception:
+                            pass
+
+                    # 2. 内容文本/结构相似度判定
+                    if tbl_df is not None and existing_df is not None:
+                        try:
+                            sim = _table_similarity(tbl_df, existing_df)
+                            score = max(score, sim)
+                        except Exception:
+                            pass
+
+                    cluster_scores.append(score)
+
+                avg_score = sum(cluster_scores) / len(cluster_scores) if cluster_scores else 0.0
+                if avg_score >= 0.4 and avg_score > best_score:
+                    best_score = avg_score
+                    best_cluster_idx = c_idx
+
+            if best_cluster_idx >= 0:
+                clusters[best_cluster_idx][src] = tbl
+            else:
+                clusters.append({src: tbl})
+
+    return clusters
+
+
 def three_way_vote(
     inspector_tables: List[Dict[str, Any]],
     find_tables_results: List[Dict[str, Any]],
@@ -675,23 +779,18 @@ def three_way_vote(
         for src_name, src_tables in sources.items():
             page_tables[src_name] = [t for t in src_tables if t.get('page_idx', 0) == page]
 
-        # 取该页上所有来源的表格
-        max_count = max(len(ts) for ts in page_tables.values()) if page_tables else 0
-        if max_count == 0:
+        # 智能对齐该页上不同来源的表格簇，避免 raw zip 错位
+        aligned_clusters = _align_page_tables(page_tables, priority)
+        if not aligned_clusters:
             continue
 
-        # 逐个表格位置匹配
-        for tbl_idx in range(max_count):
-            candidates = {}
-            for src_name in priority:
-                if tbl_idx < len(page_tables.get(src_name, [])):
-                    candidates[src_name] = page_tables[src_name][tbl_idx]
-
+        # 逐个对齐表格簇进行投票
+        for tbl_idx, candidates in enumerate(aligned_clusters):
             if not candidates:
                 continue
 
-            # 两两比较
-            src_names = list(candidates.keys())
+            # 两两比较（严格按照 priority 优先级顺序排列）
+            src_names = [s for s in priority if s in candidates]
             best_result = None
             best_extractor = None
             agreement_found = False
@@ -780,6 +879,7 @@ def three_way_vote(
                             break
                 
                 best_result['df'].attrs['vote_extractor'] = best_extractor
+                best_result['df'].attrs['extractor'] = best_extractor
                 best_result['df'].attrs['cross_validated'] = agreement_found
                 fused.append(best_result)
 
@@ -1247,6 +1347,24 @@ def verify_and_rescue_table_with_agent(df: pd.DataFrame, pdf_path: str, page_idx
                 rescued_df.attrs = df.attrs.copy()
                 print(f"[Agent Verification] 任务 {task_id} 抢救成功: {rescued_df.shape[0]}行 × {rescued_df.shape[1]}列")
                 return rescued_df
+
+        # 若 Agent Bridge 未返回（如无头环境），且启用了 LLM，尝试 LLMTableReasoner 直接修复
+        if os.getenv("LLM_TABLE_REASONER_ENABLED") or df.attrs.get('enable_llm'):
+            try:
+                from llm_reasoner import get_llm_reasoner
+                reasoner = get_llm_reasoner()
+                if reasoner.is_available():
+                    repaired = None
+                    if img_bytes:
+                        repaired = reasoner.parse_degraded_table_layout(img_bytes)
+                    if (repaired is None or repaired.empty) and df is not None:
+                        repaired = reasoner.repair_defective_table(df)
+                    if repaired is not None and not repaired.empty:
+                        repaired.attrs = df.attrs.copy()
+                        print(f"[LLM Verification] LLM 推理修复成功: {repaired.shape[0]}行 × {repaired.shape[1]}列")
+                        return repaired
+            except Exception as e_llm:
+                print(f"[LLM Verification] 推理抢救跳过: {e_llm}")
     except Exception as e:
         print(f"[Agent Verification] 门禁抢救旁路跳过: {e}")
 
@@ -1298,6 +1416,7 @@ def extract_via_paddleocr_fullpage(pdf_path: str, pages: Optional[List[int]] = N
                     if df is not None and not df.empty and df.shape[0] >= 1 and df.shape[1] >= 2:
                         df.attrs['extractor'] = 'paddleocr_vl'
                         df.attrs['page_idx'] = block[0]
+                        df.attrs['covered_pages'] = list(block)
                         # 触发 Post-OCR 门禁检验与 Agent 协同验证
                         df = verify_and_rescue_table_with_agent(df, pdf_path, block[0], df.attrs.get('label', ''))
                         results.append({
@@ -1305,6 +1424,7 @@ def extract_via_paddleocr_fullpage(pdf_path: str, pages: Optional[List[int]] = N
                             'page_idx': block[0],
                             'table_idx': t_idx,
                             'bbox': None,
+                            'covered_pages': list(block),
                         })
             except Exception as e:
                 print(f"[PaddleOCR-VL FullPage] Block {[p+1 for p in block]} 提取异常: {e}")
@@ -1372,8 +1492,23 @@ def extract_tables_from_pdf(
         logs.append(f"  pdf-inspector 错误: {inspector_result['error']}")
 
     pdf_type = inspector_result['pdf_type']
-    pages_with_tables = inspector_result['pages_with_tables']
-    inspector_tables = [t for t in inspector_result['tables'] if t.get('page_idx') is not None]
+    inspector_tables = []
+    for t in inspector_result['tables']:
+        if t.get('page_idx') is not None:
+            inspector_tables.append(t)
+        else:
+            lbl = t['df'].attrs.get('label') or format_table_label(t['df'].attrs.get('table_title', ''))
+            resolved_p = caption_page_map.get(lbl) if (caption_page_map and lbl) else None
+            if resolved_p is None and pages_with_tables and len(pages_with_tables) == 1:
+                resolved_p = pages_with_tables[0] - 1
+            if resolved_p is not None:
+                t['page_idx'] = resolved_p
+                t['df'].attrs['page_idx'] = resolved_p
+                inspector_tables.append(t)
+            else:
+                t['page_idx'] = 0
+                t['df'].attrs['page_idx'] = 0
+                inspector_tables.append(t)
 
     # 精准候选页面决策体系：
     # 1. 若文本层已明确检测到表标题声明 (caption_pages)，以 caption_pages 为绝对基准；
@@ -1494,14 +1629,22 @@ def extract_tables_from_pdf(
             ocr_candidate_pages = sorted(list(pages_requiring_ocr))
             logs.append(f"→ Step 3b: 检验未通过/待精细识别页面 {[p+1 for p in ocr_candidate_pages]} 全面由 PaddleOCR-VL-1.6 独立接管提取")
             
-            # 清理待 OCR 页面的残次原生表，绝不混淆
-            ocr_candidate_set = set(ocr_candidate_pages)
-            all_results = [r for r in all_results if r.get('page_idx') not in ocr_candidate_set]
-            
             ocr_results = extract_via_paddleocr_fullpage(pdf_path, ocr_candidate_pages)
             if ocr_results:
+                # 仅在 OCR 成功获得非空表格时，才替换对应页面的原生表
+                ocr_success_pages = set()
+                for r in ocr_results:
+                    if r.get('covered_pages'):
+                        ocr_success_pages.update(r['covered_pages'])
+                    elif r.get('page_idx') is not None:
+                        ocr_success_pages.add(r['page_idx'])
+                if not ocr_success_pages:
+                    ocr_success_pages = set(ocr_candidate_pages)
+                all_results = [r for r in all_results if r.get('page_idx') not in ocr_success_pages]
                 all_results.extend(ocr_results)
-                logs.append(f"  PaddleOCR-VL 独立接管提取到 {len(ocr_results)} 个表格")
+                logs.append(f"  PaddleOCR-VL 独立接管提取到 {len(ocr_results)} 个表格 (覆盖页面: {[p+1 for p in sorted(ocr_success_pages)]})")
+            else:
+                logs.append("  PaddleOCR-VL 未提取到有效表格或执行失败，保留原生解析结果")
 
         # Step 3c: 仍未覆盖且从未被 PaddleOCR 处理过的页面 → text_alignment
         extracted_pages = set(r.get('page_idx', -1) for r in all_results if r.get('page_idx') is not None)

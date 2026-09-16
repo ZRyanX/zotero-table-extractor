@@ -306,7 +306,7 @@ def call_pp_structure_v3_api(file_path: str, config: Optional[dict] = None, time
     return call_paddleocr_job(file_path, model=model, config=config, timeout=timeout, cancel_event=cancel_event)
 
 
-def extract_pp_structure_table_crops(pdf_path: str, config: Optional[dict] = None, cancel_event=None) -> List[Dict[str, Any]]:
+def extract_pp_structure_table_crops(pdf_path: str, config: Optional[dict] = None, cancel_event=None, pages: Optional[List[int]] = None) -> List[Dict[str, Any]]:
     """
     通过 PP-StructureV3 提取 PDF 中所有表格的图像切图 Crop 和页面上下文。
     返回结构与原 extract_table_crops_from_pdf 兼容：
@@ -342,6 +342,8 @@ def extract_pp_structure_table_crops(pdf_path: str, config: Optional[dict] = Non
             break
 
         p_idx = p_info["page_idx"]
+        if pages is not None and p_idx not in pages:
+            continue
         md = p_info["markdown"]
         images = p_info["images"]  # dict { "table_1.png": "http..." }
 

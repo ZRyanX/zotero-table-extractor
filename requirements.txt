@@ -2,10 +2,13 @@
 pymupdf>=1.23.0
 pdfplumber>=0.10.0
 camelot-py[cv]>=0.11.0
-pandas>=2.0.0
+pandas>=2.0.0,<3.0.0
 openpyxl>=3.1.0
 requests>=2.28.0
 pillow>=10.0.0
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+pdf-inspector
 
 # Local AI / Vision Layout Detection (ONNX)
 onnxruntime>=1.16.0
@@ -14,6 +17,8 @@ numpy>=1.24.0
 # Dynamic Web & Browser Automation (Online Pipeline)
 playwright>=1.40.0
 curl_cffi>=0.6.0
+nest_asyncio>=1.5.0
+websockets>=11.0
 
 # Optional / Extended Scrapers (Online Pipeline Enhancement)
 # scrapling>=0.2.0

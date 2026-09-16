@@ -80,8 +80,10 @@ class LLMTableReasoner:
         self.timeout = int(config.get("LLM_TIMEOUT") or config.get("llm_timeout", 60))
 
     def is_available(self) -> bool:
-        """检查大语言模型外部 API 是否已配置并可用。"""
-        return bool(self.enabled and self.api_key)
+        """检查大语言模型外部 API 或 Agent Bridge 是否已配置并可用。"""
+        has_api = bool(self.enabled and self.api_key)
+        has_bridge = bool(self.enabled and self.agent_bridge is not None)
+        return has_api or has_bridge
 
     def _call_chat_completion(
         self, 
@@ -144,6 +146,15 @@ class LLMTableReasoner:
 
         raw_resp = self._call_chat_completion(messages, temperature=0.0)
         if not raw_resp:
+            if self.agent_bridge:
+                task_id = self.agent_bridge.create_reasoning_task(
+                    task_type="complex_hierarchy",
+                    pdf_path="",
+                    page_idx=0,
+                    table_label="Table",
+                    raw_html=table_raw_html_or_md
+                )
+                return self.agent_bridge.check_resolved_task(task_id, timeout_seconds=5.0)
             return None
 
         # Parse JSON from response
@@ -160,6 +171,29 @@ class LLMTableReasoner:
         except Exception as e:
             print(f"[LLM Table Reasoner] JSON 解析失败: {e}")
         return None
+
+    def repair_defective_table(self, df: pd.DataFrame, context_notes: str = "") -> pd.DataFrame:
+        """
+        利用大模型/智能体对存在严重表头错位、挤压或格式缺陷的 DataFrame 进行语义重构修复。
+        """
+        if df is None or df.empty or not self.is_available():
+            return df
+
+        original_attrs = dict(getattr(df, 'attrs', {}))
+        try:
+            md_str = df.to_markdown(index=False)
+        except Exception:
+            try:
+                md_str = df.to_csv(index=False)
+            except Exception:
+                return df
+
+        repaired_df = self.reason_complex_table_hierarchy(md_str)
+        if repaired_df is not None and not repaired_df.empty:
+            repaired_df.attrs.update(original_attrs)
+            repaired_df.attrs['llm_repaired'] = True
+            return repaired_df
+        return df
 
     def disambiguate_multipage_continuation(
         self, 

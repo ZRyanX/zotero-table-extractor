@@ -140,13 +140,15 @@ def _get_path_setting(key: str, default: Optional[str] = None) -> Optional[str]:
 
 
 def get_aihub_root() -> str:
-    """获取 AIHub 根目录。"""
+    """获取 AIHub 根目录。优先级：config/环境变量 > 系统已存在目录 > 用户主目录/AIHub"""
     custom = _get_path_setting("AIHUB_ROOT")
     if custom:
         return custom
     if IS_MACOS and os.path.isdir(_MACOS_AIHUB_ROOT):
         return _MACOS_AIHUB_ROOT
-    return find_windows_aihub_root()
+    if IS_WINDOWS:
+        return find_windows_aihub_root()
+    return os.path.join(get_user_home(), "AIHub")
 
 
 def get_paper_tables_dir() -> str:
@@ -268,16 +270,16 @@ def get_playwright_profile_dir() -> str:
 def adapt_path(path: str) -> str:
     """
     通用路径自适应映射：
-    - 在 macOS 下：100% 保持入参的原样字符串返回，绝不作变动；
-    - 在 Windows 下：自动将 macOS 格式的硬编码路径映射至对应的 Windows 本地路径。
+    - 若路径已在本机物理存在，直接返回；
+    - 若路径包含历史固定挂载路径（如 /Volumes/ExFat/AIHub）但在当前主机不存在，自动映射至本地有效工作路径；
+    - 在 Windows 下：自动将 POSIX 格式映射至 Windows 本地驱动器路径。
     """
     if not path or not isinstance(path, str):
         return path
 
-    if IS_MACOS:
+    if os.path.exists(path):
         return path
 
-    # Windows 映射逻辑
     norm = path.replace("\\", "/")
 
     # 1. /Volumes/ExFat/AIHub/paper_tables/...

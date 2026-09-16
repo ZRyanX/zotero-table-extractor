@@ -8,15 +8,16 @@ table_postprocess.py — 表格 DataFrame 纯文本后处理（自 extract_zoter
 """
 
 import io
+import os
 import re
 from typing import List, Optional, Tuple, Dict, Any, Union
 
 import pandas as pd
 
 try:
-    from .common import format_table_label, TABLE_LABEL_PATTERN, TABLE_LABEL_RE, is_markdown_separator
+    from .common import format_table_label, TABLE_LABEL_PATTERN, TABLE_LABEL_RE, is_markdown_separator, df_map
 except ImportError:
-    from common import format_table_label, TABLE_LABEL_PATTERN, TABLE_LABEL_RE, is_markdown_separator
+    from common import format_table_label, TABLE_LABEL_PATTERN, TABLE_LABEL_RE, is_markdown_separator, df_map
 
 
 def clean_text(val):
@@ -537,10 +538,7 @@ def _clean_vlm_dataframe(df: pd.DataFrame, original_attrs: dict) -> pd.DataFrame
         df.columns = unique_cols
 
     # 2. 安全单元格清洗与地学符号无损规整（不拆分文本）
-    if hasattr(df, 'map'):
-        df = df.map(lambda x: clean_latex_and_ocr(clean_text(str(x))) if pd.notna(x) and str(x).strip() not in ('nan', 'None') else "")
-    else:
-        df = df.applymap(lambda x: clean_latex_and_ocr(clean_text(str(x))) if pd.notna(x) and str(x).strip() not in ('nan', 'None') else "")
+    df = df_map(df, lambda x: clean_latex_and_ocr(clean_text(str(x))) if pd.notna(x) and str(x).strip() not in ('nan', 'None') else "")
 
     # 3. 剥离跨页拼接中可能残留的印刷重复表头行
     df = strip_embedded_duplicate_headers(df)
@@ -550,10 +548,7 @@ def _clean_vlm_dataframe(df: pd.DataFrame, original_attrs: dict) -> pd.DataFrame
 
     # 5. 转义 Excel 公式
     df.columns = [escape_formula(c) for c in df.columns]
-    if hasattr(df, 'map'):
-        df = df.map(escape_formula)
-    else:
-        df = df.applymap(escape_formula)
+    df = df_map(df, escape_formula)
 
     if hasattr(df, 'attrs'):
         df.attrs.update(original_attrs)
@@ -751,10 +746,7 @@ def postprocess_dataframe(df, headers=None):
         df.columns = headers
         
     df.columns = [clean_latex_and_ocr(clean_text(c)) for c in df.columns]
-    if hasattr(df, 'map'):
-        df = df.map(lambda x: clean_latex_and_ocr(clean_text(x)) if isinstance(x, str) else x)
-    else:
-        df = df.applymap(lambda x: clean_latex_and_ocr(clean_text(x)) if isinstance(x, str) else x)
+    df = df_map(df, lambda x: clean_latex_and_ocr(clean_text(x)) if isinstance(x, str) else x)
 
     # 保证列名唯一
     if not df.columns.is_unique:
@@ -779,19 +771,27 @@ def postprocess_dataframe(df, headers=None):
     df = _filter_noise_and_placeholders(df)
 
     # 步骤 E: 数值类型推断与公式转义
-    if hasattr(df, 'map'):
-        df = df.map(try_numeric)
-    else:
-        df = df.applymap(try_numeric)
+    df = df_map(df, try_numeric)
         
     df = strip_embedded_duplicate_headers(df)
 
     df.columns = [escape_formula(c) for c in df.columns]
-    if hasattr(df, 'map'):
-        df = df.map(escape_formula)
-    else:
-        df = df.applymap(escape_formula)
+    df = df_map(df, escape_formula)
         
+    # 步骤 F: 智能体/大模型语义修复（当启用 LLM 且表头/结构异常时）
+    if os.getenv("LLM_TABLE_REASONER_ENABLED") or original_attrs.get('enable_llm'):
+        try:
+            from llm_reasoner import get_llm_reasoner
+            reasoner = get_llm_reasoner()
+            if reasoner.is_available():
+                unnamed_cols = sum(1 for c in df.columns if str(c).startswith("Unnamed") or not str(c).strip())
+                if unnamed_cols > len(df.columns) * 0.4:
+                    repaired = reasoner.repair_defective_table(df)
+                    if repaired is not None and not repaired.empty:
+                        df = repaired
+        except Exception:
+            pass
+
     if hasattr(df, 'attrs'):
         df.attrs.update(original_attrs)
         
@@ -1097,10 +1097,14 @@ def merge_continuation_tables(dfs):
         )
         is_block_sequence = (prev_page is None and curr_page is None)
         
-        # 跨页续表必须满足标签完全相同，或者明确带有续表/continued 标识，或者无标签且列数高度匹配
-        is_same_label = (lbl and prev_lbl and lbl.lower() == prev_lbl.lower())
+        # 页面跨度距离约束：防止相隔甚远的独立章节/附表同名表被错误合并为续表 (如跨度超过2页)
+        page_dist = abs(curr_page - prev_page) if (prev_page is not None and curr_page is not None) else None
+        page_nearby = (page_dist is None) or (page_dist <= 2)
+
+        # 跨页续表必须满足标签完全相同且页码邻近(<=2页)，或者明确带有续表标识且页码邻近，或者无标签且列数高度匹配
+        is_same_label = bool(lbl and prev_lbl and lbl.lower() == prev_lbl.lower() and page_nearby)
         title_str = str(df.attrs.get('table_title', '')).lower()
-        is_explicit_cont = bool(re.search(r'(?:续表|接上表|continued|\(cont\)|cont\.)', title_str))
+        is_explicit_cont = bool(re.search(r'(?:续表|接上表|continued|\(cont\)|cont\.)', title_str)) and page_nearby
         
         cols_match = (
             df.shape[1] == prev_df.shape[1] or

@@ -62,6 +62,38 @@ def autofit_excel_columns(file_path, title=None):
         print(f"Warning: Failed to auto-fit column widths: {e}")
 
 
+def _load_excel_with_attrs(tbl_path, output_path=None):
+    """从磁盘加载 Excel 表格，并尽可能恢复其 .attrs 元数据 (标题、页码等)。"""
+    existing_df = pd.read_excel(tbl_path)
+    if not hasattr(existing_df, 'attrs'):
+        existing_df.attrs = {}
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(tbl_path, read_only=True)
+        if wb.properties and wb.properties.title:
+            existing_df.attrs['table_title'] = wb.properties.title
+            existing_df.attrs['label'] = wb.properties.title
+        wb.close()
+    except Exception:
+        pass
+    if output_path:
+        cap_file = os.path.join(output_path, "table_captions.txt")
+        if os.path.exists(cap_file):
+            base = os.path.splitext(os.path.basename(tbl_path))[0]
+            try:
+                with open(cap_file, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        if ':' in line:
+                            k, v = line.split(':', 1)
+                            if k.strip() == base or make_safe_filename(k.strip()) == base:
+                                existing_df.attrs['table_title'] = v.strip()
+                                existing_df.attrs['label'] = k.strip()
+                                break
+            except Exception:
+                pass
+    return existing_df
+
+
 def save_tables_to_excel(dataframes, output_path, headers=None, single_file=True, skip_labels=None, skip_supplementary=False):
     """
     Saves a list of DataFrames to Excel.
@@ -71,11 +103,35 @@ def save_tables_to_excel(dataframes, output_path, headers=None, single_file=True
     if not dataframes:
         return False
 
-    if single_file and not output_path.lower().endswith('.xlsx'):
+    if single_file and not str(output_path).lower().endswith('.xlsx'):
         single_file = False
 
+    # 0. 规范化输入：无缝兼容 ExtractedTable 统一对象、dict 管道与原生 pd.DataFrame
+    norm_dfs = []
+    for d in dataframes:
+        if d is None:
+            continue
+        if hasattr(d, 'to_dataframe'):
+            norm_dfs.append(d.to_dataframe())
+        elif hasattr(d, 'df') and isinstance(d.df, pd.DataFrame):
+            if hasattr(d, 'sync_attrs'):
+                d.sync_attrs()
+            norm_dfs.append(d.df)
+        elif isinstance(d, dict) and 'df' in d:
+            df_item = d['df']
+            if hasattr(df_item, 'attrs'):
+                for k in ('label', 'table_title', 'caption', 'page_idx', 'extractor', 'source'):
+                    if k in d and k not in df_item.attrs:
+                        df_item.attrs[k] = d[k]
+            norm_dfs.append(df_item)
+        elif isinstance(d, pd.DataFrame):
+            norm_dfs.append(d)
+
+    if not norm_dfs:
+        return False
+
     # 1. 预先合并跨页未命名续表/同名续表，避免未命名 1 行续表被 postprocess 当作空表过滤
-    merged_raw_dfs = merge_continuation_tables(dataframes)
+    merged_raw_dfs = merge_continuation_tables(norm_dfs)
 
     cleaned_dfs = []
     for df in merged_raw_dfs:
@@ -151,7 +207,7 @@ def save_tables_to_excel(dataframes, output_path, headers=None, single_file=True
         captions = []
         main_count = 0
         supp_count = 0
-        written_files = set()
+        written_files = {}  # tbl_path -> DataFrame (with preserved .attrs)
         for idx, df in enumerate(cleaned_dfs):
             # Try to resolve title/caption and label from attrs
             title = df.attrs.get('table_title') or ""
@@ -198,12 +254,7 @@ def save_tables_to_excel(dataframes, output_path, headers=None, single_file=True
                 extracted_label = ""
                 
             # 若全文包含多级章节表号（如 表1-1 或 表1.1），过滤掉伪单数字表号（如 表1、表2、Table 1）
-            if extracted_label and has_chapter_labels and re.match(r'^(?:Table\s*\d+|表\s*\d+)$', extracted_label, re.IGNORECASE):
-                print(f"Skipping generic single-number table {extracted_label} on page {df.attrs.get('page_idx')} in multi-chapter document...")
-                continue
-
-            is_supp = is_supplementary(extracted_label or title)
-            
+            is_supp = is_supplementary(label or title)
             if extracted_label:
                 file_label = extracted_label
             else:
@@ -229,12 +280,13 @@ def save_tables_to_excel(dataframes, output_path, headers=None, single_file=True
             tbl_path = os.path.join(output_path, f"{safe_label}.xlsx")
             
             # Check if this file already exists (e.g. from an earlier page or part of a continued table)
-            # Only merge if the file was written during the current run of the script.
-            # Otherwise, overwrite it to prevent polluting with leftover files from previous runs.
-            if os.path.exists(tbl_path) and tbl_path in written_files:
+            if os.path.exists(tbl_path):
                 print(f"File {tbl_path} already exists. Merging dataframes...")
                 try:
-                    existing_df = pd.read_excel(tbl_path)
+                    if tbl_path in written_files:
+                        existing_df = written_files[tbl_path]
+                    else:
+                        existing_df = _load_excel_with_attrs(tbl_path, output_path)
                     
                     # Determine relationship between new df and existing_df
                     cols1 = [str(c).lower().strip() for c in existing_df.columns]
@@ -248,7 +300,11 @@ def save_tables_to_excel(dataframes, output_path, headers=None, single_file=True
 
                     # 判断是否为同一张大表的跨页续表部分（续表应纵向拼接）
                     title_str = str(df.attrs.get('table_title', '')).lower()
-                    is_cont_part = bool(re.search(r'(?:续表|接上表|continued|\(cont\)|cont\.)', title_str)) or '(续)' in str(df.attrs.get('table_title', ''))
+                    is_cont_part = (
+                        bool(re.search(r'(?:续表|接上表|continued|\(cont\)|cont\.)', title_str)) or
+                        '(续)' in str(df.attrs.get('table_title', '')) or
+                        bool(df.attrs.get('is_continuation'))
+                    )
                     
                     if is_cont_part:
                         from table_postprocess import combine_df_group
@@ -296,16 +352,23 @@ def save_tables_to_excel(dataframes, output_path, headers=None, single_file=True
                     except Exception as e:
                         print(f"Warning during duplicate row cleaning: {e}")
                         
+                    # 严格保留并合并 .attrs 元数据，避免覆写丢失
+                    saved_attrs = dict(getattr(existing_df, 'attrs', {}))
+                    saved_attrs.update({k: v for k, v in getattr(df, 'attrs', {}).items() if v is not None})
+                    if not hasattr(df_to_save, 'attrs') or df_to_save.attrs is None:
+                        df_to_save.attrs = {}
+                    df_to_save.attrs.update(saved_attrs)
+                        
                     df_to_save.to_excel(tbl_path, index=False)
-                    autofit_excel_columns(tbl_path, title=title or file_label)
-                    written_files.add(tbl_path)
+                    autofit_excel_columns(tbl_path, title=df_to_save.attrs.get('table_title') or title or file_label)
+                    written_files[tbl_path] = df_to_save
                     print(f"Saved: {tbl_path}")
                 except Exception as e:
                     print(f"Error merging dataframes for {tbl_path}: {e}")
             else:
                 df.to_excel(tbl_path, index=False)
                 autofit_excel_columns(tbl_path, title=title or file_label)
-                written_files.add(tbl_path)
+                written_files[tbl_path] = df
                 print(f"Saved: {tbl_path}")
             
             # Collect caption info
