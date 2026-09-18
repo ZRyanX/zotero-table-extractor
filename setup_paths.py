@@ -14,7 +14,11 @@ setup_paths.py — Zotero Table Extractor 跨平台路径自定义与交互式�
   python setup_paths.py            # 交互式引导配置
   python setup_paths.py --auto     # 非交互式一键自动探测并保存推荐路径
   python setup_paths.py --show     # 查看当前各项路径配置与有效性状态
-  python setup_paths.py --reset    # 重置 config.json 为默认空白模板
+  python setup_paths.py --reset    # 重置 config.json 为默认空白模板（自动预备份）
+  python setup_paths.py --update   # 在线安全更新技能并平滑迁移配置（保留原私有信息）
+  python setup_paths.py --check-update # 检查远端代码更新与本地缺失配置项
+  python setup_paths.py --rollback # 回滚至最近一次备份的配置状态
+  python setup_paths.py --list-backups # 查看历史配置快照列表
 """
 
 import os
@@ -165,24 +169,51 @@ def load_existing_config() -> Dict[str, Any]:
     """读取现有配置，若不存在则读取示例配置。"""
     if os.path.isfile(CONFIG_PATH):
         try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            with open(CONFIG_PATH, "r", encoding="utf-8-sig") as f:
                 return json.load(f)
         except Exception as e:
             c_print(f"读取 config.json 出错: {e}，将使用模板", COLOR_YELLOW)
 
     if os.path.isfile(EXAMPLE_CONFIG_PATH):
         try:
-            with open(EXAMPLE_CONFIG_PATH, "r", encoding="utf-8") as f:
+            with open(EXAMPLE_CONFIG_PATH, "r", encoding="utf-8-sig") as f:
                 return json.load(f)
         except Exception:
             pass
     return {}
 
 def save_config(config_data: Dict[str, Any]):
-    """保存配置至 config.json。"""
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(config_data, f, indent=2, ensure_ascii=False)
-    c_print(f"\n[✓] 配置已成功写入：{CONFIG_PATH}", COLOR_GREEN)
+    """保存配置至 config.json。写入前自动创建安全备份并执行原子替换。"""
+    try:
+        # 优先引入 updater 的 ConfigBackupManager 建立版本化快照
+        scripts_dir = os.path.join(ROOT_DIR, "scripts")
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        from updater import ConfigBackupManager
+        ConfigBackupManager(ROOT_DIR).create_backup(reason="setup_paths_save")
+    except Exception:
+        if os.path.isfile(CONFIG_PATH):
+            try:
+                shutil.copy2(CONFIG_PATH, os.path.join(ROOT_DIR, "config.backup.json"))
+            except Exception:
+                pass
+
+    tmp_target = CONFIG_PATH + f".tmp_{os.getpid()}"
+    try:
+        with open(tmp_target, "w", encoding="utf-8") as f:
+            json.dump(config_data, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_target, CONFIG_PATH)
+        c_print(f"\n[✓] 配置已安全写入并同步防护快照：{CONFIG_PATH}", COLOR_GREEN)
+    finally:
+        if os.path.exists(tmp_target):
+            try:
+                os.remove(tmp_target)
+            except Exception:
+                pass
+
 
 # ---------------------------------------------------------------------------
 # 4. 交互引导逻辑
@@ -444,7 +475,21 @@ def show_status():
 
 
 def reset_to_template():
-    """重置为默认模板。"""
+    """重置为默认模板，执行前自动创建配置快照以防误触。"""
+    if os.path.isfile(CONFIG_PATH):
+        try:
+            scripts_dir = os.path.join(ROOT_DIR, "scripts")
+            if scripts_dir not in sys.path:
+                sys.path.insert(0, scripts_dir)
+            from updater import ConfigBackupManager
+            ConfigBackupManager(ROOT_DIR).create_backup(reason="pre_reset_to_template")
+            c_print("[*] 正在重置前对现有配置建立紧急快照备份...", COLOR_CYAN)
+        except Exception:
+            try:
+                shutil.copy2(CONFIG_PATH, os.path.join(ROOT_DIR, "config.backup.json"))
+            except Exception:
+                pass
+
     if os.path.isfile(EXAMPLE_CONFIG_PATH):
         shutil.copy(EXAMPLE_CONFIG_PATH, CONFIG_PATH)
         c_print(f"[✓] 已重置 config.json 为官方出厂模板：{CONFIG_PATH}", COLOR_GREEN)
@@ -456,7 +501,14 @@ def main():
     parser = argparse.ArgumentParser(description="Zotero Table Extractor 跨平台路径与环境初始化配置向导")
     parser.add_argument("--auto", action="store_true", help="非交互式一键自动探测并保存推荐路径")
     parser.add_argument("--show", "--status", action="store_true", help="查看当前各项路径的配置与有效性状态")
-    parser.add_argument("--reset", action="store_true", help="重置 config.json 为默认空白模板")
+    parser.add_argument("--reset", action="store_true", help="重置 config.json 为默认空白模板（操作前自动安全备份）")
+    parser.add_argument("--update", action="store_true", help="在线安全更新技能并迁移新配置项（严格保留原 API Keys 与自定义路径）")
+    parser.add_argument("--check-update", action="store_true", help="检查远端是否存在更新并检测缺失的配置项")
+    parser.add_argument("--rollback", nargs="?", const="latest", help="回滚 config.json 至最近或指定 ID 的快照")
+    parser.add_argument("--list-backups", action="store_true", help="查看所有历史配置备份清单")
+    parser.add_argument("--dry-run", action="store_true", help="模拟演练更新全流程，不修改文件")
+    parser.add_argument("--force", action="store_true", help="强制在线拉取更新")
+    parser.add_argument("--install-deps", action="store_true", help="更新后自动安装/升级 Python 依赖")
     args = parser.parse_args()
 
     if args.reset:
@@ -465,6 +517,52 @@ def main():
         show_status()
     elif args.auto:
         run_auto_defaults()
+    elif args.update or args.check_update or args.rollback is not None or args.list_backups:
+        scripts_dir = os.path.join(ROOT_DIR, "scripts")
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        from updater import SkillUpdater
+        updater = SkillUpdater(ROOT_DIR)
+
+        if args.list_backups:
+            backups = updater.backup_mgr.list_backups()
+            c_print("\n【历史配置快照清单】", COLOR_BOLD + COLOR_CYAN)
+            if not backups:
+                c_print("  当前暂无历史快照记录。", COLOR_GRAY)
+            else:
+                for idx, b in enumerate(backups, 1):
+                    c_print(f"  [{idx}] ID: {b.get('id')} | 时间: {b.get('timestamp')} | 原因: {b.get('reason')} | 键数: {b.get('keys_count')}")
+                    c_print(f"      路径: {b.get('file_path')}", COLOR_GRAY)
+        elif args.rollback is not None:
+            updater.rollback(args.rollback)
+        elif args.check_update:
+            check_res = updater.check()
+            diff = check_res["config_diff"]
+            c_print("=" * 72, COLOR_BLUE)
+            c_print("  🔍 Zotero Table Extractor 在线更新与环境检测报告", COLOR_BOLD + COLOR_CYAN)
+            c_print("=" * 72, COLOR_BLUE)
+            c_print(f"• 本地配置文件 (config.json)      : {diff['total_user_keys']} 项已配置")
+            c_print(f"• 官方最新模板 (config.example.json): {diff['total_example_keys']} 项标准参数")
+            if diff["missing_in_user"]:
+                c_print(f"  [!] 本地缺失的新参数 ({len(diff['missing_in_user'])} 个): {', '.join(diff['missing_in_user'])}", COLOR_YELLOW)
+                c_print("      建议运行 python update.py 进行一键平滑迁移（原有私有配置 100% 保留）", COLOR_CYAN)
+            else:
+                c_print("  [✓] 本地配置字段完全齐备，无需迁移补齐", COLOR_GREEN)
+            if check_res.get("is_git"):
+                git_st = check_res.get("git_status", {})
+                c_print(f"• Git 当前分支: {git_st.get('current_branch')} | 本地 commit: {git_st.get('local_commit')}")
+                if git_st.get("has_update"):
+                    c_print(f"  [★] 发现远端最新代码！落后远端 {git_st.get('behind_count')} 个提交", COLOR_BOLD + COLOR_GREEN)
+                else:
+                    c_print("  [✓] 本地代码已是远端最新版本", COLOR_GREEN)
+            else:
+                rel_st = check_res.get("release_status", {})
+                c_print(f"• 归档版本: {rel_st.get('tag_name')} ({rel_st.get('name')})")
+                if rel_st.get("available"):
+                    c_print("  [✓] 可通过 GitHub Release / Archive 归档进行安全更新", COLOR_GREEN)
+            c_print("=" * 72, COLOR_BLUE)
+        elif args.update:
+            updater.perform_update(force=args.force, dry_run=args.dry_run, install_deps=args.install_deps)
     else:
         run_interactive_wizard()
 

@@ -4,6 +4,9 @@ config.backup.json
 *.local.json
 *.backup.json
 *.bak
+.backups/
+backups/
+.updater_tmp/
 
 # Browser user data and login profiles (contains real cookies & passwords)
 profiles/
@@ -26,5 +29,8 @@ __pycache__/
 scratch/
 *.db
 *.log
+*.tmp
+*.tmp_*
+.tmp_*
 baked_rotated_pdf_*
 ppstruct_subset_*

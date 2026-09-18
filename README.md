@@ -33,11 +33,13 @@
 - [🏗 架构设计与数据流转图](#-架构设计与数据流转图)
 - [💻 环境要求与安装](#-环境要求与安装)
 - [⚙️ 配置指南](#️-配置指南)
-  - [1. 配置文件初始化 (config.json)](#1-配置文件初始化-configjson)
-  - [2. 环境变量优先支持](#2-环境变量优先支持)
-  - [3. 详细配置项说明](#3-详细配置项说明)
-  - [4. 各种 API 获取方式](#4-各种-api-获取方式)
-  - [5. 期刊与知网登录向导 (login.py)](#5-期刊与知网登录向导-loginpy)
+  - [1. 跨平台路径与环境交互式配置向导 (setup_paths.py)](#1-跨平台路径与环境交互式配置向导强烈推荐)
+  - [2. 配置文件手动初始化 (config.json)](#2-配置文件手动初始化-configjson)
+  - [3. 环境变量优先支持](#3-环境变量优先支持)
+  - [4. 详细配置项说明](#4-详细配置项说明)
+  - [5. 技能在线更新与配置防护机制 (update.py)](#5-技能在线更新与配置防护机制-updatepy)
+  - [6. 各种 API 获取方式](#6-各种-api-获取方式)
+  - [7. 期刊与知网登录向导 (login.py)](#7-期刊与知网登录向导-loginpy)
 - [🚀 使用方法](#-使用方法)
   - [单篇 PDF 表格提取](#单篇-pdf-表格提取)
   - [在线文献 URL / DOI 提取](#在线文献-url--doi-提取)
@@ -334,7 +336,52 @@ cp config.example.json config.json
 1. 访问 [Firecrawl 官网](https://www.firecrawl.dev/) 注册并获取 API Key；
 2. 填入 `config.json` 的 `FIRECRAWL_API_KEY`。
 
-### 5. 期刊与知网登录向导 (login.py)
+### 5. 技能在线更新与配置防护机制 (update.py)
+
+为了确保用户能够始终享受到上游算法优化与功能修复，同时**绝对杜绝更新时覆盖用户配置好的 API 密钥与个人目录（如 Zotero 数据路径、Excel 导出目录、本地模型等）**，本项目内置了企业级的在线更新与个人配置绝对保护引擎：
+
+#### 🌟 核心防护特性
+1. **零覆盖保证 (Zero-Overwrite)**：无论远端代码如何迭代，现有 `config.json` 中的所有个人凭据（`FIRECRAWL_API_KEY`、`ELSEVIER_API_KEY`、`PADDLEOCR_MCP_AISTUDIO_ACCESS_TOKEN`、`LLM_API_KEY` 等）与个性化路径绝对 100% 保持原样；
+2. **智能双向合并 (Intelligent 2-Way Merge)**：上游 `config.example.json` 若引入了新的特性参数，引擎会自动检测并无缝增量补充进用户的 `config.json` 中，无需用户手动对比复制；
+3. **多版本自动快照与一键回滚 (Rollback)**：每次更新前，系统会在 `.backups/` 目录中建立带时间戳的全量快照与校验 Manifest。如遇异常或需退回，只需一条命令即可毫秒级回滚；
+4. **Git 与 Release 归档双模支持**：
+   - **Git 环境**：自动探测分支、安全 Stash 本地已跟踪修改、执行快进合并；
+   - **免 Git / ZIP 部署环境**：自动从 GitHub Releases / Archive 拉取最新稳定归档包，遵循白名单过滤机制，绝对屏蔽并保护 `config.json`、`profiles/`、本地模型与用户数据库；
+5. **凭据脱敏核验单**：更新后在终端高亮打印脱敏核验清单，直观确认各项私有密钥毫发无损。
+
+#### 常用更新命令参考
+
+```bash
+# 1. 一键在线安全更新（自动检测、安全拉取、配置智能合并）
+python update.py
+# 或通过配置向导调用：
+python setup_paths.py --update
+
+# 2. 仅检查远端是否有新版本及本地是否缺失新配置项（只读安全探测）
+python update.py --check
+# 或：
+python setup_paths.py --check-update
+
+# 3. 演练模式（Dry-run 模拟更新全流程，不修改任何磁盘文件）
+python update.py --dry-run
+
+# 4. 回滚至最近一次备份的配置状态
+python update.py --rollback
+
+# 5. 列出所有历史配置快照列表
+python update.py --list-backups
+
+# 6. 仅同步 config.example.json 最新模板项进 config.json（不拉取代码）
+python update.py --merge-only
+
+# 7. 更新后自动升级 Python 运行依赖
+python update.py --install-deps
+
+# 8. 以结构化 JSON 输出结果（专为 Agent、MCP 工具与自动化脚本设计）
+python update.py --check --json
+```
+
+### 6. 期刊与知网登录向导 (login.py)
 
 为了让爬虫能够下载或查看机构订阅的高校数据库（如知网、Springer、Wiley），项目提供了统一的交互式登录与 Cookie 保持向导：
 
@@ -450,8 +497,9 @@ python scripts/verify_tables.py --root "/path/to/output_dir"
 zotero-table-extractor/
 ├── README.md                         # 项目主说明文档（本文件）
 ├── SKILL.md                          # AI Agent 技能协议定义与提示词
-├── requirements.txt                  # Python 依赖清单
+├── update.py                         # 🔄 技能在线更新与个人配置绝对防护主入口
 ├── setup_paths.py                    # 🛠 跨平台路径与环境交互式初始化配置向导
+├── requirements.txt                  # Python 依赖清单
 ├── config.json                       # 运行时私有配置 (受 .gitignore 保护，切勿提交)
 ├── config.example.json               # 配置文件模板
 ├── .gitignore                        # Git 忽略配置 (保护密钥、缓存与临时数据库)
@@ -463,6 +511,7 @@ zotero-table-extractor/
 │   └── doclayout-yolo-docstructbench-q8-6c25a56c.onnx # 8位量化 YOLO 版面检测模型
 ├── scratch/                          # 临时诊断测试与试验脚本目录
 └── scripts/                          # 核心源码库
+    ├── updater.py                    # 🛡️ 在线安全更新与智能配置迁移/回滚引擎
     ├── setup_paths.py                # 🛠 路径配置向导入口薄壳
     ├── extract_zotero_table.py       # 🚀 CLI 主入口：单篇/批量/清单表格提取总调度
     ├── batch_run.py                  # 🚀 Zotero 全库并发提取调度器（子进程隔离）

@@ -66,6 +66,8 @@ description: 从 Zotero 选中条目（依赖 ai4paper-zotero MCP 获取物理�
 ```text
 zotero-table-extractor/
 ├── SKILL.md                         # 技能说明文档
+├── update.py                        # 🔄 技能在线更新与个人配置绝对防护主入口
+├── setup_paths.py                   # 🛠 跨平台路径与环境交互式初始化配置向导
 ├── config.json                      # 运行期配置 (含 API Keys，受 .gitignore 保护勿提交)
 ├── config.example.json              # 配置模板
 ├── figures/                         # 技能超清架构图 (draw.io 工程源文件及 PNG/SVG 导出)
@@ -76,6 +78,8 @@ zotero-table-extractor/
 │   └── doclayout-yolo-docstructbench-q8-6c25a56c.onnx
 ├── scratch/                         # 临时诊断脚本与测试套件
 └── scripts/                         # 核心提取代码库
+    ├── updater.py                   # 🛡️ 在线安全更新与智能配置迁移/回滚引擎
+    ├── setup_paths.py               # 🛠 路径配置向导入口薄壳
     ├── extract_zotero_table.py      # CLI 主入口（支持单篇、目录批量或 .txt 路径清单）
     ├── pdf_table_extractor.py       # 本地 PDF 提取管线（分类+多方投票+两阶段OCR接管）
     ├── pdf_tables.py                # 表格切图定位与本地/结构化导出回退
@@ -169,6 +173,42 @@ python scripts/batch_run.py --pdf-only --workers 4
 | `--pdf-only` | 标志 | `False` | 批量运行时跳过在线网络抓取，纯本地 PDF 提取 |
 | `--timeout` | 整数 | `300` | 单篇文献处理超时上限（秒） |
 | `--limit` | 整数 | `0` | 限制处理文献篇数（0 表示全量执行） |
+
+### 3. 技能在线安全更新与配置防护 (`update.py` / `setup_paths.py --update`)
+
+```bash
+# 一键在线安全更新（支持 Git 与 Release 归档双模，严格保留个人 API Keys 与自定义路径）
+python update.py
+
+# 仅检查远端更新与本地缺失的新配置项（只读探测，不改动文件）
+python update.py --check
+
+# 演练模式模拟更新全流程（不产生磁盘写入）
+python update.py --dry-run
+
+# 一键回滚至最近一次备份的配置状态
+python update.py --rollback
+
+# 查看所有历史快照清单
+python update.py --list-backups
+
+# 仅将 config.example.json 最新模板项安全并入 config.json（不拉取代码）
+python update.py --merge-only
+
+# 以结构化 JSON 输出结果（专为 Agent 与自动化流程设计）
+python update.py --check --json
+```
+
+| 参数 | 类型 | 默认值 | 作用说明 |
+| :--- | :--- | :--- | :--- |
+| `--check` | 标志 | `False` | 仅检测更新状态与缺失字段，不执行任何写入 |
+| `--dry-run` | 标志 | `False` | 模拟演练更新全流程，不修改文件 |
+| `--rollback` | 字符串 | `"latest"` | 回滚 config.json 至最近或指定 ID 的快照 |
+| `--list-backups` | 标志 | `False` | 列出所有可用的历史配置快照 |
+| `--merge-only` | 标志 | `False` | 仅将 config.example.json 中的新项安全并入 config.json |
+| `--force` | 标志 | `False` | 强制拉取更新并重置跟踪代码文件 |
+| `--install-deps` | 标志 | `False` | 更新后自动运行 pip install -r requirements.txt |
+| `--json` | 标志 | `False` | 以结构化 JSON 输出结果，便于 Agent 与脚本集成 |
 
 ## 配置项（config.json）
 
