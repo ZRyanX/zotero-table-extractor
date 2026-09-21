@@ -13,7 +13,10 @@ import io
 import os
 import re
 import sys
+import logging
 from typing import List, Dict, Any, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 try:
     import pymupdf as fitz
@@ -33,20 +36,21 @@ except ImportError:
 
 # 引入本包内的预过滤与视觉检测逻辑
 try:
-    from .common import load_config
+    from .common import load_config, make_unique_columns
     from .ocr_client import extract_pp_structure_table_crops
     from .pdf_page_filter import page_may_contain_tables
     from .doclayout_yolo_detector import DocLayoutYoloDetector
     from .excel_export import save_tables_to_excel
 except ImportError:
     try:
-        from common import load_config
+        from common import load_config, make_unique_columns
         from ocr_client import extract_pp_structure_table_crops
         from pdf_page_filter import page_may_contain_tables
         from doclayout_yolo_detector import DocLayoutYoloDetector
         from excel_export import save_tables_to_excel
     except ImportError:
         load_config = lambda: {}
+        make_unique_columns = lambda cols: [str(c) for c in cols]
         extract_pp_structure_table_crops = None
         page_may_contain_tables = None
         DocLayoutYoloDetector = None
@@ -141,11 +145,315 @@ def extract_table_crops_from_pdf(
         for r in regions:
             r["page_index"] = page_idx
             r["page_text"] = page_text
+            # 极速探测矢量文本质量与 OCR 需求感知 (Rust ~1ms)
+            if r.get("crop_bbox"):
+                reg_info = inspect_crop_region(pdf_path, page_idx, r["crop_bbox"], dpi=dpi)
+                r["needs_ocr"] = reg_info["needs_ocr"]
+                r["ocr_reason"] = reg_info["ocr_reason"]
+                r["region_vector_text"] = reg_info["text"]
+                r["pdf_bbox"] = reg_info["pdf_bbox"]
             extracted_crops.append(r)
 
     doc.close()
     print(f"[PDF-Tables] 共从 {total_pages} 页 PDF 中定位并提取出 {len(extracted_crops)} 个表格区域 Crop。")
     return extracted_crops
+
+
+def convert_crop_to_mediabox(
+    pdf_path: str,
+    page_index: int,
+    crop_bbox: List[float],
+    dpi: int = 200
+) -> Tuple[float, float, float, float, float]:
+    """
+    将 DocLayout-YOLO 在 rendered pixmap (dpi 分辨率) 上的检测框 [px0, py0, px1, py1]
+    精确换算为 PDF MediaBox 72-DPI 点坐标（top-left 原点: x_min, y_min, x_max, y_max），
+    全面适配 page.rotation (0, 90, 180, 270) 与 page.cropbox 偏移。
+    返回 (x_min, y_min, x_max, y_max, mediabox_height)。
+    """
+    eff_dpi = max(1.0, float(dpi)) if dpi else 200.0
+    scale = 72.0 / eff_dpi
+    try:
+        with fitz.open(pdf_path) as doc:
+            if 0 <= page_index < len(doc):
+                page = doc[page_index]
+                vis_rect = fitz.Rect(
+                    crop_bbox[0] * scale,
+                    crop_bbox[1] * scale,
+                    crop_bbox[2] * scale,
+                    crop_bbox[3] * scale
+                )
+                unrot_rect = vis_rect * page.derotation_matrix
+                cb_x0 = page.cropbox.x0
+                cb_y0 = page.cropbox.y0
+                x0 = unrot_rect.x0 + cb_x0
+                y0 = unrot_rect.y0 + cb_y0
+                x1 = unrot_rect.x1 + cb_x0
+                y1 = unrot_rect.y1 + cb_y0
+                return min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1), page.mediabox.height
+    except Exception as e:
+        logger.debug(f"[PDF-Tables] convert_crop_to_mediabox error: {e}")
+
+    x0, y0, x1, y1 = crop_bbox[0] * scale, crop_bbox[1] * scale, crop_bbox[2] * scale, crop_bbox[3] * scale
+    return min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1), 842.0
+
+
+def inspect_crop_region(pdf_path: str, page_index: int, crop_bbox: List[float], dpi: int = 200) -> Dict[str, Any]:
+    """
+    使用 pdf-inspector (Rust 极速 ~1ms) 判定给定目标检测区域内是否具有高质量矢量文本，
+    或是否由于纯图像/损坏字体导致必须触发 OCR (needs_ocr)。
+
+    参数:
+    - pdf_path: PDF 路径
+    - page_index: 0-indexed 页码
+    - crop_bbox: [px1, py1, px2, py2] 像素坐标
+    - dpi: 渲染分辨率
+
+    返回:
+    {
+        'needs_ocr': bool,
+        'ocr_reason': Optional[str],
+        'text': str,
+        'pdf_bbox': [x1, y1, x2, y2], # 72 DPI PDF 点坐标（top-left 原点）
+    }
+    """
+    x1, y1, x2, y2, mb_height = convert_crop_to_mediabox(pdf_path, page_index, crop_bbox, dpi)
+    pdf_bbox = [x1, y1, x2, y2]
+
+    res = {
+        'needs_ocr': False,
+        'ocr_reason': None,
+        'text': '',
+        'pdf_bbox': pdf_bbox,
+    }
+
+    try:
+        import pdf_inspector
+        if hasattr(pdf_inspector, 'extract_text_in_regions'):
+            region_texts = pdf_inspector.extract_text_in_regions(pdf_path, [(page_index, [[x1, y1, x2, y2]])])
+            if region_texts and region_texts[0].regions:
+                reg = region_texts[0].regions[0]
+                text = (reg.text or "").strip()
+                res['text'] = text
+                # 判定条件：显式 needs_ocr 标记，或仅包含图片标记 [Image: ...]，或文本极度匮乏
+                is_image_only = text.startswith('[Image:') or (len(text) < 5 and not any(c.isalnum() for c in text))
+                res['needs_ocr'] = bool(reg.needs_ocr or is_image_only)
+                res['ocr_reason'] = reg.ocr_reason if reg.needs_ocr else ('image_only' if is_image_only else None)
+                return res
+    except Exception as e:
+        logger.debug(f"[PDF-Tables] inspect_crop_region 提示: {e}")
+
+    # 回退方案: PyMuPDF 启发式检测
+    try:
+        with fitz.open(pdf_path) as doc:
+            if 0 <= page_index < len(doc):
+                page = doc[page_index]
+                clip_rect = fitz.Rect(
+                    x1 - page.cropbox.x0,
+                    y1 - page.cropbox.y0,
+                    x2 - page.cropbox.x0,
+                    y2 - page.cropbox.y0
+                )
+                txt = page.get_text("text", clip=clip_rect).strip()
+                res['text'] = txt
+                imgs = page.get_images()
+                res['needs_ocr'] = len(txt) < 8 and len(imgs) > 0
+                res['ocr_reason'] = 'heuristic_low_text_image' if res['needs_ocr'] else None
+    except Exception:
+        pass
+
+    return res
+
+
+def rebuild_df_with_style_hierarchy(
+    pdf_path: str,
+    page_index: int,
+    crop_rect: fitz.Rect,
+    page_height: float,
+    crop_bbox: Optional[List[float]] = None,
+    dpi: int = 200,
+) -> Tuple[Optional[Any], str, str]:
+    """
+    利用 pdf_inspector.extract_text_with_positions 的丰富样式属性 (is_bold, font_size, font, mcid)
+    从裁剪区域精准重建带有复合表头分层与附注隔离的 Pandas DataFrame。
+
+    特点:
+    - 样式感知表头：首行与次行连续加粗或次行为括号单位时，自动合成多行复合表头
+    - 字号感知注脚：利用字号差异 (font_size < data_font_size) 完美分离底部小字号注释，杜绝污染数据行
+    - 坐标区间投影：基于真实 x 轴物理区间对齐列边界，杜绝单元格内空格切词破坏
+    - 全面适配页面旋转 (90/180/270 度) 与 CropBox/MediaBox 物理偏移
+    """
+    if pd is None or not os.path.exists(pdf_path):
+        return None, "", ""
+
+    try:
+        import pdf_inspector
+        if not hasattr(pdf_inspector, 'extract_text_with_positions'):
+            return None, "", ""
+        # extract_text_with_positions 内部使用 1-indexed pages
+        items = pdf_inspector.extract_text_with_positions(pdf_path, pages=[page_index + 1])
+    except Exception:
+        return None, "", ""
+
+    if not items:
+        return None, "", ""
+
+    # 精确计算 MediaBox 坐标区间 (top-left 原点)
+    if crop_bbox is not None:
+        x_min, y_min, x_max, y_max, mb_height = convert_crop_to_mediabox(pdf_path, page_index, crop_bbox, dpi)
+    else:
+        try:
+            with fitz.open(pdf_path) as doc:
+                page = doc[page_index]
+                unrot_rect = crop_rect * page.derotation_matrix
+                cb_x0, cb_y0 = page.cropbox.x0, page.cropbox.y0
+                x0 = unrot_rect.x0 + cb_x0
+                y0 = unrot_rect.y0 + cb_y0
+                x1 = unrot_rect.x1 + cb_x0
+                y1 = unrot_rect.y1 + cb_y0
+                x_min, y_min, x_max, y_max = min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)
+                mb_height = page.mediabox.height
+        except Exception:
+            x_min, y_min, x_max, y_max = crop_rect.x0, crop_rect.y0, crop_rect.x1, crop_rect.y1
+            mb_height = page_height
+
+    # 过滤落在 crop 范围内的 items (top-left 坐标空间: top_y = mb_height - it.y)
+    filtered = []
+    for it in items:
+        top_y = mb_height - it.y
+        if (x_min - 4.0 <= it.x <= x_max + 4.0 and
+                y_min - 4.0 <= top_y <= y_max + 4.0):
+            filtered.append(it)
+
+    if len(filtered) < 4:
+        return None, "", ""
+
+    # 按 top_y 坐标分行（4.5pt 容差），同行内按 x 排序
+    sorted_items = sorted(filtered, key=lambda it: (mb_height - it.y, it.x))
+    lines = []
+    curr_line = []
+    curr_y = None
+    for it in sorted_items:
+        y_mid = mb_height - it.y
+        if curr_y is None or abs(y_mid - curr_y) < 4.5:
+            curr_line.append(it)
+            if curr_y is None:
+                curr_y = y_mid
+        else:
+            lines.append(sorted(curr_line, key=lambda x: x.x))
+            curr_line = [it]
+            curr_y = y_mid
+    if curr_line:
+        lines.append(sorted(curr_line, key=lambda x: x.x))
+
+    if not lines:
+        return None, "", ""
+
+    caption = ""
+    footnote_parts = []
+    table_lines = []
+
+    # 识别顶部 1~2 行的 Caption
+    for l in lines:
+        line_str = " ".join(it.text.strip() for it in l if it.text.strip())
+        if not line_str:
+            continue
+        if re.match(r'^(?:Table|Tab\.|表)\s*\d+(?:\.\d+)?', line_str, re.IGNORECASE) and len(line_str) < 200:
+            if not caption:
+                caption = line_str
+            continue
+        table_lines.append(l)
+
+    if not table_lines:
+        return None, caption, ""
+
+    # 识别并剔除底部附注/Footnote（利用字号差异与特定关键字）
+    all_sizes = [it.font_size for l in table_lines for it in l if it.font_size > 0]
+    median_size = sorted(all_sizes)[len(all_sizes) // 2] if all_sizes else 9.0
+
+    filtered_table_lines = []
+    for l in reversed(table_lines):
+        line_str = " ".join(it.text.strip() for it in l if it.text.strip())
+        avg_sz = sum(it.font_size for it in l) / len(l) if l else median_size
+        low = line_str.lower()
+        is_fn = (
+            line_str.startswith(("注", "*", "†", "‡", "§")) or
+            low.startswith("note") or
+            "minimum" in low or "standard deviation" in low or
+            "p < 0." in low or
+            re.search(r'\b(?:n\s*=\s*\d|df\s*=)', line_str)
+        )
+        if not filtered_table_lines and (is_fn or avg_sz <= median_size - 1.2):
+            footnote_parts.insert(0, line_str)
+        else:
+            filtered_table_lines.insert(0, l)
+
+    table_lines = filtered_table_lines
+    if not table_lines:
+        return None, caption, " ".join(footnote_parts)
+
+    # 复合多行表头识别：若前 1~2 行全为加粗或括号单位，合并为复合表头
+    header_rows = [table_lines[0]]
+    data_start_idx = 1
+    if len(table_lines) >= 3:
+        l0 = table_lines[0]
+        l1 = table_lines[1]
+        b0 = sum(1 for it in l0 if it.is_bold) / len(l0) if l0 else 0
+        b1 = sum(1 for it in l1 if it.is_bold) / len(l1) if l1 else 0
+        is_units = all(
+            re.match(r'^\(.*\)$', it.text.strip()) or it.text.strip() in ('%', 'wt.%', 'MPa', 'g/t', 'm', 'km', '°C')
+            for it in l1 if it.text.strip()
+        )
+        if (b0 >= 0.4 and b1 >= 0.4) or is_units:
+            header_rows.append(l1)
+            data_start_idx = 2
+
+    # 基于表头项的 x 坐标聚类列边界
+    col_clusters = []
+    for h_row in header_rows:
+        for it in h_row:
+            matched = False
+            for clust in col_clusters:
+                avg_cx = sum(x.x for x in clust) / len(clust)
+                if abs(it.x - avg_cx) < 22.0:
+                    clust.append(it)
+                    matched = True
+                    break
+            if not matched:
+                col_clusters.append([it])
+
+    if not col_clusters:
+        return None, caption, " ".join(footnote_parts)
+
+    col_clusters = sorted(col_clusters, key=lambda cl: sum(x.x for x in cl) / len(cl))
+    col_headers = []
+    col_centers = []
+    for cl in col_clusters:
+        cl_sorted = sorted(cl, key=lambda it: (mb_height - it.y, it.x))
+        col_headers.append(" ".join(it.text.strip() for it in cl_sorted if it.text.strip()))
+        col_centers.append(sum(it.x for it in cl) / len(cl))
+
+    col_headers = [c if c else f"Col_{i+1}" for i, c in enumerate(col_headers)]
+    col_headers = make_unique_columns(col_headers)
+
+    # 重建数据行
+    table_rows = []
+    for l in table_lines[data_start_idx:]:
+        row_cells = [""] * len(col_headers)
+        for it in l:
+            best_idx = min(range(len(col_centers)), key=lambda i: abs(col_centers[i] - it.x))
+            if row_cells[best_idx]:
+                row_cells[best_idx] += " " + it.text.strip()
+            else:
+                row_cells[best_idx] = it.text.strip()
+        if any(c for c in row_cells):
+            table_rows.append(row_cells)
+
+    if not table_rows:
+        return None, caption, " ".join(footnote_parts)
+
+    df = pd.DataFrame(table_rows, columns=col_headers)
+    return df, caption, " ".join(footnote_parts)
 
 
 def _rebuild_df_from_words(words, clip_rect=None):
@@ -283,6 +591,13 @@ def crop_to_dataframe(pdf_path: str, crop_info: Dict[str, Any], dpi: int = 200) 
     caption = ""
     footnote = ""
 
+    # 极速探测矢量文本质量与 OCR 需求感知
+    if "needs_ocr" not in crop_info:
+        reg_info = inspect_crop_region(pdf_path, crop_info["page_index"], crop_bbox, dpi=crop_dpi)
+        crop_info["needs_ocr"] = reg_info["needs_ocr"]
+        crop_info["ocr_reason"] = reg_info["ocr_reason"]
+        crop_info["region_vector_text"] = reg_info["text"]
+
     # --- 优先: PyMuPDF find_tables() 结构化提取 ---
     try:
         finder = page.find_tables()
@@ -310,9 +625,24 @@ def crop_to_dataframe(pdf_path: str, crop_info: Dict[str, Any], dpi: int = 200) 
                 df.attrs['label'] = crop_info.get('label', '')
                 df.attrs['table_title'] = crop_info.get('caption', '')
     except Exception as e:
-        print(f"[PDF-Tables] find_tables() 不可用，回退 word-level: {e}")
+        print(f"[PDF-Tables] find_tables() 不可用，回退样式感知/word-level: {e}")
 
-    # --- 回退: word-level 按列聚类重建 ---
+    # --- 增强回退 1: 基于 pdf_inspector 的样式感知多行表头与注脚分离重建 ---
+    if df is None or df.empty:
+        try:
+            df, cap_style, fn_style = rebuild_df_with_style_hierarchy(
+                pdf_path, crop_info["page_index"], crop_rect, page.rect.height,
+                crop_bbox=crop_bbox, dpi=crop_dpi
+            )
+            if df is not None and not df.empty:
+                df.attrs['label'] = crop_info.get('label', '')
+                df.attrs['table_title'] = cap_style or crop_info.get('caption', '')
+                caption = cap_style
+                footnote = fn_style
+        except Exception as e_style:
+            logger.debug(f"[PDF-Tables] rebuild_df_with_style_hierarchy 提示: {e_style}")
+
+    # --- 传统兜底 2: word-level 按列聚类重建 ---
     if df is None or df.empty:
         words = page.get_text("words", clip=crop_rect)
         if words:

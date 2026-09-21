@@ -132,10 +132,16 @@ def process_single_pdf(pdf_path, args, is_batch=False, plan=None):
             import pymupdf as fitz
 
             try:
-                from .pdf_table_extractor import has_text_layer
+                from .pdf_table_extractor import has_text_layer, quick_classify_pdf
             except ImportError:
-                from pdf_table_extractor import has_text_layer
-            is_native = has_text_layer(pdf_path)
+                from pdf_table_extractor import has_text_layer, quick_classify_pdf
+            
+            # 使用 pdf-inspector quick_classify_pdf (5~10ms) 进行超快速预检
+            clf_res = quick_classify_pdf(pdf_path)
+            if clf_res.get('confidence', 0) >= 0.8 and clf_res.get('pdf_type') in ('text_based', 'scanned'):
+                is_native = (clf_res['pdf_type'] == 'text_based')
+            else:
+                is_native = has_text_layer(pdf_path)
 
             doc = fitz.open(pdf_path)
             page_rotations = [get_page_effective_rotation(p) for p in doc]

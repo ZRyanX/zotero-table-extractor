@@ -436,6 +436,24 @@ def format_table_label(raw_label: str) -> str:
     return s
 
 
+def make_unique_columns(cols: list) -> list:
+    """
+    确保 DataFrame 列名列表中的每个列名严格唯一，避免同名列导致的索引混乱或报错。
+    若存在重复列名，按出现的先后顺序添加 _2, _3 等后缀。
+    """
+    seen = {}
+    unique_cols = []
+    for i, c in enumerate(cols):
+        name = str(c).strip() if (c is not None and str(c).strip()) else f"Col_{i+1}"
+        if name not in seen:
+            seen[name] = 1
+            unique_cols.append(name)
+        else:
+            seen[name] += 1
+            unique_cols.append(f"{name}_{seen[name]}")
+    return unique_cols
+
+
 # ---------------------------------------------------------------------------
 # 表格过滤
 # ---------------------------------------------------------------------------

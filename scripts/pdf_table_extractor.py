@@ -55,32 +55,406 @@ except ImportError:
     pd = None
 
 try:
-    from .common import format_table_label, TABLE_LABEL_PATTERN, TABLE_LABEL_RE, is_table_squeezed, is_table_low_quality, is_markdown_separator, df_map
+    from .common import format_table_label, TABLE_LABEL_PATTERN, TABLE_LABEL_RE, is_table_squeezed, is_table_low_quality, is_markdown_separator, df_map, make_unique_columns
 except ImportError:
-    from common import format_table_label, TABLE_LABEL_PATTERN, TABLE_LABEL_RE, is_table_squeezed, is_table_low_quality, is_markdown_separator, df_map
+    from common import format_table_label, TABLE_LABEL_PATTERN, TABLE_LABEL_RE, is_table_squeezed, is_table_low_quality, is_markdown_separator, df_map, make_unique_columns
 
 logger = logging.getLogger(__name__)
 
 
 # ===========================================================================
-# 1. pdf-inspector: PDF 分类 + 表格定位 + Markdown 表格提取
+# 1. pdf-inspector: 极速分类 + 结构树语义提取 + Markdown 表格提取
 #    GitHub: https://github.com/firecrawl/pdf-inspector
 # ===========================================================================
+
+def quick_classify_pdf(pdf_path: str) -> Dict[str, Any]:
+    """
+    使用 pdf-inspector 进行超快速 (5~10ms) 预检分类与 OCR 需求页面检测。
+    在 pdf-inspector 不可用或解析异常时平滑回退至 PyMuPDF 启发式检测。
+
+    返回:
+    {
+        'pdf_type': 'text_based' | 'scanned' | 'mixed' | 'unknown',
+        'confidence': float,
+        'page_count': int,
+        'pages_needing_ocr': List[int],  # 0-indexed
+        'has_text': bool,
+    }
+    """
+    res = {
+        'pdf_type': 'unknown',
+        'confidence': 0.0,
+        'page_count': 0,
+        'pages_needing_ocr': [],
+        'has_text': False,
+    }
+    if not os.path.exists(pdf_path):
+        return res
+
+    try:
+        import pdf_inspector
+        if hasattr(pdf_inspector, 'classify_pdf'):
+            clf = pdf_inspector.classify_pdf(pdf_path)
+            res['pdf_type'] = getattr(clf, 'pdf_type', 'unknown')
+            res['confidence'] = getattr(clf, 'confidence', 0.0)
+            res['page_count'] = getattr(clf, 'page_count', 0)
+            res['pages_needing_ocr'] = list(getattr(clf, 'pages_needing_ocr', []))
+            res['has_text'] = res['pdf_type'] in ('text_based', 'mixed')
+            return res
+    except Exception as e:
+        logger.debug(f"[pdf-inspector] classify_pdf 快速分类提示: {e}")
+
+    # 回退方案: PyMuPDF 启发式检测
+    try:
+        with fitz.open(pdf_path) as doc:
+            res['page_count'] = len(doc)
+            has_txt = has_text_layer(pdf_path)
+            res['has_text'] = has_txt
+            res['pdf_type'] = 'text_based' if has_txt else 'scanned'
+            res['confidence'] = 0.5
+    except Exception:
+        pass
+    return res
+
+
+def extract_via_structure_tree(pdf_path: str, pages: Optional[List[int]] = None) -> List[Dict[str, Any]]:
+    """
+    利用 pdf-inspector 深度解析 Tagged PDF / PDF/UA 文档的语义结构树 (Structure Tree)。
+    直接提取出版商原生排版的 Table, TH, TD 元素，解决多栏报纸式排版跨栏流转、
+    复合多行表头与行表头对齐难题，实现 100% 真实矢量的结构化重构。
+
+    参数:
+    - pdf_path: PDF 文件绝对路径
+    - pages: 可选目标页码列表 (0-indexed)
+
+    返回:
+    List[{'df': DataFrame, 'page_idx': int, 'table_idx': int, 'bbox': [x1, y1, x2, y2]}],
+    其中 df.attrs 包含 'extractor'='pdf_inspector_structure' 与真实表题声明。
+    """
+    if pd is None or not os.path.exists(pdf_path):
+        return []
+
+    try:
+        import pdf_inspector
+        if not hasattr(pdf_inspector, 'extract_structure_elements') or not hasattr(pdf_inspector, 'extract_text_with_positions'):
+            return []
+    except ImportError:
+        return []
+
+    # pdf_inspector 内部 pages 参数为 1-indexed
+    p_1idx = [pg + 1 for pg in pages] if pages is not None else None
+
+    try:
+        se_all = pdf_inspector.extract_structure_elements(pdf_path, pages=p_1idx)
+    except Exception as e_se:
+        logger.debug(f"[pdf-inspector] extract_structure_elements 提示: {e_se}")
+        return []
+
+    if not se_all:
+        return []
+
+    se_by_page = {}
+    for x in se_all:
+        se_by_page.setdefault(x.page, []).append(x)
+
+    results = []
+    try:
+        doc = fitz.open(pdf_path)
+    except Exception:
+        doc = None
+
+    for pg in sorted(se_by_page.keys()):
+        page_se = se_by_page[pg]
+        table_elements = [x for x in page_se if x.role in ('TH', 'TD')]
+        if not table_elements:
+            continue
+
+        page_height = 842.0
+        if doc is not None and 0 <= pg - 1 < len(doc):
+            page_height = doc[pg - 1].rect.height
+
+        try:
+            items = pdf_inspector.extract_text_with_positions(pdf_path, pages=[pg])
+        except Exception as e_items:
+            logger.debug(f"[pdf-inspector] extract_text_with_positions 提示: {e_items}")
+            continue
+
+        if not items:
+            continue
+
+        role_map = {x.mcid: x.role for x in page_se}
+        mcid_items = {}
+        for it in items:
+            if it.mcid is not None and it.mcid in role_map:
+                mcid_items.setdefault(it.mcid, []).append(it)
+
+        # 提取本页所有的 Caption 结构元素
+        captions = []
+        for x in page_se:
+            if x.role == 'Caption' and x.mcid in mcid_items:
+                its = mcid_items[x.mcid]
+                c_text = ' '.join(it.text.strip() for it in its if it.text.strip())
+                avg_y = sum(it.y for it in its) / len(its)
+                captions.append({'mcid': x.mcid, 'text': c_text, 'y': avg_y})
+
+        # 页面多表格切分：根据 Caption / 独立段落 / 新 TH 表头块分离同一页内的不同表格
+        table_chunks = []
+        curr_chunk = []
+        has_td = False
+        saw_intervening = False
+
+        for x in page_se:
+            if x.role in ('Caption', 'Table', 'Part', 'Art', 'Sect', 'Div', 'BlockQuote', 'P', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'Figure', 'Formula', 'Lbl', 'LBody', 'Note', 'Link'):
+                saw_intervening = True
+            elif x.role in ('TH', 'TD') and x.mcid in mcid_items:
+                if x.role == 'TH' and has_td:
+                    if saw_intervening:
+                        table_chunks.append(curr_chunk)
+                        curr_chunk = []
+                        has_td = False
+                        saw_intervening = False
+                if x.role == 'TD':
+                    has_td = True
+                curr_chunk.append(x)
+                saw_intervening = False
+        if curr_chunk:
+            table_chunks.append(curr_chunk)
+
+        used_captions = set()
+
+        for tbl_idx, chunk in enumerate(table_chunks):
+            # 构建该表格所有单元格实体
+            cells = []
+            for x in chunk:
+                if x.role in ('TH', 'TD') and x.mcid in mcid_items:
+                    its = mcid_items[x.mcid]
+                    its_sorted = sorted(its, key=lambda it: (-it.y, it.x))
+                    text = ' '.join(it.text.strip() for it in its_sorted if it.text.strip())
+                    avg_x = sum(it.x for it in its) / len(its)
+                    avg_y = sum(it.y for it in its) / len(its)
+                    min_x = min(it.x for it in its)
+                    max_x = max(it.x + it.width for it in its)
+                    cells.append({
+                        'mcid': x.mcid,
+                        'role': x.role,
+                        'text': text,
+                        'x': avg_x,
+                        'y': avg_y,
+                        'min_x': min_x,
+                        'max_x': max_x,
+                    })
+
+            if not cells:
+                continue
+
+            # 页面多栏流动与分块解算：检测阅读流中的逆向垂直跳跃 (y_curr > last_y + 45pt 即为换栏)
+            panels = []
+            curr_panel = []
+            last_y = None
+            for c in cells:
+                if last_y is not None and c['y'] > last_y + 45.0:
+                    panels.append(curr_panel)
+                    curr_panel = [c]
+                else:
+                    curr_panel.append(c)
+                last_y = c['y']
+            if curr_panel:
+                panels.append(curr_panel)
+
+            tbl_headers = []
+            tbl_col_centers = []
+            tbl_rows = []
+
+            for pan_idx, pan in enumerate(panels):
+                th_cells = [c for c in pan if c['role'] == 'TH']
+                if th_cells and pan_idx == 0:
+                    top_y = max(c['y'] for c in pan)
+                    col_th_cells = [c for c in th_cells if c['y'] >= top_y - 25.0]
+                    th_by_y = sorted(col_th_cells, key=lambda c: -c['y'])
+                    th_rows_grouped = []
+                    cur_r = []
+                    cur_y = None
+                    for c in th_by_y:
+                        if cur_y is None or abs(c['y'] - cur_y) < 4.0:
+                            cur_r.append(c)
+                            if cur_y is None:
+                                cur_y = c['y']
+                        else:
+                            th_rows_grouped.append(sorted(cur_r, key=lambda x: x['x']))
+                            cur_r = [c]
+                            cur_y = c['y']
+                    if cur_r:
+                        th_rows_grouped.append(sorted(cur_r, key=lambda x: x['x']))
+
+                    is_hierarchy = (
+                        len(th_rows_grouped) >= 2 and
+                        len(th_rows_grouped[1]) >= 4 and
+                        len(th_rows_grouped[0]) <= len(th_rows_grouped[1]) * 0.6
+                    )
+
+                    if is_hierarchy:
+                        row0 = th_rows_grouped[0]
+                        row1 = th_rows_grouped[1]
+                        headers = []
+                        col_centers = []
+                        for sub in row1:
+                            matched_sup = None
+                            for i, sup in enumerate(row0):
+                                next_x = row0[i+1]['x'] if i+1 < len(row0) else 999999.0
+                                if sup['x'] - 15.0 <= sub['x'] < next_x - 15.0:
+                                    matched_sup = sup['text']
+                                    break
+                            if matched_sup and matched_sup != sub['text']:
+                                headers.append(f'{matched_sup} {sub["text"]}')
+                            else:
+                                headers.append(sub['text'])
+                            col_centers.append(sub['x'])
+                        if row0[0]['x'] < row1[0]['x'] - 20.0:
+                            headers.insert(0, row0[0]['text'])
+                            col_centers.insert(0, row0[0]['x'])
+                    else:
+                        col_clusters = []
+                        for c in sorted(col_th_cells, key=lambda c: c['x']):
+                            matched = False
+                            for clust in col_clusters:
+                                avg_cx = sum(x['x'] for x in clust) / len(clust)
+                                if abs(c['x'] - avg_cx) < 18.0:
+                                    clust.append(c)
+                                    matched = True
+                                    break
+                            if not matched:
+                                col_clusters.append([c])
+                        headers = []
+                        col_centers = []
+                        for clust in col_clusters:
+                            clust_sorted = sorted(clust, key=lambda x: -x['y'])
+                            headers.append(' '.join(x['text'] for x in clust_sorted if x['text']))
+                            col_centers.append(sum(x['x'] for x in clust) / len(clust))
+
+                    tbl_headers = headers
+                    tbl_col_centers = col_centers
+                    data_cells = [c for c in pan if c not in col_th_cells]
+                else:
+                    data_cells = pan
+
+                # 若数据行在表头左侧存在独立数据列（即第 0 列为省略表头的行头）
+                if data_cells and tbl_col_centers and any(c['x'] < min(tbl_col_centers) - 20.0 for c in data_cells):
+                    left_x = min(c['x'] for c in data_cells)
+                    tbl_headers.insert(0, 'Index')
+                    tbl_col_centers.insert(0, left_x)
+
+                n_cols = len(tbl_headers)
+                if n_cols == 0:
+                    continue
+
+                if pan_idx > 0 and len(data_cells) % n_cols == 0:
+                    for i in range(0, len(data_cells), n_cols):
+                        row = [c['text'] for c in data_cells[i:i+n_cols]]
+                        tbl_rows.append(row)
+                elif len(data_cells) % n_cols == 0:
+                    for i in range(0, len(data_cells), n_cols):
+                        row = [c['text'] for c in data_cells[i:i+n_cols]]
+                        tbl_rows.append(row)
+                else:
+                    data_by_y = sorted(data_cells, key=lambda c: -c['y'])
+                    curr_r = []
+                    curr_y = None
+                    rows_grouped = []
+                    for c in data_by_y:
+                        if curr_y is None or abs(c['y'] - curr_y) < 4.0:
+                            curr_r.append(c)
+                            if curr_y is None:
+                                curr_y = c['y']
+                        else:
+                            rows_grouped.append(sorted(curr_r, key=lambda x: x['x']))
+                            curr_r = [c]
+                            curr_y = c['y']
+                    if curr_r:
+                        rows_grouped.append(sorted(curr_r, key=lambda x: x['x']))
+
+                    for r in rows_grouped:
+                        row_vals = [''] * n_cols
+                        for c in r:
+                            best_idx = min(range(n_cols), key=lambda i: abs(tbl_col_centers[i] - c['x']))
+                            if row_vals[best_idx]:
+                                row_vals[best_idx] += ' ' + c['text']
+                            else:
+                                row_vals[best_idx] = c['text']
+                        if any(v.strip() for v in row_vals):
+                            tbl_rows.append(row_vals)
+
+            if not tbl_rows or not tbl_headers:
+                continue
+
+            unique_cols = make_unique_columns(tbl_headers)
+            df = pd.DataFrame(tbl_rows, columns=unique_cols)
+
+            tbl_min_y = min(c['y'] for c in cells)
+            tbl_max_y = max(c['y'] for c in cells)
+
+            matched_cap = None
+            avail_caps = [c for c in captions if c['text'] not in used_captions]
+            above_caps = [c for c in avail_caps if c['y'] >= tbl_max_y - 15.0]
+            if above_caps:
+                best_c = min(above_caps, key=lambda c: abs(c['y'] - tbl_max_y))
+                matched_cap = best_c['text']
+                used_captions.add(matched_cap)
+            elif avail_caps:
+                best_c = min(avail_caps, key=lambda c: abs(c['y'] - tbl_max_y))
+                if abs(best_c['y'] - tbl_min_y) <= 40.0:
+                    matched_cap = best_c['text']
+                    used_captions.add(matched_cap)
+
+            df.attrs['extractor'] = 'pdf_inspector_structure'
+            df.attrs['page_idx'] = pg - 1
+            df.attrs['has_semantic_th'] = True
+            if matched_cap:
+                df.attrs['table_title'] = matched_cap
+                m_lbl = re.search(r'((?:Table|Tab\.|表)\s*\d+)', matched_cap, re.IGNORECASE)
+                if m_lbl:
+                    df.attrs['label'] = m_lbl.group(1)
+
+            b_x0 = min(c['min_x'] for c in cells)
+            b_x1 = max(c['max_x'] for c in cells)
+            b_y0 = page_height - tbl_max_y
+            b_y1 = page_height - tbl_min_y
+            bbox = [b_x0, min(b_y0, b_y1), b_x1, max(b_y0, b_y1)]
+
+            results.append({
+                'df': df,
+                'page_idx': pg - 1,
+                'table_idx': tbl_idx,
+                'bbox': bbox,
+            })
+
+    if doc is not None:
+        try:
+            doc.close()
+        except Exception:
+            pass
+
+    if results:
+        print(f"[pdf-inspector] 结构树语义提取成功: {len(results)} 个表格 (Tagged PDF/UA)")
+    return results
+
 
 def classify_and_extract_via_inspector(pdf_path: str, caption_page_map: Optional[Dict[str, int]] = None) -> Dict[str, Any]:
     """
     使用 pdf-inspector 进行:
-    - PDF 类型分类 (text_based / scanned / image_based / mixed)
+    - 快速预检分类与 OCR 需求感知 (classify_pdf)
+    - 语义结构树高精度表格提取 (extract_via_structure_tree)
     - 表格页面定位 (pages_with_tables)
-    - Markdown 表格提取 (从 markdown 中解析表格)
+    - 逐页 Markdown 表格提取 (extract_pages_markdown / process_pdf)
 
     返回:
     {
         'pdf_type': str,
         'confidence': float,
+        'page_count': int,
         'pages_with_tables': List[int],
         'pages_needing_ocr': List[int],
         'tables': List[{'df': DataFrame, 'page_idx': int, 'extractor': str, 'bbox': None}],
+        'structure_tables': List[{'df': DataFrame, 'page_idx': int, 'extractor': str, 'bbox': List}],
         'markdown': str or None,
         'error': str or None,
     }
@@ -88,9 +462,11 @@ def classify_and_extract_via_inspector(pdf_path: str, caption_page_map: Optional
     result = {
         'pdf_type': 'unknown',
         'confidence': 0.0,
+        'page_count': 0,
         'pages_with_tables': [],
         'pages_needing_ocr': [],
         'tables': [],
+        'structure_tables': [],
         'markdown': None,
         'error': None,
     }
@@ -98,39 +474,60 @@ def classify_and_extract_via_inspector(pdf_path: str, caption_page_map: Optional
     try:
         import pdf_inspector
 
-        # 优先使用 extract_pages_markdown 获取逐页 Markdown，精准绑定表格与页码
-        if hasattr(pdf_inspector, 'extract_pages_markdown'):
+        # 0. 超快速 (5~10ms) 预检分类与 OCR 需求感知
+        if hasattr(pdf_inspector, 'classify_pdf'):
             try:
-                pages_res = pdf_inspector.extract_pages_markdown(pdf_path)
-                result['pdf_type'] = 'text_based'
-                result['confidence'] = 0.95
-                result['pages_with_tables'] = list(getattr(pages_res, 'pages_with_tables', []))
-                result['pages_needing_ocr'] = list(getattr(pages_res, 'pages_needing_ocr', []))
-                
-                full_md_list = []
-                for p_item in pages_res.pages:
-                    p_idx = p_item.page
-                    p_md = p_item.markdown or ""
-                    full_md_list.append(f"<!-- Page {p_idx+1} -->\n{p_md}")
-                    if p_md:
-                        p_tables = _parse_markdown_tables(p_md, caption_page_map, default_page=p_idx)
-                        for tbl_df, p_hint in p_tables:
-                            actual_page = p_hint if p_hint is not None else p_idx
-                            tbl_df.attrs['extractor'] = 'pdf_inspector'
-                            tbl_df.attrs['page_idx'] = actual_page
-                            if not tbl_df.attrs.get('label'):
-                                tbl_df.attrs['label'] = f"Table {len(result['tables'])+1}"
-                            result['tables'].append({
-                                'df': tbl_df,
-                                'page_idx': actual_page,
-                                'table_idx': len(result['tables']),
-                                'bbox': None,
-                            })
-                result['markdown'] = "\n\n".join(full_md_list)
-            except Exception as e_epm:
-                print(f"[pdf-inspector] extract_pages_markdown 提示: {e_epm}，回退到 process_pdf")
+                clf = pdf_inspector.classify_pdf(pdf_path)
+                result['pdf_type'] = getattr(clf, 'pdf_type', 'unknown')
+                result['confidence'] = getattr(clf, 'confidence', 0.0)
+                result['pages_needing_ocr'] = list(getattr(clf, 'pages_needing_ocr', []))
+                result['page_count'] = getattr(clf, 'page_count', 0)
+            except Exception as e_clf:
+                logger.debug(f"[pdf-inspector] classify_pdf notice: {e_clf}")
 
-        if not result['tables']:
+        # 1. 优先尝试从 Tagged PDF / PDF/UA 语义结构树中直接提取表格 (最高精度)
+        try:
+            struct_tbls = extract_via_structure_tree(pdf_path)
+            if struct_tbls:
+                result['structure_tables'] = struct_tbls
+        except Exception as e_st:
+            logger.debug(f"[pdf-inspector] extract_via_structure_tree notice: {e_st}")
+
+        # 2. 若非扫描件，优先使用 extract_pages_markdown 获取逐页 Markdown，精准绑定表格与页码
+        if result['pdf_type'] != 'scanned' or not result['pages_needing_ocr']:
+            if hasattr(pdf_inspector, 'extract_pages_markdown'):
+                try:
+                    pages_res = pdf_inspector.extract_pages_markdown(pdf_path)
+                    result['pdf_type'] = 'text_based'
+                    result['confidence'] = max(result['confidence'], 0.95)
+                    result['pages_with_tables'] = list(getattr(pages_res, 'pages_with_tables', []))
+                    if not result['pages_needing_ocr']:
+                        result['pages_needing_ocr'] = list(getattr(pages_res, 'pages_needing_ocr', []))
+                    
+                    full_md_list = []
+                    for p_item in pages_res.pages:
+                        p_idx = p_item.page
+                        p_md = p_item.markdown or ""
+                        full_md_list.append(f"<!-- Page {p_idx+1} -->\n{p_md}")
+                        if p_md:
+                            p_tables = _parse_markdown_tables(p_md, caption_page_map, default_page=p_idx)
+                            for tbl_df, p_hint in p_tables:
+                                actual_page = p_hint if p_hint is not None else p_idx
+                                tbl_df.attrs['extractor'] = 'pdf_inspector'
+                                tbl_df.attrs['page_idx'] = actual_page
+                                if not tbl_df.attrs.get('label'):
+                                    tbl_df.attrs['label'] = f"Table {len(result['tables'])+1}"
+                                result['tables'].append({
+                                    'df': tbl_df,
+                                    'page_idx': actual_page,
+                                    'table_idx': len(result['tables']),
+                                    'bbox': None,
+                                })
+                    result['markdown'] = "\n\n".join(full_md_list)
+                except Exception as e_epm:
+                    print(f"[pdf-inspector] extract_pages_markdown 提示: {e_epm}，回退到 process_pdf")
+
+        if not result['tables'] and result['pdf_type'] != 'scanned':
             pi_result = pdf_inspector.process_pdf(pdf_path)
             result['pdf_type'] = pi_result.pdf_type
             result['confidence'] = pi_result.confidence
@@ -162,7 +559,6 @@ def classify_and_extract_via_inspector(pdf_path: str, caption_page_map: Optional
         print("[pdf-inspector] 未安装，跳过")
     except Exception as e:
         result['error'] = str(e)
-        # pdf-inspector 解析失败时，回退到 PyMuPDF 文本层判断
         has_text = has_text_layer(pdf_path)
         if has_text:
             result['pdf_type'] = 'text_based'
@@ -736,14 +1132,15 @@ def three_way_vote(
     camelot_tables: List[Dict[str, Any]],
     align_tables: Optional[List[Dict[str, Any]]] = None,
     similarity_threshold: float = 0.75,
+    structure_tables: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[str], Dict[str, Any]]:
     """
-    多方投票融合: pdf-inspector + find_tables + text_alignment + pdfplumber + Camelot。
+    多方投票融合: pdf-inspector-structure + pdf-inspector + find_tables + text_alignment + pdfplumber + Camelot。
 
     规则:
-    - 任意两个一致 (相似度 >= similarity_threshold，默认 0.75) → 取一致的版本（优先 pdf-inspector > find_tables > text_alignment > pdfplumber > Camelot）
+    - 任意两个一致 (相似度 >= similarity_threshold，默认 0.75) → 取一致的版本（优先 pdf_inspector_structure > pdf-inspector > find_tables > text_alignment > pdfplumber > Camelot）
     - 质量检查：若选中的候选表存在列挤压，自动降级切换至无挤压的候选表
-    - 多方均不一致 → 取优先级最高的结果
+    - 多方均不一致 → 取优先级最高的结果（若有出版商语义结构树表格 pdf_inspector_structure，绝对优先保障矢量保真度）
     - 仅一方有结果 → 取该方结果
 
     返回 (fused_tables, logs, vote_summary)
@@ -759,6 +1156,7 @@ def three_way_vote(
 
     # 按页码分组所有来源
     sources = {
+        'pdf_inspector_structure': structure_tables or [],
         'pdf_inspector': inspector_tables,
         'find_tables': find_tables_results,
         'text_alignment': align_tables or [],
@@ -772,8 +1170,8 @@ def three_way_vote(
         for t in src_tables:
             all_pages.add(t.get('page_idx', 0))
 
-    # 优先级排序：pdf_inspector 结构化优先，find_tables 矢量线框与无线框文本对齐紧随其后
-    priority = ['pdf_inspector', 'find_tables', 'text_alignment', 'pdfplumber', 'camelot']
+    # 优先级排序：pdf_inspector_structure 出版商结构树绝对优先，pdf_inspector 结构化紧随其后，find_tables 矢量线框与无线框文本对齐紧随其后
+    priority = ['pdf_inspector_structure', 'pdf_inspector', 'find_tables', 'text_alignment', 'pdfplumber', 'camelot']
 
     for page in sorted(all_pages):
         page_tables = {}
@@ -818,8 +1216,11 @@ def three_way_vote(
                     best_extractor = list(candidates.keys())[0]
                     logs.append(f"Page {page+1} Table {tbl_idx+1}: 仅 {best_extractor} 有结果 → 采用")
                 else:
-                    # 取 pdf_inspector (benchmark 最优)
-                    if 'pdf_inspector' in candidates:
+                    # 取最高优先级候选 (pdf_inspector_structure / pdf_inspector)
+                    if 'pdf_inspector_structure' in candidates:
+                        best_result = candidates['pdf_inspector_structure']
+                        best_extractor = 'pdf_inspector_structure'
+                    elif 'pdf_inspector' in candidates:
                         best_result = candidates['pdf_inspector']
                         best_extractor = 'pdf_inspector'
                     else:
@@ -833,7 +1234,7 @@ def three_way_vote(
                             s = _table_similarity(candidates[src_names[i]]['df'], candidates[src_names[j]]['df'])
                             sims.append(f"{src_names[i]}~{src_names[j]}={s:.2f}")
                             max_sim = max(max_sim, s)
-                    logs.append(f"Page {page+1} Table {tbl_idx+1}: 三方不一致 [{', '.join(sims)}] "
+                    logs.append(f"Page {page+1} Table {tbl_idx+1}: 多方不一致 [{', '.join(sims)}] "
                                 f"→ 采用 {best_extractor} (最高优先级)")
                     # 记录低置信度页面
                     if max_sim < 0.90:
@@ -841,9 +1242,9 @@ def three_way_vote(
                     page_scores.setdefault(page, {})['max_similarity'] = max_sim
 
             # 列挤压质量检查与自动纠正：
-            # 若选出的候选表存在列挤压（如数值挤在同一单元格），且同页有未挤压的候选表（如 text_alignment），则自动切换为未挤压版本
+            # 若选出的候选表存在列挤压（如数值挤在同一单元格），且同页有未挤压的候选表，则自动切换为未挤压版本
             if best_result is not None and is_table_squeezed(best_result['df']):
-                for alt_name in ['text_alignment', 'pdfplumber', 'camelot', 'pdf_inspector']:
+                for alt_name in ['pdf_inspector_structure', 'text_alignment', 'pdfplumber', 'camelot', 'pdf_inspector']:
                     if alt_name in candidates and not is_table_squeezed(candidates[alt_name]['df']) and not is_table_low_quality(candidates[alt_name]['df']):
                         logs.append(f"Page {page+1} Table {tbl_idx+1}: {best_extractor} 存在列挤压问题 → 自动切换为未挤压的 {alt_name}")
                         best_result = candidates[alt_name]
@@ -1598,6 +1999,11 @@ def extract_tables_from_pdf(
 
         native_target_pages = [p for p in target_pages if p not in image_table_pages] if target_pages is not None else None
 
+        # 优先提取 Tagged PDF / PDF/UA 语义结构树表格 (最高保真度)
+        structure_results = extract_via_structure_tree(pdf_path, pages=native_target_pages)
+        if structure_results:
+            logs.append(f"  Tagged PDF 结构树提取到 {len(structure_results)} 个语义表格 (pdf_inspector_structure)")
+
         ft_results = extract_via_find_tables(pdf_path, pages=native_target_pages)
         plumber_results = extract_via_pdfplumber(pdf_path, pages=native_target_pages)
         camelot_results = extract_via_camelot(pdf_path, pages=native_target_pages)
@@ -1606,7 +2012,9 @@ def extract_tables_from_pdf(
         # 多方投票融合
         logs.append("→ Step 3: 多方投票融合")
         fused, vote_logs, vote_summary = three_way_vote(
-            inspector_tables, ft_results, plumber_results, camelot_results, align_tables=align_results
+            inspector_tables, ft_results, plumber_results, camelot_results,
+            align_tables=align_results,
+            structure_tables=structure_results,
         )
         logs.extend(vote_logs)
 
@@ -1702,14 +2110,191 @@ def extract_tables_from_pdf(
 # 5b. 文本对齐提取（无线框表格）
 # ===========================================================================
 
+def _align_table_with_positions(
+    pdf_path: str,
+    page_idx: int,
+    table_y_start: float,
+    table_y_end: float,
+    page_height: float,
+    page_width: float,
+) -> Optional[Any]:
+    """
+    基于 pdf_inspector.extract_text_with_positions 的样式感知对齐提取：
+    - 精确利用字号识别与剔除底部小字号附注/Footnote (font_size < data_font_size)
+    - 结合 is_bold 样式感知合并多行复合表头
+    - 基于物理坐标区间投影聚类分列
+    """
+    if pd is None:
+        return None
+
+    try:
+        import pdf_inspector
+        if not hasattr(pdf_inspector, 'extract_text_with_positions'):
+            return None
+        items = pdf_inspector.extract_text_with_positions(pdf_path, pages=[page_idx + 1])
+    except Exception:
+        return None
+
+    if not items:
+        return None
+
+    # 获取 MediaBox 高度与 CropBox 偏移，确保在旋转/偏移页面下坐标绝对对齐
+    cb_y0 = 0.0
+    mb_height = page_height
+    try:
+        with fitz.open(pdf_path) as doc:
+            if 0 <= page_idx < len(doc):
+                p = doc[page_idx]
+                cb_y0 = p.cropbox.y0
+                mb_height = p.mediabox.height
+    except Exception:
+        pass
+
+    eff_y_start = table_y_start + cb_y0
+    eff_y_end = table_y_end + cb_y0
+
+    # 过滤落在当前表格 y 轴范围内的文字项 (top-down: y_top = mb_height - it.y)
+    table_items = []
+    for it in items:
+        top_y = mb_height - it.y
+        if top_y < eff_y_start - 3.0 or top_y > eff_y_end + 3.0:
+            continue
+        if top_y > mb_height * 0.90 and it.text.strip().isdigit() and len(it.text.strip()) <= 4:
+            continue
+        table_items.append(it)
+
+    if len(table_items) < 4:
+        return None
+
+    # 按 top_y 坐标分行 (容差 4.5pt)
+    sorted_items = sorted(table_items, key=lambda it: (mb_height - it.y, it.x))
+    lines = []
+    curr_line = []
+    curr_y = None
+    for it in sorted_items:
+        y_mid = mb_height - it.y
+        if curr_y is None or abs(y_mid - curr_y) < 4.5:
+            curr_line.append(it)
+            if curr_y is None:
+                curr_y = y_mid
+        else:
+            lines.append(sorted(curr_line, key=lambda x: x.x))
+            curr_line = [it]
+            curr_y = y_mid
+    if curr_line:
+        lines.append(sorted(curr_line, key=lambda x: x.x))
+
+    if not lines:
+        return None
+
+    # 终止条件判定：过滤掉尾部遭遇的正文段落
+    valid_lines = []
+    for l in lines:
+        line_str = " ".join(it.text.strip() for it in l if it.text.strip())
+        if not line_str:
+            continue
+        if (len(line_str) > 30 and '。' in line_str) or re.match(r'^[1-9]\d*(?:\.[1-9]\d*){1,2}\s+[\u4e00-\u9fa5]{2,}', line_str):
+            break
+        valid_lines.append(l)
+
+    if len(valid_lines) < 2:
+        return None
+
+    # 剔除底部的脚注行 (结合字号与特定开头关键词)
+    all_sizes = [it.font_size for l in valid_lines for it in l if it.font_size > 0]
+    median_size = sorted(all_sizes)[len(all_sizes) // 2] if all_sizes else 9.0
+
+    data_lines = []
+    for l in reversed(valid_lines):
+        line_str = " ".join(it.text.strip() for it in l if it.text.strip())
+        avg_sz = sum(it.font_size for it in l) / len(l) if l else median_size
+        low = line_str.lower()
+        is_fn = (
+            line_str.startswith(('注', '*', '†', '‡', '§')) or
+            low.startswith('note') or
+            'standard deviation' in low or
+            'p < 0.' in low
+        )
+        if not data_lines and (is_fn or avg_sz <= median_size - 1.2):
+            continue
+        data_lines.insert(0, l)
+
+    if len(data_lines) < 2:
+        return None
+
+    # 表头行识别：若前 1~2 行具有加粗属性或单位模式，作为复合表头
+    header_rows = [data_lines[0]]
+    body_start_idx = 1
+    if len(data_lines) >= 3:
+        l0 = data_lines[0]
+        l1 = data_lines[1]
+        b0 = sum(1 for it in l0 if it.is_bold) / len(l0) if l0 else 0
+        b1 = sum(1 for it in l1 if it.is_bold) / len(l1) if l1 else 0
+        is_units = all(
+            re.match(r'^\(.*\)$', it.text.strip()) or it.text.strip() in ('%', 'wt.%', 'MPa', 'g/t', 'm', 'km', '°C')
+            for it in l1 if it.text.strip()
+        )
+        if (b0 >= 0.4 and b1 >= 0.4) or is_units:
+            header_rows.append(l1)
+            body_start_idx = 2
+
+    # 列边界聚类 (基于表头水平区间与 x 坐标聚类)
+    col_clusters = []
+    for h_row in header_rows:
+        for it in h_row:
+            matched = False
+            for clust in col_clusters:
+                avg_cx = sum(x.x for x in clust) / len(clust)
+                if abs(it.x - avg_cx) < 22.0:
+                    clust.append(it)
+                    matched = True
+                    break
+            if not matched:
+                col_clusters.append([it])
+
+    if not col_clusters:
+        return None
+
+    col_clusters = sorted(col_clusters, key=lambda cl: sum(x.x for x in cl) / len(cl))
+    col_headers = []
+    col_centers = []
+    for cl in col_clusters:
+        cl_sorted = sorted(cl, key=lambda it: (mb_height - it.y, it.x))
+        col_headers.append(" ".join(it.text.strip() for it in cl_sorted if it.text.strip()))
+        col_centers.append(sum(it.x for it in cl) / len(cl))
+
+    col_names = [c if c else f"Col_{i+1}" for i, c in enumerate(col_headers)]
+    col_names = make_unique_columns(col_names)
+
+    # 重建数据行
+    table_rows = []
+    for l in data_lines[body_start_idx:]:
+        row_cells = [""] * len(col_names)
+        for it in l:
+            best_idx = min(range(len(col_centers)), key=lambda i: abs(col_centers[i] - it.x))
+            if row_cells[best_idx]:
+                row_cells[best_idx] += " " + it.text.strip()
+            else:
+                row_cells[best_idx] = it.text.strip()
+        if any(c for c in row_cells):
+            table_rows.append(row_cells)
+
+    if not table_rows:
+        return None
+
+    df = pd.DataFrame(table_rows, columns=col_names)
+    return df
+
+
 def extract_via_text_alignment(pdf_path: str, pages: Optional[List[int]] = None) -> List[Dict[str, Any]]:
     """
     对无线框表格的文本对齐提取。
 
     策略：
     1. 在页面文本中搜索 "表x.x" caption 定位表格起始位置
-    2. 从 caption 之后的文本行中，用 word 坐标的 x 聚类分列、y 分行重建 DataFrame
-    3. 遇到正文段落（单列长文本）或下一 caption 时停止
+    2. 优先使用 pdf-inspector (extract_text_with_positions) 进行字号感知注脚剔除与样式感知表头对齐
+    3. 回退至使用 word 坐标的 x 聚类分列、y 分行重建 DataFrame
+    4. 遇到正文段落（单列长文本）或下一 caption 时停止
 
     适用于学位论文中大量无网格线的表格。
     """
@@ -1830,6 +2415,29 @@ def extract_via_text_alignment(pdf_path: str, pages: Optional[List[int]] = None)
                         sec_rect = page.search_for(sec_m.group(1).strip()[:10])
                         if sec_rect:
                             table_y_end = min(table_y_end, sec_rect[0].y0 - 2)
+
+                # 优先尝试基于 pdf_inspector extract_text_with_positions 的样式感知对齐
+                pos_df = None
+                try:
+                    pos_df = _align_table_with_positions(
+                        pdf_path, page_idx, table_y_start, table_y_end, page.rect.height, page.rect.width
+                    )
+                except Exception as e_pos:
+                    logger.debug(f"[text_alignment] _align_table_with_positions notice: {e_pos}")
+
+                if pos_df is not None and not pos_df.empty and pos_df.shape[0] >= 1 and pos_df.shape[1] >= 2:
+                    pos_df.attrs['extractor'] = 'text_alignment'
+                    pos_df.attrs['label'] = cap['label']
+                    if cap.get('title'):
+                        pos_df.attrs['table_title'] = cap['title']
+                    pos_df.attrs['page_idx'] = page_idx
+                    results.append({
+                        'df': pos_df,
+                        'page_idx': page_idx,
+                        'table_idx': ci,
+                        'bbox': [0.0, table_y_start, page.rect.width, table_y_end],
+                    })
+                    continue
 
                 # 过滤出表格区域内的 words（排除页面底部单独页码）
                 table_words = [w for w in words if w[1] >= table_y_start and w[1] < table_y_end and not (w[1] > page.rect.height * 0.90 and w[4].isdigit())]
