@@ -76,7 +76,7 @@
 
 ### 2. 本地原生 PDF 5 引擎投票共识
 对于含有完整矢量文本层的 Native PDF，启动多算法交叉核验，兼顾极速与极高准确率（单页约 0.1s）：
-- **`pdf-inspector`**：Rust 编写的高性能检测器，快速判定 PDF 类型并解析 Markdown 表格；
+- **[`pdf-inspector`](https://github.com/firecrawl/pdf-inspector)**：Rust 编写的高性能检测器，快速判定 PDF 类型并解析 Markdown 表格；
 - **`PyMuPDF find_tables()`**：极速矢量线框表格识别；
 - **`text_alignment`**：基于文字坐标聚类分列的无线框对齐引擎；
 - **`pdfplumber`**：基于字符空间矩形与相交线框的结构提取；
@@ -579,9 +579,11 @@ zotero-table-extractor/
    - 针对大模型时代设计的开源异步网页爬取引擎，提供了出色的抗指纹与会话连接能力。
 10. **[MendableAI / Firecrawl](https://github.com/mendableai/firecrawl)**  
     - 为 LLM 设计的高质量网页 Markdown 转换与抽取服务。
-11. **[openpyxl](https://foss.heptapod.net/openpyxl/openpyxl)**  
+11. **[firecrawl / pdf-inspector](https://github.com/firecrawl/pdf-inspector)**  
+   - 基于 Rust 编写的高性能极速 PDF 预审与版面结构分析器，单页毫秒级（约 80ms）完成 PDF 类型分类（文本版 / 扫描版）及原生 Markdown 表格初步定位与提取。
+12. **[openpyxl](https://foss.heptapod.net/openpyxl/openpyxl)**  
     - 强大的 Excel 读写库，本项目依赖其实现出版级单元格排版、交替斑马纹、自适应列宽与 Dublin Core 属性注入。
-12. **[Microsoft / ONNX Runtime](https://github.com/microsoft/onnxruntime)**  
+13. **[Microsoft / ONNX Runtime](https://github.com/microsoft/onnxruntime)**  
     - 高性能跨平台深度学习推理引擎，保障了 DocLayout-YOLO 在 CPU 与各类 GPU 环境下的轻快运行。
 
 ---

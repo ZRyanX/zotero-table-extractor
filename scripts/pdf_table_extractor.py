@@ -64,6 +64,7 @@ logger = logging.getLogger(__name__)
 
 # ===========================================================================
 # 1. pdf-inspector: PDF 分类 + 表格定位 + Markdown 表格提取
+#    GitHub: https://github.com/firecrawl/pdf-inspector
 # ===========================================================================
 
 def classify_and_extract_via_inspector(pdf_path: str, caption_page_map: Optional[Dict[str, int]] = None) -> Dict[str, Any]:

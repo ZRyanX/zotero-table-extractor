@@ -53,7 +53,7 @@ description: 从 Zotero 选中条目（依赖 ai4paper-zotero MCP 获取物理�
 
 | 组件 | 作用 |
 |---|---|
-| `pdf-inspector` | Rust 库，PDF 分类 + 表格定位 + Markdown 提取，~80ms 高性能 |
+| [`pdf-inspector`](https://github.com/firecrawl/pdf-inspector) | Rust 库，PDF 分类 + 表格定位 + Markdown 提取，~80ms 高性能 |
 | `Camelot` + `pdfplumber` | 结构化表格提取，与原生线框进行多方投票交叉验证 |
 | `PyMuPDF find_tables()` | PDF 矢量线框表格提取（零 OCR，高保真） |
 | `text_alignment` | 无线框表格的文本坐标对齐与自适应重组 |
