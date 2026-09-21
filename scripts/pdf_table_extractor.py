@@ -268,9 +268,7 @@ def extract_via_structure_tree(pdf_path: str, pages: Optional[List[int]] = None)
             for pan_idx, pan in enumerate(panels):
                 th_cells = [c for c in pan if c['role'] == 'TH']
                 if th_cells and pan_idx == 0:
-                    top_y = max(c['y'] for c in pan)
-                    col_th_cells = [c for c in th_cells if c['y'] >= top_y - 25.0]
-                    th_by_y = sorted(col_th_cells, key=lambda c: -c['y'])
+                    th_by_y = sorted(th_cells, key=lambda c: -c['y'])
                     th_rows_grouped = []
                     cur_r = []
                     cur_y = None
@@ -286,15 +284,31 @@ def extract_via_structure_tree(pdf_path: str, pages: Optional[List[int]] = None)
                     if cur_r:
                         th_rows_grouped.append(sorted(cur_r, key=lambda x: x['x']))
 
+                    # 动态判定表头所占有的连续行：从顶部行开始，行间距 <= 20pt 均归入复合表头体系；
+                    # 若后续某行仅有 1 个位于极左侧的 TH 单元格，则识别为数据行的行表头（Stub Header），跳出表头判定。
+                    col_header_rows = []
+                    prev_r_y = None
+                    for r_idx, r in enumerate(th_rows_grouped):
+                        r_y = r[0]['y']
+                        if prev_r_y is not None and abs(prev_r_y - r_y) > 20.0:
+                            break
+                        if len(r) == 1 and col_header_rows and len(col_header_rows[0]) > 1:
+                            if r[0]['x'] < col_header_rows[0][0]['x'] + 35.0:
+                                break
+                        col_header_rows.append(r)
+                        prev_r_y = r_y
+
+                    col_th_cells = [c for r in col_header_rows for c in r] if col_header_rows else [c for c in th_cells if c['y'] >= max(c['y'] for c in pan) - 35.0]
+
                     is_hierarchy = (
-                        len(th_rows_grouped) >= 2 and
-                        len(th_rows_grouped[1]) >= 4 and
-                        len(th_rows_grouped[0]) <= len(th_rows_grouped[1]) * 0.6
+                        len(col_header_rows) >= 2 and
+                        len(col_header_rows[1]) >= 4 and
+                        len(col_header_rows[0]) <= len(col_header_rows[1]) * 0.75
                     )
 
                     if is_hierarchy:
-                        row0 = th_rows_grouped[0]
-                        row1 = th_rows_grouped[1]
+                        row0 = col_header_rows[0]
+                        row1 = col_header_rows[1]
                         headers = []
                         col_centers = []
                         for sub in row1:
@@ -313,12 +327,17 @@ def extract_via_structure_tree(pdf_path: str, pages: Optional[List[int]] = None)
                             headers.insert(0, row0[0]['text'])
                             col_centers.insert(0, row0[0]['x'])
                     else:
+                        # 动态自适应列头聚类容差
+                        all_th_x = sorted(c['x'] for c in col_th_cells)
+                        th_gaps = [all_th_x[i+1] - all_th_x[i] for i in range(len(all_th_x)-1) if all_th_x[i+1] - all_th_x[i] > 6.0]
+                        col_tol = max(6.0, min(18.0, min(th_gaps) * 0.45)) if th_gaps else 18.0
+
                         col_clusters = []
                         for c in sorted(col_th_cells, key=lambda c: c['x']):
                             matched = False
                             for clust in col_clusters:
                                 avg_cx = sum(x['x'] for x in clust) / len(clust)
-                                if abs(c['x'] - avg_cx) < 18.0:
+                                if abs(c['x'] - avg_cx) < col_tol:
                                     clust.append(c)
                                     matched = True
                                     break
@@ -337,51 +356,47 @@ def extract_via_structure_tree(pdf_path: str, pages: Optional[List[int]] = None)
                 else:
                     data_cells = pan
 
-                # 若数据行在表头左侧存在独立数据列（即第 0 列为省略表头的行头）
-                if data_cells and tbl_col_centers and any(c['x'] < min(tbl_col_centers) - 20.0 for c in data_cells):
-                    left_x = min(c['x'] for c in data_cells)
-                    tbl_headers.insert(0, 'Index')
-                    tbl_col_centers.insert(0, left_x)
+                # 若数据行在表头左侧存在独立数据列（即第 0 列为省略表头的行头，门限自适应）
+                if data_cells and tbl_col_centers:
+                    min_th_x = min(tbl_col_centers)
+                    leftmost_data_cells = [c for c in data_cells if c['x'] < min_th_x - 8.0]
+                    if leftmost_data_cells:
+                        left_x = sum(c['x'] for c in leftmost_data_cells) / len(leftmost_data_cells)
+                        tbl_headers.insert(0, 'Index')
+                        tbl_col_centers.insert(0, left_x)
 
                 n_cols = len(tbl_headers)
                 if n_cols == 0:
                     continue
 
-                if pan_idx > 0 and len(data_cells) % n_cols == 0:
-                    for i in range(0, len(data_cells), n_cols):
-                        row = [c['text'] for c in data_cells[i:i+n_cols]]
-                        tbl_rows.append(row)
-                elif len(data_cells) % n_cols == 0:
-                    for i in range(0, len(data_cells), n_cols):
-                        row = [c['text'] for c in data_cells[i:i+n_cols]]
-                        tbl_rows.append(row)
-                else:
-                    data_by_y = sorted(data_cells, key=lambda c: -c['y'])
-                    curr_r = []
-                    curr_y = None
-                    rows_grouped = []
-                    for c in data_by_y:
-                        if curr_y is None or abs(c['y'] - curr_y) < 4.0:
-                            curr_r.append(c)
-                            if curr_y is None:
-                                curr_y = c['y']
-                        else:
-                            rows_grouped.append(sorted(curr_r, key=lambda x: x['x']))
-                            curr_r = [c]
+                # 始终使用物理 y 坐标行聚类 + x 轴物理列投影重建数据行，
+                # 严禁因单元格总数恰好整除便盲目顺序切片，杜绝空单元格缺失引发的全表跨行错移
+                data_by_y = sorted(data_cells, key=lambda c: -c['y'])
+                curr_r = []
+                curr_y = None
+                rows_grouped = []
+                for c in data_by_y:
+                    if curr_y is None or abs(c['y'] - curr_y) < 4.5:
+                        curr_r.append(c)
+                        if curr_y is None:
                             curr_y = c['y']
-                    if curr_r:
+                    else:
                         rows_grouped.append(sorted(curr_r, key=lambda x: x['x']))
+                        curr_r = [c]
+                        curr_y = c['y']
+                if curr_r:
+                    rows_grouped.append(sorted(curr_r, key=lambda x: x['x']))
 
-                    for r in rows_grouped:
-                        row_vals = [''] * n_cols
-                        for c in r:
-                            best_idx = min(range(n_cols), key=lambda i: abs(tbl_col_centers[i] - c['x']))
-                            if row_vals[best_idx]:
-                                row_vals[best_idx] += ' ' + c['text']
-                            else:
-                                row_vals[best_idx] = c['text']
-                        if any(v.strip() for v in row_vals):
-                            tbl_rows.append(row_vals)
+                for r in rows_grouped:
+                    row_vals = [''] * n_cols
+                    for c in r:
+                        best_idx = min(range(n_cols), key=lambda i: abs(tbl_col_centers[i] - c['x']))
+                        if row_vals[best_idx]:
+                            row_vals[best_idx] += ' ' + c['text']
+                        else:
+                            row_vals[best_idx] = c['text']
+                    if any(v.strip() for v in row_vals):
+                        tbl_rows.append(row_vals)
 
             if not tbl_rows or not tbl_headers:
                 continue

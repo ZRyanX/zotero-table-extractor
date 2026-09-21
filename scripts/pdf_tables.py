@@ -408,14 +408,29 @@ def rebuild_df_with_style_hierarchy(
             header_rows.append(l1)
             data_start_idx = 2
 
+    # 动态自适应列聚类容差：根据表头内部最小非零水平间距确定，杜绝密集多列表格将相邻两列误合并
+    all_header_xs = sorted(it.x for h_row in header_rows for it in h_row)
+    gaps = [all_header_xs[i+1] - all_header_xs[i] for i in range(len(all_header_xs)-1) if all_header_xs[i+1] - all_header_xs[i] > 6.0]
+    if gaps:
+        min_gap = min(gaps)
+        cluster_tol = max(6.0, min(18.0, min_gap * 0.45))
+    else:
+        cluster_tol = 16.0
+
     # 基于表头项的 x 坐标聚类列边界
     col_clusters = []
     for h_row in header_rows:
         for it in h_row:
             matched = False
             for clust in col_clusters:
+                # 检查该 cluster 中是否已存在本行的其他不同 item（防止同行两列误合）
+                same_row_items = [x for x in clust if any(x is item for item in h_row)]
+                if same_row_items:
+                    # 同行中只有紧挨着的连贯词（距离 < 8pt）才允许归入同一列头
+                    if any(abs(it.x - (x.x + getattr(x, 'width', 0))) > 8.0 and abs(it.x - x.x) > 10.0 for x in same_row_items):
+                        continue
                 avg_cx = sum(x.x for x in clust) / len(clust)
-                if abs(it.x - avg_cx) < 22.0:
+                if abs(it.x - avg_cx) < cluster_tol:
                     clust.append(it)
                     matched = True
                     break
@@ -634,6 +649,15 @@ def crop_to_dataframe(pdf_path: str, crop_info: Dict[str, Any], dpi: int = 200) 
                 pdf_path, crop_info["page_index"], crop_rect, page.rect.height,
                 crop_bbox=crop_bbox, dpi=crop_dpi
             )
+            if df is not None and not df.empty:
+                # 质量门禁：检查是否发生列挤压、列数过少或低质量
+                try:
+                    from common import is_table_squeezed, is_table_low_quality
+                    if is_table_squeezed(df) or is_table_low_quality(df) or df.shape[1] < 2:
+                        logger.debug("[PDF-Tables] rebuild_df_with_style_hierarchy 存在列挤压或低质量，回退到后续策略")
+                        df = None
+                except Exception:
+                    pass
             if df is not None and not df.empty:
                 df.attrs['label'] = crop_info.get('label', '')
                 df.attrs['table_title'] = cap_style or crop_info.get('caption', '')
