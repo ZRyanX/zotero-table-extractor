@@ -100,11 +100,22 @@ def load_config():
     if not data.get("ZOTERO_DB_PATH"):
         data["ZOTERO_DB_PATH"] = get_zotero_db_path()
 
+    # 默认多云与引擎配置
+    if "MINERU_API_KEY" not in data:
+        data["MINERU_API_KEY"] = ""
+    if "MINERU_API_BASE" not in data:
+        data["MINERU_API_BASE"] = "https://mineru.net"
+    if "OCR_ENGINE" not in data:
+        data["OCR_ENGINE"] = "auto"
+
     # 环境变量覆盖敏感配置
     env_overrides = {
         'FIRECRAWL_API_KEY': 'FIRECRAWL_API_KEY',
         'ELSEVIER_API_KEY': 'ELSEVIER_API_KEY',
         'PADDLEOCR_MCP_AISTUDIO_ACCESS_TOKEN': 'PADDLEOCR_ACCESS_TOKEN',
+        'MINERU_API_KEY': 'MINERU_API_KEY',
+        'MINERU_API_BASE': 'MINERU_API_BASE',
+        'OCR_ENGINE': 'OCR_ENGINE',
     }
     for config_key, env_key in env_overrides.items():
         env_val = os.getenv(env_key)

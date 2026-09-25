@@ -81,8 +81,8 @@ def extract_table_crops_from_pdf(
 ) -> List[Dict[str, Any]]:
     """
     从本地 PDF 文件中提取所有表格及相关上下文（Caption/Footnote）的图像区域 Crop。
-    优先使用在线 PP-StructureV3 进行精准版面分析与表格切图；
-    若离线或未配置 Token，平滑回退至本地 DocLayout-YOLO 目标检测。
+    优先使用本地超快 DocLayout-YOLO 视觉目标检测（~15ms 本地离线推理，零 Token 消耗与零网络时延）；
+    仅在本地模型被禁用、未检出有效表格或推理异常时，平滑回退至云端 PP-StructureV3。
     
     返回列表，各项结构：
     {
@@ -102,61 +102,85 @@ def extract_table_crops_from_pdf(
 
     config = load_config() if load_config else {}
 
-    # 1. 优先使用 PP-StructureV3 进行在线版面定位与切图
+    # 1. 优先使用本地超快 DocLayout-YOLO 目标检测
+    yolo_enabled = config.get("DOCLAYOUT_YOLO_ENABLED", True)
+    if yolo_enabled and DocLayoutYoloDetector is not None:
+        try:
+            print("[PDF-Tables] 正在使用本地 DocLayout-YOLO 进行超快版面定位与表格切图...")
+            model_dir = config.get("DOCLAYOUT_MODEL_DIR")
+            conf_thresh = conf_threshold if conf_threshold != 0.25 else config.get("DOCLAYOUT_CONF_THRESHOLD", conf_threshold)
+
+            detector = None
+            try:
+                if model_dir:
+                    try:
+                        from .doclayout_yolo_detector import ensure_model_file
+                    except ImportError:
+                        from doclayout_yolo_detector import ensure_model_file
+                    model_path = ensure_model_file(model_dir)
+                    detector = DocLayoutYoloDetector(model_path=model_path)
+            except Exception as e_m:
+                print(f"[PDF-Tables] 尝试指定模型目录加载 DocLayout-YOLO 提示: {e_m}")
+
+            if detector is None:
+                detector = DocLayoutYoloDetector()
+
+            doc = fitz.open(pdf_path)
+            extracted_crops = []
+            total_pages = len(doc)
+
+            zoom = dpi / 72.0
+            mat = fitz.Matrix(zoom, zoom)
+
+            target_pages = [p for p in pages if 0 <= p < total_pages] if pages is not None else list(range(total_pages))
+
+            for page_idx in target_pages:
+                if cancel_event is not None and cancel_event.is_set():
+                    break
+                page = doc[page_idx]
+                page_text = page.get_text("text")
+
+                # 启发式预检：若页面不含图表特征且未显式指定目标页，则提前跳过
+                if enable_filter and pages is None and page_may_contain_tables and not page_may_contain_tables(page_text):
+                    continue
+
+                pix = page.get_pixmap(matrix=mat, alpha=False)
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+
+                # 运行 DocLayout-YOLO 表格+上下文检测
+                regions = detector.extract_extended_table_regions(img, conf_threshold=conf_thresh)
+                for r in regions:
+                    r["page_index"] = page_idx
+                    r["page_text"] = page_text
+                    # 极速探测矢量文本质量与 OCR 需求感知 (Rust ~1ms)
+                    if r.get("crop_bbox"):
+                        reg_info = inspect_crop_region(pdf_path, page_idx, r["crop_bbox"], dpi=dpi)
+                        r["needs_ocr"] = reg_info["needs_ocr"]
+                        r["ocr_reason"] = reg_info["ocr_reason"]
+                        r["region_vector_text"] = reg_info["text"]
+                        r["pdf_bbox"] = reg_info["pdf_bbox"]
+                    extracted_crops.append(r)
+
+            doc.close()
+            print(f"[PDF-Tables] 本地 DocLayout-YOLO 从 {total_pages} 页 PDF 中定位并提取出 {len(extracted_crops)} 个表格区域 Crop。")
+            if extracted_crops:
+                return extracted_crops
+            else:
+                print("[PDF-Tables] 本地 DocLayout-YOLO 未在目标页检出表格，尝试云端版面分析回退...")
+        except Exception as e:
+            print(f"[PDF-Tables] 本地 DocLayout-YOLO 视觉检测异常: {e}，尝试云端版面分析回退...")
+
+    # 2. 回退：云端 PP-StructureV3 在线版面定位与表格切图
     if config.get("USE_PP_STRUCTURE", True) and extract_pp_structure_table_crops is not None:
         try:
-            print("[PDF-Tables] 正在使用 PP-StructureV3 进行在线版面定位与表格切图...")
+            print("[PDF-Tables] 正在使用 PP-StructureV3 进行在线版面定位与表格切图回退...")
             pp_crops = extract_pp_structure_table_crops(pdf_path, config=config, cancel_event=cancel_event, pages=pages)
             if pp_crops:
                 return pp_crops
         except Exception as e:
-            print(f"[PDF-Tables] PP-StructureV3 切图提示: {e}，尝试本地模型回退...")
+            print(f"[PDF-Tables] PP-StructureV3 切图回退提示: {e}")
 
-    # 2. 回退：本地 DocLayout-YOLO 视觉检测
-    if DocLayoutYoloDetector is None:
-        print("[PDF-Tables] 提示: 未检测到 DocLayoutYoloDetector 依赖，跳过本地 AI 表格定位。")
-        return []
-
-    detector = DocLayoutYoloDetector()
-    doc = fitz.open(pdf_path)
-    extracted_crops = []
-    total_pages = len(doc)
-
-    zoom = dpi / 72.0
-    mat = fitz.Matrix(zoom, zoom)
-
-    target_pages = [p for p in pages if 0 <= p < total_pages] if pages is not None else list(range(total_pages))
-
-    for page_idx in target_pages:
-        if cancel_event is not None and cancel_event.is_set():
-            break
-        page = doc[page_idx]
-        page_text = page.get_text("text")
-
-        # 启发式预检：若页面不含图表特征则提前跳过
-        if enable_filter and page_may_contain_tables and not page_may_contain_tables(page_text):
-            continue
-
-        pix = page.get_pixmap(matrix=mat, alpha=False)
-        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-
-        # 运行 DocLayout-YOLO 表格+上下文检测
-        regions = detector.extract_extended_table_regions(img)
-        for r in regions:
-            r["page_index"] = page_idx
-            r["page_text"] = page_text
-            # 极速探测矢量文本质量与 OCR 需求感知 (Rust ~1ms)
-            if r.get("crop_bbox"):
-                reg_info = inspect_crop_region(pdf_path, page_idx, r["crop_bbox"], dpi=dpi)
-                r["needs_ocr"] = reg_info["needs_ocr"]
-                r["ocr_reason"] = reg_info["ocr_reason"]
-                r["region_vector_text"] = reg_info["text"]
-                r["pdf_bbox"] = reg_info["pdf_bbox"]
-            extracted_crops.append(r)
-
-    doc.close()
-    print(f"[PDF-Tables] 共从 {total_pages} 页 PDF 中定位并提取出 {len(extracted_crops)} 个表格区域 Crop。")
-    return extracted_crops
+    return []
 
 
 def convert_crop_to_mediabox(

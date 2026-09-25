@@ -41,6 +41,7 @@ import os
 import re
 import io
 import time
+import tempfile
 import logging
 from typing import List, Dict, Any, Optional, Tuple
 
@@ -1854,6 +1855,136 @@ def extract_via_paddleocr_fullpage(pdf_path: str, pages: Optional[List[int]] = N
     return results
 
 
+def extract_via_paddleocr_crops(pdf_path: str, pages: Optional[List[int]] = None, cancel_event=None) -> List[Dict[str, Any]]:
+    """
+    针对待精细识别/救助页面，优先利用本地 DocLayout-YOLO 裁剪出表格主体区域 (Table Crop)，
+    仅将目标切图提交给 PaddleOCR-VL-1.6 进行精细多模态解析，大幅节省 75%+ Token 并防止长表截断；
+    若特定页面未定位到切图或切图解析失败，平滑回退至整页 extract_via_paddleocr_fullpage。
+    """
+    if pd is None or not os.path.exists(pdf_path):
+        return []
+
+    if cancel_event is not None and cancel_event.is_set():
+        return []
+
+    if pages is None:
+        try:
+            doc = fitz.open(pdf_path)
+            pages = list(range(len(doc)))
+            doc.close()
+        except Exception:
+            pages = []
+    if not pages:
+        return []
+
+    results = []
+    import sys
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    if script_dir not in sys.path:
+        sys.path.insert(0, script_dir)
+
+    try:
+        import ocr_client
+        from table_postprocess import parse_structured_vlm_content
+        from common import load_config
+        config = load_config()
+    except Exception as e:
+        print(f"[PaddleOCR-VL Crops] 依赖加载失败: {e}，回退整页提取")
+        return extract_via_paddleocr_fullpage(pdf_path, pages)
+
+    # 1. 尝试使用本地 DocLayout-YOLO 优先切图提取
+    crops = []
+    try:
+        from pdf_tables import extract_table_crops_from_pdf
+        print(f"[PaddleOCR-VL Crops] 正在通过 DocLayout-YOLO 对候选页面 {[p+1 for p in pages]} 进行目标表格切图...")
+        crops = extract_table_crops_from_pdf(pdf_path, pages=pages, enable_filter=False, cancel_event=cancel_event)
+    except Exception as e:
+        print(f"[PaddleOCR-VL Crops] 本地切图提取提示: {e}")
+
+    # 按页面索引归类切图
+    crops_by_page = {}
+    for c in (crops or []):
+        p_idx = c.get("page_index")
+        if p_idx is not None:
+            crops_by_page.setdefault(p_idx, []).append(c)
+
+    pages_resolved = set()
+
+    for page_idx in pages:
+        if cancel_event is not None and cancel_event.is_set():
+            break
+        page_crops = crops_by_page.get(page_idx, [])
+        if not page_crops:
+            continue
+
+        page_success = False
+        for t_idx, crop in enumerate(page_crops):
+            if cancel_event is not None and cancel_event.is_set():
+                break
+            img = crop.get("image")
+            if img is None:
+                continue
+
+            temp_img_path = None
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f_tmp:
+                    temp_img_path = f_tmp.name
+                img.save(temp_img_path, format="PNG")
+
+                print(f"[PaddleOCR-VL Crops] 正在提交第 {page_idx+1} 页 Table Crop #{t_idx+1} (尺寸: {img.size}) 至 VLM...")
+                crop_md = ocr_client.call_paddleocr_vl_online_api(temp_img_path, config=config, timeout=180, cancel_event=cancel_event)
+                if not crop_md:
+                    continue
+
+                dfs = parse_structured_vlm_content(crop_md)
+                from table_postprocess import merge_continuation_tables
+                dfs = merge_continuation_tables(dfs)
+
+                for sub_t_idx, df in enumerate(dfs):
+                    if df is not None and not df.empty and df.shape[0] >= 1 and df.shape[1] >= 2:
+                        df.attrs['extractor'] = 'paddleocr_vl_crop'
+                        df.attrs['page_idx'] = page_idx
+                        df.attrs['covered_pages'] = [page_idx]
+                        if crop.get("crop_bbox"):
+                            df.attrs['crop_bbox'] = crop['crop_bbox']
+                        if crop.get("pdf_bbox"):
+                            df.attrs['pdf_bbox'] = crop['pdf_bbox']
+
+                        # 触发 Post-OCR 门禁检验与 Agent 协同验证
+                        df = verify_and_rescue_table_with_agent(df, pdf_path, page_idx, df.attrs.get('label', ''))
+                        results.append({
+                            'df': df,
+                            'page_idx': page_idx,
+                            'table_idx': t_idx + sub_t_idx,
+                            'bbox': crop.get("crop_bbox"),
+                            'pdf_bbox': crop.get("pdf_bbox"),
+                            'covered_pages': [page_idx],
+                        })
+                        page_success = True
+            except Exception as e_crop:
+                print(f"[PaddleOCR-VL Crops] 处理第 {page_idx+1} 页 Crop #{t_idx+1} 异常: {e_crop}")
+            finally:
+                if temp_img_path and os.path.exists(temp_img_path):
+                    try:
+                        os.unlink(temp_img_path)
+                    except Exception:
+                        pass
+
+        if page_success:
+            pages_resolved.add(page_idx)
+
+    # 2. 检查哪些页面未能通过切图获得表格，对这些页面平滑回退至整页 extract_via_paddleocr_fullpage
+    unresolved_pages = [p for p in pages if p not in pages_resolved]
+    if unresolved_pages:
+        print(f"[PaddleOCR-VL Crops] 页面 {[p+1 for p in unresolved_pages]} 未检出有效切图或切图解析未果，平滑回退至整页 PaddleOCR-VL 识别...")
+        fallback_results = extract_via_paddleocr_fullpage(pdf_path, unresolved_pages)
+        results.extend(fallback_results)
+
+    if results:
+        print(f"[PaddleOCR-VL Crops] 综合切图与回退，共提取到 {len(results)} 个表格")
+    return results
+
+
 def extract_tables_from_pdf(
     pdf_path: str,
     use_ocr_fallback: bool = True,
@@ -2048,12 +2179,12 @@ def extract_tables_from_pdf(
         logs.extend(val_logs)
         all_results = valid_fused
 
-        # 若检验发现任何问题、缺陷或低置信度页面，直接走 PaddleOCR-VL 独立提取接管
+        # 若检验发现任何问题、缺陷或低置信度页面，优先通过 DocLayout-YOLO 目标切图送入 PaddleOCR-VL 独立接管提取
         if pages_requiring_ocr and use_ocr_fallback:
             ocr_candidate_pages = sorted(list(pages_requiring_ocr))
-            logs.append(f"→ Step 3b: 检验未通过/待精细识别页面 {[p+1 for p in ocr_candidate_pages]} 全面由 PaddleOCR-VL-1.6 独立接管提取")
+            logs.append(f"→ Step 3b: 检验未通过/待精细识别页面 {[p+1 for p in ocr_candidate_pages]} 优先通过 DocLayout-YOLO 切图送入 PaddleOCR-VL-1.6 独立接管提取")
             
-            ocr_results = extract_via_paddleocr_fullpage(pdf_path, ocr_candidate_pages)
+            ocr_results = extract_via_paddleocr_crops(pdf_path, ocr_candidate_pages)
             if ocr_results:
                 # 仅在 OCR 成功获得非空表格时，才替换对应页面的原生表
                 ocr_success_pages = set()

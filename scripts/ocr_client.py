@@ -15,6 +15,7 @@ import re
 import sys
 import time
 import tempfile
+import zipfile
 from typing import List, Dict, Any, Optional
 
 import requests
@@ -65,6 +66,288 @@ OPTIONAL_PAYLOAD = {
 }
 
 
+def _sleep_cancel_aware(seconds: float, cancel_event=None) -> bool:
+    """可响应取消事件的休眠函数，若收到取消信号返回 True。"""
+    steps = max(1, int(seconds * 2))
+    for _ in range(steps):
+        if cancel_event is not None and cancel_event.is_set():
+            return True
+        time.sleep(seconds / steps)
+    return False
+
+
+# ===========================================================================
+# MinerU 官方 API 客户端与多云视觉容灾集成
+# ===========================================================================
+
+class MinerUClient:
+    """
+    MinerU 官方云端 API 客户端 (mineru.net)。
+    官方提供每日 1,000 页免费提取额度，用于多云双活与百度 AIStudio 队列熔断兜底。
+    """
+    def __init__(self, api_key: str = "", api_base: str = "https://mineru.net"):
+        self.api_key = api_key or os.getenv("MINERU_API_KEY", "")
+        self.api_base = (api_base or os.getenv("MINERU_API_BASE", "https://mineru.net") or "https://mineru.net").rstrip("/")
+
+    def submit_task(self, file_path: str, is_ocr: bool = True, enable_table: bool = True, enable_formula: bool = True) -> Optional[str]:
+        """
+        提交解析任务至 MinerU API，返回 batch_id 或 task_id。
+        支持本地 PDF / 图片文件及远程 URL。
+        """
+        if not self.api_key:
+            print("[MinerU] 提示: 未配置 MINERU_API_KEY，无法提交任务")
+            return None
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+
+        # 远程 URL 方式
+        if isinstance(file_path, str) and file_path.startswith(("http://", "https://")):
+            url = f"{self.api_base}/api/v4/extract/task"
+            payload = {
+                "url": file_path,
+                "is_ocr": is_ocr,
+                "enable_table": enable_table,
+                "enable_formula": enable_formula,
+                "model": "vlm",
+                "model_version": "vlm"
+            }
+            try:
+                resp = requests.post(url, json=payload, headers=headers, timeout=60)
+                if resp.status_code == 200:
+                    data = resp.json().get("data", {})
+                    task_id = data.get("task_id") or data.get("batch_id")
+                    return task_id
+                else:
+                    print(f"[MinerU] URL 任务提交失败 status={resp.status_code}: {resp.text[:200]}")
+                    return None
+            except Exception as e:
+                print(f"[MinerU] URL 任务提交异常: {e}")
+                return None
+
+        # 本地文件方式：注册批量上传并 PUT 到 OSS
+        if not os.path.exists(file_path):
+            print(f"[MinerU] 文件不存在: {file_path}")
+            return None
+
+        batch_url = f"{self.api_base}/api/v4/file-urls/batch"
+        filename = os.path.basename(file_path)
+        payload = {
+            "files": [{"name": filename}],
+            "model_version": "vlm",
+            "enable_formula": enable_formula,
+            "enable_table": enable_table,
+            "is_ocr": is_ocr
+        }
+
+        try:
+            resp = requests.post(batch_url, json=payload, headers=headers, timeout=60)
+            if resp.status_code != 200:
+                print(f"[MinerU] 批量上传注册失败 status={resp.status_code}: {resp.text[:200]}")
+                return None
+            res_json = resp.json()
+            data = res_json.get("data", {}) if "data" in res_json else res_json
+            batch_id = data.get("batch_id") or data.get("id") or res_json.get("batch_id")
+            
+            # 获取上传链接
+            upload_url = None
+            if "file_urls" in data and isinstance(data["file_urls"], list) and data["file_urls"]:
+                upload_url = data["file_urls"][0]
+            elif "files" in data and isinstance(data["files"], list) and data["files"]:
+                upload_url = data["files"][0].get("upload_url")
+            elif "files" in res_json and isinstance(res_json["files"], list) and res_json["files"]:
+                upload_url = res_json["files"][0].get("upload_url")
+
+            if not upload_url:
+                print(f"[MinerU] 未从响应中获得上传 URL: {res_json}")
+                return None
+
+            # 上传文件内容 (注意: Content-Type 置空以防止签名冲突)
+            with open(file_path, "rb") as f:
+                put_headers = {"Content-Type": ""}
+                put_resp = requests.put(upload_url, data=f, headers=put_headers, timeout=120)
+                if put_resp.status_code not in (200, 201):
+                    print(f"[MinerU] 文件上传 OSS 失败 status={put_resp.status_code}")
+                    return None
+
+            return batch_id
+        except Exception as e:
+            print(f"[MinerU] 提交任务异常: {e}")
+            return None
+
+    def poll_task(self, task_id: str, timeout: int = 600, cancel_event=None) -> Dict[str, Any]:
+        """
+        轮询 MinerU 任务状态，直至完成或超时。
+        """
+        if not self.api_key or not task_id:
+            return {"success": False, "error": "invalid_args"}
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+        query_url = f"{self.api_base}/api/v4/extract-results/batch/{task_id}"
+        task_query_url = f"{self.api_base}/api/v4/extract/task/{task_id}"
+
+        start_time = time.time()
+        print(f"[MinerU] 任务已提交 (ID: {task_id})，开始轮询结果...")
+
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                print("[MinerU] 收到取消信号，中止轮询")
+                return {"success": False, "error": "cancelled"}
+
+            if time.time() - start_time > timeout:
+                print(f"[MinerU] 任务轮询超时 ({timeout}s)")
+                return {"success": False, "error": "timeout"}
+
+            try:
+                resp = requests.get(query_url, headers=headers, timeout=30)
+                if resp.status_code == 404:
+                    resp = requests.get(task_query_url, headers=headers, timeout=30)
+            except Exception as e:
+                print(f"[MinerU] 轮询网络异常: {e}")
+                if _sleep_cancel_aware(5, cancel_event):
+                    return {"success": False, "error": "cancelled"}
+                continue
+
+            if resp.status_code != 200:
+                print(f"[MinerU] 轮询状态码非 200: {resp.status_code}")
+                if _sleep_cancel_aware(5, cancel_event):
+                    return {"success": False, "error": "cancelled"}
+                continue
+
+            res_json = resp.json()
+            data = res_json.get("data", {})
+            state = data.get("state") or data.get("status")
+            error_msg = data.get("message") or data.get("errorMsg") or data.get("err_msg")
+
+            extract_results = data.get("extract_result") or data.get("extract_results") or []
+            if isinstance(extract_results, list) and extract_results:
+                first_res = extract_results[0]
+                if isinstance(first_res, dict):
+                    state = first_res.get("state") or first_res.get("status") or state
+                    if not error_msg:
+                        error_msg = first_res.get("err_msg") or first_res.get("message") or first_res.get("errorMsg")
+
+            if state in ("done", "success"):
+                print("[MinerU] 任务解析成功！")
+                return {"success": True, "state": "done", "data": data}
+            elif state in ("failed", "error"):
+                error_msg = error_msg or "Unknown failure"
+                print(f"[MinerU] 任务执行失败: {error_msg}")
+                return {"success": False, "state": "failed", "error": error_msg}
+            else:
+                if _sleep_cancel_aware(5, cancel_event):
+                    return {"success": False, "error": "cancelled"}
+
+    def parse_mineru_table_result(self, result_data: Any) -> str:
+        """
+        解析 MinerU 返回的产物，提取 Markdown 字符串。
+        """
+        if not result_data:
+            return ""
+
+        if isinstance(result_data, str):
+            if "\n|" in result_data or result_data.strip().startswith("#"):
+                return result_data
+            if result_data.startswith(("http://", "https://")) and ".zip" in result_data:
+                return self._download_and_extract_md(result_data)
+
+        if isinstance(result_data, dict):
+            if "markdown" in result_data and result_data["markdown"]:
+                return result_data["markdown"]
+
+            extract_results = result_data.get("extract_result") or result_data.get("extract_results") or []
+            if isinstance(extract_results, list) and extract_results:
+                first_res = extract_results[0]
+                if isinstance(first_res, dict):
+                    if "markdown" in first_res and first_res["markdown"]:
+                        return first_res["markdown"]
+                    if "full_zip_url" in first_res and first_res["full_zip_url"]:
+                        return self._download_and_extract_md(first_res["full_zip_url"])
+
+            zip_url = result_data.get("result_url") or result_data.get("full_zip_url")
+            if zip_url:
+                return self._download_and_extract_md(zip_url)
+
+        return ""
+
+    def _download_and_extract_md(self, zip_url: str) -> str:
+        try:
+            resp = requests.get(zip_url, timeout=120)
+            if resp.status_code != 200:
+                print(f"[MinerU] 下载 ZIP 结果包失败 status={resp.status_code}")
+                return ""
+            with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+                md_files = [n for n in zf.namelist() if n.lower().endswith(".md")]
+                if md_files:
+                    chosen = md_files[0]
+                    for name in md_files:
+                        base = os.path.basename(name).lower()
+                        if base in ("output.md", "auto.md", "full.md"):
+                            chosen = name
+                            break
+                    md_bytes = zf.read(chosen)
+                    return md_bytes.decode("utf-8", errors="replace")
+        except Exception as e:
+            print(f"[MinerU] 解压提取 Markdown 失败: {e}")
+        return ""
+
+
+def mineru_submit_task(file_path: str, config: Optional[dict] = None) -> Optional[str]:
+    """快捷提交 MinerU 任务。"""
+    if config is None:
+        config = load_config()
+    client = MinerUClient(
+        api_key=config.get("MINERU_API_KEY", ""),
+        api_base=config.get("MINERU_API_BASE", "https://mineru.net")
+    )
+    return client.submit_task(file_path)
+
+
+def mineru_poll_task(task_id: str, config: Optional[dict] = None, timeout: int = 600, cancel_event=None) -> Dict[str, Any]:
+    """快捷轮询 MinerU 任务。"""
+    if config is None:
+        config = load_config()
+    client = MinerUClient(
+        api_key=config.get("MINERU_API_KEY", ""),
+        api_base=config.get("MINERU_API_BASE", "https://mineru.net")
+    )
+    return client.poll_task(task_id, timeout=timeout, cancel_event=cancel_event)
+
+
+def parse_mineru_table_result(result_data: Any) -> str:
+    """解析 MinerU 产物并返回 Markdown 字符串。"""
+    client = MinerUClient()
+    return client.parse_mineru_table_result(result_data)
+
+
+def call_mineru_api(file_path: str, config: Optional[dict] = None, timeout: int = 600, cancel_event=None) -> str:
+    """
+    通过 MinerU 官方云端 API 进行高保真多模态解析并返回 Markdown 表格字符串。
+    """
+    if config is None:
+        config = load_config()
+    client = MinerUClient(
+        api_key=config.get("MINERU_API_KEY", ""),
+        api_base=config.get("MINERU_API_BASE", "https://mineru.net")
+    )
+    task_id = client.submit_task(file_path)
+    if not task_id:
+        return ""
+    poll_res = client.poll_task(task_id, timeout=timeout, cancel_event=cancel_event)
+    if not poll_res.get("success"):
+        return ""
+    return client.parse_mineru_table_result(poll_res.get("data", {}))
+
+
+# 全局默认 MinerU 客户端实例
+mineru_client = MinerUClient()
+
+
 # ===========================================================================
 # 核心：通用 AIStudio 异步作业调用与轮询
 # ===========================================================================
@@ -79,6 +362,7 @@ def call_paddleocr_job(
     """
     通用 AIStudio 作业调用底层函数。支持 PP-StructureV3 / PaddleOCR-VL-1.6 等任意模型。
     支持本地文件路径或公开可访问的 HTTP(S) URL。
+    当 AIStudio 发生队列已满 (status=400 队列已满) 或超时时，无缝自动故障转移至 MinerU API。
 
     返回字典：
     {
@@ -101,7 +385,24 @@ def call_paddleocr_job(
         or config.get("PADDLEOCR_MCP_AISTUDIO_ACCESS_TOKEN")
         or ""
     )
+    def _make_failover_result(mineru_md: str) -> Dict[str, Any]:
+        return {
+            "success": True,
+            "model": "mineru",
+            "jsonl_url": "",
+            "combined_markdown": mineru_md,
+            "pages": [{"page_idx": 0, "markdown": mineru_md, "images": {}}],
+            "error": None,
+            "failover": True
+        }
+
     if not token:
+        # 若未配置百度 Token 但配置了 MinerU，直接平滑切换
+        if config.get("MINERU_API_KEY"):
+            print(f"[{model}] 提示: 未配置百度 AIStudio Token，自动切换至 MinerU API 解析...")
+            mineru_md = call_mineru_api(file_path, config=config, timeout=timeout, cancel_event=cancel_event)
+            if mineru_md:
+                return _make_failover_result(mineru_md)
         print(f"[{model}] 错误: 未配置 Token (PADDLEOCR_ACCESS_TOKEN 环境变量或 config.json)")
         return {"success": False, "model": model, "error": "no_token", "combined_markdown": "", "pages": []}
 
@@ -117,15 +418,7 @@ def call_paddleocr_job(
         print(f"[{model}] 文件不存在: {file_path}")
         return {"success": False, "model": model, "error": "file_not_found", "combined_markdown": "", "pages": []}
 
-    def _sleep_cancel_aware(seconds):
-        steps = max(1, int(seconds * 2))
-        for _ in range(steps):
-            if cancel_event is not None and cancel_event.is_set():
-                return True
-            time.sleep(seconds / steps)
-        return False
-
-    # 提交作业（支持指数退避与满队列重试）
+    # 提交作业（支持指数退避与满队列重试，并在队列爆满或超时时无缝熔断至 MinerU）
     retry_waits = [5, 15, 30, 60, 90]
     job_id = None
     for attempt, wait_time in enumerate(retry_waits):
@@ -151,6 +444,12 @@ def call_paddleocr_job(
                     job_response = requests.post(JOB_URL, headers=headers, data=data, files=files, timeout=120)
         except Exception as e:
             print(f"[{model}] 提交作业失败: {e}")
+            is_net_err = isinstance(e, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)) or "timeout" in str(e).lower() or "connection" in str(e).lower()
+            if is_net_err and config.get("MINERU_API_KEY") and config.get("OCR_ENGINE", "auto") in ("auto", "mineru"):
+                print(f"[{model}] 百度 AIStudio 提交网络异常/超时，触发多云熔断，自动切换至 MinerU API...")
+                mineru_md = call_mineru_api(file_path, config=config, timeout=timeout, cancel_event=cancel_event)
+                if mineru_md:
+                    return _make_failover_result(mineru_md)
             return {"success": False, "model": model, "error": str(e), "combined_markdown": "", "pages": []}
 
         if job_response.status_code == 200:
@@ -158,15 +457,30 @@ def call_paddleocr_job(
             job_id = resp_data.get("jobId")
             break
         elif job_response.status_code == 400 and "队列已满" in job_response.text:
+            if config.get("MINERU_API_KEY") and config.get("OCR_ENGINE", "auto") in ("auto", "mineru"):
+                print(f"[{model}] 遇到百度 AIStudio 队列已满 (status=400 队列已满)，立即触发多云双活熔断，无缝切换至 MinerU API...")
+                mineru_md = call_mineru_api(file_path, config=config, timeout=timeout, cancel_event=cancel_event)
+                if mineru_md:
+                    return _make_failover_result(mineru_md)
             print(f"[{model}] 队列已满, 等待 {wait_time}s 后重试 ({attempt+1}/{len(retry_waits)})...")
-            if _sleep_cancel_aware(wait_time):
+            if _sleep_cancel_aware(wait_time, cancel_event):
                 return {"success": False, "model": model, "error": "cancelled", "combined_markdown": "", "pages": []}
             continue
         else:
             print(f"[{model}] 提交作业失败, status={job_response.status_code}: {job_response.text[:200]}")
+            if job_response.status_code in (500, 502, 503, 504) and config.get("MINERU_API_KEY") and config.get("OCR_ENGINE", "auto") in ("auto", "mineru"):
+                print(f"[{model}] 百度 AIStudio 服务端异常 (status={job_response.status_code})，触发多云熔断，自动切换至 MinerU API...")
+                mineru_md = call_mineru_api(file_path, config=config, timeout=timeout, cancel_event=cancel_event)
+                if mineru_md:
+                    return _make_failover_result(mineru_md)
             return {"success": False, "model": model, "error": f"status_{job_response.status_code}", "combined_markdown": "", "pages": []}
     else:
         print(f"[{model}] 提交作业重试 {len(retry_waits)} 次后仍失败")
+        if config.get("MINERU_API_KEY") and config.get("OCR_ENGINE", "auto") in ("auto", "mineru"):
+            print(f"[{model}] 百度 AIStudio 多次重试未成功，无缝切换至 MinerU API...")
+            mineru_md = call_mineru_api(file_path, config=config, timeout=timeout, cancel_event=cancel_event)
+            if mineru_md:
+                return _make_failover_result(mineru_md)
         return {"success": False, "model": model, "error": "max_retries_exceeded", "combined_markdown": "", "pages": []}
 
     if not job_id:
@@ -182,19 +496,24 @@ def call_paddleocr_job(
 
         if time.time() - start_time > timeout:
             print(f"[{model}] 轮询超时 ({timeout}s)，跳过")
+            if config.get("MINERU_API_KEY") and config.get("OCR_ENGINE", "auto") in ("auto", "mineru"):
+                print(f"[{model}] 百度 AIStudio 轮询超时，无缝切换至 MinerU API...")
+                mineru_md = call_mineru_api(file_path, config=config, timeout=timeout, cancel_event=cancel_event)
+                if mineru_md:
+                    return _make_failover_result(mineru_md)
             return {"success": False, "model": model, "error": "timeout", "combined_markdown": "", "pages": []}
 
         try:
             result_response = requests.get(f"{JOB_URL}/{job_id}", headers=headers, timeout=30)
         except Exception as e:
             print(f"[{model}] 轮询请求异常: {e}")
-            if _sleep_cancel_aware(5):
+            if _sleep_cancel_aware(5, cancel_event):
                 return {"success": False, "model": model, "error": "cancelled", "combined_markdown": "", "pages": []}
             continue
 
         if result_response.status_code != 200:
             print(f"[{model}] 轮询失败, status={result_response.status_code}")
-            if _sleep_cancel_aware(5):
+            if _sleep_cancel_aware(5, cancel_event):
                 return {"success": False, "model": model, "error": "cancelled", "combined_markdown": "", "pages": []}
             continue
 
@@ -203,7 +522,7 @@ def call_paddleocr_job(
         state = data.get("state")
 
         if state == "pending":
-            if _sleep_cancel_aware(3):
+            if _sleep_cancel_aware(3, cancel_event):
                 return {"success": False, "model": model, "error": "cancelled", "combined_markdown": "", "pages": []}
         elif state == "running":
             try:
@@ -212,7 +531,7 @@ def call_paddleocr_job(
                 print(f"[{model}] 运行中: {extracted_pages}/{total_pages} 页")
             except Exception:
                 pass
-            if _sleep_cancel_aware(5):
+            if _sleep_cancel_aware(5, cancel_event):
                 return {"success": False, "model": model, "error": "cancelled", "combined_markdown": "", "pages": []}
         elif state == "done":
             jsonl_url = data.get("resultUrl", {}).get("jsonUrl", "")
@@ -221,9 +540,14 @@ def call_paddleocr_job(
         elif state == "failed":
             error_msg = data.get("errorMsg", "unknown")
             print(f"[{model}] 作业失败: {error_msg}")
+            if config.get("MINERU_API_KEY") and config.get("OCR_ENGINE", "auto") in ("auto", "mineru"):
+                print(f"[{model}] 百度 AIStudio 任务失败 ({error_msg})，无缝切换至 MinerU API...")
+                mineru_md = call_mineru_api(file_path, config=config, timeout=timeout, cancel_event=cancel_event)
+                if mineru_md:
+                    return _make_failover_result(mineru_md)
             return {"success": False, "model": model, "error": error_msg, "combined_markdown": "", "pages": []}
         else:
-            if _sleep_cancel_aware(5):
+            if _sleep_cancel_aware(5, cancel_event):
                 return {"success": False, "model": model, "error": "cancelled", "combined_markdown": "", "pages": []}
 
 
@@ -344,8 +668,8 @@ def extract_pp_structure_table_crops(pdf_path: str, config: Optional[dict] = Non
         p_idx = p_info["page_idx"]
         if pages is not None and p_idx not in pages:
             continue
-        md = p_info["markdown"]
-        images = p_info["images"]  # dict { "table_1.png": "http..." }
+        md = p_info.get("markdown", "")
+        images = p_info.get("images", {})  # dict { "table_1.png": "http..." }
 
         # 从 images 字典中找出表格切图
         tbl_img_urls = []
@@ -394,14 +718,26 @@ def extract_pp_structure_table_crops(pdf_path: str, config: Optional[dict] = Non
 def call_paddleocr_vl_online_api(file_path: str, config: Optional[dict] = None, timeout: int = 600, cancel_event=None) -> str:
     """
     通过 AIStudio 在线 API 调用 PaddleOCR-VL-1.6。
+    支持多云双活与容灾回退：
+    - 若配置 OCR_ENGINE="mineru"，直接调用 MinerU API；
+    - 若配置 OCR_ENGINE="auto"，优先调用 PaddleOCR-VL，在队列已满或超时时无缝自动切换至 MinerU API。
     支持传整个 PDF 文件或单页图片文件 / 图像 URL。
     返回合并后的 Markdown 字符串。
     """
     if config is None:
         config = load_config()
+
+    engine = config.get("OCR_ENGINE", "auto").lower()
+    if engine == "mineru":
+        return call_mineru_api(file_path, config=config, timeout=timeout, cancel_event=cancel_event)
+
     model = config.get("PADDLEOCR_MCP_MODEL", "PaddleOCR-VL-1.6")
     res = call_paddleocr_job(file_path, model=model, config=config, timeout=timeout, cancel_event=cancel_event)
-    return res.get("combined_markdown", "")
+    md = res.get("combined_markdown", "")
+    if not md and config.get("MINERU_API_KEY") and not res.get("failover") and engine in ("auto", "mineru"):
+        print("[Dual-Cloud Failover] AIStudio 未返回有效解析结果，尝试 MinerU API 进行视觉兜底...")
+        md = call_mineru_api(file_path, config=config, timeout=timeout, cancel_event=cancel_event)
+    return md
 
 
 def run_ppstructure_vlm_pipeline(pdf_path: str, pages: Optional[List[int]] = None, cancel_event=None) -> str:
@@ -453,14 +789,19 @@ def run_ppstructure_vlm_pipeline(pdf_path: str, pages: Optional[List[int]] = Non
     pp_md = pp_res.get("combined_markdown", "")
     pages_data = pp_res.get("pages", [])
 
+    # 若阶段 1 发生 MinerU 双活故障转移且已获得解析结果，直接产出结果，避免重复冗余请求
+    if pp_res.get("failover") and pp_md:
+        print("[PP-StructureV3 -> VLM] 阶段 1 已通过 MinerU 双活容灾成功解析，直接产出结果")
+        return pp_md
+
     # 收集包含表格的页面与切图 URL
     table_pages = set()
     table_crop_images = []
     for p_info in pages_data:
         sub_p_idx = p_info["page_idx"]
         orig_p_idx = pages[sub_p_idx] if (pages and sub_p_idx < len(pages)) else sub_p_idx
-        md = p_info["markdown"]
-        images = p_info["images"]
+        md = p_info.get("markdown", "")
+        images = p_info.get("images", {})
         has_table = bool(re.search(r'(?:<table|\|[^\n]+\|[^\n]+\||\|[\s:\-|]+\||(?:表|Table)\s*\d+)', md, re.IGNORECASE))
         if has_table or images:
             table_pages.add(orig_p_idx)

@@ -199,12 +199,12 @@ class DocLayoutYoloDetector:
         area2 = (b2[2] - b2[0]) * (b2[3] - b2[1])
         return inter / (area1 + area2 - inter + 1e-6)
 
-    def extract_extended_table_regions(self, img: Image.Image, padding: int = 15) -> List[Dict[str, Any]]:
+    def extract_extended_table_regions(self, img: Image.Image, padding: int = 15, conf_threshold: Optional[float] = None) -> List[Dict[str, Any]]:
         """
         核心合并逻辑：找到每个表格主体 (table)，自动搜寻并联合其附近的表格标题 (table_caption) 
         和表格脚注 (table_footnote)，生成包含完整语义上下文的扩充矩形框 (Extended Bounding Box)。
         """
-        detections = self.detect(img)
+        detections = self.detect(img, conf_threshold=conf_threshold)
         tables = [d for d in detections if d["type"] == "table"]
         captions = [d for d in detections if d["type"] == "table_caption"]
         footnotes = [d for d in detections if d["type"] == "table_footnote"]

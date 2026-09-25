@@ -424,8 +424,11 @@ def expand_multiline_subrows(df):
 def try_numeric(val):
     if isinstance(val, str):
         val_clean = val.replace(',', '').strip()
+        # 保护带前导零的代码字符串（如 001, 08, -001）避免失真转为 1, 8
+        if re.match(r'^[+-]?0\d+$', val_clean):
+            return val
         try:
-            if '.' in val_clean:
+            if '.' in val_clean or 'e' in val_clean.lower():
                 return float(val_clean)
             else:
                 return int(val_clean)
@@ -435,10 +438,12 @@ def try_numeric(val):
 
 def escape_formula(val):
     if isinstance(val, str) and val.startswith(('=', '+', '-', '@')):
+        clean_val = val.replace(',', '').strip()
+        # 保护带前导零的代码字符串（如 -001, +02），避免被转换为数值丢失前导零，加单引号防 Excel 解释
+        if re.match(r'^[+-]?0\d+$', clean_val):
+            return "'" + val
         try:
-            clean_val = val.replace(',', '').strip()
-            float(clean_val)
-            if '.' in clean_val:
+            if '.' in clean_val or 'e' in clean_val.lower():
                 return float(clean_val)
             else:
                 return int(clean_val)
@@ -546,7 +551,34 @@ def _clean_vlm_dataframe(df: pd.DataFrame, original_attrs: dict) -> pd.DataFrame
     # 4. 去除完全空白行与列
     df = df.dropna(how='all', axis=0).dropna(how='all', axis=1)
 
-    # 5. 转义 Excel 公式
+    # 5. 数值类型安全推断（使数值列在 Excel 中呈现为可计算的真实数值，同时保护文本标签与前导零编号）
+    for col in df.columns:
+        vals = df[col].tolist()
+        non_empty = [v for v in vals if pd.notna(v) and str(v).strip() != ""]
+        if not non_empty:
+            continue
+
+        def _can_be_numeric(v):
+            if isinstance(v, bool):
+                return False
+            if isinstance(v, (int, float)):
+                return True
+            s = str(v).replace(',', '').strip()
+            # 保护带前导零的代码/样号（如 001, 08, -001）避免失真
+            if re.match(r'^[+-]?0\d+$', s):
+                return False
+            try:
+                float(s)
+                return True
+            except (ValueError, TypeError):
+                return False
+
+        num_count = sum(1 for v in non_empty if _can_be_numeric(v))
+        # 若非空单元格大部分为数值（例如 >= 50%），安全推断为数值类型
+        if num_count / len(non_empty) >= 0.5:
+            df[col] = df[col].apply(lambda x: try_numeric(x) if _can_be_numeric(x) else x)
+
+    # 6. 转义 Excel 公式
     df.columns = [escape_formula(c) for c in df.columns]
     df = df_map(df, escape_formula)
 
@@ -825,33 +857,53 @@ def is_merged_row_table(table):
     return False
 
 
+def _normalize_col_name(name: str) -> str:
+    """学术表头规范化：消除上下标、单位括号、不确定度格式差异与标点空格。"""
+    s = str(name).lower().strip()
+    # 替换下标与上标数字为普通数字 (如 SiO₂ -> sio2)
+    sub_map = str.maketrans("₀₁₂₃₄₅₆₇₈₉⁰¹²³⁴⁵⁶⁷⁸⁹", "01234567890123456789")
+    s = s.translate(sub_map)
+    # 规整不确定度与误差表示
+    s = re.sub(r'1\s*(?:σ|sigma|s\b)', '1sigma', s)
+    s = re.sub(r'2\s*(?:σ|sigma|s\b)', '2sigma', s)
+    s = s.replace('±', '+/-')
+    # 去除括号单位如 (wt%), [ppm], (ppm), (%), (ma)
+    s = re.sub(r'[\(\[\{](?:wt\.?%?|ppm|ppb|%|‰|ma|ga|ka|℃|°c)[\)\]\}]', '', s)
+    # 去除标点空格
+    s = re.sub(r'[\s_\(\)（）\[\]\{\}\.\/\:\-]+', '', s)
+    return s
+
+
 def align_dataframe_columns(df_to_align: pd.DataFrame, target_cols: List[str]) -> pd.DataFrame:
     """
     Dynamically aligns columns of df_to_align to target_cols using string similarity,
-    fuzzy element/unit matching, and data type alignment.
+    fuzzy element/unit matching, subscript normalization, and data type alignment.
     Missing target columns are filled with empty string.
+    Constructs columns sequentially via pd.concat to prevent dictionary key collisions
+    on duplicate column names (e.g. repeated uncertainty/error headers like '1σ', '±').
     """
     if df_to_align is None or df_to_align.empty:
-        return df_to_align
+        return pd.DataFrame(columns=target_cols)
 
     curr_cols = list(df_to_align.columns)
     if curr_cols == target_cols:
         return df_to_align
 
-    aligned_data = {}
+    aligned_series = []
     matched_curr = set()
+    num_rows = len(df_to_align)
 
     for t_col in target_cols:
-        t_clean = re.sub(r'[\s_\(\)（）\.\/]+', '', str(t_col).lower())
+        t_clean = _normalize_col_name(t_col)
         best_match = None
         best_score = 0.0
 
         for c_idx, c_col in enumerate(curr_cols):
             if c_idx in matched_curr:
                 continue
-            c_clean = re.sub(r'[\s_\(\)（）\.\/]+', '', str(c_col).lower())
+            c_clean = _normalize_col_name(c_col)
             
-            # Exact or substring match
+            # Exact or substring match after academic normalization
             if t_clean == c_clean:
                 best_match = c_idx
                 best_score = 1.0
@@ -863,12 +915,52 @@ def align_dataframe_columns(df_to_align: pd.DataFrame, target_cols: List[str]) -
                     best_match = c_idx
 
         if best_match is not None and best_score >= 0.40:
-            aligned_data[t_col] = df_to_align.iloc[:, best_match].tolist()
+            s = df_to_align.iloc[:, best_match].reset_index(drop=True)
+            s.name = t_col
+            aligned_series.append(s)
             matched_curr.add(best_match)
         else:
-            aligned_data[t_col] = [""] * len(df_to_align)
+            aligned_series.append(pd.Series([""] * num_rows, name=t_col))
 
-    return pd.DataFrame(aligned_data, columns=target_cols)
+    res_df = pd.concat(aligned_series, axis=1)
+    res_df.columns = target_cols
+    return res_df
+
+
+def is_pure_data_value(s_in):
+    """
+    判断字符串是否为纯数据值（包括标准数值、科学计数法、检出限缩写与误差表示）。
+    """
+    s = str(s_in).strip()
+    if not s:
+        return False
+    # 常见地质化学式/同位素/单位/字段词，属于表头文本，非纯数据
+    if (re.match(r'^(?:[A-Z][a-z]?\d*)+$', s) or '/' in s or 'δ' in s or '‰' in s or 
+        '%' in s or any(w in s.lower() for w in ['ppm', 'ppb', 'wt', 'sample', 'spot', 'no.', 'mineral', 'rock', 'age', 'stage', 'type', 'depth'])):
+        return False
+    s_lower = s.lower().strip()
+    # 1. 常见缺失值与检出限缩写 (<, >, b.d., n.d., etc.)
+    if s_lower in ('-', '—', '–', 'n.d.', 'nd', 'bdl', 'b.d.l.', 'b.d.', 'n/a', 'na', 'n.a.', 'tr', 'trace', 'loq', 'lod', 'dl', 'nil', 'none', 'below detection'):
+        return True
+    # 2. 误差与不确定度符号缩写 (±, 1σ, 2σ, etc.)
+    if s_lower in ('1σ', '2σ', '1s', '2s', '±', '1sigma', '2sigma', '±1σ', '±2σ'):
+        return True
+    # 3. 标准整数、浮点数、科学计数法 (如 123, -4.56, 1.2e-4)
+    if re.match(r'^-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?$', s):
+        return True
+    # 4. 带检出限/不等号符号的数值 (如 <0.01, >100, ≤0.05, ≥99, ~0.5)
+    if re.match(r'^[<>≤≥~]\s*-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?$', s):
+        return True
+    # 5. 带误差与不确定度的数值 (如 12.34±0.56, 12.34 ± 0.56, 12.34(56), 12.3+0.5/-0.2, 12.3(1σ))
+    if re.match(r'^-?\d+(?:\.\d+)?\s*±\s*\d+(?:\.\d+)?$', s):
+        return True
+    if re.match(r'^-?\d+(?:\.\d+)?\s*\(\d+\)$', s):
+        return True
+    if re.match(r'^-?\d+(?:\.\d+)?\s*[+-]\s*\d+(?:\.\d+)?\s*/\s*[+-]\s*\d+(?:\.\d+)?$', s):
+        return True
+    if re.match(r'^-?\d+(?:\.\d+)?\s*(?:±\s*\d+(?:\.\d+)?)?\s*(?:1σ|2σ|1s|2s|1sigma|2sigma)$', s, re.IGNORECASE):
+        return True
+    return False
 
 
 def combine_df_group(group):
@@ -879,16 +971,6 @@ def combine_df_group(group):
         
     base_df = group[0]
     base_cols = list(base_df.columns)
-    
-    def is_pure_data_value(s_in):
-        s = str(s_in).strip()
-        if not s:
-            return False
-        # 常见地质化学式/同位素/单位/字段词，属于表头文本，非纯数据
-        if (re.match(r'^(?:[A-Z][a-z]?\d*)+$', s) or '/' in s or 'δ' in s or '‰' in s or 
-            '%' in s or any(w in s.lower() for w in ['ppm', 'ppb', 'wt', 'sample', 'spot', 'no.', 'mineral', 'rock', 'age', 'stage', 'type', 'depth'])):
-            return False
-        return bool(re.match(r'^-?\d+(?:\.\d+)?$', s) or s in ('-', '—', 'n.d.', 'bdl', 'b.d.l.'))
 
     # Detect horizontal column-split tables (e.g. Table 4 Part 1 on Page 17 & Part 2 on Page 18)
     # 必须满足：两表均为具有独立表头文本的横向分块，首列同名，且列名非纯数字或数据特征
@@ -897,16 +979,22 @@ def combine_df_group(group):
         col1_list = [str(c).strip() for c in group[0].columns[1:]]
         col2_list = [str(c).strip() for c in group[1].columns[1:]]
         has_numeric_cols = sum(1 for c in col2_list if is_pure_data_value(c)) / max(1, len(col2_list)) >= 0.25
-        if not has_numeric_cols:
-            col1_set = set(c.lower() for c in col1_list)
-            col2_set = set(c.lower() for c in col2_list)
+        has_named_cols_1 = sum(1 for c in group[0].columns if not str(c).startswith('Unnamed:') and str(c).strip()) >= 2
+        has_named_cols_2 = sum(1 for c in group[1].columns if not str(c).startswith('Unnamed:') and str(c).strip()) >= 2
+        if not has_numeric_cols and has_named_cols_1 and has_named_cols_2:
+            first_c0 = _normalize_col_name(group[0].columns[0])
+            first_c1 = _normalize_col_name(group[1].columns[0])
+            first_col_compatible = (first_c0 == first_c1 or not first_c0 or not first_c1 or
+                                    any(w in first_c0 and w in first_c1 for w in ['sample', 'spot', 'id', 'no', 'site', 'name', 'station']))
+            col1_set = set(_normalize_col_name(c) for c in col1_list)
+            col2_set = set(_normalize_col_name(c) for c in col2_list)
             row_counts = [len(g) for g in group if g is not None and not g.empty]
             max_rows = max(row_counts) if row_counts else 0
             min_rows = min(row_counts) if row_counts else 0
             rows_compatible = max_rows > 0 and min_rows / max_rows >= 0.5
             if (col1_set and col2_set and
                     len(col1_set & col2_set) / max(1, len(col1_set)) < 0.35 and
-                    rows_compatible):
+                    rows_compatible and first_col_compatible):
                 is_horizontal = True
                 
     if is_horizontal:
@@ -955,10 +1043,16 @@ def combine_df_group(group):
             continue
         next_df = next_df.reset_index(drop=True)
         
+        # 保护 pandas 自动生成的 RangeIndex/纯数字序号列名，避免误判为第一行数据
+        is_seq_int = (
+            isinstance(next_df.columns, pd.RangeIndex) or
+            list(next_df.columns) == list(range(len(next_df.columns))) or
+            [str(c).strip() for c in next_df.columns] == [str(i) for i in range(len(next_df.columns))]
+        )
         # 检查 next_df 的 columns 是否实质上是第一行数据（续表无表头时常见现象）
         next_cols = [str(c).strip() for c in next_df.columns]
         data_col_count = sum(1 for c in next_cols if is_pure_data_value(c))
-        is_data_in_columns = (data_col_count / max(1, len(next_cols)) >= 0.4)
+        is_data_in_columns = (not is_seq_int) and (data_col_count / max(1, len(next_cols)) >= 0.4)
         
         if is_data_in_columns:
             # 将 next_df.columns 转回为第一行数据，避免丢失数据首行
@@ -981,21 +1075,49 @@ def combine_df_group(group):
             next_df = pd.concat([row_from_cols, next_df], ignore_index=True)
         else:
             # 动态语义对齐：当列数不完全相同或列名略有变动时，执行基于相似度的自适应对齐
-            if len(next_df.columns) == len(base_cols):
-                next_df.columns = base_cols
-            elif abs(len(next_df.columns) - len(base_cols)) <= 4:
-                next_df = align_dataframe_columns(next_df, base_cols)
+            has_named_cols = sum(1 for c in next_df.columns if not str(c).startswith('Unnamed:') and str(c).strip()) >= 2
+            if list(next_df.columns) == list(base_cols):
+                pass
+            elif len(next_df.columns) == len(base_cols):
+                if has_named_cols:
+                    next_df = align_dataframe_columns(next_df, base_cols)
+                else:
+                    next_df.columns = base_cols
+            elif abs(len(next_df.columns) - len(base_cols)) <= 6:
+                if has_named_cols:
+                    next_df = align_dataframe_columns(next_df, base_cols)
+                else:
+                    first_row = [str(x).strip() for x in next_df.iloc[0].values if pd.notna(x)] if len(next_df) > 0 else []
+                    row_has_named = sum(1 for c in first_row if c and not c.startswith('Unnamed:') and any(_normalize_col_name(c) == _normalize_col_name(b) for b in base_cols)) >= 2
+                    if row_has_named:
+                        next_df.columns = [str(x).strip() if pd.notna(x) and str(x).strip() else f"Col_{i}" for i, x in enumerate(next_df.iloc[0].values)]
+                        next_df = next_df.iloc[1:].reset_index(drop=True)
+                        next_df = align_dataframe_columns(next_df, base_cols)
+                    else:
+                        if len(next_df.columns) < len(base_cols):
+                            for i in range(len(base_cols) - len(next_df.columns)):
+                                next_df[f"Extra_{i}"] = ""
+                            next_df.columns = base_cols
+                        else:
+                            next_df = next_df.iloc[:, :len(base_cols)]
+                            next_df.columns = base_cols
             else:
                 # 列数差异过大，跳过合并
                 continue
 
-            # 逐行剥离 next_df 顶部的多层重复表头行、序号行与单位行
+            # 逐行剥离 next_df 顶部的多层重复表头行、序号行、单位行与重复子表头/分节横幅行
             while len(next_df) > 0:
                 first_row = [str(x).strip() for x in next_df.iloc[0].values if pd.notna(x)]
+                row_str = " ".join(first_row).lower()
                 is_index_row = len(first_row) >= 3 and all(re.match(r'^\d+$', c) for c in first_row if c)
-                is_repeat_header = sum(1 for c in first_row if c and any(c.lower() == str(b).strip().lower() for b in base_cols)) / max(1, len(base_cols)) >= 0.25
+                first_row_is_data = sum(1 for c in first_row if is_pure_data_value(c)) / max(1, len(first_row)) >= 0.3
+                is_repeat_header = (not first_row_is_data) and sum(1 for c in first_row if c and any(_normalize_col_name(c) == _normalize_col_name(b) for b in base_cols)) / max(1, len(base_cols)) >= 0.25
                 is_unit_row = len(first_row) > 0 and all(any(u in c.lower() for u in ['wt%', 'ppm', 'ppb', '%', '‰', 'ma', 'ga', 'ka', '℃', '°c']) or c.startswith('(') for c in first_row if c)
-                if is_index_row or is_repeat_header or is_unit_row:
+                # 续表标题横幅行 (如 "Table 1 (continued)", "Table 1 Continued", "接上表", "Table 1 (cont'd)")
+                is_cont_banner = bool(re.search(r'(?:table\s*\d+|表\s*\d+|续表|接上表|续上表|continued|cont\'?d|\(cont\b|cont\.)', row_str)) and len([c for c in first_row if c]) <= 3
+                # 跨页重复子表头分类行 (如 "Major elements (wt%)", "Trace elements", "Rare earth elements" 等)
+                is_category_banner = len([c for c in first_row if c]) <= 2 and any(kw in row_str for kw in ['major element', 'trace element', 'rare earth', 'ree', 'oxide', 'isotope', 'sample', 'host rock', 'mineral', '主量', '微量', '稀土', '同位素', '元素', '氧化物', '样品'])
+                if is_index_row or is_repeat_header or is_unit_row or is_cont_banner or is_category_banner:
                     next_df = next_df.iloc[1:].reset_index(drop=True)
                 else:
                     break
@@ -1066,12 +1188,32 @@ def merge_continuation_tables(dfs):
     def norm_label(lbl):
         if not lbl:
             return None
-        clean = re.sub(r'\s*\((?:contd|continued|cont)\.?\)', '', str(lbl), flags=re.IGNORECASE)
+        # 移除常见的续表后缀如 (continued), Continued, (cont.), cont., cont'd, (续), （续）, 续, 续表, 接上表
+        clean = re.sub(r'[\s,\-–—]*[\(（]?(?:cont\'?d|continued|cont|续表|续上表|接上表|续)\.?[）\)]?', '', str(lbl), flags=re.IGNORECASE)
+        # 规整中英文表号前缀空格（如 "表1" -> "表 1", "Table1" -> "Table 1"）
+        clean = re.sub(r'^(table|表)\s*([0-9a-zA-Z]+)', r'\1 \2', clean, flags=re.IGNORECASE)
+        clean = re.sub(r'[:.\-–—\s]+$', '', clean)
         clean = re.sub(r'\s+', ' ', clean).strip()
         return clean
 
     merged_dfs = []
     current_group = []
+
+    def _finalize_merged_group(grp):
+        res_combined = combine_df_group(grp)
+        if res_combined is not None:
+            all_pages = []
+            for g in grp:
+                p = g.attrs.get('page_idx')
+                if p is not None and p not in all_pages:
+                    all_pages.append(p)
+                for cp in g.attrs.get('covered_pages', []):
+                    if cp not in all_pages:
+                        all_pages.append(cp)
+            if all_pages:
+                res_combined.attrs['covered_pages'] = sorted(all_pages)
+                res_combined.attrs['page_idx'] = all_pages[0]
+        return res_combined
 
     for df in normalized_dfs:
         if df is None or df.empty:
@@ -1101,22 +1243,34 @@ def merge_continuation_tables(dfs):
         page_dist = abs(curr_page - prev_page) if (prev_page is not None and curr_page is not None) else None
         page_nearby = (page_dist is None) or (page_dist <= 2)
 
-        # 跨页续表必须满足标签完全相同且页码邻近(<=2页)，或者明确带有续表标识且页码邻近，或者无标签且列数高度匹配
+        # 跨页续表必须满足标签完全相同且页码邻近(<=2页)，或者明确带有续表标识且页码邻近，或者无标签且列数/语义高度匹配
         is_same_label = bool(lbl and prev_lbl and lbl.lower() == prev_lbl.lower() and page_nearby)
+        raw_lbl = str(df.attrs.get('label', '')).lower()
         title_str = str(df.attrs.get('table_title', '')).lower()
-        is_explicit_cont = bool(re.search(r'(?:续表|接上表|continued|\(cont\)|cont\.)', title_str)) and page_nearby
+        combined_hint = f"{raw_lbl} {title_str}"
+        is_explicit_cont = bool(re.search(r'(?:续表|接上表|续上表|（续）|\(续\)|continued|cont\'?d|\(cont\b|cont\.)', combined_hint)) and page_nearby
         
+        # 列匹配：列数差异小 (<=4) 或存在明显学术列名重合
+        common_cols = set(_normalize_col_name(c) for c in df.columns) & set(_normalize_col_name(c) for c in prev_df.columns)
+        has_common_cols = len(common_cols - {'', 'unnamed', 'unnamed0', 'unnamed1', 'unnamed2'}) >= 2
         cols_match = (
-            df.shape[1] == prev_df.shape[1] or
-            abs(df.shape[1] - prev_df.shape[1]) <= 2
+            abs(df.shape[1] - prev_df.shape[1]) <= 4 or
+            has_common_cols
         )
 
-        # 小表安全防护：若两表均为独立小表（<6行）且无明确续表标识，禁止单纯因列数相同盲目合并
-        is_small_unlabeled_pair = (df.shape[0] < 6 and prev_df.shape[0] < 6 and not is_explicit_cont)
+        # 小表安全防护：若两表均为独立小表（<6行）且无明确续表标识，禁止单纯因列数相同盲目合并；
+        # 但若续表列名实质上是数据行（如检出限、误差、纯数值），则确系续表首行（保护 RangeIndex）
+        is_seq_int = (
+            isinstance(df.columns, pd.RangeIndex) or
+            list(df.columns) == list(range(len(df.columns))) or
+            [str(c).strip() for c in df.columns] == [str(i) for i in range(len(df.columns))]
+        )
+        cols_are_data = (not is_seq_int) and (sum(1 for c in df.columns if is_pure_data_value(c)) / max(1, len(df.columns)) >= 0.3)
+        is_small_unlabeled_pair = (df.shape[0] < 6 and prev_df.shape[0] < 6 and not is_explicit_cont and not cols_are_data)
 
         is_unlabeled_cont = (
-            (not lbl or is_explicit_cont) and
-            (is_next_page or is_block_sequence) and
+            (not lbl or is_explicit_cont or cols_are_data) and
+            (is_next_page or is_block_sequence or (page_dist is not None and page_dist <= 2)) and
             prev_lbl and
             cols_match and
             not is_small_unlabeled_pair
@@ -1131,15 +1285,17 @@ def merge_continuation_tables(dfs):
         if is_same_label or is_unlabeled_cont:
             if not df.attrs.get('label') and prev_df.attrs.get('label'):
                 df.attrs['label'] = prev_df.attrs.get('label')
+            if not df.attrs.get('table_title') and prev_df.attrs.get('table_title'):
+                df.attrs['table_title'] = prev_df.attrs.get('table_title')
             current_group.append(df)
         else:
-            combined = combine_df_group(current_group)
+            combined = _finalize_merged_group(current_group)
             if combined is not None:
                 merged_dfs.append(combined)
             current_group = [df]
 
     if current_group:
-        combined = combine_df_group(current_group)
+        combined = _finalize_merged_group(current_group)
         if combined is not None:
             merged_dfs.append(combined)
 
