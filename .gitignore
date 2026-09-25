@@ -27,6 +27,7 @@ __pycache__/
 
 # Temporary files & local databases
 scratch/
+dist/
 *.db
 *.log
 *.tmp

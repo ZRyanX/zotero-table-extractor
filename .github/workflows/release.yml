@@ -1,0 +1,51 @@
+name: Release Assets Packager
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Tag name to package (e.g. v1.4.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository with full tags
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set Tag Name
+        id: vars
+        run: |
+          if [ -n "${{ github.event.inputs.tag_name }}" ]; then
+            TAG="${{ github.event.inputs.tag_name }}"
+          else
+            TAG="${{ github.event.release.tag_name }}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Package Release Archive
+        run: |
+          python scripts/package_release.py --tag "${{ steps.vars.outputs.tag }}"
+
+      - name: Upload Assets to GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.vars.outputs.tag }}"
+          gh release upload "${TAG}" \
+            "dist/zotero-table-extractor-${TAG}.zip" \
+            "dist/zotero-table-extractor-${TAG}.zip.sha256" \
+            --clobber

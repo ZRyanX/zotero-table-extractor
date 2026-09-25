@@ -811,11 +811,20 @@ class ArchiveUpdateStrategy:
             req = urllib.request.Request(GITHUB_API_LATEST_RELEASE, headers=headers)
             with urllib.request.urlopen(req, timeout=10) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
+                assets = data.get("assets", [])
+                asset_zip_url = None
+                for a in assets:
+                    aname = a.get("name", "").lower()
+                    if aname.endswith(".zip") and not aname.endswith(".sha256"):
+                        asset_zip_url = a.get("browser_download_url")
+                        break
+                download_url = asset_zip_url or data.get("zipball_url") or GITHUB_ARCHIVE_MAIN_ZIP
+
                 return {
                     "available": True,
                     "tag_name": data.get("tag_name"),
                     "name": data.get("name"),
-                    "zipball_url": data.get("zipball_url") or GITHUB_ARCHIVE_MAIN_ZIP,
+                    "zipball_url": download_url,
                     "published_at": data.get("published_at"),
                     "body": data.get("body", "")
                 }
