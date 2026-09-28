@@ -46,7 +46,7 @@ MANDATORY_ENTRIES = [
     "requirements.txt",
     "setup_paths.py",
     "update.py",
-    "models/doclayout-yolo-docstructbench-q8-6c25a56c.onnx",
+    "models/doclayout_yolo_docstructbench_imgsz1280_2501.onnx",
 ]
 
 

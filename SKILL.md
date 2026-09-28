@@ -75,7 +75,7 @@ zotero-table-extractor/
 │   ├── zotero_table_extractor_architecture.png
 │   └── zotero_table_extractor_architecture.svg
 ├── models/                          # 本地离线 ONNX 检测模型
-│   └── doclayout-yolo-docstructbench-q8-6c25a56c.onnx
+│   └── doclayout_yolo_docstructbench_imgsz1280_2501.onnx
 ├── scratch/                         # 临时诊断脚本与测试套件
 └── scripts/                         # 核心提取代码库
     ├── updater.py                   # 🛡️ 在线安全更新与智能配置迁移/回滚引擎

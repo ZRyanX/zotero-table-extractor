@@ -87,7 +87,7 @@
 针对扫描版 PDF、混合排版以及低置信度复杂页：
 - **前置表格定位与切图**：
   - 在线模式：调用百度 **PP-StructureV3** 版面分析模型，毫秒级定位页面内表格 Bounding Box 并高精度裁切；
-  - 离线/兜底模式：内置 **DocLayout-YOLO**（DocStructBench 8位量化 ONNX 权重，约 19MB），无网环境下本地完成目标检测。
+  - 离线/兜底模式：内置 **DocLayout-YOLO**（DocStructBench 1280x1280 高分辨率 ONNX 权重，内置端到端 NMS，约 73MB），无网环境下本地完成目标检测。
 - **高精度多模态重构**：
   - 将表格定位区域或全页送入 **PaddleOCR-VL-1.6** 多模态大模型；
   - 输出精准的 HTML `<table>` 与 Markdown 结构，轻松应对跨行跨列合并单元格、旋转表格与倾斜扫描件。
@@ -239,7 +239,7 @@ playwright install chromium
 ```
 
 ### 5. 本地视觉模型准备
-项目在 `models/` 目录下默认配备了 `doclayout-yolo-docstructbench-q8-6c25a56c.onnx`（约 19.5MB）。若未找到，脚本会在首次运行检测时自动下载，或可手动放置于 `models/` 或 `~/.zotero_models/`。
+项目在 `models/` 目录下默认配备了 `doclayout_yolo_docstructbench_imgsz1280_2501.onnx`（约 72.8MB）。若未找到，脚本会在首次运行检测时自动从 Hugging Face 或 hf-mirror 镜像源高速下载，或可手动放置于 `models/` 或 `~/.zotero_models/`。
 
 ---
 
@@ -508,7 +508,7 @@ zotero-table-extractor/
 │   ├── zotero_table_extractor_architecture.png    # 高清 PNG 架构图
 │   └── zotero_table_extractor_architecture.svg    # 原生矢量 SVG 架构图
 ├── models/                           # 本地离线 ONNX 视觉模型目录
-│   └── doclayout-yolo-docstructbench-q8-6c25a56c.onnx # 8位量化 YOLO 版面检测模型
+│   └── doclayout_yolo_docstructbench_imgsz1280_2501.onnx # 1280 尺度端到端 YOLO 版面检测模型
 ├── scratch/                          # 临时诊断测试与试验脚本目录
 └── scripts/                          # 核心源码库
     ├── updater.py                    # 🛡️ 在线安全更新与智能配置迁移/回滚引擎
