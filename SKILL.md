@@ -17,31 +17,35 @@ description: 从 Zotero 选中条目（依赖 ai4paper-zotero MCP 获取物理�
        │
        ├─ 1. 在线 HTML 提取（最优先，速度快/原生数字保真）
        │     Elsevier XOCS XML / CNKI / Springer / 通用出版社
-       │     若在线表数 < PDF caption 检测数 → 放弃部分预览，执行本地 PDF 提取
+       │     核验在线提取表号集合与数量；若存在缺失表号 → 保留已抓取在线高保真表，由本地 PDF 管线精准补漏
        │
        └─ 2. 本地 PDF 提取
               │
               ▼
-         pdf-inspector (Rust, ~80ms)
-              │
-              ├─ PDF 分类: text_based / scanned / mixed
-              ├─ 表格页定位: pages_with_tables
-              └─ Markdown 表格提取
+         多信号候选表格页挖掘（全覆盖防漏）
+              ├─ 文本 Caption / 续表声明扫描
+              ├─ Tagged PDF / PDF/UA 语义结构树检测
+              ├─ pdf-inspector 分类与 Markdown 表格定位
+              ├─ 全图扫描页 / 图像密集页检测
+              ├─ 矢量线框 (find_tables) 毫秒级探测
+              └─ 跨页续表多模态追溯 (关键词/纯数据密度/网格线/图片续表)
               │
               ├──────────┬──────────────────┐
               │          │                  │
            Native     Scanned            Mixed
               │          │                  │
               ▼          ▼                  ▼
-         多方投票:   PP-StructureV3     多方投票(文本页)
-         pdf-inspector 定位 + 切图     + OCR/VLM(扫描页)
-         + find_tables + PaddleOCR-VL-1.6
-         + text_align  多模态精细解析
-         + pdfplumber
+         多方投票:   DocLayout-YOLO     多方投票(文本页)
+         pdf-inspector + PP-StructureV3  + OCR/VLM(扫描页)
+         + find_tables 局部切图与补扫
+         + text_align  + PaddleOCR-VL-1.6
+         + pdfplumber  多模态精细解析
          + Camelot
               │
-              ├─ 任意两方相似度 >= 0.75 → 判定一致并采用投票结果
-              ├─ 相似度 < 0.90 标记为低置信度页 → 触发 PP-StructureV3 + PaddleOCR-VL 在线深度接管
+              ├─ 2D bbox 空间重叠 (IoU/IoM) + 表号标签防冲突聚类，杜绝同页多表误合并
+              ├─ 任意两方相似度 >= 0.75 → 判定一致并采用投票结果 (结构树绝对优先)
+              ├─ 低置信度或检验瑕疵页 → DocLayout-YOLO 切图 (覆盖不足时 PP-Structure 补扫) + PaddleOCR-VL 接管
+              ├─ 表级精细对齐与替换策略：精准替换瑕疵表，保留同页未受干扰的有效原生表
               ├─ 7 阶轻量直通安全后处理（公式注入防御、数值类型推断、多级表头展平、付费墙过滤）
               └─ 跨页续表与多分页自适应合并
               │

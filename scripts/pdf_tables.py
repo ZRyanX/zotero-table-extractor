@@ -77,7 +77,8 @@ def extract_table_crops_from_pdf(
     conf_threshold: float = 0.25,
     enable_filter: bool = True,
     cancel_event = None,
-    pages: Optional[List[int]] = None
+    pages: Optional[List[int]] = None,
+    config: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
     从本地 PDF 文件中提取所有表格及相关上下文（Caption/Footnote）的图像区域 Crop。
@@ -100,7 +101,8 @@ def extract_table_crops_from_pdf(
         print(f"[PDF-Tables] 文件不存在: {pdf_path}")
         return []
 
-    config = load_config() if load_config else {}
+    if config is None:
+        config = load_config() if load_config else {}
 
     # 1. 优先使用本地超快 DocLayout-YOLO 目标检测
     yolo_enabled = config.get("DOCLAYOUT_YOLO_ENABLED", True)
@@ -162,7 +164,92 @@ def extract_table_crops_from_pdf(
                     extracted_crops.append(r)
 
             doc.close()
-            print(f"[PDF-Tables] 本地 DocLayout-YOLO 从 {total_pages} 页 PDF 中定位并提取出 {len(extracted_crops)} 个表格区域 Crop。")
+            yolo_covered_pages = set(r.get("page_index") for r in extracted_crops if r.get("page_index") is not None)
+            # 若调用方显式指定候选页面集合 (pages is not None)，未覆盖的候选页视作缺失页；
+            # 若未显式指定 (pages is None，即整篇 PDF)，不可将全文所有无表正文页盲目当作漏检页。
+            missing_pages = [p for p in target_pages if p not in yolo_covered_pages] if pages is not None else []
+
+            # 检查是否有页面检测到的切图数少于预期 Caption 声明数
+            page_decls = {}
+            try:
+                try:
+                    from .table_validator import scan_pdf_table_declarations
+                except ImportError:
+                    from table_validator import scan_pdf_table_declarations
+                page_decls = scan_pdf_table_declarations(pdf_path)
+                for p in target_pages:
+                    decls_on_p = [d for d in page_decls.get(p, []) if not d.get('is_continuation')]
+                    crops_on_p = sum(1 for r in extracted_crops if r.get('page_index') == p)
+                    if len(decls_on_p) > crops_on_p and p not in missing_pages:
+                        missing_pages.append(p)
+            except Exception:
+                pass
+
+            print(f"[PDF-Tables] 本地 DocLayout-YOLO 从 {total_pages} 页 PDF 中定位并提取出 {len(extracted_crops)} 个表格区域 Crop (已覆盖页面: {sorted(list(yolo_covered_pages))})。")
+
+            # 若目标页面全部已被 YOLO 充分覆盖，直接返回
+            if extracted_crops and not missing_pages:
+                return extracted_crops
+
+            # 若部分页面遗漏，或者 YOLO 未检出切图，触发 PP-Structure 补扫缺失区域
+            if config.get("USE_PP_STRUCTURE", True) and extract_pp_structure_table_crops is not None:
+                pages_to_supplement = missing_pages if extracted_crops else target_pages
+                if pages_to_supplement:
+                    try:
+                        print(f"[PDF-Tables] YOLO 覆盖不足 (待补扫页面: {[p+1 for p in sorted(pages_to_supplement)]})，正在调用 PP-StructureV3 补扫缺失区域...")
+                        pp_crops = extract_pp_structure_table_crops(pdf_path, config=config, cancel_event=cancel_event, pages=sorted(pages_to_supplement))
+                        if pp_crops:
+                            for p_sup in pages_to_supplement:
+                                pp_on_p = [c for c in pp_crops if c.get("page_index") == p_sup]
+                                if not pp_on_p:
+                                    continue
+                                decls_cnt = len([d for d in page_decls.get(p_sup, []) if not d.get('is_continuation')])
+                                y_on_p = [c for c in extracted_crops if c.get("page_index") == p_sup]
+
+                                # 若 PP-Structure 在该页检测到的表格数达到或超过预期声明数，且 YOLO 仅检出不完整的部分表格
+                                # 优先采纳 PP-Structure 的整页完整切图，避免无 bbox 时重复添加
+                                if decls_cnt > 0 and len(pp_on_p) >= decls_cnt and len(y_on_p) < decls_cnt:
+                                    extracted_crops = [c for c in extracted_crops if c.get("page_index") != p_sup]
+                                    extracted_crops.extend(pp_on_p)
+                                    continue
+
+                                for pp_c in pp_on_p:
+                                    pp_box = pp_c.get("crop_bbox")
+                                    pp_img = pp_c.get("image")
+                                    is_dup = False
+                                    for y_c in extracted_crops:
+                                        if y_c.get("page_index") != p_sup:
+                                            continue
+                                        y_box = y_c.get("crop_bbox")
+                                        if pp_box and y_box:
+                                            b1, b2 = pp_box, y_box
+                                            x_inter = max(0.0, min(float(b1[2]), float(b2[2])) - max(float(b1[0]), float(b2[0])))
+                                            y_inter = max(0.0, min(float(b1[3]), float(b2[3])) - max(float(b1[1]), float(b2[1])))
+                                            inter = x_inter * y_inter
+                                            min_a = min((float(b1[2])-float(b1[0]))*(float(b1[3])-float(b1[1])), (float(b2[2])-float(b2[0]))*(float(b2[3])-float(b2[1])))
+                                            if min_a > 0 and inter / min_a >= 0.4:
+                                                is_dup = True
+                                                break
+                                        elif pp_img is not None and y_c.get("image") is not None:
+                                            try:
+                                                w1, h1 = pp_img.size
+                                                w2, h2 = y_c["image"].size
+                                                ar1, ar2 = w1 / max(1, h1), w2 / max(1, h2)
+                                                if abs(ar1 - ar2) / max(ar1, ar2) < 0.20:
+                                                    import numpy as np
+                                                    t1 = np.asarray(pp_img.resize((32, 32)).convert('L'), dtype=np.float32)
+                                                    t2 = np.asarray(y_c["image"].resize((32, 32)).convert('L'), dtype=np.float32)
+                                                    if np.mean(np.abs(t1 - t2)) < 35.0:
+                                                        is_dup = True
+                                                        break
+                                            except Exception:
+                                                pass
+                                    if not is_dup:
+                                        extracted_crops.append(pp_c)
+                            print(f"[PDF-Tables] 结合 DocLayout-YOLO 与 PP-StructureV3 补扫，最终共获得 {len(extracted_crops)} 个表格区域 Crop。")
+                    except Exception as e_pp:
+                        print(f"[PDF-Tables] PP-StructureV3 补扫提示: {e_pp}")
+
             if extracted_crops:
                 return extracted_crops
             else:

@@ -59,11 +59,16 @@ except ImportError:
 
 # Split-out helpers
 try:
+    from .common import format_table_label
     from .table_postprocess import parse_structured_vlm_content
     from .excel_export import make_safe_filename, save_tables_to_excel
     from .pdf_tables import get_page_effective_rotation, export_crops_to_excel
     from .pdf_table_extractor import extract_tables_from_pdf
 except ImportError:
+    try:
+        from common import format_table_label
+    except ImportError:
+        format_table_label = lambda x: str(x).strip() if x else ""
     from table_postprocess import parse_structured_vlm_content
     from excel_export import make_safe_filename, save_tables_to_excel
     from pdf_tables import get_page_effective_rotation, export_crops_to_excel
@@ -73,11 +78,10 @@ except ImportError:
         extract_tables_from_pdf = None
 
 
-def _count_pdf_table_captions(pdf_path: str) -> int:
+def scan_pdf_table_expected_labels(pdf_path: str) -> Tuple[Set[str], int]:
     """
-    轻量级扫描 PDF 文本层，统计表格 caption 数量（如 "表1" "Table 2" "表3.2"）。
-    支持长文献（上限 150 页），使用 format_table_label 统一规范化表号，
-    用于判断在线提取是否遗漏了表格并驱动本地增量补充。
+    轻量级扫描 PDF 文本层，提取全文预期的标准表格标题声明与表号集合。
+    支持长文献（全篇扫描，无 150 页人为截断），返回 (expected_labels, expected_count)。
     """
     try:
         try:
@@ -90,11 +94,29 @@ def _count_pdf_table_captions(pdf_path: str) -> int:
         TABLE_LABEL_RE = re.compile(r'\b((?:TABLE|Table|表)\s*\d+(?:\.\d+)?)', re.IGNORECASE)
 
     try:
+        try:
+            from .table_validator import scan_pdf_table_declarations
+        except ImportError:
+            from table_validator import scan_pdf_table_declarations
+        decls = scan_pdf_table_declarations(pdf_path)
+        labels = set()
+        for p, d_list in decls.items():
+            for d in d_list:
+                if not d.get('is_continuation'):
+                    lbl = d.get('label')
+                    if lbl:
+                        labels.add(format_table_label(lbl))
+        if labels:
+            return labels, len(labels)
+    except Exception:
+        pass
+
+    try:
         import pymupdf as fitz
         doc = fitz.open(pdf_path)
         labels = set()
-        max_scan_pages = min(150, len(doc))
-        for i in range(max_scan_pages):
+        num_pages = len(doc)
+        for i in range(num_pages):
             text = doc[i].get_text("text")
             if not text:
                 continue
@@ -112,9 +134,15 @@ def _count_pdf_table_captions(pdf_path: str) -> int:
                 if formatted:
                     labels.add(formatted)
         doc.close()
-        return len(labels)
+        return labels, len(labels)
     except Exception:
-        return 0
+        return set(), 0
+
+
+def _count_pdf_table_captions(pdf_path: str) -> int:
+    """保持向后兼容的轻量级表数统计"""
+    _, count = scan_pdf_table_expected_labels(pdf_path)
+    return count
 
 
 def process_single_pdf(pdf_path, args, is_batch=False, plan=None):
@@ -302,11 +330,33 @@ def _do_process_single_pdf(pdf_path, orig_pdf_path, args, is_batch=False, plan=N
             )
             if online_dfs:
                 extracted_online = True
-                expected_count = _count_pdf_table_captions(orig_pdf_path)
-                if expected_count > len(online_dfs):
-                    print(f"[Online Warning] 在线提取获得 {len(online_dfs)} 个表，而 PDF 完整文档中检测到约 {expected_count} 个表 caption。")
+                expected_labels, expected_count = scan_pdf_table_expected_labels(orig_pdf_path)
+
+                # 收集已获取的在线表格标签
+                online_labels = set()
+                online_skip_labels = set()
+                for o_df in online_dfs:
+                    lbl = o_df.attrs.get('label') or o_df.attrs.get('table_title')
+                    if lbl:
+                        check_lbl = format_table_label(lbl)
+                        if check_lbl:
+                            online_labels.add(check_lbl)
+                            online_skip_labels.add(make_safe_filename(check_lbl))
+
+                missing_labels = (expected_labels - online_labels) if expected_labels else set()
+                is_complete = False
+                if expected_labels:
+                    is_complete = (len(missing_labels) == 0 and len(online_dfs) >= expected_count)
                 else:
-                    print(f"[Online] Got {len(online_dfs)} tables via online HTML source. Saving...")
+                    is_complete = (len(online_dfs) >= expected_count)
+
+                if not is_complete:
+                    if missing_labels:
+                        print(f"[Online Warning] 在线提取获得 {len(online_dfs)} 个表，缺失预期表号: {sorted(list(missing_labels))} (全文共检测到 {expected_count} 个表声明)。")
+                    else:
+                        print(f"[Online Warning] 在线提取获得 {len(online_dfs)} 个表，少于全文预期数量 {expected_count} 个表。")
+                else:
+                    print(f"[Online] Got {len(online_dfs)} tables via online HTML source (覆盖全部 {len(online_labels)} 个预期表号). Saving...")
 
                 # 始终保存已成功抓取的在线高保真表格
                 save_ok = save_tables_to_excel(online_dfs, target_output,
@@ -314,15 +364,8 @@ def _do_process_single_pdf(pdf_path, orig_pdf_path, args, is_batch=False, plan=N
                                               skip_supplementary=getattr(args, 'skip_supplementary', False))
                 if save_ok:
                     print(f"[Online] Successfully extracted tables via online HTML source -> {target_output}")
-                    if online_only or expected_count <= len(online_dfs):
+                    if online_only or is_complete:
                         return True
-                    # 收集已保存的 online 标签，让后续本地 PDF 提取仅补充缺失表格
-                    online_skip_labels = set()
-                    for o_df in online_dfs:
-                        lbl = o_df.attrs.get('label') or o_df.attrs.get('table_title')
-                        if lbl:
-                            check_lbl = format_table_label(lbl)
-                            online_skip_labels.add(make_safe_filename(check_lbl))
                     print(f"[Online -> PDF Supplement] 已保留 {len(online_dfs)} 个在线表格，将由本地 PDF 管线补充剩余缺失表格...")
             else:
                 print("[Online] Online extraction returned no tables; falling back to PDF.")

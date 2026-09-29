@@ -274,18 +274,58 @@ def validate_native_extraction_pipeline(
             if p_idx - 1 >= 0:
                 pages_requiring_ocr.add(p_idx - 1)
 
-    # 4. 检验文献全局表号连续性
+    # 4. 检验文献全局表号连续性与空间匹配
     extracted_labels = set()
+    bound_table_ids = set()
     for r in valid_native_results:
-        lbl = r['df'].attrs.get('label') or r.get('label')
+        df = r.get('df')
+        lbl = (df.attrs.get('label') if df is not None and hasattr(df, 'attrs') else None) or r.get('label')
         if lbl:
-            extracted_labels.add(format_table_label(lbl))
+            fmt_lbl = format_table_label(lbl)
+            if fmt_lbl:
+                extracted_labels.add(fmt_lbl)
+                if fmt_lbl in all_declared_labels:
+                    bound_table_ids.add(id(r))
 
     for lbl in all_declared_labels:
         if lbl not in extracted_labels:
             decl_p = label_to_declared_page.get(lbl, 0)
-            validation_logs.append(f"  ❌ 缺失声明表号 [{lbl}] (所在页: Page {decl_p + 1}) → 标记重走 PaddleOCR-VL")
-            pages_requiring_ocr.add(decl_p)
+            decl_info = next((d for d in page_declarations.get(decl_p, []) if format_table_label(d.get('label')) == lbl), None)
+            decl_title = (decl_info.get('title') or "") if decl_info else ""
+
+            # 容错：若 declared_page 上已提取到有效表格且该表未分配冲突表号，尝试自动绑定
+            matched_on_page = False
+            for r in valid_native_results:
+                if id(r) in bound_table_ids:
+                    continue
+                df = r.get('df')
+                r_p = r.get('page_idx', df.attrs.get('page_idx') if df is not None and hasattr(df, 'attrs') else None)
+                if r_p == decl_p:
+                    r_lbl = (df.attrs.get('label') if df is not None and hasattr(df, 'attrs') else None) or r.get('label')
+                    r_fmt = format_table_label(r_lbl) if r_lbl else ""
+                    # 如果已有标签且属于其他已被声明的表号，严禁覆盖抢夺！
+                    if r_fmt and r_fmt in all_declared_labels and r_fmt != lbl:
+                        continue
+
+                    # 检查标题相似度或直接未分配明确表号
+                    r_title = (df.attrs.get('table_title') if df is not None and hasattr(df, 'attrs') else None) or r.get('table_title', '')
+                    title_match = bool(decl_title and r_title and (decl_title in r_title or r_title in decl_title))
+
+                    # 若该页只有一个候选表或标题匹配或未命名，进行安全绑定
+                    if not r_fmt or title_match or r_fmt not in all_declared_labels:
+                        if df is not None and hasattr(df, 'attrs'):
+                            df.attrs['label'] = lbl
+                            if decl_title and not df.attrs.get('table_title'):
+                                df.attrs['table_title'] = decl_title
+                        r['label'] = lbl
+                        extracted_labels.add(lbl)
+                        bound_table_ids.add(id(r))
+                        matched_on_page = True
+                        validation_logs.append(f"  ℹ️ Page {decl_p + 1} 成功将原生提取表格绑定至声明表号 [{lbl}]")
+                        break
+            if not matched_on_page:
+                validation_logs.append(f"  ❌ 缺失声明表号 [{lbl}] (所在页: Page {decl_p + 1}) → 标记重走 PaddleOCR-VL")
+                pages_requiring_ocr.add(decl_p)
 
     # 5. 整合三方投票的低置信度页面
     low_confidence_pages = vote_summary.get('low_confidence_pages', set())
@@ -294,10 +334,13 @@ def validate_native_extraction_pipeline(
             validation_logs.append(f"  ⚠️ Page {p + 1} 三方投票分歧较大/低置信度 → 标记重走 PaddleOCR-VL")
             pages_requiring_ocr.add(p)
 
-    # 6. 未提取到任何有效表格但属于候选表格页的页面
+    # 6. 未提取到任何有效表格但属于候选表格页的页面 (涵盖无标题表、全图表与独立视觉表页)
     for p_idx in target_pages:
-        if p_idx not in page_to_valid_tables and p_idx in page_declarations:
-            validation_logs.append(f"  ❌ Page {p_idx + 1} 含有表格声明但未获得任何有效原生表格 → 标记重走 PaddleOCR-VL")
+        if p_idx not in page_to_valid_tables:
+            if p_idx in page_declarations:
+                validation_logs.append(f"  ❌ Page {p_idx + 1} 含有表格声明但未获得任何有效原生表格 → 标记重走 PaddleOCR-VL")
+            else:
+                validation_logs.append(f"  ❌ Page {p_idx + 1} 为候选表格页但未获得任何有效原生表格 → 标记重走 PaddleOCR-VL")
             pages_requiring_ocr.add(p_idx)
 
     # 7. 扩展跨页上下文（连续 block 处理）

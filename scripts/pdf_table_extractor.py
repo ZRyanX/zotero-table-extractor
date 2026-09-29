@@ -1007,14 +1007,30 @@ def extract_via_camelot(pdf_path: str, pages: Optional[List[int]] = None) -> Lis
 # 5. 三方投票融合
 # ===========================================================================
 
+def _compute_bbox_iou(b1, b2) -> Tuple[float, float]:
+    """计算两个 bbox [x0, y0, x1, y1] 的 2D IoU 与 IoM (Intersection over Minimum)"""
+    if not b1 or not b2 or len(b1) < 4 or len(b2) < 4:
+        return 0.0, 0.0
+    x_inter = max(0.0, min(float(b1[2]), float(b2[2])) - max(float(b1[0]), float(b2[0])))
+    y_inter = max(0.0, min(float(b1[3]), float(b2[3])) - max(float(b1[1]), float(b2[1])))
+    inter_area = x_inter * y_inter
+    if inter_area <= 0.0:
+        return 0.0, 0.0
+    a1 = max(1.0, (float(b1[2]) - float(b1[0])) * (float(b1[3]) - float(b1[1])))
+    a2 = max(1.0, (float(b2[2]) - float(b2[0])) * (float(b2[3]) - float(b2[1])))
+    iou = inter_area / (a1 + a2 - inter_area)
+    iom = inter_area / min(a1, a2)
+    return iou, iom
+
+
 def _table_similarity(df1, df2) -> float:
     """
     计算两个 DataFrame 的内容相似度 (0~1)。
 
-    改进：支持行列偏移容错。
-    - 先尝试直接逐单元格比对（原始方式）
-    - 若直接比对相似度低（< 0.5），尝试行偏移 ±1~2 行重新比对，取最高值
-    - 同时引入 Jaccard 集合相似度作为补充（不依赖行列对齐）
+    改进：
+    - 支持行列偏移容错
+    - 结合单元格匹配与 Jaccard 集合相似度
+    - 防误判：若实质单元格内容完全不相关，严禁单凭行列形状匹配给出高分
     """
     if df1 is None or df2 is None or df1.empty or df2.empty:
         return 0.0
@@ -1031,6 +1047,8 @@ def _table_similarity(df1, df2) -> float:
     def _cell_match(v1, v2):
         v1 = str(v1).strip().lower() if v1 is not None else ""
         v2 = str(v2).strip().lower() if v2 is not None else ""
+        if not v1 and not v2:
+            return 0.0
         if v1 == v2:
             return 1.0
         elif v1 and v2 and (v1 in v2 or v2 in v1):
@@ -1069,9 +1087,12 @@ def _table_similarity(df1, df2) -> float:
     else:
         jaccard = 0.0
 
-    # 综合相似度：对齐比对权重 0.5，Jaccard 权重 0.2，形状权重 0.3
-    content_sim = max(best_content_sim, jaccard * 0.8)
-    return 0.3 * shape_sim + 0.5 * best_content_sim + 0.2 * jaccard
+    # 若内容比对与 Jaccard 均极低 (无实质共同单元格)，严禁单凭外形形状给出高相似度
+    if best_content_sim < 0.10 and jaccard < 0.10:
+        return 0.0
+
+    # 综合相似度：对齐比对权重 0.55，Jaccard 权重 0.25，形状权重 0.20
+    return 0.20 * shape_sim + 0.55 * best_content_sim + 0.25 * jaccard
 
 
 def _align_page_tables(
@@ -1080,7 +1101,8 @@ def _align_page_tables(
 ) -> List[Dict[str, Dict[str, Any]]]:
     """
     将同一页面上由不同提取器提取的表格进行空间位置与内容对齐。
-    避免简单的 raw zip 索引错位对比（如一方少提取了一个表导致后续所有表偏移错位）。
+    优先依据二维 bbox 的重叠 (IoU/IoM) 匹配，杜绝将同页不同位置表格错误聚合；
+    辅以显式表号冲突检查和高阈值内容相似度判定。
     返回一组对齐后的候选簇列表: [{'pdf_inspector': t1, 'find_tables': t2}, ...]
     """
     clusters: List[Dict[str, Dict[str, Any]]] = []
@@ -1092,7 +1114,8 @@ def _align_page_tables(
 
         for tbl in src_tbls:
             tbl_df = tbl.get('df')
-            tbl_bbox = tbl.get('bbox')
+            tbl_bbox = tbl.get('pdf_bbox') or tbl.get('bbox')
+            tbl_label = tbl_df.attrs.get('label') if tbl_df is not None else tbl.get('label')
             best_cluster_idx = -1
             best_score = 0.0
 
@@ -1101,35 +1124,54 @@ def _align_page_tables(
                     continue  # 该簇已包含该来源表格，不放入同一簇
 
                 cluster_scores = []
+                cluster_disqualified = False
                 for existing_src, existing_tbl in cluster.items():
                     existing_df = existing_tbl.get('df')
-                    existing_bbox = existing_tbl.get('bbox')
+                    existing_bbox = existing_tbl.get('pdf_bbox') or existing_tbl.get('bbox')
+                    existing_label = (existing_df.attrs.get('label') if existing_df is not None and hasattr(existing_df, 'attrs') else None) or existing_tbl.get('label')
                     score = 0.0
 
-                    # 1. 空间垂直重叠判定 (若两者均有有效 bbox)
-                    if tbl_bbox and existing_bbox:
-                        try:
-                            v_overlap = max(0.0, min(tbl_bbox[3], existing_bbox[3]) - max(tbl_bbox[1], existing_bbox[1]))
-                            h1 = max(1.0, tbl_bbox[3] - tbl_bbox[1])
-                            h2 = max(1.0, existing_bbox[3] - existing_bbox[1])
-                            v_ratio = v_overlap / max(h1, h2)
-                            if v_ratio >= 0.4:
-                                score = max(score, 0.7 + 0.3 * v_ratio)
-                        except Exception:
-                            pass
+                    # 1. 显式表号标签冲突检查 (如 Table 1 vs Table 2，绝对严禁聚入同簇)
+                    if tbl_label and existing_label:
+                        fmt1 = format_table_label(tbl_label)
+                        fmt2 = format_table_label(existing_label)
+                        if fmt1 and fmt2 and fmt1 != fmt2:
+                            cluster_disqualified = True
+                            break
 
-                    # 2. 内容文本/结构相似度判定
+                    # 2. 空间二维重叠判定 (若两者均有有效 bbox)
+                    has_both_bboxes = bool(tbl_bbox and existing_bbox and len(tbl_bbox) >= 4 and len(existing_bbox) >= 4)
+                    spatial_matched = False
+                    if has_both_bboxes:
+                        iou, iom = _compute_bbox_iou(tbl_bbox, existing_bbox)
+                        if iom >= 0.35 or iou >= 0.20:
+                            score = max(score, 0.70 + 0.30 * iom)
+                            spatial_matched = True
+                        elif iom == 0.0 and iou == 0.0:
+                            # 明确在同一页面的不同空间区域（如一上一下或分栏左右），绝对严禁聚入同一簇
+                            cluster_disqualified = True
+                            break
+
+                    # 3. 内容文本/结构相似度判定
                     if tbl_df is not None and existing_df is not None:
                         try:
                             sim = _table_similarity(tbl_df, existing_df)
-                            score = max(score, sim)
+                            if spatial_matched:
+                                score = max(score, 0.40 * score + 0.60 * sim)
+                            else:
+                                score = max(score, sim)
                         except Exception:
                             pass
 
                     cluster_scores.append(score)
 
+                if cluster_disqualified:
+                    continue
+
                 avg_score = sum(cluster_scores) / len(cluster_scores) if cluster_scores else 0.0
-                if avg_score >= 0.4 and avg_score > best_score:
+                # 聚类阈值要求：无空间信息时需更严格的内容匹配 (>= 0.60)，避免同页小表误聚
+                threshold = 0.45 if any(tbl_bbox and (ex.get('pdf_bbox') or ex.get('bbox')) for ex in cluster.values()) else 0.60
+                if avg_score >= threshold and avg_score > best_score:
                     best_score = avg_score
                     best_cluster_idx = c_idx
 
@@ -1198,6 +1240,12 @@ def three_way_vote(
         aligned_clusters = _align_page_tables(page_tables, priority)
         if not aligned_clusters:
             continue
+
+        # 页面级各主力引擎检测表数的分歧检验 (独立覆盖率感知)
+        active_counts = [len(tbls) for s, tbls in page_tables.items() if tbls and s in ['pdf_inspector_structure', 'pdf_inspector', 'find_tables']]
+        if active_counts and (max(active_counts) - min(active_counts) >= 2):
+            logs.append(f"Page {page+1}: 主力引擎检测表数存在较大分歧 (counts={active_counts}) → 标记为低置信度页")
+            low_confidence_pages.add(page)
 
         # 逐个对齐表格簇进行投票
         for tbl_idx, candidates in enumerate(aligned_clusters):
@@ -1985,6 +2033,171 @@ def extract_via_paddleocr_crops(pdf_path: str, pages: Optional[List[int]] = None
     return results
 
 
+def reconcile_native_and_ocr_tables(
+    native_results: List[Dict[str, Any]],
+    ocr_results: List[Dict[str, Any]],
+    ocr_candidate_pages: List[int],
+    logs: Optional[List[str]] = None
+) -> List[Dict[str, Any]]:
+    """
+    表级智能对齐与替换策略（避免粗暴按页全部删除原生表导致同页其他有效表丢失）。
+    
+    规则：
+    1. 非 OCR 接管候选页面的原生表格完全不受影响保留。
+    2. 对 OCR 接管页面：
+       - 优先按表号标签 (label/table_title) 精确匹配原生表与 OCR 表。
+       - 其次按 2D bbox 空间重叠 (IoU >= 0.2 或 IoM >= 0.35) 匹配。
+       - 再次按文本内容高相似度 (sim >= 0.55) 匹配。
+       - 对成功匹配的原生表，由高质量 OCR 结果精准替换该表。
+       - 对未匹配的 OCR 结果（新发现的表格），追加保留。
+       - 对同页上未被 OCR 覆盖但本身合格的原生表，予以安全保留，绝不因同页其他表重跑 OCR 而丢失！
+    """
+    if not ocr_results:
+        return native_results
+
+    if logs is None:
+        logs = []
+
+    ocr_pages_set = set(ocr_candidate_pages)
+    unaffected = [r for r in native_results if r.get('page_idx') not in ocr_pages_set]
+    merged = list(unaffected)
+    handled_ocr_ids = set()
+
+    def _safe_label(item):
+        if not item or not isinstance(item, dict):
+            return ""
+        df = item.get('df')
+        lbl = df.attrs.get('label') if (df is not None and hasattr(df, 'attrs')) else None
+        if not lbl:
+            lbl = item.get('label')
+        return str(lbl).strip() if lbl else ""
+
+    for p in ocr_candidate_pages:
+        p_nat = [r for r in native_results if r.get('page_idx') == p]
+        p_ocr = [r for r in ocr_results if r.get('page_idx') == p or (r.get('covered_pages') and p in r['covered_pages'])]
+
+        if not p_ocr:
+            # 该页未产生 OCR 结果，保留原有原生表格
+            merged.extend(p_nat)
+            continue
+
+        if not p_nat:
+            # 该页原生无表，采纳尚未加入的 OCR 表格
+            for ocr_item in p_ocr:
+                if id(ocr_item) not in handled_ocr_ids:
+                    handled_ocr_ids.add(id(ocr_item))
+                    merged.append(ocr_item)
+            continue
+
+        matched_nat_indices = set()
+        matched_ocr_indices = set()
+
+        # 1. 表号标签精确匹配
+        for i_ocr, ocr_item in enumerate(p_ocr):
+            ocr_lbl = _safe_label(ocr_item)
+            if not ocr_lbl:
+                continue
+            fmt_ocr = format_table_label(ocr_lbl)
+            if not fmt_ocr:
+                continue
+            for i_nat, nat_item in enumerate(p_nat):
+                if i_nat in matched_nat_indices:
+                    continue
+                nat_lbl = _safe_label(nat_item)
+                if nat_lbl and format_table_label(nat_lbl) == fmt_ocr:
+                    matched_nat_indices.add(i_nat)
+                    matched_ocr_indices.add(i_ocr)
+                    if id(ocr_item) not in handled_ocr_ids:
+                        handled_ocr_ids.add(id(ocr_item))
+                        merged.append(ocr_item)
+                    logs.append(f"  Page {p+1}: 表号 [{fmt_ocr}] 原生版本被 OCR 版本精准替换")
+                    break
+
+        # 2. 空间二维 bbox 重叠匹配
+        for i_ocr, ocr_item in enumerate(p_ocr):
+            if i_ocr in matched_ocr_indices:
+                continue
+            b_ocr = ocr_item.get('pdf_bbox') or ocr_item.get('bbox')
+            if not b_ocr:
+                continue
+            best_nat_idx = -1
+            best_iom = 0.0
+            for i_nat, nat_item in enumerate(p_nat):
+                if i_nat in matched_nat_indices:
+                    continue
+                b_nat = nat_item.get('pdf_bbox') or nat_item.get('bbox')
+                if not b_nat:
+                    continue
+                iou, iom = _compute_bbox_iou(b_nat, b_ocr)
+                if (iom >= 0.35 or iou >= 0.20) and iom > best_iom:
+                    best_iom = iom
+                    best_nat_idx = i_nat
+
+            if best_nat_idx >= 0:
+                matched_nat_indices.add(best_nat_idx)
+                matched_ocr_indices.add(i_ocr)
+                if id(ocr_item) not in handled_ocr_ids:
+                    handled_ocr_ids.add(id(ocr_item))
+                    merged.append(ocr_item)
+                logs.append(f"  Page {p+1}: 空间重叠 (IoM={best_iom:.2f}) 原生表格被 OCR 版本精准替换")
+
+        # 3. 内容相似度匹配
+        for i_ocr, ocr_item in enumerate(p_ocr):
+            if i_ocr in matched_ocr_indices:
+                continue
+            df_ocr = ocr_item.get('df')
+            if df_ocr is None or df_ocr.empty:
+                continue
+            best_nat_idx = -1
+            best_sim = 0.0
+            for i_nat, nat_item in enumerate(p_nat):
+                if i_nat in matched_nat_indices:
+                    continue
+                df_nat = nat_item.get('df')
+                if df_nat is None or df_nat.empty:
+                    continue
+                sim = _table_similarity(df_nat, df_ocr)
+                if sim >= 0.55 and sim > best_sim:
+                    best_sim = sim
+                    best_nat_idx = i_nat
+
+            if best_nat_idx >= 0:
+                matched_nat_indices.add(best_nat_idx)
+                matched_ocr_indices.add(i_ocr)
+                if id(ocr_item) not in handled_ocr_ids:
+                    handled_ocr_ids.add(id(ocr_item))
+                    merged.append(ocr_item)
+                logs.append(f"  Page {p+1}: 内容相似 (sim={best_sim:.2f}) 原生表格被 OCR 版本精准替换")
+
+        # 4. 未被匹配的 OCR 结果（视觉补充定位到的新表）
+        for i_ocr, ocr_item in enumerate(p_ocr):
+            if i_ocr not in matched_ocr_indices and id(ocr_item) not in handled_ocr_ids:
+                handled_ocr_ids.add(id(ocr_item))
+                merged.append(ocr_item)
+                logs.append(f"  Page {p+1}: OCR 补充检出新表格，予以采纳")
+
+        # 5. 未被匹配的原生结果（同页未被 OCR 覆盖的兄弟表格）
+        for i_nat, nat_item in enumerate(p_nat):
+            if i_nat not in matched_nat_indices:
+                df_nat = nat_item.get('df')
+                # 检查该原生表是否有效，若有效则坚决保留，防止漏表
+                if df_nat is not None and not is_table_low_quality(df_nat):
+                    merged.append(nat_item)
+                    logs.append(f"  Page {p+1}: 原生表格未受 OCR 干扰且质量合格，安全予以保留")
+                elif df_nat is not None:
+                    # 损坏表若 OCR 未能给出对应切图，仍保留但带标记，防止整张表丢失
+                    merged.append(nat_item)
+                    logs.append(f"  Page {p+1}: 原生表格有质量瑕疵且未匹配到 OCR 切图，保留兜底")
+
+    # 兜底：处理可能未明确绑定至 candidate_pages 的 OCR 结果
+    for ocr_item in ocr_results:
+        if id(ocr_item) not in handled_ocr_ids:
+            handled_ocr_ids.add(id(ocr_item))
+            merged.append(ocr_item)
+
+    return merged
+
+
 def extract_tables_from_pdf(
     pdf_path: str,
     use_ocr_fallback: bool = True,
@@ -2040,69 +2253,160 @@ def extract_tables_from_pdf(
         logs.append(f"  pdf-inspector 错误: {inspector_result['error']}")
 
     pdf_type = inspector_result['pdf_type']
+    raw_pages_with_tables = inspector_result.get('pages_with_tables', [])
+    inspector_table_pages = sorted(list(set(p - 1 for p in raw_pages_with_tables if isinstance(p, int) and p > 0)))
+
+    structure_pages = set()
+    for st in inspector_result.get('structure_tables', []):
+        p = st.get('page_idx')
+        if p is None and hasattr(st.get('df'), 'attrs'):
+            p = st['df'].attrs.get('page_idx')
+        if p is not None:
+            structure_pages.add(p)
+
     inspector_tables = []
+    unresolved_inspector_tables = []
     for t in inspector_result['tables']:
         if t.get('page_idx') is not None:
             inspector_tables.append(t)
         else:
             lbl = t['df'].attrs.get('label') or format_table_label(t['df'].attrs.get('table_title', ''))
             resolved_p = caption_page_map.get(lbl) if (caption_page_map and lbl) else None
-            if resolved_p is None and pages_with_tables and len(pages_with_tables) == 1:
-                resolved_p = pages_with_tables[0] - 1
+            if resolved_p is None and len(inspector_table_pages) == 1:
+                resolved_p = inspector_table_pages[0]
             if resolved_p is not None:
                 t['page_idx'] = resolved_p
                 t['df'].attrs['page_idx'] = resolved_p
                 inspector_tables.append(t)
+                logs.append(f"  pdf-inspector 表格 [{lbl or '未命名'}] 成功映射至 Page {resolved_p+1}")
             else:
-                t['page_idx'] = 0
-                t['df'].attrs['page_idx'] = 0
-                inspector_tables.append(t)
+                unresolved_inspector_tables.append(t)
 
-    # 精准候选页面决策体系：
-    # 1. 若文本层已明确检测到表标题声明 (caption_pages)，以 caption_pages 为绝对基准；
-    #    绝不盲目并入 pdf-inspector 产生的全书双栏误判页！
-    if caption_pages:
-        detected_targets = set(caption_pages).union(image_table_pages)
-    elif image_table_pages:
-        detected_targets = set(image_table_pages)
-    elif pages_with_tables:
-        detected_targets = set(pages_with_tables)
-    else:
-        detected_targets = set()
+    # 对剩余未通过 caption 明确映射的表格，按顺序映射至 inspector_table_pages
+    for i_u, t in enumerate(unresolved_inspector_tables):
+        lbl = t['df'].attrs.get('label') or format_table_label(t['df'].attrs.get('table_title', ''))
+        if inspector_table_pages:
+            fallback_p = inspector_table_pages[min(i_u, len(inspector_table_pages) - 1)]
+        else:
+            fallback_p = 0
+        t['page_idx'] = fallback_p
+        t['df'].attrs['page_idx'] = fallback_p
+        inspector_tables.append(t)
+        logs.append(f"  pdf-inspector 表格 [{lbl or '未命名'}] 页码映射回退至 Page {fallback_p+1}")
 
-    # 自动包含可能的跨页续表后继页（支持多页长表连续追溯，如跨 3~5 页的大表）
+    # ── 候选表格页面决策与多信号并集体系 ──
+    # 结合 Caption 声明、全图扫描页、结构树语义表格、pdf-inspector 检出页与矢量网格探测
+    candidate_sources = {}
+    def _add_candidate(page_idx: int, src: str):
+        if page_idx not in candidate_sources:
+            candidate_sources[page_idx] = set()
+        candidate_sources[page_idx].add(src)
+
+    for p in caption_pages:
+        _add_candidate(p, 'caption')
+    for p in image_table_pages:
+        _add_candidate(p, 'image_scan')
+    for p in structure_pages:
+        _add_candidate(p, 'structure_tree')
+    for p in inspector_table_pages:
+        _add_candidate(p, 'pdf_inspector')
+    for t in inspector_tables:
+        p = t.get('page_idx')
+        if p is not None:
+            _add_candidate(p, 'inspector_table')
+
+    # 对未命中的页面进行轻量矢量线框补扫 (PyMuPDF find_tables 仅花费数毫秒)
+    try:
+        with fitz.open(pdf_path) as doc_check:
+            pages_to_check = range(len(doc_check)) if not candidate_sources else [p for p in range(len(doc_check)) if p not in candidate_sources]
+            max_vec_scan = 300 if not candidate_sources else 150
+            for p_idx in pages_to_check:
+                if p_idx >= max_vec_scan:
+                    break
+                p_obj = doc_check[p_idx]
+                try:
+                    tabs = p_obj.find_tables()
+                    if tabs and tabs.tables:
+                        valid_vec_tabs = [tb for tb in tabs.tables if tb.row_count >= 2 and tb.col_count >= 2]
+                        if valid_vec_tabs:
+                            _add_candidate(p_idx, 'vector_find_tables')
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # 自动包含可能的跨页续表后继页（结合关键字、版面检测、密集数据与连续性）
     try:
         doc = fitz.open(pdf_path)
-        continuation_candidates = set()
-        for p in caption_pages:
+        base_pages = sorted(list(candidate_sources.keys()))
+        for p in base_pages:
             next_p = p + 1
-            while next_p < len(doc) and next_p <= p + 6:
-                next_text = doc[next_p].get_text("text").strip()
-                lines = [l.strip() for l in next_text.split('\n') if l.strip() and not (l.strip().isdigit() and len(l.strip()) <= 4) and not re.search(r'(?:大学|学位论文)', l)]
-                if not lines:
+            while next_p < len(doc) and next_p <= p + 10:
+                if next_p in candidate_sources and 'caption' in candidate_sources[next_p]:
                     break
-                first_line = lines[0]
-                # 如果遇到新章节标题、新图题、新表题或致谢/参考文献，停止追溯
-                if re.match(r'^\d+\.\d+', first_line) or re.match(r'^(?:附表|附录表|补充表|表|Table)\s*\d+', first_line) or first_line.startswith(('图', 'Fig', '参考文献', '致谢')):
-                    break
-                
-                # 1. 显式续表关键字
-                cond_kw = any(k in next_text[:400] for k in ['续表', '（续）', '(续)', 'continued', 'Continued', '(cont.)', '(Cont.)'])
-                # 2. 密集纯数据元胞（附录超长连续大表，无表头直接连续密集数值）
-                data_token_count = sum(1 for l in lines if re.match(r'^-?\d+(?:\.\d+)?$', l) or l in ('/', '-', '—', '–', 'n.d.', 'bdl', 'b.d.l.') or re.match(r'^[A-Za-z0-9\-_–—/]+$', l))
-                cond_dense = len(lines) >= 25 and (data_token_count / len(lines) >= 0.65)
 
-                if cond_kw or cond_dense:
-                    continuation_candidates.add(next_p)
+                # 检查 next_p 是否有明确续表声明
+                if next_p in page_decls:
+                    has_decl_cont = any(d.get('is_continuation') for d in page_decls[next_p])
+                    if has_decl_cont:
+                        _add_candidate(next_p, 'continuation_decl')
+                        next_p += 1
+                        continue
+                    else:
+                        # next_p 包含新的独立表格声明，当前表格的续表追溯在此终结
+                        break
+
+                next_page = doc[next_p]
+                next_text = next_page.get_text("text").strip()
+                lines = [l.strip() for l in next_text.split('\n') if l.strip() and not (l.strip().isdigit() and len(l.strip()) <= 4) and not re.search(r'(?:大学|学位论文)', l)]
+                
+                if not lines and not next_page.get_images():
+                    break
+
+                first_line = lines[0] if lines else ""
+                is_continuation_line = any(k in first_line for k in ['续', 'cont', 'Cont'])
+                is_new_table = bool(re.match(r'^(?:附表|附录表|补充表|表|Table)\s*\d+', first_line)) and not is_continuation_line
+                if re.match(r'^\d+\.\d+', first_line) or is_new_table or first_line.startswith(('图', 'Fig', '参考文献', '致谢', 'References', 'Acknowledgements')):
+                    break
+
+                # 1. 显式续表关键字 (中英文多模态)
+                cond_kw = any(k in next_text[:500] for k in ['续表', '（续）', '(续)', '续前表', 'continued', 'Continued', '(cont.)', '(Cont.)', "cont'd", "Cont'd"])
+                
+                # 2. 密集纯数据元胞（长数据表，无表头直接连续密集数值）
+                data_token_count = sum(1 for l in lines if re.match(r'^-?\d+(?:\.\d+)?%?$', l) or l in ('/', '-', '—', '–', 'n.d.', 'bdl', 'b.d.l.', 'nd', 'N/A') or re.match(r'^[A-Z0-9\-_–—/]{1,8}$', l))
+                cond_dense = len(lines) >= 20 and (data_token_count / len(lines) >= 0.65)
+
+                # 3. 矢量线框表格判定 (续表往往带有表格水平/垂直网格线)
+                cond_vec_table = False
+                try:
+                    f_tabs = next_page.find_tables()
+                    if f_tabs and f_tabs.tables:
+                        if any(tb.row_count >= 3 for tb in f_tabs.tables):
+                            cond_vec_table = True
+                except Exception:
+                    pass
+
+                # 4. 纯图续表（前一页为图片表且当前页同样为大图页）
+                cond_img_cont = ('image_scan' in candidate_sources.get(p, set()) and p in image_table_pages and next_p in image_table_pages)
+
+                if cond_kw or cond_dense or cond_vec_table or cond_img_cont:
+                    reasons = []
+                    if cond_kw: reasons.append("keyword")
+                    if cond_dense: reasons.append("dense_data")
+                    if cond_vec_table: reasons.append("vector_grid")
+                    if cond_img_cont: reasons.append("image_continuation")
+                    _add_candidate(next_p, f"continuation({','.join(reasons)})")
                     next_p += 1
                 else:
                     break
         doc.close()
-        detected_targets = detected_targets.union(continuation_candidates)
-    except Exception:
-        pass
+    except Exception as e_cont:
+        logs.append(f"  续表推断异常: {e_cont}")
 
-    target_pages = sorted(detected_targets) if detected_targets else None
+    target_pages = sorted(list(candidate_sources.keys())) if candidate_sources else None
+    if target_pages:
+        src_summary = {p + 1: sorted(list(candidate_sources[p])) for p in target_pages}
+        logs.append(f"  候选表格页面: {[p+1 for p in target_pages]} (来源分布: {src_summary})")
 
     if not target_pages:
         logs.append("→ 未检测到候选表格页面，尝试整页高精 PaddleOCR-VL 全文识别")
@@ -2186,18 +2490,8 @@ def extract_tables_from_pdf(
             
             ocr_results = extract_via_paddleocr_crops(pdf_path, ocr_candidate_pages)
             if ocr_results:
-                # 仅在 OCR 成功获得非空表格时，才替换对应页面的原生表
-                ocr_success_pages = set()
-                for r in ocr_results:
-                    if r.get('covered_pages'):
-                        ocr_success_pages.update(r['covered_pages'])
-                    elif r.get('page_idx') is not None:
-                        ocr_success_pages.add(r['page_idx'])
-                if not ocr_success_pages:
-                    ocr_success_pages = set(ocr_candidate_pages)
-                all_results = [r for r in all_results if r.get('page_idx') not in ocr_success_pages]
-                all_results.extend(ocr_results)
-                logs.append(f"  PaddleOCR-VL 独立接管提取到 {len(ocr_results)} 个表格 (覆盖页面: {[p+1 for p in sorted(ocr_success_pages)]})")
+                logs.append(f"  PaddleOCR-VL 独立接管提取到 {len(ocr_results)} 个表格，启动表级精细对齐与安全替换...")
+                all_results = reconcile_native_and_ocr_tables(all_results, ocr_results, ocr_candidate_pages, logs)
             else:
                 logs.append("  PaddleOCR-VL 未提取到有效表格或执行失败，保留原生解析结果")
 
