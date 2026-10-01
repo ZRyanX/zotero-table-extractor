@@ -70,6 +70,200 @@ def get_page_effective_rotation(page):
     return 0
 
 
+def probe_disjoint_native_tables(page) -> int:
+    """
+    轻量探测单页中存在的原生独立表格结构数 (基于 PyMuPDF find_tables、矢量线框聚类及文本块分布)。
+    全面适配 page.rotation (0, 90, 180, 270) 与三线表/网格线群。
+    用于在页面缺失 Caption 声明时，校验 YOLO 是否漏检了同页并存的无标题多表。
+    """
+    candidate_bboxes = []
+
+    rot = getattr(page, 'rotation', 0)
+    rot = rot if isinstance(rot, int) else 0
+    rot = rot % 360
+    rot_mat = getattr(page, 'rotation_matrix', None) if rot != 0 else None
+
+    # 1. PyMuPDF find_tables 探测 (有线框表格，返回坐标已为视觉方向坐标)
+    try:
+        tabs = page.find_tables()
+        if tabs and hasattr(tabs, 'tables') and isinstance(tabs.tables, (list, tuple)):
+            for tb in tabs.tables:
+                r_cnt = getattr(tb, "row_count", 0)
+                c_cnt = getattr(tb, "col_count", 0)
+                if r_cnt >= 2 and c_cnt >= 2:
+                    bbox = getattr(tb, "bbox", None)
+                    if bbox and len(bbox) == 4:
+                        w = bbox[2] - bbox[0]
+                        h = bbox[3] - bbox[1]
+                        if w > 40 and h > 20:
+                            candidate_bboxes.append(list(bbox))
+    except Exception:
+        pass
+
+    # 2. 矢量线框群探测 (精准支持学术三线表与网格线群，支持页面旋转归一化)
+    try:
+        drawings = page.get_drawings()
+        if isinstance(drawings, (list, tuple)) and drawings:
+            h_lines = []
+            for d in drawings:
+                for item in d.get("items", []):
+                    if item[0] == "l":  # line: ("l", p1, p2)
+                        p1, p2 = item[1], item[2]
+                        p1_x = getattr(p1, 'x', 0) if hasattr(p1, 'x') else (p1[0] if isinstance(p1, (list, tuple)) else 0)
+                        p1_y = getattr(p1, 'y', 0) if hasattr(p1, 'y') else (p1[1] if isinstance(p1, (list, tuple)) else 0)
+                        p2_x = getattr(p2, 'x', 0) if hasattr(p2, 'x') else (p2[0] if isinstance(p2, (list, tuple)) else 0)
+                        p2_y = getattr(p2, 'y', 0) if hasattr(p2, 'y') else (p2[1] if isinstance(p2, (list, tuple)) else 0)
+                        if rot_mat is not None:
+                            try:
+                                pt1 = fitz.Point(p1_x, p1_y) * rot_mat
+                                pt2 = fitz.Point(p2_x, p2_y) * rot_mat
+                                p1_x, p1_y = pt1.x, pt1.y
+                                p2_x, p2_y = pt2.x, pt2.y
+                            except Exception:
+                                pass
+                        y_diff = abs(p1_y - p2_y)
+                        x_diff = abs(p1_x - p2_x)
+                        if y_diff <= 2.0 and x_diff >= 50.0:
+                            h_lines.append((
+                                min(p1_x, p2_x), min(p1_y, p2_y),
+                                max(p1_x, p2_x), max(p1_y, p2_y)
+                            ))
+                    elif item[0] == "re":  # rect: ("re", Rect)
+                        r = item[1]
+                        if rot_mat:
+                            try:
+                                r = fitz.Rect(r) * rot_mat
+                            except Exception:
+                                pass
+                        r_h = getattr(r, 'height', 0)
+                        r_w = getattr(r, 'width', 0)
+                        if r_h <= 3.5 and r_w >= 50.0:
+                            h_lines.append((r.x0, r.y0, r.x1, r.y1))
+
+                # 兼容未包含 items 的直接矩形绘制
+                if not d.get("items"):
+                    dr = d.get("rect")
+                    if dr:
+                        if rot_mat:
+                            try:
+                                dr = fitz.Rect(dr) * rot_mat
+                            except Exception:
+                                pass
+                        dr_h = getattr(dr, 'height', 0)
+                        dr_w = getattr(dr, 'width', 0)
+                        if dr_h <= 3.5 and dr_w >= 50.0:
+                            h_lines.append((dr.x0, dr.y0, dr.x1, dr.y1))
+
+            if len(h_lines) >= 2:
+                # 按水平跨度聚类，支持同页并列多栏表格
+                span_groups = []
+                for l in sorted(h_lines, key=lambda b: (b[1] + b[3]) / 2.0):
+                    matched = False
+                    l_w = max(1.0, l[2] - l[0])
+                    for grp in span_groups:
+                        g_l = grp[0]
+                        g_w = max(1.0, g_l[2] - g_l[0])
+                        x_inter = max(0.0, min(l[2], g_l[2]) - max(l[0], g_l[0]))
+                        min_w = min(l_w, g_w)
+                        if min_w > 0 and (x_inter / min_w >= 0.65 or (abs(l[0] - g_l[0]) <= 30 and abs(l[2] - g_l[2]) <= 30)):
+                            grp.append(l)
+                            matched = True
+                            break
+                    if not matched:
+                        span_groups.append([l])
+
+                for grp in span_groups:
+                    if len(grp) < 2:
+                        continue
+                    grp.sort(key=lambda b: (b[1] + b[3]) / 2.0)
+                    curr_tbl = [grp[0]]
+                    has_large_gap = False
+
+                    for i in range(1, len(grp)):
+                        prev_y = (curr_tbl[-1][1] + curr_tbl[-1][3]) / 2.0
+                        curr_y = (grp[i][1] + grp[i][3]) / 2.0
+                        gap = curr_y - prev_y
+
+                        if gap <= 45.0:
+                            if has_large_gap:
+                                # 已出现过表体大跨度，紧接着小间距线说明进入新表格表头
+                                if len(curr_tbl) >= 2:
+                                    bx0 = min(line[0] for line in curr_tbl)
+                                    by0 = min(line[1] for line in curr_tbl)
+                                    bx1 = max(line[2] for line in curr_tbl)
+                                    by1 = max(line[3] for line in curr_tbl)
+                                    if (bx1 - bx0) >= 50 and (by1 - by0) >= 15:
+                                        candidate_bboxes.append([bx0, by0, bx1, by1])
+                                curr_tbl = [grp[i]]
+                                has_large_gap = False
+                            else:
+                                curr_tbl.append(grp[i])
+                        elif gap <= 350.0 and not has_large_gap and len(curr_tbl) <= 2:
+                            # 三线表或双线表表体跨度：允许在表头 1~2 条线后出现一次跨度 (最高 350pt)
+                            curr_tbl.append(grp[i])
+                            has_large_gap = True
+                        else:
+                            # 间距过大或已包含表体，当前表格结束
+                            if len(curr_tbl) >= 2:
+                                bx0 = min(line[0] for line in curr_tbl)
+                                by0 = min(line[1] for line in curr_tbl)
+                                bx1 = max(line[2] for line in curr_tbl)
+                                by1 = max(line[3] for line in curr_tbl)
+                                if (bx1 - bx0) >= 50 and (by1 - by0) >= 15:
+                                    candidate_bboxes.append([bx0, by0, bx1, by1])
+                            curr_tbl = [grp[i]]
+                            has_large_gap = False
+
+                    if len(curr_tbl) >= 2:
+                        bx0 = min(line[0] for line in curr_tbl)
+                        by0 = min(line[1] for line in curr_tbl)
+                        bx1 = max(line[2] for line in curr_tbl)
+                        by1 = max(line[3] for line in curr_tbl)
+                        if (bx1 - bx0) >= 50 and (by1 - by0) >= 15:
+                            candidate_bboxes.append([bx0, by0, bx1, by1])
+    except Exception:
+        pass
+
+    # 3. 针对无框文本对齐表格的探测 (当表格数较少时始终探测，避免漏检与线框表并存的无线框表)
+    if len(candidate_bboxes) < 4:
+        try:
+            tabs_text = page.find_tables(vertical_strategy="text")
+            if tabs_text and hasattr(tabs_text, 'tables') and isinstance(tabs_text.tables, (list, tuple)):
+                for tb in tabs_text.tables:
+                    if getattr(tb, "row_count", 0) >= 3 and getattr(tb, "col_count", 0) >= 2:
+                        bbox = getattr(tb, "bbox", None)
+                        if bbox and len(bbox) == 4:
+                            w = bbox[2] - bbox[0]
+                            h = bbox[3] - bbox[1]
+                            if w > 80 and h > 30:
+                                candidate_bboxes.append(list(bbox))
+        except Exception:
+            pass
+
+    if not candidate_bboxes:
+        return 0
+
+    # 4. 空间聚类：合并重叠候选框，计算相互独立不相交的表格结构数
+    disjoint_clusters = []
+    for b in candidate_bboxes:
+        matched = False
+        for cl in disjoint_clusters:
+            x_inter = max(0.0, min(b[2], cl[2]) - max(b[0], cl[0]))
+            y_inter = max(0.0, min(b[3], cl[3]) - max(b[1], cl[1]))
+            inter = x_inter * y_inter
+            min_a = min((b[2] - b[0]) * (b[3] - b[1]), (cl[2] - cl[0]) * (cl[3] - cl[1]))
+            if min_a > 0 and (inter / min_a) > 0.20:
+                cl[0] = min(cl[0], b[0])
+                cl[1] = min(cl[1], b[1])
+                cl[2] = max(cl[2], b[2])
+                cl[3] = max(cl[3], b[3])
+                matched = True
+                break
+        if not matched:
+            disjoint_clusters.append(list(b))
+
+    return len(disjoint_clusters)
+
 
 def extract_table_crops_from_pdf(
     pdf_path: str,
@@ -135,6 +329,7 @@ def extract_table_crops_from_pdf(
             mat = fitz.Matrix(zoom, zoom)
 
             target_pages = [p for p in pages if 0 <= p < total_pages] if pages is not None else list(range(total_pages))
+            native_signal_counts = {}
 
             for page_idx in target_pages:
                 if cancel_event is not None and cancel_event.is_set():
@@ -142,8 +337,30 @@ def extract_table_crops_from_pdf(
                 page = doc[page_idx]
                 page_text = page.get_text("text")
 
-                # 启发式预检：若页面不含图表特征且未显式指定目标页，则提前跳过
+                # 启发式预检：若未显式指定目标页 (pages is None)，针对纯正文页进行极速轻量跳过
+                skip_candidate = False
                 if enable_filter and pages is None and page_may_contain_tables and not page_may_contain_tables(page_text):
+                    # 极速轻量绘图预检：若页面文本无图表特征且完全不含矢量线条/矩形，直接跳过
+                    has_drawings = False
+                    try:
+                        drawings = page.get_drawings()
+                        if isinstance(drawings, (list, tuple)) and len(drawings) > 0:
+                            has_drawings = True
+                    except Exception:
+                        pass
+                    if not has_drawings:
+                        native_signal_counts[page_idx] = 0
+                        continue
+                    skip_candidate = True
+
+                # 轻量探测当前页原生独立表格结构数（用于无标题多表缺切图时触发二次补扫）
+                try:
+                    native_signal_counts[page_idx] = probe_disjoint_native_tables(page)
+                except Exception:
+                    native_signal_counts[page_idx] = 0
+
+                # 若启发式未命中且原生探测亦为 0，则安全跳过视觉目标检测
+                if skip_candidate and native_signal_counts[page_idx] == 0:
                     continue
 
                 pix = page.get_pixmap(matrix=mat, alpha=False)
@@ -169,7 +386,7 @@ def extract_table_crops_from_pdf(
             # 若未显式指定 (pages is None，即整篇 PDF)，不可将全文所有无表正文页盲目当作漏检页。
             missing_pages = [p for p in target_pages if p not in yolo_covered_pages] if pages is not None else []
 
-            # 检查是否有页面检测到的切图数少于预期 Caption 声明数
+            # 检查是否有页面检测到的切图数少于预期 Caption 声明数或原生表格候选数
             page_decls = {}
             try:
                 try:
@@ -177,13 +394,21 @@ def extract_table_crops_from_pdf(
                 except ImportError:
                     from table_validator import scan_pdf_table_declarations
                 page_decls = scan_pdf_table_declarations(pdf_path)
-                for p in target_pages:
-                    decls_on_p = [d for d in page_decls.get(p, []) if not d.get('is_continuation')]
-                    crops_on_p = sum(1 for r in extracted_crops if r.get('page_index') == p)
-                    if len(decls_on_p) > crops_on_p and p not in missing_pages:
-                        missing_pages.append(p)
             except Exception:
-                pass
+                page_decls = {}
+
+            for p in target_pages:
+                decls_on_p = [d for d in page_decls.get(p, []) if not d.get('is_continuation')]
+                crops_on_p = sum(1 for r in extracted_crops if r.get('page_index') == p)
+                native_cnt_on_p = native_signal_counts.get(p, 0)
+
+                # 条件 1：Caption 声明数多于 YOLO 切图数
+                has_caption_deficit = len(decls_on_p) > crops_on_p
+                # 条件 2：页面缺少 Caption 声明（或声明数不足），但原生信号表明存在多个独立表格结构，而 YOLO 检出切图不足 (如仅检出 1 个或更少切图)
+                has_native_multitable_deficit = (crops_on_p < native_cnt_on_p) and (native_cnt_on_p >= 2)
+
+                if (has_caption_deficit or has_native_multitable_deficit) and p not in missing_pages:
+                    missing_pages.append(p)
 
             print(f"[PDF-Tables] 本地 DocLayout-YOLO 从 {total_pages} 页 PDF 中定位并提取出 {len(extracted_crops)} 个表格区域 Crop (已覆盖页面: {sorted(list(yolo_covered_pages))})。")
 
@@ -204,11 +429,13 @@ def extract_table_crops_from_pdf(
                                 if not pp_on_p:
                                     continue
                                 decls_cnt = len([d for d in page_decls.get(p_sup, []) if not d.get('is_continuation')])
+                                native_cnt = native_signal_counts.get(p_sup, 0)
+                                expected_cnt = max(decls_cnt, native_cnt)
                                 y_on_p = [c for c in extracted_crops if c.get("page_index") == p_sup]
 
-                                # 若 PP-Structure 在该页检测到的表格数达到或超过预期声明数，且 YOLO 仅检出不完整的部分表格
+                                # 若 PP-Structure 在该页检测到的表格数达到或超过预期声明数/原生候选数，且 YOLO 仅检出不完整的部分表格
                                 # 优先采纳 PP-Structure 的整页完整切图，避免无 bbox 时重复添加
-                                if decls_cnt > 0 and len(pp_on_p) >= decls_cnt and len(y_on_p) < decls_cnt:
+                                if expected_cnt > 0 and len(pp_on_p) >= expected_cnt and len(y_on_p) < expected_cnt:
                                     extracted_crops = [c for c in extracted_crops if c.get("page_index") != p_sup]
                                     extracted_crops.extend(pp_on_p)
                                     continue

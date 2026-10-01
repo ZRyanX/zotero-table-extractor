@@ -1609,22 +1609,22 @@ def reconcile_table_captions(all_results: List[Dict[str, Any]], pdf_path: str) -
                 used_captions.add(assigned_label)
 
             # 2.5 跨页续表自动关联继承：若本页无 caption 匹配且表格无独立表号，检查是否为前序表格的跨页续表
-            if not assigned_label:
+            if not assigned_label or df.attrs.get('is_continuation'):
                 # 寻找前一个已分配有效 label 的结果
                 for prev_r in reversed(all_results):
                     if prev_r is r:
                         continue
                     prev_p = prev_r.get('page_idx', 0)
-                    prev_lbl = prev_r.get('label') or prev_r.get('df', {}).attrs.get('label')
+                    prev_lbl = prev_r.get('label') or (prev_r.get('df') is not None and prev_r['df'].attrs.get('label'))
                     if prev_p < p_idx and prev_lbl:
                         prev_df_cols = prev_r['df'].shape[1] if prev_r.get('df') is not None else 0
-                        # 判定条件：连续页（相差 <= 3 页）且列数高度匹配
-                        # 增加小表防护：若两表均为小表（<6行），禁止误判为跨页续表
-                        is_small_pair = (df.shape[0] < 6 and (prev_r.get('df') is None or prev_r['df'].shape[0] < 6))
-                        if (p_idx - prev_p <= 3) and (df.shape[1] == prev_df_cols or abs(df.shape[1] - prev_df_cols) <= 2) and not is_small_pair:
+                        is_marked_cont = bool(df.attrs.get('is_continuation'))
+                        is_small_pair = (df.shape[0] < 6 and (prev_r.get('df') is None or prev_r['df'].shape[0] < 6)) and not is_marked_cont
+                        cols_ok = (df.shape[1] == prev_df_cols or abs(df.shape[1] - prev_df_cols) <= 2 or is_marked_cont)
+                        if (p_idx - prev_p <= 3) and cols_ok and not is_small_pair:
                             assigned_label = prev_lbl
                             assigned_title = f"{prev_lbl} (续)"
-                        break
+                            break
 
             # 3. 语种感知规范回退（中文文献用 表N，英文文献用 Table N）
             if not assigned_label:
@@ -1647,6 +1647,230 @@ def reconcile_table_captions(all_results: List[Dict[str, Any]], pdf_path: str) -
         print(f"[Caption Reconciliation Error] {e}")
 
     return all_results
+
+
+def _check_sparse_continuation_table(prev_page, next_page) -> bool:
+    """
+    针对无表头文字、无网格线且文本稀疏的跨页无框续表进行高灵敏度几何连续性探测：
+    1. 校验前一页底部是否存在真实表格结构（通过 find_tables、矢量横线群或多列对齐文本确认）
+    2. 校验后一页顶部内容是否紧密承接前页（顶端位置连续性，排除新章节/图表标题与叙述性正文段落）
+    3. 校验前后两页的水平跨度一致性 (Horizontal Span Consistency)
+    4. 校验后一页顶部文字的多列对齐特征 (Column Alignment) 与列间隙特征
+    全面兼容页面旋转（page.rotation = 0, 90, 180, 270）。
+    """
+    try:
+        prev_h = getattr(prev_page.rect, "height", 842.0) if hasattr(prev_page, "rect") else 842.0
+        next_h = getattr(next_page.rect, "height", 842.0) if hasattr(next_page, "rect") else 842.0
+
+        def _get_vis_words(page):
+            try:
+                words = page.get_text("words")
+            except Exception:
+                return []
+            if not isinstance(words, (list, tuple)) or not words:
+                return []
+            rot = getattr(page, 'rotation', 0)
+            rot = rot if isinstance(rot, int) else 0
+            rot = rot % 360
+            if rot == 0:
+                return words
+            rot_mat = getattr(page, 'rotation_matrix', None)
+            if rot_mat is None:
+                return words
+            res = []
+            for w in words:
+                try:
+                    r = fitz.Rect(w[0], w[1], w[2], w[3]) * rot_mat
+                    res.append((r.x0, r.y0, r.x1, r.y1, w[4], w[5], w[6], w[7]))
+                except Exception:
+                    res.append(w)
+            return res
+
+        # 1. 探查后继页 (next_page) 顶部的文字分布与顶端位置连续性
+        next_words = _get_vis_words(next_page)
+        if not next_words or len(next_words) < 4:
+            return False
+
+        # 过滤页眉 (一般位于顶部 30pt 以内或 < 5% 页高)
+        top_words = [w for w in next_words if 30.0 <= w[1] <= next_h * 0.48 and w[3] <= next_h * 0.52]
+        if len(top_words) < 4:
+            return False
+
+        top_y0 = min(w[1] for w in top_words)
+        # 若顶部文字起点离页顶过远（超过页高 35%），则并非紧密承接前页顶部的续表
+        if top_y0 > next_h * 0.35:
+            return False
+
+        # 将 top_words 按纵向坐标分行 (容差 5pt)
+        sorted_words = sorted(top_words, key=lambda w: (round(w[1] / 6.0) * 6.0, w[0]))
+        lines = []
+        curr_line = [sorted_words[0]]
+        for w in sorted_words[1:]:
+            if abs(w[1] - curr_line[-1][1]) <= 5.0:
+                curr_line.append(w)
+            else:
+                lines.append(sorted(curr_line, key=lambda x: x[0]))
+                curr_line = [w]
+        if curr_line:
+            lines.append(sorted(curr_line, key=lambda x: x[0]))
+
+        if len(lines) < 2:
+            return False
+
+        # 终止条件校验：若首行属于新章节标题、新图题或新独立表题，直接拒绝
+        first_line_text = " ".join(w[4] for w in lines[0] if len(w) > 4 and w[4]).strip()
+        if re.match(r'^(?:\d+[\.\s]|[A-Z][\.\s]|Chapter|Section|第[一二三四五六七八九十\d]+[章节篇]|Conclusion|References|Acknowledgements|参考文献|致谢|图|Fig)', first_line_text, re.IGNORECASE):
+            return False
+        if re.match(r'^(?:附表|附录表|补充表|表|Table|Tab\.)\s*\d+', first_line_text, re.IGNORECASE) and not re.search(r'(?:续|cont)', first_line_text, re.IGNORECASE):
+            return False
+
+        # 正文停用词密度过滤：若包含高比例常见叙述性停用词，说明为正文自然语言段落而非表格元胞
+        prose_stopwords = {'the', 'of', 'and', 'in', 'to', 'a', 'is', 'that', 'for', 'it', 'as', 'was', 'with', 'be', 'by', 'on', 'not', 'this', 'are', 'or', 'an', 'they', 'which', 'from', 'at', 'we', 'were', 'has', 'have', 'had', 'been', 'their', 'which', 'its', 'also', 'between', 'these', 'those'}
+        tokens = [w[4].lower().strip(".,;:?!()[]'\"") for w in top_words if len(w) > 4 and w[4]]
+        if tokens:
+            sw_ratio = sum(1 for t in tokens if t in prose_stopwords) / len(tokens)
+            if sw_ratio >= 0.22:
+                return False
+
+        # 多列对齐特征与列间隙探测 (Column Alignment)
+        line_col_starts = []
+        for line in lines:
+            starts = [line[0][0]]
+            for i in range(1, len(line)):
+                gap = line[i][0] - line[i-1][2]
+                if gap >= 12.0:
+                    starts.append(line[i][0])
+            line_col_starts.append(starts)
+
+        # 统计跨行保持几何对齐的列坐标聚类 (容差 12pt)
+        col_clusters = []
+        for l_idx, starts in enumerate(line_col_starts):
+            for s in starts:
+                matched = False
+                for cl in col_clusters:
+                    if abs(cl['center'] - s) <= 12.0:
+                        cl['lines'].add(l_idx)
+                        cl['points'].append(s)
+                        cl['center'] = sum(cl['points']) / len(cl['points'])
+                        matched = True
+                        break
+                if not matched:
+                    col_clusters.append({'center': s, 'lines': {l_idx}, 'points': [s]})
+
+        # 跨越多行（>= 2 行）保持对齐的列数
+        aligned_col_count = sum(1 for cl in col_clusters if len(cl['lines']) >= 2)
+        has_multi_col = any(len(starts) >= 2 for starts in line_col_starts)
+        if aligned_col_count < 2 or not has_multi_col:
+            return False
+
+        # 2. 探查前一页底部表格的水平区间与底部位置（必须存在触底表格，杜绝普通正文误判）
+        prev_span = None
+        # 优先通过 find_tables 获取前一页最底部的表格
+        try:
+            prev_tabs = prev_page.find_tables()
+            if prev_tabs and hasattr(prev_tabs, 'tables') and isinstance(prev_tabs.tables, (list, tuple)):
+                for tb in prev_tabs.tables:
+                    bbox = getattr(tb, 'bbox', None)
+                    if bbox and len(bbox) == 4 and bbox[3] >= prev_h * 0.45:
+                        if prev_span is None or bbox[3] > prev_span[3]:
+                            prev_span = [bbox[0], bbox[1], bbox[2], bbox[3]]
+        except Exception:
+            pass
+
+        # 尝试通过矢量横线 (三线表/网格表) 探测前页底部表格
+        if prev_span is None:
+            try:
+                drawings = prev_page.get_drawings()
+                rot_prev = getattr(prev_page, 'rotation', 0)
+                rot_prev = rot_prev if isinstance(rot_prev, int) else 0
+                rot_mat_p = getattr(prev_page, 'rotation_matrix', None) if (rot_prev % 360) != 0 else None
+                if drawings and isinstance(drawings, (list, tuple)):
+                    h_lines = []
+                    for d in drawings:
+                        for it in d.get('items', []):
+                            if it[0] == 'l':
+                                p1, p2 = it[1], it[2]
+                                if rot_mat_p:
+                                    try: p1, p2 = p1 * rot_mat_p, p2 * rot_mat_p
+                                    except Exception: pass
+                                y_diff = abs(getattr(p1, 'y', 0) - getattr(p2, 'y', 0))
+                                if y_diff <= 2.0 and p1.y >= prev_h * 0.45:
+                                    h_lines.append((min(p1.x, p2.x), min(p1.y, p2.y), max(p1.x, p2.x), max(p1.y, p2.y)))
+                            elif it[0] == 're':
+                                r = it[1]
+                                if rot_mat_p:
+                                    try: r = fitz.Rect(r) * rot_mat_p
+                                    except Exception: pass
+                                if getattr(r, 'height', 0) <= 3.5 and getattr(r, 'y1', 0) >= prev_h * 0.45:
+                                    h_lines.append((r.x0, r.y0, r.x1, r.y1))
+                    if len(h_lines) >= 2:
+                        prev_span = [
+                            min(l[0] for l in h_lines),
+                            min(l[1] for l in h_lines),
+                            max(l[2] for l in h_lines),
+                            max(l[3] for l in h_lines)
+                        ]
+            except Exception:
+                pass
+
+        # 尝试通过文字排布探测前页下半部分的无框多列文本表格 (严格校验列对齐，杜绝正文段落)
+        if prev_span is None:
+            try:
+                prev_words = _get_vis_words(prev_page)
+                if isinstance(prev_words, (list, tuple)) and prev_words:
+                    low_words = [w for w in prev_words if w[1] >= prev_h * 0.45 and w[3] <= prev_h * 0.98]
+                    if len(low_words) >= 4:
+                        low_tokens = [w[4].lower().strip(".,;:?!()[]'\"") for w in low_words if len(w) > 4 and w[4]]
+                        sw_ratio_low = sum(1 for t in low_tokens if t in prose_stopwords) / max(1, len(low_tokens))
+                        if sw_ratio_low < 0.22:
+                            p_sorted = sorted(low_words, key=lambda w: (round(w[1] / 6.0) * 6.0, w[0]))
+                            p_lines = []
+                            p_curr = [p_sorted[0]]
+                            for w in p_sorted[1:]:
+                                if abs(w[1] - p_curr[-1][1]) <= 5.0:
+                                    p_curr.append(w)
+                                else:
+                                    p_lines.append(p_curr)
+                                    p_curr = [w]
+                            if p_curr:
+                                p_lines.append(p_curr)
+                            if len(p_lines) >= 2:
+                                p_has_col = any(len([1 for i in range(1, len(l)) if l[i][0] - l[i-1][2] >= 12.0]) >= 1 for l in p_lines)
+                                if p_has_col:
+                                    prev_span = [
+                                        min(w[0] for w in low_words),
+                                        min(w[1] for w in low_words),
+                                        max(w[2] for w in low_words),
+                                        max(w[3] for w in low_words)
+                                    ]
+            except Exception:
+                pass
+
+        if prev_span is None:
+            return False
+
+        # 3. 水平跨度一致性检查 (Horizontal Span Consistency)
+        next_x0 = min(w[0] for w in top_words)
+        next_x1 = max(w[2] for w in top_words)
+        prev_x0, prev_x1 = prev_span[0], prev_span[2]
+
+        prev_w = max(1.0, prev_x1 - prev_x0)
+        next_w = max(1.0, next_x1 - next_x0)
+        if prev_w < 50.0 or next_w < 50.0:
+            return False
+
+        x_overlap = max(0.0, min(prev_x1, next_x1) - max(prev_x0, next_x0))
+        min_w = min(prev_w, next_w)
+        overlap_ratio = x_overlap / min_w
+        width_ratio = min(prev_w, next_w) / max(prev_w, next_w)
+
+        # 水平交叠比例低于 60% 或总宽度差距过大，不视为同一张表的跨页承接
+        if overlap_ratio < 0.60 or width_ratio < 0.45:
+            return False
+
+        return True
+    except Exception:
+        return False
 
 
 def group_continuation_atomic_blocks(pdf_path: str, pages: List[int]) -> List[List[int]]:
@@ -1701,7 +1925,14 @@ def group_continuation_atomic_blocks(pdf_path: str, pages: List[int]) -> List[Li
                     data_token_count = sum(1 for l in lines if re.match(r'^-?\d+(?:\.\d+)?$', l) or l in ('/', '-', '—', '–', 'n.d.', 'bdl', 'b.d.l.') or re.match(r'^[A-Za-z0-9\-_–—/\.\(\)]+$', l))
                     is_dense_data_table = len(lines) >= 15 and (data_token_count / len(lines) >= 0.50)
 
-                    if is_explicit_cont or is_dense_data_table:
+                    # 累加判定条件 3：稀疏无框多列对齐续表探测
+                    is_sparse_cont = False
+                    try:
+                        is_sparse_cont = _check_sparse_continuation_table(doc[next_p - 1], doc[next_p])
+                    except Exception:
+                        pass
+
+                    if is_explicit_cont or is_dense_data_table or is_sparse_cont:
                         all_target_pages.add(next_p)
                         next_p += 1
                     else:
@@ -2315,27 +2546,45 @@ def extract_tables_from_pdf(
         if p is not None:
             _add_candidate(p, 'inspector_table')
 
-    # 对未命中的页面进行轻量矢量线框补扫 (PyMuPDF find_tables 仅花费数毫秒)
+    # 对未命中的页面进行自适应分块全篇矢量线框探测 (无硬编码页数上限，自适应轻量级绘图探测)
     try:
         with fitz.open(pdf_path) as doc_check:
-            pages_to_check = range(len(doc_check)) if not candidate_sources else [p for p in range(len(doc_check)) if p not in candidate_sources]
-            max_vec_scan = 300 if not candidate_sources else 150
-            for p_idx in pages_to_check:
-                if p_idx >= max_vec_scan:
-                    break
-                p_obj = doc_check[p_idx]
-                try:
-                    tabs = p_obj.find_tables()
-                    if tabs and tabs.tables:
-                        valid_vec_tabs = [tb for tb in tabs.tables if tb.row_count >= 2 and tb.col_count >= 2]
-                        if valid_vec_tabs:
-                            _add_candidate(p_idx, 'vector_find_tables')
-                except Exception:
-                    pass
+            total_pages = len(doc_check)
+            pages_to_check = [p for p in range(total_pages) if p not in candidate_sources]
+            # 自适应分块：根据文档总页数自适应调节分块大小，分块间显式清理内存引用
+            chunk_size = 50 if total_pages <= 300 else 100
+            for chunk_start in range(0, len(pages_to_check), chunk_size):
+                chunk = pages_to_check[chunk_start:chunk_start + chunk_size]
+                for p_idx in chunk:
+                    p_obj = None
+                    try:
+                        p_obj = doc_check[p_idx]
+                        # 轻量矢量绘图预检：对于纯文本长篇专著/附录，若无矢量线条/矩形，直接跳过重量级版面分析
+                        has_drawings = True
+                        try:
+                            drawings = p_obj.get_drawings()
+                            if isinstance(drawings, (list, tuple)) and len(drawings) == 0:
+                                has_drawings = False
+                        except Exception:
+                            has_drawings = True
+
+                        if has_drawings:
+                            tabs = p_obj.find_tables()
+                            if tabs and hasattr(tabs, 'tables') and tabs.tables:
+                                valid_vec_tabs = [
+                                    tb for tb in tabs.tables
+                                    if getattr(tb, 'row_count', 0) >= 2 and getattr(tb, 'col_count', 0) >= 2
+                                ]
+                                if valid_vec_tabs:
+                                    _add_candidate(p_idx, 'vector_find_tables')
+                    except Exception:
+                        pass
+                    finally:
+                        p_obj = None
     except Exception:
         pass
 
-    # 自动包含可能的跨页续表后继页（结合关键字、版面检测、密集数据与连续性）
+    # 自动包含可能的跨页续表后继页（结合关键字、版面检测、密集数据、几何列对齐与连续性）
     try:
         doc = fitz.open(pdf_path)
         base_pages = sorted(list(candidate_sources.keys()))
@@ -2386,15 +2635,25 @@ def extract_tables_from_pdf(
                 except Exception:
                     pass
 
-                # 4. 纯图续表（前一页为图片表且当前页同样为大图页）
-                cond_img_cont = ('image_scan' in candidate_sources.get(p, set()) and p in image_table_pages and next_p in image_table_pages)
+                # 4. 纯图续表（前序页为图片表且当前页同样为大图页）
+                prev_img_p = next_p - 1
+                cond_img_cont = (prev_img_p in image_table_pages and next_p in image_table_pages and ('image_scan' in candidate_sources.get(p, set()) or any('image_continuation' in s for s in candidate_sources.get(prev_img_p, set()))))
 
-                if cond_kw or cond_dense or cond_vec_table or cond_img_cont:
+                # 5. 稀疏/无框跨页续表判定 (几何列对齐、水平跨度一致性与页顶连续性，紧邻前序页连续链)
+                cond_sparse_cont = False
+                try:
+                    prev_p_obj = doc[next_p - 1]
+                    cond_sparse_cont = _check_sparse_continuation_table(prev_p_obj, next_page)
+                except Exception:
+                    pass
+
+                if cond_kw or cond_dense or cond_vec_table or cond_img_cont or cond_sparse_cont:
                     reasons = []
                     if cond_kw: reasons.append("keyword")
                     if cond_dense: reasons.append("dense_data")
                     if cond_vec_table: reasons.append("vector_grid")
                     if cond_img_cont: reasons.append("image_continuation")
+                    if cond_sparse_cont: reasons.append("sparse_alignment")
                     _add_candidate(next_p, f"continuation({','.join(reasons)})")
                     next_p += 1
                 else:
@@ -2507,6 +2766,19 @@ def extract_tables_from_pdf(
                 if ta_page not in extracted_pages and not is_table_low_quality(ta['df']):
                     all_results.append(ta)
                     extracted_pages.add(ta_page)
+
+    # 标记来自续表候选页且未显式命名的表格片段，辅助跨页拼接引擎
+    continuation_pages = set()
+    for p_cand, srcs in candidate_sources.items():
+        if any('continuation' in s for s in srcs):
+            continuation_pages.add(p_cand)
+    if all_results and continuation_pages:
+        for r in all_results:
+            p_idx = r.get('page_idx')
+            if p_idx in continuation_pages:
+                df_item = r.get('df')
+                if df_item is not None and hasattr(df_item, 'attrs') and not df_item.attrs.get('label'):
+                    df_item.attrs['is_continuation'] = True
 
     # Step 4: 预对齐真实表号 + 跨页续表合并
     if all_results:

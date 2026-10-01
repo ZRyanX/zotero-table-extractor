@@ -27,8 +27,8 @@ description: 从 Zotero 选中条目（依赖 ai4paper-zotero MCP 获取物理�
               ├─ Tagged PDF / PDF/UA 语义结构树检测
               ├─ pdf-inspector 分类与 Markdown 表格定位
               ├─ 全图扫描页 / 图像密集页检测
-              ├─ 矢量线框 (find_tables) 毫秒级探测
-              └─ 跨页续表多模态追溯 (关键词/纯数据密度/网格线/图片续表)
+              ├─ 矢量线框 (find_tables) 全篇自适应分块探测 (绘图轻量预检，无页数硬上限)
+              └─ 跨页续表多模态追溯 (关键词/纯数据密度/网格线/图片/无框稀疏多列对齐)
               │
               ├──────────┬──────────────────┐
               │          │                  │
@@ -44,7 +44,7 @@ description: 从 Zotero 选中条目（依赖 ai4paper-zotero MCP 获取物理�
               │
               ├─ 2D bbox 空间重叠 (IoU/IoM) + 表号标签防冲突聚类，杜绝同页多表误合并
               ├─ 任意两方相似度 >= 0.75 → 判定一致并采用投票结果 (结构树绝对优先)
-              ├─ 低置信度或检验瑕疵页 → DocLayout-YOLO 切图 (覆盖不足时 PP-Structure 补扫) + PaddleOCR-VL 接管
+              ├─ 低置信度或检验瑕疵页 → DocLayout-YOLO 切图 (Caption缺失/多表覆盖不足时原生信号校验 + PP-Structure 补扫) + PaddleOCR-VL 接管
               ├─ 表级精细对齐与替换策略：精准替换瑕疵表，保留同页未受干扰的有效原生表
               ├─ 7 阶轻量直通安全后处理（公式注入防御、数值类型推断、多级表头展平、付费墙过滤）
               └─ 跨页续表与多分页自适应合并

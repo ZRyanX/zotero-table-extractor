@@ -1248,7 +1248,7 @@ def merge_continuation_tables(dfs):
         raw_lbl = str(df.attrs.get('label', '')).lower()
         title_str = str(df.attrs.get('table_title', '')).lower()
         combined_hint = f"{raw_lbl} {title_str}"
-        is_explicit_cont = bool(re.search(r'(?:续表|接上表|续上表|（续）|\(续\)|continued|cont\'?d|\(cont\b|cont\.)', combined_hint)) and page_nearby
+        is_explicit_cont = bool(re.search(r'(?:续表|接上表|续上表|（续）|\(续\)|continued|cont\'?d|\(cont\b|cont\.)', combined_hint) or df.attrs.get('is_continuation')) and page_nearby
         
         # 列匹配：列数差异小 (<=4) 或存在明显学术列名重合
         common_cols = set(_normalize_col_name(c) for c in df.columns) & set(_normalize_col_name(c) for c in prev_df.columns)
@@ -1283,9 +1283,9 @@ def merge_continuation_tables(dfs):
             continue
 
         if is_same_label or is_unlabeled_cont:
-            if not df.attrs.get('label') and prev_df.attrs.get('label'):
+            if (not df.attrs.get('label') or df.attrs.get('is_continuation')) and prev_df.attrs.get('label'):
                 df.attrs['label'] = prev_df.attrs.get('label')
-            if not df.attrs.get('table_title') and prev_df.attrs.get('table_title'):
+            if (not df.attrs.get('table_title') or df.attrs.get('is_continuation')) and prev_df.attrs.get('table_title'):
                 df.attrs['table_title'] = prev_df.attrs.get('table_title')
             current_group.append(df)
         else:
