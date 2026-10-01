@@ -13,7 +13,7 @@ import re
 from typing import List, Optional
 
 LATIN_PAGE_HINT = re.compile(
-    r'(?:^|[^a-z0-9_])(?:fig(?:ure)?s?|tables?|charts?|schemes?|equations?|eqs?|formulae?|figura|figure|tabella|tabelle|grafico|grafici|schema|schemi|equazione|equazioni)(?:$|[^a-z0-9_])',
+    r'(?:^|[^a-z0-9_])(?:fig(?:ure)?s?|tables?|tab(?:\.|\b)|tabs(?:\.|\b)|charts?|schemes?|equations?|eqs?|formulae?|figura|figure|tabella|tabelle|grafico|grafici|schema|schemi|equazione|equazioni)(?:$|[^a-z0-9_])',
     re.IGNORECASE
 )
 
@@ -32,7 +32,7 @@ MATHEMATICAL_PAGE_HINT = re.compile(r'[=∑∫√±≤≥≈≠]')
 
 # 续表标记（跨页续表常见前缀，无需完整 Table N 关键词）
 CONTINUATION_HINT = re.compile(
-    r'(?:continued|cont\'d|contd|续表|续上表|（续）|\(续\)|接上页|接上表)',
+    r'(?:continued|cont\'d|contd|续表|续上表|（续）|\(续\)|接上页|接上表|\bcont\.?\b|\b续\b)',
     re.IGNORECASE
 )
 
@@ -58,11 +58,37 @@ def _has_dense_data_rows(page_text: str, min_rows: int = 3) -> bool:
     return False
 
 
+def _has_tabular_text_rows(page_text: str, min_rows: int = 2) -> bool:
+    """
+    启发式检测页面是否包含纯文字对比表、术语表或对齐列（涵盖无数值/少量数值表格）。
+    判据：至少 min_rows 行包含制表符 '\t'、竖线 '|' 或多列空格分列对齐结构。
+    """
+    if not page_text:
+        return False
+    lines = page_text.split('\n')
+    tab_or_pipe_count = 0
+    aligned_col_count = 0
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        if '\t' in line or line.count('|') >= 2:
+            tab_or_pipe_count += 1
+            if tab_or_pipe_count >= min_rows:
+                return True
+        cols = re.split(r'\s{2,}|\t', line)
+        if len(cols) >= 2 and all(len(c.strip()) <= 60 for c in cols):
+            aligned_col_count += 1
+            if aligned_col_count >= 3:
+                return True
+    return False
+
+
 def page_may_contain_tables(page_text: str) -> bool:
     """
     判断 PDF 页面文本是否可能包含表格或图表元素。
     如果页面纯图片/无可提取文本，或者匹配到中/英/俄文图表关键词、
-    数学符号、续表标记、或密集数据行，则返回 True。
+    数学符号、续表标记、密集数据行、或文本对齐对比结构，则返回 True。
     """
     if not page_text or len(page_text.strip()) < 80:
         # 无文本或极少文本（如仅有页眉页脚）的扫描页/插图大表页，必须交由视觉模型检测
@@ -80,6 +106,10 @@ def page_may_contain_tables(page_text: str) -> bool:
 
     # 数据密集行检测：捕获跨页续表、纯数据页（无标题关键词）
     if _has_dense_data_rows(page_text):
+        return True
+
+    # 纯文字对比表/术语表检测：捕获无大量数字的排版对齐表格
+    if _has_tabular_text_rows(page_text):
         return True
 
     return False

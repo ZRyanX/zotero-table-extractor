@@ -19,9 +19,9 @@ except ImportError:
 
 # Table post-processing helpers
 try:
-    from .table_postprocess import postprocess_dataframe, merge_continuation_tables
+    from .table_postprocess import postprocess_dataframe, merge_continuation_tables, is_paywall_table
 except ImportError:
-    from table_postprocess import postprocess_dataframe, merge_continuation_tables
+    from table_postprocess import postprocess_dataframe, merge_continuation_tables, is_paywall_table
 
 
 def make_safe_filename(name):
@@ -130,8 +130,35 @@ def save_tables_to_excel(dataframes, output_path, headers=None, single_file=True
     if not norm_dfs:
         return False
 
+    # 0. 隔离被识别为付费墙/登录警告的表格（避免被续表合并引擎误当作空表丢弃）
+    active_dfs = []
+    paywall_rej_count = 0
+    for df in norm_dfs:
+        if df is not None and (df.attrs.get('rejected_reason') == 'paywall' or is_paywall_table(df)):
+            raw_rej = df.attrs.get('rejected_raw_df', df)
+            if raw_rej is not None and not raw_rej.empty:
+                rej_dir = output_path if (os.path.isdir(output_path) or not output_path.endswith('.xlsx')) else os.path.dirname(output_path)
+                rej_dir = os.path.join(rej_dir, "rejected")
+                os.makedirs(rej_dir, exist_ok=True)
+                paywall_rej_count += 1
+                rej_path = os.path.join(rej_dir, f"paywall_table_{paywall_rej_count}.xlsx")
+                try:
+                    rej_export = raw_rej.copy()
+                    if hasattr(rej_export, 'attrs') and 'rejected_raw_df' in rej_export.attrs:
+                        rej_export.attrs = {k: v for k, v in rej_export.attrs.items() if k != 'rejected_raw_df'}
+                    rej_export.to_excel(rej_path, index=False)
+                    autofit_excel_columns(rej_path)
+                    print(f"Isolated paywall table to: {rej_path}")
+                except Exception as e_rej:
+                    print(f"Failed to isolate paywall table: {e_rej}")
+            continue
+        active_dfs.append(df)
+
+    if not active_dfs:
+        return paywall_rej_count > 0
+
     # 1. 预先合并跨页未命名续表/同名续表，避免未命名 1 行续表被 postprocess 当作空表过滤
-    merged_raw_dfs = merge_continuation_tables(norm_dfs)
+    merged_raw_dfs = merge_continuation_tables(active_dfs)
 
     cleaned_dfs = []
     for df in merged_raw_dfs:
@@ -149,6 +176,25 @@ def save_tables_to_excel(dataframes, output_path, headers=None, single_file=True
                 print(f"[Filter] 表格 {safe_check} 已由先前步骤提取，跳过以避免重复")
                 continue
         proc = postprocess_dataframe(df, headers)
+        if proc is not None and proc.attrs.get('rejected_reason') == 'paywall':
+            raw_rej = proc.attrs.get('rejected_raw_df', df)
+            if raw_rej is not None and not raw_rej.empty:
+                rej_dir = output_path if (os.path.isdir(output_path) or not output_path.endswith('.xlsx')) else os.path.dirname(output_path)
+                rej_dir = os.path.join(rej_dir, "rejected")
+                os.makedirs(rej_dir, exist_ok=True)
+                paywall_rej_count += 1
+                rej_path = os.path.join(rej_dir, f"paywall_table_{paywall_rej_count}.xlsx")
+                try:
+                    rej_export = raw_rej.copy()
+                    if hasattr(rej_export, 'attrs') and 'rejected_raw_df' in rej_export.attrs:
+                        rej_export.attrs = {k: v for k, v in rej_export.attrs.items() if k != 'rejected_raw_df'}
+                    rej_export.to_excel(rej_path, index=False)
+                    autofit_excel_columns(rej_path)
+                    print(f"Isolated paywall table to: {rej_path}")
+                except Exception as e_rej:
+                    print(f"Failed to isolate paywall table: {e_rej}")
+            continue
+
         if proc is not None and not proc.empty:
             if is_metadata_table(proc):
                 print(f"[Filter] 过滤非数据表/元数据表: {proc.attrs.get('table_title') or proc.attrs.get('label') or '未命名'}")
@@ -159,7 +205,7 @@ def save_tables_to_excel(dataframes, output_path, headers=None, single_file=True
             cleaned_dfs.append(proc)
 
     if not cleaned_dfs:
-        return False
+        return paywall_rej_count > 0
         
     if single_file:
         # Ensure parent directory exists
@@ -174,6 +220,11 @@ def save_tables_to_excel(dataframes, output_path, headers=None, single_file=True
             with pd.ExcelWriter(output_path) as writer:
                 main_count = 0
                 supp_count = 0
+                unlabelled_count = 0
+                has_chapter_labels = any(
+                    bool(re.match(r'^(?:附表|附录表|表|Supplementary\s+Table|Table)\s*\d+[\-–—\.]\d+', str(d.attrs.get('label', '')).strip(), re.IGNORECASE))
+                    for d in cleaned_dfs
+                )
                 for idx, df in enumerate(cleaned_dfs):
                     label = df.attrs.get('label')
                     title = df.attrs.get('table_title')
@@ -182,7 +233,10 @@ def save_tables_to_excel(dataframes, output_path, headers=None, single_file=True
                     if label:
                         sheet_name = re.sub(r'[\\/*?:\[\]]', '_', label)[:31].strip()
                     else:
-                        if is_supp:
+                        if has_chapter_labels:
+                            unlabelled_count += 1
+                            sheet_name = f"unlabelled_{unlabelled_count}"
+                        elif is_supp:
                             supp_count += 1
                             sheet_name = f"Supplementary Table {supp_count}"
                         else:
@@ -207,6 +261,7 @@ def save_tables_to_excel(dataframes, output_path, headers=None, single_file=True
         captions = []
         main_count = 0
         supp_count = 0
+        unlabelled_count = 0
         written_files = {}  # tbl_path -> DataFrame (with preserved .attrs)
         for idx, df in enumerate(cleaned_dfs):
             # Try to resolve title/caption and label from attrs
@@ -258,17 +313,19 @@ def save_tables_to_excel(dataframes, output_path, headers=None, single_file=True
             if extracted_label:
                 file_label = extracted_label
             else:
-                # 若全文普遍使用多级章节表号（如 表1-1、表1.1），无表题的零散表格碎片不单独导出为泛化数字 表1、表2
+                # 若全文普遍使用多级章节表号（如 表1-1、表1.1），无表题的零散表格碎片导出为 unlabelled_N
                 if has_chapter_labels:
-                    print(f"Skipping unlabelled table fragment on page {df.attrs.get('page_idx')} in chapter document...")
-                    continue
-                # 语种感知回退（中文文献用 表1、附表1；英文文献用 Table 1、Table S1）
-                if is_supp:
-                    supp_count += 1
-                    file_label = f"附表{supp_count}" if is_cn else f"Table S{supp_count}"
+                    unlabelled_count += 1
+                    file_label = f"unlabelled_{unlabelled_count}"
+                    print(f"Exporting unlabelled table fragment on page {df.attrs.get('page_idx')} as {file_label} in chapter document...")
                 else:
-                    main_count += 1
-                    file_label = f"表{main_count}" if is_cn else f"Table {main_count}"
+                    # 语种感知回退（中文文献用 表1、附表1；英文文献用 Table 1、Table S1）
+                    if is_supp:
+                        supp_count += 1
+                        file_label = f"附表{supp_count}" if is_cn else f"Table S{supp_count}"
+                    else:
+                        main_count += 1
+                        file_label = f"表{main_count}" if is_cn else f"Table {main_count}"
                 
             file_label = file_label.replace('\xa0', ' ').strip()
             safe_label = make_safe_filename(file_label)

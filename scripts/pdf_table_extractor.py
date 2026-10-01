@@ -510,12 +510,13 @@ def classify_and_extract_via_inspector(pdf_path: str, caption_page_map: Optional
             logger.debug(f"[pdf-inspector] extract_via_structure_tree notice: {e_st}")
 
         # 2. 若非扫描件，优先使用 extract_pages_markdown 获取逐页 Markdown，精准绑定表格与页码
-        if result['pdf_type'] != 'scanned' or not result['pages_needing_ocr']:
+        if result['pdf_type'] not in ('scanned', 'image_based') and not result['pages_needing_ocr']:
             if hasattr(pdf_inspector, 'extract_pages_markdown'):
                 try:
                     pages_res = pdf_inspector.extract_pages_markdown(pdf_path)
-                    result['pdf_type'] = 'text_based'
-                    result['confidence'] = max(result['confidence'], 0.95)
+                    if result['pdf_type'] in ('unknown', ''):
+                        result['pdf_type'] = 'text_based'
+                    result['confidence'] = max(result['confidence'], 0.85)
                     result['pages_with_tables'] = list(getattr(pages_res, 'pages_with_tables', []))
                     if not result['pages_needing_ocr']:
                         result['pages_needing_ocr'] = list(getattr(pages_res, 'pages_needing_ocr', []))
@@ -681,7 +682,7 @@ def extract_table_caption_from_page(page, table_bbox: Optional[List[float]] = No
     try:
         if table_bbox:
             y_top = table_bbox[1]
-            clip_rect = fitz.Rect(0, max(0, y_top - 95), page.rect.width, max(0, y_top - 1))
+            clip_rect = fitz.Rect(0, max(0, y_top - 140), page.rect.width, max(0, y_top - 1))
             words = page.get_text("words", clip=clip_rect)
         else:
             words = page.get_text("words")
@@ -706,7 +707,7 @@ def extract_table_caption_from_page(page, table_bbox: Optional[List[float]] = No
                 lines.append(' '.join(curr_line))
 
             for i, line in enumerate(lines):
-                if any(k in line for k in ['期 雷欣儒等', '第 11 期', 'Vol.', 'pp.', 'http://', 'doi:', 'Journal of', 'Acta ']):
+                if any(k in line for k in ['期 雷欣儒等', '第 11 期', 'http://', 'Journal of', 'Acta ']) and not TABLE_LABEL_RE.search(line):
                     continue
                 m = TABLE_LABEL_RE.search(line)
                 if m:
@@ -716,7 +717,8 @@ def extract_table_caption_from_page(page, table_bbox: Optional[List[float]] = No
                     after = line[pos + len(m.group(0)):].strip()
                     if any(before.rstrip().endswith(p) for p in ['（', '(', '从', '见', '如', '由', '根据', '在']):
                         continue
-                    if after.startswith(('）', ')', '中', '可以', '所示', '可知', '看出', ':', '：')):
+                    after_clean = after.lstrip(':：').strip()
+                    if after_clean.startswith(('）', ')', '中', '可以', '所示', '可知', '看出')):
                         continue
                     
                     cap_parts = [line[pos:]]
@@ -746,13 +748,14 @@ def extract_table_caption_from_page(page, table_bbox: Optional[List[float]] = No
                 i += 1
         
         for i, line in enumerate(merged_lines):
-            if any(k in line for k in ['期 雷欣儒等', '第 11 期', 'Vol.', 'pp.', 'http://', 'doi:', 'Journal of', 'Acta ']):
+            if any(k in line for k in ['期 雷欣儒等', '第 11 期', 'http://', 'Journal of', 'Acta ']) and not TABLE_LABEL_RE.search(line):
                 continue
             m = re.search(r'^(' + TABLE_LABEL_PATTERN + r')[\.\:\s]*(.*)', line, re.IGNORECASE)
             if m:
                 label = format_table_label(m.group(1))
                 after = m.group(2).strip()
-                if after.startswith(('）', ')', '中', '可以', '所示', '可知', '看出')):
+                after_clean = after.lstrip(':：').strip()
+                if after_clean.startswith(('）', ')', '中', '可以', '所示', '可知', '看出')):
                     continue
                 collected = [line]
                 for j in range(i + 1, min(i + 3, len(merged_lines))):
@@ -779,8 +782,8 @@ def extract_table_caption_from_page(page, table_bbox: Optional[List[float]] = No
                 ref_label = f'表{num}'
                 if ref_label in page_text:
                     return ref_label, f'{ref_label} {title}'
-    except Exception:
-        pass
+    except Exception as e_cap:
+        logger.debug(f"extract_table_caption_from_page notice: {e_cap}")
     return '', ''
 
 
@@ -828,7 +831,7 @@ def extract_via_find_tables(pdf_path: str, pages: Optional[List[int]] = None) ->
                         rows = table.extract()
                     except Exception:
                         continue
-                    if not rows or len(rows) < 2:
+                    if not rows or len(rows) < 1:
                         continue
 
                     clean_rows = []
@@ -837,10 +840,13 @@ def extract_via_find_tables(pdf_path: str, pages: Optional[List[int]] = None) ->
                         if any(c for c in clean_row):
                             clean_rows.append(clean_row)
 
-                    if len(clean_rows) < 2:
+                    if len(clean_rows) < 1:
                         continue
 
-                    df = pd.DataFrame(clean_rows[1:], columns=clean_rows[0])
+                    if len(clean_rows) == 1:
+                        df = pd.DataFrame(clean_rows, columns=[f"Col_{i+1}" for i in range(len(clean_rows[0]))])
+                    else:
+                        df = pd.DataFrame(clean_rows[1:], columns=clean_rows[0])
                     df.attrs['extractor'] = 'find_tables'
                     t_bbox = list(table.bbox) if table.bbox else None
                     label, caption = extract_table_caption_from_page(page, t_bbox)
@@ -893,16 +899,19 @@ def extract_via_pdfplumber(pdf_path: str, pages: Optional[List[int]] = None) -> 
                 for tbl_idx, table in enumerate(tables):
                     try:
                         data = table.extract()
-                        if not data or len(data) < 2:
+                        if not data or len(data) < 1:
                             continue
                         clean_rows = []
                         for row in data:
                             clean_row = [("" if cell is None else str(cell).strip()) for cell in row]
                             if any(c for c in clean_row):
                                 clean_rows.append(clean_row)
-                        if len(clean_rows) < 2:
+                        if len(clean_rows) < 1:
                             continue
-                        df = pd.DataFrame(clean_rows[1:], columns=clean_rows[0])
+                        if len(clean_rows) == 1:
+                            df = pd.DataFrame(clean_rows, columns=[f"Col_{i+1}" for i in range(len(clean_rows[0]))])
+                        else:
+                            df = pd.DataFrame(clean_rows[1:], columns=clean_rows[0])
                         df.attrs['extractor'] = 'pdfplumber'
                         df.attrs['page_idx'] = page_idx
                         t_bbox = list(table.bbox) if table.bbox else None
@@ -970,17 +979,22 @@ def extract_via_camelot(pdf_path: str, pages: Optional[List[int]] = None) -> Lis
         else:
             page_str = 'all'
 
+        pages_with_camelot = set()
         for flavor in ['lattice', 'stream']:
             try:
                 tables = camelot.read_pdf(pdf_path, flavor=flavor, pages=page_str)
                 if tables and len(tables) > 0:
                     for tbl_idx, table in enumerate(tables):
                         df = table.df
-                        if df is None or df.empty or len(df) < 2:
+                        if df is None or df.empty or len(df) < 1:
                             continue
+                        page_idx = int(getattr(table, 'page', 1)) - 1
+                        if flavor == 'stream':
+                            existing_on_page = [r['df'] for r in results if r.get('page_idx') == page_idx]
+                            if any(_table_similarity(ex, df) >= 0.50 for ex in existing_on_page):
+                                continue
                         df = df_map(df, lambda x: str(x).strip() if x is not None else "")
                         df.attrs['extractor'] = f'camelot_{flavor}'
-                        page_idx = table.page - 1 if hasattr(table, 'page') else tbl_idx
                         df.attrs['page_idx'] = page_idx
                         results.append({
                             'df': df,
@@ -988,8 +1002,7 @@ def extract_via_camelot(pdf_path: str, pages: Optional[List[int]] = None) -> Lis
                             'table_idx': tbl_idx,
                             'bbox': None,
                         })
-                    if results:
-                        break
+                        pages_with_camelot.add(page_idx)
             except Exception as e:
                 logger.debug(f"Camelot {flavor} error: {e}")
                 continue
@@ -1142,10 +1155,11 @@ def _align_page_tables(
                     # 2. 空间二维重叠判定 (若两者均有有效 bbox)
                     has_both_bboxes = bool(tbl_bbox and existing_bbox and len(tbl_bbox) >= 4 and len(existing_bbox) >= 4)
                     spatial_matched = False
+                    iom = 0.0
                     if has_both_bboxes:
-                        iou, iom = _compute_bbox_iou(tbl_bbox, existing_bbox)
+                        iou, iom_val = _compute_bbox_iou(tbl_bbox, existing_bbox)
+                        iom = iom_val
                         if iom >= 0.35 or iou >= 0.20:
-                            score = max(score, 0.70 + 0.30 * iom)
                             spatial_matched = True
                         elif iom == 0.0 and iou == 0.0:
                             # 明确在同一页面的不同空间区域（如一上一下或分栏左右），绝对严禁聚入同一簇
@@ -1153,15 +1167,22 @@ def _align_page_tables(
                             break
 
                     # 3. 内容文本/结构相似度判定
+                    sim = 0.0
                     if tbl_df is not None and existing_df is not None:
                         try:
                             sim = _table_similarity(tbl_df, existing_df)
-                            if spatial_matched:
-                                score = max(score, 0.40 * score + 0.60 * sim)
-                            else:
-                                score = max(score, sim)
                         except Exception:
-                            pass
+                            sim = 0.0
+
+                    # 空间匹配但内容无关时，禁止聚类（避免同页嵌套/相邻两表被合并覆盖误杀）
+                    if spatial_matched:
+                        has_same_fmt_label = bool(tbl_label and existing_label and format_table_label(tbl_label) == format_table_label(existing_label))
+                        if sim < 0.40 and not has_same_fmt_label:
+                            cluster_disqualified = True
+                            break
+                        score = max(score, 0.40 * (0.50 + 0.50 * iom) + 0.60 * sim)
+                    else:
+                        score = max(score, sim)
 
                     cluster_scores.append(score)
 
@@ -1170,7 +1191,7 @@ def _align_page_tables(
 
                 avg_score = sum(cluster_scores) / len(cluster_scores) if cluster_scores else 0.0
                 # 聚类阈值要求：无空间信息时需更严格的内容匹配 (>= 0.60)，避免同页小表误聚
-                threshold = 0.45 if any(tbl_bbox and (ex.get('pdf_bbox') or ex.get('bbox')) for ex in cluster.values()) else 0.60
+                threshold = 0.50 if any(tbl_bbox and (ex.get('pdf_bbox') or ex.get('bbox')) for ex in cluster.values()) else 0.60
                 if avg_score >= threshold and avg_score > best_score:
                     best_score = avg_score
                     best_cluster_idx = c_idx
@@ -2110,7 +2131,7 @@ def extract_via_paddleocr_fullpage(pdf_path: str, pages: Optional[List[int]] = N
                 from table_postprocess import merge_continuation_tables
                 dfs = merge_continuation_tables(dfs)
                 for t_idx, df in enumerate(dfs):
-                    if df is not None and not df.empty and df.shape[0] >= 1 and df.shape[1] >= 2:
+                    if df is not None and not df.empty and df.shape[0] >= 1 and df.shape[1] >= 1:
                         df.attrs['extractor'] = 'paddleocr_vl'
                         df.attrs['page_idx'] = block[0]
                         df.attrs['covered_pages'] = list(block)
@@ -2220,7 +2241,7 @@ def extract_via_paddleocr_crops(pdf_path: str, pages: Optional[List[int]] = None
                 dfs = merge_continuation_tables(dfs)
 
                 for sub_t_idx, df in enumerate(dfs):
-                    if df is not None and not df.empty and df.shape[0] >= 1 and df.shape[1] >= 2:
+                    if df is not None and not df.empty and df.shape[0] >= 1 and df.shape[1] >= 1:
                         df.attrs['extractor'] = 'paddleocr_vl_crop'
                         df.attrs['page_idx'] = page_idx
                         df.attrs['covered_pages'] = [page_idx]
@@ -2249,7 +2270,20 @@ def extract_via_paddleocr_crops(pdf_path: str, pages: Optional[List[int]] = None
                     except Exception:
                         pass
 
-        if page_success:
+        # 统计该页期望表数与实际成功提取数，若提取数少于期望表数（如一页双表只切出一张），整页不可标记为完全 resolved
+        expected_page_tables = 1
+        try:
+            try:
+                from .table_validator import scan_pdf_table_declarations
+            except ImportError:
+                from table_validator import scan_pdf_table_declarations
+            p_decls = scan_pdf_table_declarations(pdf_path).get(page_idx, [])
+            expected_page_tables = max(1, len(crops), len([d for d in p_decls if not d.get('is_continuation')]))
+        except Exception:
+            expected_page_tables = max(1, len(crops))
+
+        page_extracted_count = sum(1 for r in results if r.get('page_idx') == page_idx)
+        if page_success and page_extracted_count >= expected_page_tables:
             pages_resolved.add(page_idx)
 
     # 2. 检查哪些页面未能通过切图获得表格，对这些页面平滑回退至整页 extract_via_paddleocr_fullpage
@@ -2262,6 +2296,34 @@ def extract_via_paddleocr_crops(pdf_path: str, pages: Optional[List[int]] = None
     if results:
         print(f"[PaddleOCR-VL Crops] 综合切图与回退，共提取到 {len(results)} 个表格")
     return results
+
+
+def _should_replace_with_ocr(nat_item, ocr_item) -> bool:
+    """
+    质量比对门禁：严格比较原生表格与 OCR 表格质量，防止空表、行数截断或劣质 OCR 破坏优质原生表。
+    """
+    df_n = nat_item.get('df') if isinstance(nat_item, dict) else nat_item
+    df_o = ocr_item.get('df') if isinstance(ocr_item, dict) else ocr_item
+    if df_o is None or df_o.empty:
+        return False
+    if is_table_low_quality(df_o) and not is_table_low_quality(df_n):
+        return False
+    if is_table_low_quality(df_n) and not is_table_low_quality(df_o):
+        return True
+    # 行数截断保护：如果 OCR 行数严重少于原生且原生并非低质，保留原生
+    if df_n is not None and df_o.shape[0] < df_n.shape[0] * 0.7 and df_n.shape[0] >= 3:
+        return False
+    # 列结构保护：如果 OCR 列数严重萎缩（列切分丢失合并），保留原生
+    if df_n is not None and df_n.shape[1] >= 3 and df_o.shape[1] < df_n.shape[1] * 0.6:
+        return False
+    # 填充率对比：如果 OCR 极度稀疏而原生填充良好，保留原生
+    n_cells = df_n.size if df_n is not None else 0
+    o_cells = df_o.size
+    n_fill = sum(1 for v in df_n.values.flatten() if v is not None and str(v).strip()) / max(1, n_cells) if df_n is not None else 0
+    o_fill = sum(1 for v in df_o.values.flatten() if v is not None and str(v).strip()) / max(1, o_cells)
+    if df_n is not None and o_fill < 0.20 and n_fill >= 0.50:
+        return False
+    return True
 
 
 def reconcile_native_and_ocr_tables(
@@ -2338,10 +2400,14 @@ def reconcile_native_and_ocr_tables(
                 if nat_lbl and format_table_label(nat_lbl) == fmt_ocr:
                     matched_nat_indices.add(i_nat)
                     matched_ocr_indices.add(i_ocr)
-                    if id(ocr_item) not in handled_ocr_ids:
-                        handled_ocr_ids.add(id(ocr_item))
-                        merged.append(ocr_item)
-                    logs.append(f"  Page {p+1}: 表号 [{fmt_ocr}] 原生版本被 OCR 版本精准替换")
+                    if _should_replace_with_ocr(nat_item, ocr_item):
+                        if id(ocr_item) not in handled_ocr_ids:
+                            handled_ocr_ids.add(id(ocr_item))
+                            merged.append(ocr_item)
+                        logs.append(f"  Page {p+1}: 表号 [{fmt_ocr}] 原生版本被更优的 OCR 版本精准替换")
+                    else:
+                        merged.append(nat_item)
+                        logs.append(f"  Page {p+1}: 表号 [{fmt_ocr}] 原生版本质量优于 OCR 版本，保留原生版本")
                     break
 
         # 2. 空间二维 bbox 重叠匹配
@@ -2367,10 +2433,15 @@ def reconcile_native_and_ocr_tables(
             if best_nat_idx >= 0:
                 matched_nat_indices.add(best_nat_idx)
                 matched_ocr_indices.add(i_ocr)
-                if id(ocr_item) not in handled_ocr_ids:
-                    handled_ocr_ids.add(id(ocr_item))
-                    merged.append(ocr_item)
-                logs.append(f"  Page {p+1}: 空间重叠 (IoM={best_iom:.2f}) 原生表格被 OCR 版本精准替换")
+                nat_item = p_nat[best_nat_idx]
+                if _should_replace_with_ocr(nat_item, ocr_item):
+                    if id(ocr_item) not in handled_ocr_ids:
+                        handled_ocr_ids.add(id(ocr_item))
+                        merged.append(ocr_item)
+                    logs.append(f"  Page {p+1}: 空间重叠 (IoM={best_iom:.2f}) 原生表格被更优的 OCR 版本精准替换")
+                else:
+                    merged.append(nat_item)
+                    logs.append(f"  Page {p+1}: 空间重叠 (IoM={best_iom:.2f}) 原生表格质量更优，保留原生版本")
 
         # 3. 内容相似度匹配
         for i_ocr, ocr_item in enumerate(p_ocr):
@@ -2388,17 +2459,22 @@ def reconcile_native_and_ocr_tables(
                 if df_nat is None or df_nat.empty:
                     continue
                 sim = _table_similarity(df_nat, df_ocr)
-                if sim >= 0.55 and sim > best_sim:
+                if sim >= 0.65 and sim > best_sim:
                     best_sim = sim
                     best_nat_idx = i_nat
 
             if best_nat_idx >= 0:
                 matched_nat_indices.add(best_nat_idx)
                 matched_ocr_indices.add(i_ocr)
-                if id(ocr_item) not in handled_ocr_ids:
-                    handled_ocr_ids.add(id(ocr_item))
-                    merged.append(ocr_item)
-                logs.append(f"  Page {p+1}: 内容相似 (sim={best_sim:.2f}) 原生表格被 OCR 版本精准替换")
+                nat_item = p_nat[best_nat_idx]
+                if _should_replace_with_ocr(nat_item, ocr_item):
+                    if id(ocr_item) not in handled_ocr_ids:
+                        handled_ocr_ids.add(id(ocr_item))
+                        merged.append(ocr_item)
+                    logs.append(f"  Page {p+1}: 内容相似 (sim={best_sim:.2f}) 原生表格被更优的 OCR 版本精准替换")
+                else:
+                    merged.append(nat_item)
+                    logs.append(f"  Page {p+1}: 内容相似 (sim={best_sim:.2f}) 原生表格质量更优，保留原生版本")
 
         # 4. 未被匹配的 OCR 结果（视觉补充定位到的新表）
         for i_ocr, ocr_item in enumerate(p_ocr):
@@ -2437,12 +2513,13 @@ def extract_tables_from_pdf(
     统一 PDF 表格提取管线。
 
     管线:
-    1. pdf-inspector 分类 + 启发式 caption 检测 → 识别含表格的页面
-    2. native PDF: pdf-inspector + Camelot + pdfplumber 三方投票
-       scanned PDF: 直接走 PaddleOCR-VL
-    3. 三方投票相似度 >= 90% → 采用投票结果
-       三方投票相似度 < 90% 或未提取到 → 该页走 PaddleOCR-VL-1.6 全页结构化输出
-    4. 跨页续表合并
+    1. pdf-inspector 分类 + 语义结构树检测 + 启发式 caption / 续表声明扫描 → 识别含表格的候选页面
+    2. native PDF: pdf-inspector + PyMuPDF find_tables + text_alignment + pdfplumber + Camelot 多方投票与互补 (共 6 种提取器介入)
+       scanned PDF: 直接走 PP-StructureV3 / DocLayout-YOLO 切图 + PaddleOCR-VL
+    3. 空间重叠 (IoU/IoM) 与标签防冲突聚类，任意两方相似度 >= 0.75 判定一致；
+       相似度低于 0.75、低置信度 (<0.90) 或检验瑕疵页 → 启动切图定位与两阶段 OCR 接管
+    4. 表级精细对齐与替换策略（保留有效原生表，替换瑕疵表）
+    5. 跨页续表与多分页自适应合并
 
     返回 (results, logs)
     """
@@ -2450,7 +2527,10 @@ def extract_tables_from_pdf(
     all_results = []
 
     # ── 高精锚定：精准扫描 PDF 全文真实表标题声明 (Captions & Continuations) ──
-    from table_validator import scan_pdf_table_declarations
+    try:
+        from .table_validator import scan_pdf_table_declarations
+    except ImportError:
+        from table_validator import scan_pdf_table_declarations
     page_decls = scan_pdf_table_declarations(pdf_path)
     caption_pages = set(page_decls.keys())
     caption_page_map = {}
@@ -2463,13 +2543,16 @@ def extract_tables_from_pdf(
 
     # 检测全图扫描页（无文本层或纯图页）
     image_table_pages = set()
+    pure_image_pages = set()
     try:
         doc = fitz.open(pdf_path)
         for p_idx, page in enumerate(doc):
             words = page.get_text("words")
             images = page.get_images()
-            if len(words) < 25 and len(images) > 0:
+            if len(images) > 0 and len(words) < 80:
                 image_table_pages.add(p_idx)
+            if len(images) > 0 and len(words) < 25:
+                pure_image_pages.add(p_idx)
         doc.close()
     except Exception:
         pass
@@ -2559,7 +2642,7 @@ def extract_tables_from_pdf(
                     p_obj = None
                     try:
                         p_obj = doc_check[p_idx]
-                        # 轻量矢量绘图预检：对于纯文本长篇专著/附录，若无矢量线条/矩形，直接跳过重量级版面分析
+                        # 轻量矢量绘图预检与无线框表格自证探测
                         has_drawings = True
                         try:
                             drawings = p_obj.get_drawings()
@@ -2573,10 +2656,30 @@ def extract_tables_from_pdf(
                             if tabs and hasattr(tabs, 'tables') and tabs.tables:
                                 valid_vec_tabs = [
                                     tb for tb in tabs.tables
-                                    if getattr(tb, 'row_count', 0) >= 2 and getattr(tb, 'col_count', 0) >= 2
+                                    if getattr(tb, 'row_count', 0) >= 1 and getattr(tb, 'col_count', 0) >= 1
                                 ]
                                 if valid_vec_tabs:
                                     _add_candidate(p_idx, 'vector_find_tables')
+                        else:
+                            # 无绘图页仍跑一次 find_tables(strategy="text") 或 probe_disjoint_native_tables 轻量文本列对齐探测
+                            try:
+                                text_tabs = p_obj.find_tables(strategy="text")
+                                if text_tabs and hasattr(text_tabs, 'tables') and text_tabs.tables:
+                                    valid_text_tabs = [
+                                        tb for tb in text_tabs.tables
+                                        if getattr(tb, 'row_count', 0) >= 1 and getattr(tb, 'col_count', 0) >= 1
+                                    ]
+                                    if valid_text_tabs:
+                                        _add_candidate(p_idx, 'text_find_tables')
+                            except Exception:
+                                pass
+                            if p_idx not in candidate_sources:
+                                try:
+                                    from pdf_tables import probe_disjoint_native_tables
+                                    if probe_disjoint_native_tables(p_obj) > 0:
+                                        _add_candidate(p_idx, 'probe_disjoint_native')
+                                except Exception:
+                                    pass
                     except Exception:
                         pass
                     finally:
@@ -2615,7 +2718,9 @@ def extract_tables_from_pdf(
                 first_line = lines[0] if lines else ""
                 is_continuation_line = any(k in first_line for k in ['续', 'cont', 'Cont'])
                 is_new_table = bool(re.match(r'^(?:附表|附录表|补充表|表|Table)\s*\d+', first_line)) and not is_continuation_line
-                if re.match(r'^\d+\.\d+', first_line) or is_new_table or first_line.startswith(('图', 'Fig', '参考文献', '致谢', 'References', 'Acknowledgements')):
+                num_numeric_tokens = sum(1 for t in first_line.split() if re.match(r'^-?\d+(?:\.\d+)?$', t))
+                is_section_hdr = bool(re.match(r'^\d+\.\d+(?:\.\d+)?\s+(?:[\u4e00-\u9fa5]{2,}|[A-Z][a-z]{2,})', first_line)) and (num_numeric_tokens < 2)
+                if is_section_hdr or is_new_table or first_line.startswith(('图', 'Fig', '参考文献', '致谢', 'References', 'Acknowledgements')):
                     break
 
                 # 1. 显式续表关键字 (中英文多模态)
@@ -2623,14 +2728,14 @@ def extract_tables_from_pdf(
                 
                 # 2. 密集纯数据元胞（长数据表，无表头直接连续密集数值）
                 data_token_count = sum(1 for l in lines if re.match(r'^-?\d+(?:\.\d+)?%?$', l) or l in ('/', '-', '—', '–', 'n.d.', 'bdl', 'b.d.l.', 'nd', 'N/A') or re.match(r'^[A-Z0-9\-_–—/]{1,8}$', l))
-                cond_dense = len(lines) >= 20 and (data_token_count / len(lines) >= 0.65)
+                cond_dense = len(lines) >= 4 and (data_token_count / max(1, len(lines)) >= 0.45)
 
                 # 3. 矢量线框表格判定 (续表往往带有表格水平/垂直网格线)
                 cond_vec_table = False
                 try:
                     f_tabs = next_page.find_tables()
                     if f_tabs and f_tabs.tables:
-                        if any(tb.row_count >= 3 for tb in f_tabs.tables):
+                        if any(tb.row_count >= 2 for tb in f_tabs.tables):
                             cond_vec_table = True
                 except Exception:
                     pass
@@ -2661,6 +2766,20 @@ def extract_tables_from_pdf(
         doc.close()
     except Exception as e_cont:
         logs.append(f"  续表推断异常: {e_cont}")
+
+    # 候选总账核验 (Declaration Ledger Reconciliation):
+    # 若全文声明的表格页或表号数量超出当前候选页集合，对未入选页面触发文本层 Table N 表题快速补扫
+    total_declared_tables = sum(len(decls) for decls in page_decls.values())
+    if total_declared_tables > len(candidate_sources):
+        try:
+            with fitz.open(pdf_path) as doc_supp:
+                for p_check in range(len(doc_supp)):
+                    if p_check not in candidate_sources:
+                        p_txt = doc_supp[p_check].get_text("text")
+                        if p_txt and TABLE_LABEL_RE.search(p_txt):
+                            _add_candidate(p_check, 'declaration_ledger_supplement')
+        except Exception:
+            pass
 
     target_pages = sorted(list(candidate_sources.keys())) if candidate_sources else None
     if target_pages:
@@ -2706,7 +2825,7 @@ def extract_tables_from_pdf(
         # ── native PDF → 三方投票 + 低相似度页面回退 PaddleOCR-VL ──
         logs.append("→ Step 2: native PDF，启动三方投票 (pdf-inspector + Camelot + pdfplumber + find_tables)")
 
-        native_target_pages = [p for p in target_pages if p not in image_table_pages] if target_pages is not None else None
+        native_target_pages = [p for p in target_pages if p not in pure_image_pages] if target_pages is not None else None
 
         # 优先提取 Tagged PDF / PDF/UA 语义结构树表格 (最高保真度)
         structure_results = extract_via_structure_tree(pdf_path, pages=native_target_pages)
@@ -2735,7 +2854,11 @@ def extract_tables_from_pdf(
             logs.append("  三方投票未获得表格")
 
         # Step 3b: 三方投票综合检验模块（坏损表、表头错位、表序缺失、续表中断、单页多表漏抓检验）
-        from table_validator import validate_native_extraction_pipeline
+        try:
+            from .table_validator import validate_native_extraction_pipeline
+        except ImportError:
+            from table_validator import validate_native_extraction_pipeline
+        original_native_results = list(all_results)
         valid_fused, pages_requiring_ocr, val_logs = validate_native_extraction_pipeline(
             all_results, pdf_path, target_pages, vote_summary
         )
@@ -2750,22 +2873,30 @@ def extract_tables_from_pdf(
             ocr_results = extract_via_paddleocr_crops(pdf_path, ocr_candidate_pages)
             if ocr_results:
                 logs.append(f"  PaddleOCR-VL 独立接管提取到 {len(ocr_results)} 个表格，启动表级精细对齐与安全替换...")
-                all_results = reconcile_native_and_ocr_tables(all_results, ocr_results, ocr_candidate_pages, logs)
+                all_results = reconcile_native_and_ocr_tables(original_native_results, ocr_results, ocr_candidate_pages, logs)
             else:
-                logs.append("  PaddleOCR-VL 未提取到有效表格或执行失败，保留原生解析结果")
+                logs.append("  PaddleOCR-VL 未提取到有效表格或执行失败，保留原生解析结果 (降级回填)")
+                all_results = original_native_results
+        else:
+            if not use_ocr_fallback and len(valid_fused) < len(original_native_results):
+                logs.append("  use_ocr_fallback=False，降级保留原生未通过检验表格，防止整表永久丢失")
+                all_results = original_native_results
 
         # Step 3c: 仍未覆盖且从未被 PaddleOCR 处理过的页面 → text_alignment
         extracted_pages = set(r.get('page_idx', -1) for r in all_results if r.get('page_idx') is not None)
         ocr_processed_pages = set(ocr_candidate_pages) if 'ocr_candidate_pages' in locals() else set()
-        still_missing = sorted(p for p in target_pages if p not in extracted_pages and p not in ocr_processed_pages)
+        still_missing = sorted(p for p in target_pages if (p not in extracted_pages or len([r for r in all_results if r.get('page_idx') == p]) < len([d for d in page_decls.get(p, []) if not d.get('is_continuation')])) and p not in ocr_processed_pages)
         if still_missing:
-            logs.append(f"→ Step 3c: 对仍未覆盖的 {[p+1 for p in still_missing]} 页尝试文本对齐提取")
+            logs.append(f"→ Step 3c: 对仍未覆盖/表数不足的 {[p+1 for p in still_missing]} 页尝试文本对齐提取")
             text_align_results = extract_via_text_alignment(pdf_path, pages=still_missing)
             for ta in text_align_results:
                 ta_page = ta.get('page_idx', -1)
-                if ta_page not in extracted_pages and not is_table_low_quality(ta['df']):
-                    all_results.append(ta)
-                    extracted_pages.add(ta_page)
+                if not is_table_low_quality(ta['df']):
+                    existing_on_page = [r for r in all_results if r.get('page_idx') == ta_page]
+                    duplicate = any(_table_similarity(r['df'], ta['df']) >= 0.70 for r in existing_on_page)
+                    if not duplicate:
+                        all_results.append(ta)
+                        extracted_pages.add(ta_page)
 
     # 标记来自续表候选页且未显式命名的表格片段，辅助跨页拼接引擎
     continuation_pages = set()
@@ -2802,18 +2933,25 @@ def extract_tables_from_pdf(
         except Exception as e:
             logs.append(f"  跨页合并跳过: {e}")
 
-    if all_results:
+    total_declared_count = sum(1 for decls in page_decls.values() for d in decls if not d.get('is_continuation'))
+    if all_results and (total_declared_count == 0 or len(all_results) >= total_declared_count or not use_ocr_fallback):
         extractors = set(r['df'].attrs.get('extractor', '?') for r in all_results)
         logs.append(f"  最终: {len(all_results)} 个表格 (extractors: {extractors})")
         return all_results, logs
 
-    # Step 5: 全局 OCR 兜底
-    logs.append("→ Step 5: 结构化提取未获得有效表格，回退到全局 OCR")
+    # Step 5: 全局 OCR 兜底 (结构化提取未获得有效表格，或已提取表数少于声明表数)
+    logs.append(f"→ Step 5: 结构化提取表数 ({len(all_results)}) 少于声明表数 ({total_declared_count}) 或为空，回退到全局 OCR")
     if use_ocr_fallback:
         ocr_results = extract_via_ocr(pdf_path)
-        all_results.extend(ocr_results)
-        all_results = reconcile_table_captions(all_results, pdf_path)
-        logs.append(f"  全局 OCR 提取到 {len(ocr_results)} 个表格")
+        if ocr_results:
+            pages_to_reconcile = sorted(list(set(
+                [r.get('page_idx', 0) for r in ocr_results] +
+                [r.get('page_idx', 0) for r in all_results] +
+                [p for r in ocr_results for p in r.get('covered_pages', [])]
+            )))
+            all_results = reconcile_native_and_ocr_tables(all_results, ocr_results, pages_to_reconcile, logs)
+            all_results = reconcile_table_captions(all_results, pdf_path)
+            logs.append(f"  全局 OCR 补漏后共获得 {len(all_results)} 个表格")
 
     return all_results, logs
 
@@ -2998,6 +3136,236 @@ def _align_table_with_positions(
     return df
 
 
+def _extract_page_via_text_alignment(doc, page_idx: int, pdf_path: str) -> List[Dict[str, Any]]:
+    page = doc[page_idx]
+    text = page.get_text("text")
+    words = page.get_text("words")  # [(x0, y0, x1, y1, text, ...), ...]
+
+    if not words:
+        return []
+
+    captions_on_page = []
+
+    # 1. 优先使用 extract_table_caption_from_page 获取全页最准确的 table caption
+    page_label, page_caption = extract_table_caption_from_page(page)
+    if page_label:
+        rect = page.search_for(page_label)
+        if not rect and page_caption:
+            rect = page.search_for(page_caption[:10])
+        if not rect:
+            for m in TABLE_LABEL_RE.finditer(text):
+                rect = page.search_for(m.group(0))
+                if rect:
+                    break
+        caption_y = rect[-1].y1 if rect else page.rect.height * 0.05
+        captions_on_page.append({
+            'label': page_label,
+            'title': page_caption or page_label,
+            'y': caption_y,
+            'text_pos': 0,
+        })
+    else:
+        for m in TABLE_LABEL_RE.finditer(text):
+            label = format_table_label(m.group(0))
+            pos = m.start()
+            before = text[max(0, pos-30):pos]
+            after = text[pos + len(m.group(0)):pos + len(m.group(0)) + 80]
+            
+            ref_prefixes = ['从', '见', '如', '由', '根据', '（', '(', '在']
+            ref_suffixes = ['中', '可以', '所示', '）', ')', '可知', '看出', '中数据']
+            if any(before.rstrip().endswith(p) for p in ref_prefixes):
+                continue
+            if any(after.lstrip().startswith(s) for s in ref_suffixes):
+                continue
+            
+            after_clean = after.lstrip()
+            if len(after_clean) > 3 and not after_clean.startswith(('中', '）', ')')):
+                rect = page.search_for(m.group(0))
+                caption_y = rect[-1].y1 if rect else None
+                title_line = after_clean.split('\n')[0].strip()
+                full_title = f"{label} {title_line}" if title_line else label
+                captions_on_page.append({
+                    'label': label,
+                    'title': full_title,
+                    'y': caption_y,
+                    'text_pos': m.start(),
+                })
+
+    if not captions_on_page:
+        # 回退：搜索裸表号（如 "4.11  庆家沟锑矿床..."）
+        bare_caption_re = re.compile(r'^\s*(\d+\.\d+)\s{2,}(.{5,})', re.MULTILINE)
+        for m in bare_caption_re.finditer(text):
+            num = m.group(1)
+            title = m.group(2).strip()
+            if not re.search(r'[\u4e00-\u9fa5]', title):
+                continue
+            if '。' in title or '，' in title or '；' in title or '、' in title:
+                continue
+            if title[0].isdigit():
+                continue
+            ref_label = f'表{num}'
+            if ref_label in text:
+                rect = page.search_for(m.group(0).strip())
+                caption_y = rect[-1].y1 if rect else None
+                captions_on_page.append({
+                    'label': ref_label,
+                    'title': f'{ref_label} {title}',
+                    'y': caption_y,
+                    'text_pos': m.start(),
+                })
+                print(f"  [text_alignment] 裸表号回退: {ref_label} -> {title[:40]}")
+
+    if not captions_on_page:
+        # 无表题无线框表格探测 (uncaptioned text alignment probe)
+        pos_df = None
+        try:
+            pos_df = _align_table_with_positions(
+                pdf_path, page_idx, page.rect.height * 0.05, page.rect.height * 0.95, page.rect.height, page.rect.width
+            )
+        except Exception:
+            pos_df = None
+        if pos_df is not None and not pos_df.empty and pos_df.shape[0] >= 1 and pos_df.shape[1] >= 2 and not is_table_low_quality(pos_df):
+            pos_df.attrs['extractor'] = 'text_alignment'
+            pos_df.attrs['source'] = 'text_alignment'
+            pos_df.attrs['page_idx'] = page_idx
+            pos_df.attrs['is_uncaptioned'] = True
+            return [{
+                'df': pos_df,
+                'bbox': [0.0, page.rect.height * 0.05, page.rect.width, page.rect.height * 0.95],
+                'label': None,
+                'title': None,
+                'page_idx': page_idx,
+                'table_idx': 0,
+                'extractor': 'text_alignment',
+            }]
+        return []
+
+    page_results = []
+    # 对每个 caption，提取其下方的表格数据行
+    for ci, cap in enumerate(captions_on_page):
+        if cap['y'] is None:
+            continue
+
+        # 确定表格的 y 范围：从 caption 下方到下一个 caption 或下一个章节标题或页面底部
+        table_y_start = cap['y'] + 5  # caption 下方
+        if ci + 1 < len(captions_on_page) and captions_on_page[ci + 1]['y'] is not None:
+            table_y_end = captions_on_page[ci + 1]['y'] - 5
+        else:
+            table_y_end = page.rect.height * 0.92
+            after_pos = cap.get('text_pos', 0) + len(cap.get('title', ''))
+            sec_m = re.search(r'^[ \t]*([1-9]\d*(?:\.[1-9]\d*){1,2}[ \t]+[\u4e00-\u9fa5]{2,})', text[after_pos:], re.MULTILINE)
+            if sec_m:
+                sec_rect = page.search_for(sec_m.group(1).strip()[:10])
+                if sec_rect:
+                    table_y_end = min(table_y_end, sec_rect[0].y0 - 2)
+
+        # 优先尝试基于 pdf_inspector extract_text_with_positions 的样式感知对齐
+        pos_df = None
+        try:
+            pos_df = _align_table_with_positions(
+                pdf_path, page_idx, table_y_start, table_y_end, page.rect.height, page.rect.width
+            )
+        except Exception as e_pos:
+            logger.debug(f"[text_alignment] _align_table_with_positions notice: {e_pos}")
+
+        if pos_df is not None and not pos_df.empty and pos_df.shape[0] >= 1 and pos_df.shape[1] >= 1:
+            pos_df.attrs['extractor'] = 'text_alignment'
+            pos_df.attrs['label'] = cap['label']
+            if cap.get('title'):
+                pos_df.attrs['table_title'] = cap['title']
+            pos_df.attrs['page_idx'] = page_idx
+            page_results.append({
+                'df': pos_df,
+                'page_idx': page_idx,
+                'table_idx': ci,
+                'bbox': [0.0, table_y_start, page.rect.width, table_y_end],
+            })
+            continue
+
+        # 过滤出表格区域内的 words（排除页面底部单独页码）
+        table_words = [w for w in words if w[1] >= table_y_start and w[1] < table_y_end and not (w[1] > page.rect.height * 0.90 and w[4].isdigit())]
+
+        if len(table_words) < 4:
+            continue
+
+        # 用 x 坐标聚类分列
+        all_x0 = sorted(w[0] for w in table_words)
+        col_boundaries = [all_x0[0]]
+        for x in all_x0[1:]:
+            if x - col_boundaries[-1] > 15:
+                col_boundaries.append(x)
+
+        def col_idx(x0):
+            idx = 0
+            for i, b in enumerate(col_boundaries):
+                if x0 >= b - 5:
+                    idx = i
+                else:
+                    break
+            return idx
+
+        # 用 y 坐标分行
+        table_words.sort(key=lambda w: (round(w[1] / 5) * 5, w[0]))
+        lines = []
+        current_line = []
+        current_y = None
+        for w in table_words:
+            y_mid = (w[1] + w[3]) / 2
+            if current_y is None or abs(y_mid - current_y) < 5:
+                current_line.append(w)
+                if current_y is None:
+                    current_y = y_mid
+            else:
+                lines.append(current_line)
+                current_line = [w]
+                current_y = y_mid
+        if current_line:
+            lines.append(current_line)
+
+        # 重建表格行
+        table_rows = []
+        for line in lines:
+            line_str = " ".join(w[4] for w in line).strip()
+            if not line_str:
+                continue
+            # 终止条件：遇到正文段落（含句号且文字较长）或章节标题
+            if (len(line_str) > 25 and '。' in line_str) or re.match(r'^[1-9]\d*(?:\.[1-9]\d*){1,2}\s+[\u4e00-\u9fa5]{2,}', line_str):
+                break
+            # 跳过纯页码行
+            if line_str.isdigit() and len(line_str) <= 3:
+                continue
+            cells = [""] * max(len(col_boundaries), 1)
+            for w in line:
+                ci2 = col_idx(w[0])
+                if ci2 >= len(cells):
+                    cells.extend([""] * (ci2 + 1 - len(cells)))
+                cells[ci2] = (cells[ci2] + " " + w[4]).strip() if cells[ci2] else w[4]
+            if any(c.strip() for c in cells):
+                table_rows.append(cells)
+
+        if len(table_rows) < 1:
+            continue
+
+        if len(table_rows) == 1:
+            df = pd.DataFrame(table_rows)
+        else:
+            # 首行作表头
+            df = pd.DataFrame(table_rows[1:], columns=table_rows[0])
+        df.attrs['extractor'] = 'text_alignment'
+        df.attrs['label'] = cap['label']
+        if cap.get('title'):
+            df.attrs['table_title'] = cap['title']
+        df.attrs['page_idx'] = page_idx
+        page_results.append({
+            'df': df,
+            'page_idx': page_idx,
+            'table_idx': ci,
+            'bbox': None,
+        })
+
+    return page_results
+
+
 def extract_via_text_alignment(pdf_path: str, pages: Optional[List[int]] = None) -> List[Dict[str, Any]]:
     """
     对无线框表格的文本对齐提取。
@@ -3023,211 +3391,12 @@ def extract_via_text_alignment(pdf_path: str, pages: Optional[List[int]] = None)
         for page_idx in target_pages:
             if page_idx >= total_pages:
                 continue
-            page = doc[page_idx]
-            text = page.get_text("text")
-            words = page.get_text("words")  # [(x0, y0, x1, y1, text, ...), ...]
-
-            if not words:
+            try:
+                page_results = _extract_page_via_text_alignment(doc, page_idx, pdf_path)
+                results.extend(page_results)
+            except Exception as e_page:
+                logger.warning(f"[text_alignment] page {page_idx} error: {e_page}")
                 continue
-
-            captions_on_page = []
-
-            # 1. 优先使用 extract_table_caption_from_page 获取全页最准确的 table caption
-            page_label, page_caption = extract_table_caption_from_page(page)
-            if page_label:
-                rect = page.search_for(page_label)
-                if not rect and page_caption:
-                    rect = page.search_for(page_caption[:10])
-                if not rect:
-                    for m in TABLE_LABEL_RE.finditer(text):
-                        rect = page.search_for(m.group(0))
-                        if rect:
-                            break
-                caption_y = rect[0].y0 if rect else page.rect.height * 0.05
-                captions_on_page.append({
-                    'label': page_label,
-                    'title': page_caption or page_label,
-                    'y': caption_y,
-                    'text_pos': 0,
-                })
-            else:
-                for m in TABLE_LABEL_RE.finditer(text):
-                    label = format_table_label(m.group(0))
-                    pos = m.start()
-                    before = text[max(0, pos-30):pos]
-                    after = text[pos + len(m.group(0)):pos + len(m.group(0)) + 80]
-                    
-                    ref_prefixes = ['从', '见', '如', '由', '根据', '（', '(', '在']
-                    ref_suffixes = ['中', '可以', '所示', '）', ')', '可知', '看出', '中数据', ':', '：']
-                    if any(before.rstrip().endswith(p) for p in ref_prefixes):
-                        continue
-                    if any(after.lstrip().startswith(s) for s in ref_suffixes):
-                        continue
-                    
-                    after_clean = after.lstrip()
-                    if len(after_clean) > 3 and not after_clean.startswith(('中', '）', ')')):
-                        rect = page.search_for(m.group(0))
-                        caption_y = rect[-1].y0 if rect else None
-                        title_line = after_clean.split('\n')[0].strip()
-                        full_title = f"{label} {title_line}" if title_line else label
-                        captions_on_page.append({
-                            'label': label,
-                            'title': full_title,
-                            'y': caption_y,
-                            'text_pos': m.start(),
-                        })
-
-            if not captions_on_page:
-                # 回退：搜索裸表号（如 "4.11  庆家沟锑矿床..."）
-                # 当 "表" 和表号被 PDF 文本提取拆到两行时，caption_re 匹配不到 "表4.11"
-                # 但裸表号 "4.11" 后跟标题文字仍是有效 caption
-                bare_caption_re = re.compile(r'^\s*(\d+\.\d+)\s{2,}(.{5,})', re.MULTILINE)
-                for m in bare_caption_re.finditer(text):
-                    num = m.group(1)
-                    title = m.group(2).strip()
-                    # 严格过滤：title 必须是中文标题（含中文字符，不含句号/逗号/分号）
-                    if not re.search(r'[\u4e00-\u9fa5]', title):
-                        continue
-                    if '。' in title or '，' in title or '；' in title or '、' in title:
-                        continue
-                    # 排除 title 以数字开头（表格数据行）
-                    if title[0].isdigit():
-                        continue
-                    # 检查页面上是否有 "表X.Y" 引用（确认这个表号确实对应一个表）
-                    ref_label = f'表{num}'
-                    if ref_label in text:
-                        rect = page.search_for(m.group(0).strip())
-                        caption_y = rect[0].y0 if rect else None
-                        captions_on_page.append({
-                            'label': ref_label,
-                            'title': f'{ref_label} {title}',
-                            'y': caption_y,
-                            'text_pos': m.start(),
-                        })
-                        print(f"  [text_alignment] 裸表号回退: {ref_label} -> {title[:40]}")
-
-            if not captions_on_page:
-                continue
-
-            # 对每个 caption，提取其下方的表格数据行
-            for ci, cap in enumerate(captions_on_page):
-                if cap['y'] is None:
-                    continue
-
-                # 确定表格的 y 范围：从 caption 下方到下一个 caption 或下一个章节标题或页面底部
-                table_y_start = cap['y'] + 5  # caption 下方
-                if ci + 1 < len(captions_on_page) and captions_on_page[ci + 1]['y'] is not None:
-                    table_y_end = captions_on_page[ci + 1]['y'] - 5
-                else:
-                    table_y_end = page.rect.height * 0.92
-                    # 尝试搜索下方章节标题（如 6.6 同位素地球化学特征）作为终止边界（注意使用 [ \t]+ 避免单元格内浮点数+换行误匹配）
-                    after_pos = cap.get('text_pos', 0) + len(cap.get('title', ''))
-                    sec_m = re.search(r'^[ \t]*([1-9]\d*(?:\.[1-9]\d*){1,2}[ \t]+[\u4e00-\u9fa5]{2,})', text[after_pos:], re.MULTILINE)
-                    if sec_m:
-                        sec_rect = page.search_for(sec_m.group(1).strip()[:10])
-                        if sec_rect:
-                            table_y_end = min(table_y_end, sec_rect[0].y0 - 2)
-
-                # 优先尝试基于 pdf_inspector extract_text_with_positions 的样式感知对齐
-                pos_df = None
-                try:
-                    pos_df = _align_table_with_positions(
-                        pdf_path, page_idx, table_y_start, table_y_end, page.rect.height, page.rect.width
-                    )
-                except Exception as e_pos:
-                    logger.debug(f"[text_alignment] _align_table_with_positions notice: {e_pos}")
-
-                if pos_df is not None and not pos_df.empty and pos_df.shape[0] >= 1 and pos_df.shape[1] >= 2:
-                    pos_df.attrs['extractor'] = 'text_alignment'
-                    pos_df.attrs['label'] = cap['label']
-                    if cap.get('title'):
-                        pos_df.attrs['table_title'] = cap['title']
-                    pos_df.attrs['page_idx'] = page_idx
-                    results.append({
-                        'df': pos_df,
-                        'page_idx': page_idx,
-                        'table_idx': ci,
-                        'bbox': [0.0, table_y_start, page.rect.width, table_y_end],
-                    })
-                    continue
-
-                # 过滤出表格区域内的 words（排除页面底部单独页码）
-                table_words = [w for w in words if w[1] >= table_y_start and w[1] < table_y_end and not (w[1] > page.rect.height * 0.90 and w[4].isdigit())]
-
-                if len(table_words) < 4:
-                    continue
-
-                # 用 x 坐标聚类分列
-                all_x0 = sorted(w[0] for w in table_words)
-                col_boundaries = [all_x0[0]]
-                for x in all_x0[1:]:
-                    if x - col_boundaries[-1] > 15:
-                        col_boundaries.append(x)
-
-                def col_idx(x0):
-                    idx = 0
-                    for i, b in enumerate(col_boundaries):
-                        if x0 >= b - 5:
-                            idx = i
-                        else:
-                            break
-                    return idx
-
-                # 用 y 坐标分行
-                table_words.sort(key=lambda w: (round(w[1] / 5) * 5, w[0]))
-                lines = []
-                current_line = []
-                current_y = None
-                for w in table_words:
-                    y_mid = (w[1] + w[3]) / 2
-                    if current_y is None or abs(y_mid - current_y) < 5:
-                        current_line.append(w)
-                        if current_y is None:
-                            current_y = y_mid
-                    else:
-                        lines.append(current_line)
-                        current_line = [w]
-                        current_y = y_mid
-                if current_line:
-                    lines.append(current_line)
-
-                # 重建表格行
-                table_rows = []
-                for line in lines:
-                    line_str = " ".join(w[4] for w in line).strip()
-                    if not line_str:
-                        continue
-                    # 终止条件：遇到正文段落（含句号且文字较长）或章节标题
-                    if (len(line_str) > 25 and '。' in line_str) or re.match(r'^[1-9]\d*(?:\.[1-9]\d*){1,2}\s+[\u4e00-\u9fa5]{2,}', line_str):
-                        break
-                    # 跳过纯页码行
-                    if line_str.isdigit() and len(line_str) <= 3:
-                        continue
-                    cells = [""] * max(len(col_boundaries), 1)
-                    for w in line:
-                        ci2 = col_idx(w[0])
-                        if ci2 >= len(cells):
-                            cells.extend([""] * (ci2 + 1 - len(cells)))
-                        cells[ci2] = (cells[ci2] + " " + w[4]).strip() if cells[ci2] else w[4]
-                    if any(c.strip() for c in cells):
-                        table_rows.append(cells)
-
-                if len(table_rows) < 2:
-                    continue
-
-                # 首行作表头
-                df = pd.DataFrame(table_rows[1:], columns=table_rows[0])
-                df.attrs['extractor'] = 'text_alignment'
-                df.attrs['label'] = cap['label']
-                if cap.get('title'):
-                    df.attrs['table_title'] = cap['title']
-                df.attrs['page_idx'] = page_idx
-                results.append({
-                    'df': df,
-                    'page_idx': page_idx,
-                    'table_idx': ci,
-                    'bbox': None,
-                })
     except Exception as e:
         logger.warning(f"text_alignment error: {e}")
     finally:

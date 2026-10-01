@@ -44,7 +44,7 @@ description: 从 Zotero 选中条目（依赖 ai4paper-zotero MCP 获取物理�
               │
               ├─ 2D bbox 空间重叠 (IoU/IoM) + 表号标签防冲突聚类，杜绝同页多表误合并
               ├─ 任意两方相似度 >= 0.75 → 判定一致并采用投票结果 (结构树绝对优先)
-              ├─ 低置信度或检验瑕疵页 → DocLayout-YOLO 切图 (Caption缺失/多表覆盖不足时原生信号校验 + PP-Structure 补扫) + PaddleOCR-VL 接管
+              ├─ 低置信度 (<0.90) 或检验瑕疵页 → DocLayout-YOLO 切图 (Caption缺失/多表覆盖不足时原生信号校验 + PP-Structure 补扫) + PaddleOCR-VL 接管
               ├─ 表级精细对齐与替换策略：精准替换瑕疵表，保留同页未受干扰的有效原生表
               ├─ 7 阶轻量直通安全后处理（公式注入防御、数值类型推断、多级表头展平、付费墙过滤）
               └─ 跨页续表与多分页自适应合并
@@ -53,17 +53,35 @@ description: 从 Zotero 选中条目（依赖 ai4paper-zotero MCP 获取物理�
          Excel (每表独立文件，带标准化表号 label，支持单文件多 Sheet 或分表输出)
 ```
 
-## 关键组件
+## 关键组件（6 种协同提取器）
 
 | 组件 | 作用 |
 |---|---|
-| [`pdf-inspector`](https://github.com/firecrawl/pdf-inspector) | Rust 库，PDF 分类 + 表格定位 + Markdown 提取，~80ms 高性能 |
-| `Camelot` + `pdfplumber` | 结构化表格提取，与原生线框进行多方投票交叉验证 |
-| `PyMuPDF find_tables()` | PDF 矢量线框表格提取（零 OCR，高保真） |
-| `text_alignment` | 无线框表格的文本坐标对齐与自适应重组 |
-| `PP-StructureV3` | 在线版面分析 API，表格定位与局部切图提取 |
-| `PaddleOCR-VL-1.6` | 在线多模态大模型 API，针对定位区域进行复杂/跨行跨列结构化解析 |
+| [`pdf-inspector`](https://github.com/firecrawl/pdf-inspector) | Rust 库，PDF 分类 + 表格定位 + Markdown 结构化提取，~80ms 高性能 |
+| `PyMuPDF find_tables()` | PDF 矢量线框与无框文本表格提取（零 OCR，高保真），支持全篇网格线分析 |
+| `text_alignment` | 无线框表格的文本坐标对齐与自适应重组（支持学位论文/无网格线表） |
+| `Camelot` | 基于 OpenCV 的晶格 (lattice) 与流式 (stream) 结构化表格提取 |
+| `pdfplumber` | 基于字符精细包围盒与视觉线条的表格抽取，参与多方交叉验证 |
+| `PaddleOCR-VL-1.6` / `PP-StructureV3` | 在线多模态大模型与版面切图 API，复杂/跨行跨列与扫描页结构化多模态解析 |
 | `DocLayout-YOLO` | 本地 ONNX 版面检测（离线/无网络时的备用切图定位兜底） |
+
+## 漏检自查与完整性保障 (Self-Audit)
+
+为杜绝文献表格漏检、误剔与劣退，本技能在管线全生命周期内构建了严密的多重自查闭环：
+
+1. **表号声明预期清单扫描 (`Declaration Ledger`)**：
+   - 提取前轻量扫描 PDF 全文（含正文与附录，全篇扫描无页数人为截断），识别标准表号声明 (`Table 1`, `表1`, `Tab. 1`, `Table S1`, `TABLE III` 等) 与跨页续表标记 (`表1（续）`, `Table 1 (cont.)`, `Table 2 Continued`, `cont'd`, `续上表`)。
+   - 维护全文预期表号集合与出现频次账本，确保声明表号与提取产物一一闭环对应。
+2. **候选页动态探测与补漏机制**：
+   - 当声明表格数超出初步候选页总数时，自动启动全文回扫补齐缺失候选页；
+   - 对无绘图/矢量线框页面 (`has_drawings=False`)，自动通过文本策略 (`strategy="text"`) 及无线框对齐探测潜在文本表；
+   - 当单页出现多个表题声明时，放宽候选页表格配额，支持单页提取多张独立表格。
+3. **质量对比防劣退门禁 (`_should_replace_with_ocr`)**：
+   - OCR 结果不能盲目替换原生表格：替换前严格对比行数、非空单元格填充率与低质量标志；
+   - 若 OCR 结果为空、行数严重萎缩或质量劣于原生解析，坚决拒绝替换，保留原生表格作为降级兜底。
+4. **单行/单列与章节碎片保护**：
+   - 管道全流程（质量检验、多方投票、后处理、Excel 导出）完整支持单行表（如基线汇总、参数对照）与单列表（如指标序列）；
+   - 在多级章节文献中，无表题的零散表格碎片统一导出为 `unlabelled_N.xlsx`，杜绝静默丢弃。
 
 ## 技能目录结构
 

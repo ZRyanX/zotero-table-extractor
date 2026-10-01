@@ -81,8 +81,23 @@ def scan_pdf_table_declarations(pdf_path: str) -> Dict[int, List[Dict[str, Any]]
                 if not line_clean:
                     continue
 
-                # 1. 检查续表声明（续表、续表1、Table 1 (continued)、Continued Table 等）
-                is_cont = bool(re.search(r'^(?:续表|续附表|（续）|\(continued\)|Table\s*\w*\s*\(continued\)|Continued\s+Table)', line_clean, re.IGNORECASE))
+                # 1. 检查续表声明（续表、续表1、表1（续）、表1（续一）、Table 1 (continued)、Table 1 (cont.)、Table 2 Continued、cont'd、续上表等）
+                cont_pattern = (
+                    r'(?:续表|续附表|续前表|续上表|接上表|接上页|'
+                    r'（续[一二三四五六七八九十0-9]*）|\(续[一二三四五六七八九十0-9]*\)|'
+                    r'（续表）|\(续表\)|（续上表）|\(续上表\)|（续前表）|\(续前表\)|（接上表）|\(接上表\)|'
+                    r'（cont(?:inued|\.|\'d)?(?:\s*\d+)?\)|\(cont(?:inued|\.|\'d)?(?:\s*\d+)?\)|'
+                    r'\bContinued\b|\bcontinued\b|\bcont\'?d\b|\bcont\.?\b(?:\s*\d+)?|'
+                    r'\b续\b(?:\s*[0-9一二三四五六七八九十]+)?)'
+                )
+                is_cont = bool(re.search(r'^(?:' + cont_pattern + r'|Continued\s+Table)', line_clean, re.IGNORECASE))
+                if not is_cont:
+                    m_prefix = re.match(r'^[ \t]*(' + TABLE_LABEL_PATTERN + r')[ \t\.\:：,\-—–]*(.*)', line_clean, re.IGNORECASE)
+                    if m_prefix:
+                        after_lbl = m_prefix.group(2).strip()
+                        if re.search(cont_pattern, after_lbl, re.IGNORECASE):
+                            is_cont = True
+
                 if is_cont:
                     m_lbl = TABLE_LABEL_RE.search(line_clean)
                     lbl = format_table_label(m_lbl.group(0)) if m_lbl else "续表"
@@ -95,7 +110,7 @@ def scan_pdf_table_declarations(pdf_path: str) -> Dict[int, List[Dict[str, Any]]
                     continue
 
                 # 2. 检查正规表标题
-                m = re.match(r'^[ \t]*(' + TABLE_LABEL_PATTERN + r')[ \t\.\:：]*(.*)', line_clean, re.IGNORECASE)
+                m = re.match(r'^[ \t]*(' + TABLE_LABEL_PATTERN + r')[ \t\.\:：,\-—–]*(.*)', line_clean, re.IGNORECASE)
                 if m:
                     raw_lbl = m.group(1).strip()
                     title_part = m.group(2).strip()
@@ -153,9 +168,9 @@ def validate_native_table_dataframe(df: pd.DataFrame, page_idx: int) -> Tuple[bo
     if df is None or df.empty:
         return False, "表格为空或 DataFrame 为 None"
 
-    # 1. 基础尺寸检验
-    if df.shape[0] < 2 or df.shape[1] < 2:
-        return False, f"表格尺寸异常 ({df.shape[0]}行 × {df.shape[1]}列)，无法构成有效二维数据矩阵"
+    # 1. 基础尺寸检验（支持 1 行表/单行汇总表/键值表）
+    if df.shape[0] < 1 or df.shape[1] < 1:
+        return False, f"表格尺寸异常 ({df.shape[0]}行 × {df.shape[1]}列)，无法构成有效数据矩阵"
 
     # 2. 检查是否为低质量损坏表（已整合通用低质量过滤器）
     if is_table_low_quality(df):
@@ -175,10 +190,10 @@ def validate_native_table_dataframe(df: pd.DataFrame, page_idx: int) -> Tuple[bo
         elif all(len(v) <= 1 for v in col_vals) and len(col_vals) >= 3:
             single_char_col_count += 1
 
-    if empty_col_count >= 2:
+    if df.shape[1] > 3 and empty_col_count >= 2:
         return False, f"存在 {empty_col_count} 个完全空白列，列切分严重受损"
 
-    if single_char_col_count >= 2 and df.shape[1] <= 6:
+    if single_char_col_count >= 2 and df.shape[1] <= 6 and df.shape[0] >= 3:
         return False, f"存在 {single_char_col_count} 个单字符碎片列，疑似竖排文字被切碎"
 
     # 5. 图表坐标轴/散点图残片深度检测

@@ -152,10 +152,16 @@ def parse_structured_markdown_tables(md_content):
         """Parse markdown table lines into DataFrame with fragmentation guard."""
         try:
             clean_lines = [line for line in table_lines if not is_markdown_separator(line)]
-            if len(clean_lines) < 2:
+            if len(clean_lines) < 1:
                 return None
             csv_data = "\n".join([line.strip("|") for line in clean_lines])
-            df = pd.read_csv(io.StringIO(csv_data), sep=r'\s*\|\s*', engine='python')
+            if len(clean_lines) == 1:
+                raw_cells = [c.strip() for c in clean_lines[0].split('|') if c.strip()]
+                if not raw_cells:
+                    return None
+                df = pd.DataFrame([raw_cells], columns=[f"Col_{i+1}" for i in range(len(raw_cells))])
+            else:
+                df = pd.read_csv(io.StringIO(csv_data), sep=r'\s*\|\s*', engine='python')
             
             # 碎片化检测：列数 >30 且填充率 <30% -> 跳过
             if df.shape[1] > 30:
@@ -724,6 +730,40 @@ def _filter_noise_and_placeholders(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def is_paywall_table(df) -> bool:
+    """
+    检查表格是否为付费墙、登录拦截或Cookie弹窗提示。
+    采用严格词边界匹配与强/弱关键词共现策略，彻底避免 parent/different/register of samples 误杀。
+    """
+    if df is None or df.empty or len(df) > 4:
+        return False
+    cells_text = ' '.join(str(val) for val in df.values.flatten() if val is not None)
+    strong_paywall_patterns = [
+        r'\binstitutional\s+login\b',
+        r'\bpurchase\s+access\b',
+        r'\baccept\s+cookies\b',
+        r'\bcookie\s+policy\b',
+        r'\bsubscription\s+required\b',
+        r'\bsign\s+in\s+to\s+(?:view|access|read)\b',
+        r'\baccess\s+through\s+your\s+institution\b',
+        r'\brent\s+this\s+article\b',
+        r'\bpurchase\s+instant\s+access\b',
+    ]
+    weak_paywall_terms = [
+        r'\blogin\b',
+        r'\bsign\s+in\b',
+        r'\bsubscription\b',
+        r'\brent\b',
+        r'\bsubscribe\b',
+        r'\bpaywall\b',
+        r'\bopenathens\b',
+        r'\bshibboleth\b',
+    ]
+    has_strong = any(re.search(pat, cells_text, re.IGNORECASE) for pat in strong_paywall_patterns)
+    weak_hits = sum(1 for pat in weak_paywall_terms if re.search(pat, cells_text, re.IGNORECASE))
+    return bool(has_strong or weak_hits >= 2)
+
+
 def postprocess_dataframe(df, headers=None):
     """Clean up and format the DataFrame safely and losslessly."""
     if df is None:
@@ -742,13 +782,14 @@ def postprocess_dataframe(df, headers=None):
     original_attrs = df.attrs.copy() if hasattr(df, 'attrs') else {}
     is_vlm = (original_attrs.get('extractor') == 'paddleocr_vl' or original_attrs.get('source') == 'paddleocr_vl')
 
-    # 1. 付费墙拦截判定
-    if len(df) <= 4:
-        cells_str = ' '.join(str(val) for val in df.values.flatten()).lower()
-        paywall_keywords = ['login', 'sign in', 'purchase', 'subscription', 'rent', 'purchase access', 'institutional login', 'register', 'subscribe', 'cookie policy', 'accept cookies']
-        if any(kw in cells_str for kw in paywall_keywords):
-            print("Warning: Detected paywall or login warning table. Rejecting table.")
-            return pd.DataFrame()
+    # 1. 付费墙拦截判定（严格词边界匹配与多关键词共现，彻底避免 parent/different/register of samples 误杀）
+    if is_paywall_table(df) or original_attrs.get('rejected_reason') == 'paywall':
+        print("Warning: Detected paywall or login warning table. Isolating and rejecting table.")
+        res_df = pd.DataFrame()
+        res_df.attrs = original_attrs.copy()
+        res_df.attrs['rejected_reason'] = 'paywall'
+        res_df.attrs['rejected_raw_df'] = df.copy()
+        return res_df
 
     df = df.copy().reset_index(drop=True)
 
@@ -1250,30 +1291,34 @@ def merge_continuation_tables(dfs):
         combined_hint = f"{raw_lbl} {title_str}"
         is_explicit_cont = bool(re.search(r'(?:续表|接上表|续上表|（续）|\(续\)|continued|cont\'?d|\(cont\b|cont\.)', combined_hint) or df.attrs.get('is_continuation')) and page_nearby
         
-        # 列匹配：列数差异小 (<=4) 或存在明显学术列名重合
+        # 列匹配：对于续表合并，要求列名实质重合或为明确续表数据行
         common_cols = set(_normalize_col_name(c) for c in df.columns) & set(_normalize_col_name(c) for c in prev_df.columns)
-        has_common_cols = len(common_cols - {'', 'unnamed', 'unnamed0', 'unnamed1', 'unnamed2'}) >= 2
-        cols_match = (
-            abs(df.shape[1] - prev_df.shape[1]) <= 4 or
-            has_common_cols
-        )
+        has_common_cols = len(common_cols - {'', 'unnamed', 'unnamed0', 'unnamed1', 'unnamed2', 'col1', 'col2', 'col3'}) >= 2
 
-        # 小表安全防护：若两表均为独立小表（<6行）且无明确续表标识，禁止单纯因列数相同盲目合并；
-        # 但若续表列名实质上是数据行（如检出限、误差、纯数值），则确系续表首行（保护 RangeIndex）
+        # 小表安全防护：若续表列名实质上是数据行（如检出限、误差、纯数值），则确系续表首行（保护 RangeIndex）
         is_seq_int = (
             isinstance(df.columns, pd.RangeIndex) or
             list(df.columns) == list(range(len(df.columns))) or
             [str(c).strip() for c in df.columns] == [str(i) for i in range(len(df.columns))]
         )
         cols_are_data = (not is_seq_int) and (sum(1 for c in df.columns if is_pure_data_value(c)) / max(1, len(df.columns)) >= 0.3)
-        is_small_unlabeled_pair = (df.shape[0] < 6 and prev_df.shape[0] < 6 and not is_explicit_cont and not cols_are_data)
+
+        # 若后表有明确独立表头但与前表列名几乎无交集，即使列数相近也绝非续表
+        has_distinct_header = (not cols_are_data) and any(not str(c).startswith(('Unnamed', 'Col')) for c in df.columns)
+        if has_distinct_header and not has_common_cols and not is_explicit_cont:
+            cols_match = False
+        else:
+            cols_match = has_common_cols or (abs(df.shape[1] - prev_df.shape[1]) <= 2 and (is_explicit_cont or cols_are_data))
+
+        # 小表独立性保护：后表若只有 1~5 行且无明确续表标识、且非数据行列名且列集合差异大，坚决独立保留，杜绝前大后小误合并
+        is_small_unlabeled_independent = (df.shape[0] < 6 and not is_explicit_cont and not cols_are_data and not has_common_cols)
 
         is_unlabeled_cont = (
             (not lbl or is_explicit_cont or cols_are_data) and
             (is_next_page or is_block_sequence or (page_dist is not None and page_dist <= 2)) and
             prev_lbl and
             cols_match and
-            not is_small_unlabeled_pair
+            not is_small_unlabeled_independent
         )
 
         if is_same_page and is_same_label:

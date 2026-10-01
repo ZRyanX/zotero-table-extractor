@@ -347,8 +347,23 @@ def _do_process_single_pdf(pdf_path, orig_pdf_path, args, is_batch=False, plan=N
                 is_complete = False
                 if expected_labels:
                     is_complete = (len(missing_labels) == 0 and len(online_dfs) >= expected_count)
-                else:
+                elif expected_count > 0:
                     is_complete = (len(online_dfs) >= expected_count)
+                else:
+                    # expected_count == 0: PDF 文本扫描未检出明确表题声明
+                    # 检查 PDF 是否有潜在表格线框或矢量结构
+                    has_pdf_table_cues = False
+                    try:
+                        import pymupdf as fitz
+                        doc = fitz.open(orig_pdf_path)
+                        for page in doc:
+                            if page.find_tables().tables or len(page.get_drawings()) > 5:
+                                has_pdf_table_cues = True
+                                break
+                        doc.close()
+                    except Exception:
+                        pass
+                    is_complete = (not has_pdf_table_cues and len(online_dfs) > 0)
 
                 if not is_complete:
                     if missing_labels:
