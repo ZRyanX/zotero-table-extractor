@@ -2543,9 +2543,55 @@ def reconcile_native_and_ocr_tables(
     return merged
 
 
+def quick_detect_candidate_pages(pdf_path: str) -> List[int]:
+    """
+    轻量快速探测 PDF 中可能包含表格的候选页面索引 (0-indexed)。
+    综合真实 Caption 声明与全图/扫描页特征，耗时极低 (< 20ms)。
+    供 Tier 1 方向检测与快速预排查使用。
+    """
+    if not os.path.exists(pdf_path) or fitz is None:
+        return []
+
+    candidate_pages = set()
+    try:
+        try:
+            from .table_validator import scan_pdf_table_declarations
+        except ImportError:
+            from table_validator import scan_pdf_table_declarations
+        page_decls = scan_pdf_table_declarations(pdf_path)
+        candidate_pages.update(page_decls.keys())
+    except Exception:
+        pass
+
+    try:
+        doc = fitz.open(pdf_path)
+        for p_idx, page in enumerate(doc):
+            words = page.get_text("words")
+            num_words = len(words)
+            if num_words < 80:
+                images = page.get_images(full=False)
+                if len(images) > 0 or num_words < 10:
+                    candidate_pages.add(p_idx)
+                    continue
+
+            # 矢量绘图密度特征：若含有较多矢量绘图指令 (如复杂图表或横表线框)
+            try:
+                drawings = page.get_drawings()
+                if isinstance(drawings, (list, tuple)) and len(drawings) >= 15:
+                    candidate_pages.add(p_idx)
+            except Exception:
+                pass
+        doc.close()
+    except Exception:
+        pass
+
+    return sorted(list(candidate_pages))
+
+
 def extract_tables_from_pdf(
     pdf_path: str,
     use_ocr_fallback: bool = True,
+    candidate_pages: Optional[List[int]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
     """
     统一 PDF 表格提取管线入口。
@@ -2559,7 +2605,12 @@ def extract_tables_from_pdf(
                 from .doc_orientation_detector import remediate_pdf_pages_lossless
             except ImportError:
                 from doc_orientation_detector import remediate_pdf_pages_lossless
-            eff_pdf_path, was_rotated, tmp_lossless = remediate_pdf_pages_lossless(pdf_path)
+
+            cands = candidate_pages
+            if cands is None:
+                cands = quick_detect_candidate_pages(pdf_path)
+
+            eff_pdf_path, was_rotated, tmp_lossless = remediate_pdf_pages_lossless(pdf_path, candidate_pages=cands)
             if was_rotated and tmp_lossless:
                 pdf_path = eff_pdf_path
                 temp_pdf_to_clean = tmp_lossless

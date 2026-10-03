@@ -166,7 +166,20 @@ def process_single_pdf(pdf_path, args, is_batch=False, plan=None):
                 except ImportError:
                     from doc_orientation_detector import remediate_pdf_pages_lossless
 
-                lossless_path, was_rotated, tmp_lossless = remediate_pdf_pages_lossless(target_pdf_path)
+                cand_pages = None
+                try:
+                    try:
+                        from .pdf_table_extractor import quick_detect_candidate_pages
+                    except ImportError:
+                        from pdf_table_extractor import quick_detect_candidate_pages
+                    cand_pages = quick_detect_candidate_pages(target_pdf_path)
+                except Exception:
+                    pass
+
+                lossless_path, was_rotated, tmp_lossless = remediate_pdf_pages_lossless(
+                    target_pdf_path,
+                    candidate_pages=cand_pages
+                )
                 if was_rotated and tmp_lossless:
                     target_pdf_path = lossless_path
                     temps_to_clean.append(tmp_lossless)
@@ -221,7 +234,14 @@ def process_single_pdf(pdf_path, args, is_batch=False, plan=None):
             elif has_rotation and is_native:
                 print(f"[PDF] Native PDF 有旋转但保留文本层，跳过烘焙（避免破坏文本层）")
 
-        return _do_process_single_pdf(target_pdf_path, orig_pdf_path=pdf_path, args=args, is_batch=is_batch, plan=plan)
+        return _do_process_single_pdf(
+            target_pdf_path,
+            orig_pdf_path=pdf_path,
+            args=args,
+            is_batch=is_batch,
+            plan=plan,
+            candidate_pages=cand_pages
+        )
     finally:
         for t_p in temps_to_clean:
             if t_p and os.path.exists(t_p):
@@ -292,7 +312,7 @@ def call_journal_supp_downloader(doi_or_url: str, output_dir: str) -> bool:
     return False
 
 
-def _do_process_single_pdf(pdf_path, orig_pdf_path, args, is_batch=False, plan=None):
+def _do_process_single_pdf(pdf_path, orig_pdf_path, args, is_batch=False, plan=None, candidate_pages=None):
     output_path = args.output
     filename_base = os.path.splitext(os.path.basename(orig_pdf_path))[0]
     safe_base = make_safe_filename(filename_base)
@@ -429,7 +449,11 @@ def _do_process_single_pdf(pdf_path, orig_pdf_path, args, is_batch=False, plan=N
     pdf_extracted = False
     if extract_tables_from_pdf is not None:
         try:
-            results, logs = extract_tables_from_pdf(pdf_path, use_ocr_fallback=True)
+            results, logs = extract_tables_from_pdf(
+                pdf_path,
+                use_ocr_fallback=True,
+                candidate_pages=candidate_pages
+            )
             for log_line in logs:
                 print(f"  [Pipeline] {log_line}")
 

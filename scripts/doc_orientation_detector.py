@@ -6,15 +6,17 @@ scripts/doc_orientation_detector.py — 基于 TurboOCR doc_ori.onnx (PP-LCNet) 
 1. 模型管理与按需下载：
    自动检测并加载 models/doc_ori.onnx (PP-LCNet_x1_0_doc_ori, ~6.47MB, 4-class {0: 0°, 1: 90°, 2: 180°, 3: 270°})。
    若本地未下载，支持从官方 GitHub Release 安全原子下载并进行 SHA256 完整性校验；在无网络或模型缺失时平滑优雅降级。
-2. 图像前处理与方差导向裁剪 (Variance-Guided Crop)：
-   短边等比缩放至 256；对宽表/稀疏版面采用基于灰度方差的自适应滑动窗口裁切 224x224（避开大面积纯白留白），
+2. 图像前处理 (官方 CenterCrop 与局部方差导向裁剪)：
+   短边等比缩放至 256；全页级分类严格遵循 PaddleX / TurboOCR 官方规范 CenterCrop(224)；
+   针对局部稀疏表格切图保留灰度方差自适应滑动窗口 (Variance-Guided Crop 224x224)；
    结合 ImageNet 标准化 (mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]) 输出 [1, 3, 224, 224] float32 张量。
-3. 双轨两阶旋转识别与置信度门限：
-   - 极速矢量轨：基于 PyMuPDF span["dir"]/line["dir"] 0-时延、100% 精准识别原生矢量文字旋转；
-   - 视觉模型轨：基于 ONNX Runtime CPU 进行 doc_ori 推理，计算 Softmax 裕度 probs[top1] - probs[top2]。
-     当裕度 < 0.25 (kDocOriMargin) 时触发安全回退返回 0°，避免弱特征下的误翻转。
+3. 双轨两阶旋转识别与安全门限：
+   - 极速矢量轨：基于 PyMuPDF span["dir"]/line["dir"] 0-时延识别。全页级要求主导方向占比 >= 85% 且次级方向 <= 15%；
+     对混排页面 (如 0° 正文 + 90° 横表) 严格跳过整页旋转，交由 Tier 2 表格切图局部纠偏。
+   - 视觉模型轨：全页级结合 Top-1 概率门限 (>= 0.80) 与 Softmax 概率裕度 (>= 0.35)，贯彻“不确定时不旋转整页”策略。
 4. 两级翻转矫正 (Dual-Track Two-Tier Remediation)：
    - Tier 1: 页面级无损顺时针校准（通过 page.set_rotation 与 doc.save 无损重写 PDF /Rotate，不破坏矢量文本与排版）；
+     长文档自动联检候选页与扫描/图表密度页。
    - Tier 2: 嵌套横表切图正向矫正（通过 PIL 旋转切图使其在送入 VLM/PaddleOCR 前恢复正向，彻底防止注意力崩溃与列串位）。
 """
 
@@ -63,7 +65,17 @@ EXPECTED_SHA256 = "96e898f047a0e460ba0652e9afb8c874e53872821cfd7a3fec53a5ab62df9
 CLASS_TO_DEGREE = {0: 0, 1: 90, 2: 180, 3: 270}
 DEGREE_TO_CLASS = {0: 0, 90: 1, 180: 2, 270: 3}
 
-DEFAULT_MARGIN_THRESHOLD = 0.25  # kDocOriMargin
+DEFAULT_MARGIN_THRESHOLD = 0.25  # kDocOriMargin 通用/切图裕度门限
+DEFAULT_MIN_CONFIDENCE = 0.50
+
+# 全页级视觉模型门限：Top-1 概率 >= 0.80 且概率裕度 >= 0.35，严格防范整页误翻转
+PAGE_MARGIN_THRESHOLD = 0.35
+PAGE_MIN_CONFIDENCE = 0.80
+
+# 全页级矢量文字一致性门限：主导方向必须达到 85% 以上，且非主导次级方向文字必须微不足道 (<= 15%)
+PAGE_VECTOR_DOMINANT_RATIO = 0.85
+PAGE_VECTOR_MAX_SECONDARY_RATIO = 0.15
+PAGE_VECTOR_MIN_CHARS = 15
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
@@ -72,6 +84,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SKILL_ROOT_DIR = os.path.dirname(SCRIPT_DIR)
 SKILL_MODEL_DIR = os.path.join(SKILL_ROOT_DIR, "models")
 GLOBAL_MODEL_DIR = os.path.expanduser("~/.zotero_models")
+
 
 
 def compute_sha256(filepath: str) -> str:
@@ -174,29 +187,19 @@ def get_clockwise_correction_angle(detected_angle: int) -> int:
     return (360 - (detected_angle % 360)) % 360
 
 
-def detect_vector_text_details(page: Any, rect: Optional[Union[List[float], Tuple[float, ...]]] = None) -> Tuple[int, int, float]:
+def get_vector_text_distribution(page: Any, rect: Optional[Union[List[float], Tuple[float, ...]]] = None) -> Counter:
     """
-    极速检测 PDF 页面或局部区域 (rect) 内原生矢量文本的主导阅读旋转方向、总字符数及主导方向占比。
-    利用 PyMuPDF 原生 line["dir"] 与 span["dir"] 方向矢量计算角度，实现 0 时延、100% 精确识别。
-    
-    参数:
-      page: PyMuPDF Page 对象
-      rect: 可选的裁剪区域 [x0, y0, x1, y1] (PDF 72-dpi 坐标)
-      
-    返回:
-      (dominant_angle, total_char_count, dominant_ratio)
-      - dominant_angle: 0 | 90 | 180 | 270
-      - total_char_count: 区域内统计到的矢量字符总数
-      - dominant_ratio: 主导方向字符数占总字符数的比例 (0.0 ~ 1.0)
+    统计 PDF 页面或局部区域 (rect) 内原生矢量文本在各个旋转角度 (0, 90, 180, 270) 的字符数分布。
+    利用 PyMuPDF 原生 line["dir"] 与 span["dir"] 方向矢量进行无损几何计算。
     """
     if page is None or fitz is None:
-        return 0, 0, 0.0
+        return Counter()
 
     try:
         clip_rect = fitz.Rect(rect) if rect is not None else None
         text_dict = page.get_text("dict", clip=clip_rect) if clip_rect else page.get_text("dict")
     except Exception:
-        return 0, 0, 0.0
+        return Counter()
 
     counts = Counter()
     for block in text_dict.get("blocks", []):
@@ -230,6 +233,25 @@ def detect_vector_text_details(page: Any, rect: Optional[Union[List[float], Tupl
             snapped = int(round(angle_deg / 90.0) * 90) % 360
             counts[snapped] += text_len
 
+    return counts
+
+
+def detect_vector_text_details(page: Any, rect: Optional[Union[List[float], Tuple[float, ...]]] = None) -> Tuple[int, int, float]:
+    """
+    极速检测 PDF 页面或局部区域 (rect) 内原生矢量文本的主导阅读旋转方向、总字符数及主导方向占比。
+    利用 PyMuPDF 原生 line["dir"] 与 span["dir"] 方向矢量计算角度，实现 0 时延、100% 精确识别。
+    
+    参数:
+      page: PyMuPDF Page 对象
+      rect: 可选的裁剪区域 [x0, y0, x1, y1] (PDF 72-dpi 坐标)
+      
+    返回:
+      (dominant_angle, total_char_count, dominant_ratio)
+      - dominant_angle: 0 | 90 | 180 | 270
+      - total_char_count: 区域内统计到的矢量字符总数
+      - dominant_ratio: 主导方向字符数占总字符数的比例 (0.0 ~ 1.0)
+    """
+    counts = get_vector_text_distribution(page, rect=rect)
     if not counts:
         return 0, 0, 0.0
 
@@ -239,27 +261,32 @@ def detect_vector_text_details(page: Any, rect: Optional[Union[List[float], Tupl
     return most_common_angle, total_len, ratio
 
 
-def detect_vector_text_rotation(page: Any, rect: Optional[Union[List[float], Tuple[float, ...]]] = None) -> int:
+def detect_vector_text_rotation(
+    page: Any,
+    rect: Optional[Union[List[float], Tuple[float, ...]]] = None,
+    min_ratio: float = 0.60
+) -> int:
     """
     极速检测 PDF 页面或局部区域 (rect) 内原生矢量文本的主导阅读旋转方向。
-    保持原有签名兼容，当主导方向占比 >= 60% 时返回对应角度 (0, 90, 180, 270)，否则返回 0。
+    保持原有签名兼容，当主导方向占比 >= min_ratio 时返回对应角度 (0, 90, 180, 270)，否则返回 0。
     """
     angle, total_len, ratio = detect_vector_text_details(page, rect=rect)
-    if total_len > 0 and ratio >= 0.60:
+    if total_len > 0 and ratio >= min_ratio:
         return angle
     return 0
 
 
 def preprocess_image(
     img: Union[Any, "np.ndarray"],
-    use_variance_crop: bool = True
+    use_variance_crop: bool = False
 ) -> "np.ndarray":
     """
     TurboOCR doc_ori 标准图像前处理：
     1. 转为 RGB 模式；
     2. 短边等比缩放至 256；
-    3. 方差导向自适应裁剪 (Variance-Guided Crop) 224x224：
-       在长边方向上自适应评估多个候选裁剪窗口的灰度方差，选取纹理信息量最丰富的区域（规避空白表格边缘与大边距）；
+    3. 224x224 裁剪：
+       - 全页级分类（默认 use_variance_crop=False）：严格遵循 PaddleX / TurboOCR doc_ori 官方配置 CenterCrop(224)；
+       - 局部切图（use_variance_crop=True）：方差导向自适应滑动窗口 (Variance-Guided Crop)，选取方差最大窗口避开纯白留白；
     4. ImageNet 归一化 (mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])；
     5. HWC -> CHW，添加 batch 维度，返回 [1, 3, 224, 224] float32 张量。
     """
@@ -267,7 +294,14 @@ def preprocess_image(
         raise RuntimeError("PIL 与 numpy 是运行图像前处理的必要依赖")
 
     if isinstance(img, np.ndarray):
-        pil_img = Image.fromarray(img)
+        if np.issubdtype(img.dtype, np.floating):
+            if img.size > 0 and float(np.max(img)) <= 1.0:
+                img_uint8 = (img * 255.0).clip(0, 255).astype(np.uint8)
+            else:
+                img_uint8 = img.clip(0, 255).astype(np.uint8)
+            pil_img = Image.fromarray(img_uint8)
+        else:
+            pil_img = Image.fromarray(img)
     elif hasattr(img, "convert"):
         pil_img = img
     else:
@@ -292,7 +326,7 @@ def preprocess_image(
 
     # 224x224 裁剪
     if use_variance_crop and (new_w > 256 or new_h > 256):
-        # 宽表或长页：在长轴滑动窗口中寻找文本特征方差最大的切块，短轴保持居中
+        # 针对局部稀疏表格切图：在长轴滑动窗口中寻找文本特征方差最大的切块，短轴保持居中
         if new_w > 256:
             fixed_y = (new_h - 224) // 2
             max_x = new_w - 224
@@ -326,6 +360,7 @@ def preprocess_image(
                     best_crop = cand
             crop = best_crop if best_crop is not None else resized.crop((fixed_x, (new_h - 224) // 2, fixed_x + 224, (new_h + 224) // 2))
     else:
+        # 官方标准 CenterCrop(224)
         left = (new_w - 224) // 2
         top = (new_h - 224) // 2
         crop = resized.crop((left, top, left + 224, top + 224))
@@ -387,7 +422,8 @@ class DocOrientationDetector:
         self,
         img: Union[Any, "np.ndarray"],
         margin_threshold: float = DEFAULT_MARGIN_THRESHOLD,
-        use_variance_crop: bool = True
+        min_confidence: float = 0.0,
+        use_variance_crop: bool = False
     ) -> Dict[str, Any]:
         """
         对给定输入图片进行方向预测。
@@ -428,11 +464,15 @@ class DocOrientationDetector:
             top1_cls, top1_prob = ranked[0]
             top2_cls, top2_prob = ranked[1]
             margin = float(top1_prob - top2_prob)
+            top1_prob = float(top1_prob)
 
             raw_degree = CLASS_TO_DEGREE.get(top1_cls, 0)
 
-            # 裕度门限守卫：若区分度过低 (< margin_threshold) 或本来就是 0°，安全回退至 0°
-            if margin < margin_threshold or raw_degree == 0:
+            # 裕度门限与置信度守卫：
+            # 严格执行“不确定时不旋转”策略。
+            # 若概率裕度过低 (< margin_threshold) 或 Top-1 置信度不足 (< min_confidence) 或本身预测为 0°，
+            # 安全回退至 0°，needs_rotation = False
+            if margin < margin_threshold or top1_prob < min_confidence or raw_degree == 0:
                 detected_angle = 0
                 needs_rotation = False
             else:
@@ -444,7 +484,7 @@ class DocOrientationDetector:
             return {
                 "detected_angle": detected_angle,
                 "correction_angle": correction_angle,
-                "confidence": float(top1_prob),
+                "confidence": top1_prob,
                 "margin": margin,
                 "probs": probs,
                 "needs_rotation": needs_rotation,
@@ -470,33 +510,86 @@ def get_orientation_detector(model_path: Optional[str] = None) -> DocOrientation
 def detect_page_orientation(
     page: Any,
     detector: Optional[DocOrientationDetector] = None,
-    margin_threshold: float = DEFAULT_MARGIN_THRESHOLD
+    margin_threshold: float = PAGE_MARGIN_THRESHOLD,
+    min_confidence: float = PAGE_MIN_CONFIDENCE
 ) -> Dict[str, Any]:
     """
     对 PDF 单页进行双轨方向检测（优先 0-时延矢量文本轨，兜底视觉模型轨）。
+    全页方向一致性与安全保障：
+    1. 矢量文本轨：要求全页主导方向字符占比 >= 85% 且非主导次级方向字符占比 <= 15%。
+       若存在混合文字方向 (例如 0° 正文 + 90° 横表)，绝不翻转整页，跳过 Tier 1 纠偏，交由 Tier 2 表格切图局部处理。
+    2. 视觉模型轨：全页级严格遵循 PaddleX / TurboOCR 官方标准 CenterCrop(224) 预处理，
+       并结合 Top-1 概率门限 (>= 0.80) 与 Softmax 概率裕度 (>= 0.35)，确保不确定时不旋转整页。
     """
+    if page is None or fitz is None:
+        return {
+            "detected_angle": 0,
+            "correction_angle": 0,
+            "confidence": 0.0,
+            "margin": 0.0,
+            "needs_rotation": False,
+            "source": "fallback"
+        }
+
     # Track 1: 极速矢量文本轨
-    angle, total_len, ratio = detect_vector_text_details(page)
-    if total_len >= 15 and ratio >= 0.60:
-        if angle in (90, 180, 270):
-            corr = get_clockwise_correction_angle(angle)
-            return {
-                "detected_angle": angle,
-                "correction_angle": corr,
-                "confidence": 1.0,
-                "margin": 1.0,
-                "needs_rotation": True,
-                "source": "vector_text"
+    counts = get_vector_text_distribution(page)
+    total_len = sum(counts.values())
+    if total_len >= PAGE_VECTOR_MIN_CHARS:
+        most_common_angle, most_len = counts.most_common(1)[0]
+        ratio = most_len / float(total_len)
+        secondary_ratio = (total_len - most_len) / float(total_len)
+        upright_len = counts.get(0, 0)
+        upright_ratio = upright_len / float(total_len)
+
+        if most_common_angle == 0:
+            # 主导方向为 0° 正向 (Upright)
+            # 要求主导方向占比 >= 85%，且次级非零方向 (90°, 180°, 270°) 文字必须微不足道 (<= 15%)
+            if ratio >= PAGE_VECTOR_DOMINANT_RATIO and secondary_ratio <= PAGE_VECTOR_MAX_SECONDARY_RATIO:
+                return {
+                    "detected_angle": 0,
+                    "correction_angle": 0,
+                    "confidence": 1.0,
+                    "margin": 1.0,
+                    "needs_rotation": False,
+                    "source": "vector_text_upright"
+                }
+        else:
+            # 主导方向为旋转方向 (90°, 180°, 270°)
+            # 全页方向一致性与学术混排防误翻守卫：
+            # 若页面存在不可忽略的 0° 正向正文 (如 0° 正文 + 90° 横表，0° 字符 >= 15 或 占比 > 5%)，
+            # 严格判定为混排页面 (Mixed Text Orientation)，绝不翻转整页！交由 Tier 2 表格切图局部纠偏。
+            # 仅当 0° 字符微不足道 (< 15 字符且占比 <= 5%，如单纯页码/页眉) 且主导旋转方向达到 85% 时，
+            # 才认定整页为统一纯旋转页面进行整页翻转。
+            has_upright_body = (upright_len >= PAGE_VECTOR_MIN_CHARS)
+            if (not has_upright_body) and ratio >= PAGE_VECTOR_DOMINANT_RATIO and secondary_ratio <= PAGE_VECTOR_MAX_SECONDARY_RATIO:
+                corr = get_clockwise_correction_angle(most_common_angle)
+                return {
+                    "detected_angle": most_common_angle,
+                    "correction_angle": corr,
+                    "confidence": 1.0,
+                    "margin": 1.0,
+                    "needs_rotation": True,
+                    "source": "vector_text"
+                }
+
+        # 存在混排或一致性不足，跳过整页翻转
+        return {
+            "detected_angle": 0,
+            "correction_angle": 0,
+            "confidence": ratio,
+            "margin": 0.0,
+            "needs_rotation": False,
+            "source": "vector_mixed_skipped",
+            "details": {
+                "dominant_angle": most_common_angle,
+                "dominant_ratio": ratio,
+                "secondary_ratio": secondary_ratio,
+                "upright_len": upright_len,
+                "upright_ratio": upright_ratio,
+                "total_len": total_len,
+                "distribution": dict(counts)
             }
-        elif angle == 0:
-            return {
-                "detected_angle": 0,
-                "correction_angle": 0,
-                "confidence": 1.0,
-                "margin": 1.0,
-                "needs_rotation": False,
-                "source": "vector_text_upright"
-            }
+        }
 
     # Track 2: 视觉模型轨（针对扫描页或少字图表页）
     det = detector or get_orientation_detector()
@@ -513,7 +606,13 @@ def detect_page_orientation(
     try:
         pix = page.get_pixmap(dpi=100)
         im = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-        return det.predict(im, margin_threshold=margin_threshold, use_variance_crop=True)
+        # 全页级分类严格采用官方 CenterCrop (use_variance_crop=False) 及加严阈值
+        return det.predict(
+            im,
+            margin_threshold=margin_threshold,
+            min_confidence=min_confidence,
+            use_variance_crop=False
+        )
     except Exception as e:
         print(f"[Doc-Ori] 页面渲染缩略图推理异常: {e}")
         return {
@@ -531,7 +630,9 @@ def detect_crop_orientation(
     page: Optional[Any] = None,
     rect: Optional[Union[List[float], Tuple[float, ...]]] = None,
     detector: Optional[DocOrientationDetector] = None,
-    margin_threshold: float = DEFAULT_MARGIN_THRESHOLD
+    margin_threshold: float = DEFAULT_MARGIN_THRESHOLD,
+    min_confidence: float = DEFAULT_MIN_CONFIDENCE,
+    use_variance_crop: bool = True
 ) -> Dict[str, Any]:
     """
     对嵌套表格裁剪区域 (Table Crop) 进行双轨方向检测。
@@ -563,7 +664,7 @@ def detect_crop_orientation(
         except Exception:
             pass
 
-    # Track 2: 视觉模型轨
+    # Track 2: 视觉模型轨 (针对局部稀疏表格切图，保留方差导向滑动窗口裁剪以抓取关键线条)
     det = detector or get_orientation_detector()
     if not det.is_available():
         return {
@@ -575,17 +676,23 @@ def detect_crop_orientation(
             "source": "fallback"
         }
 
-    return det.predict(crop_img, margin_threshold=margin_threshold, use_variance_crop=True)
+    return det.predict(
+        crop_img,
+        margin_threshold=margin_threshold,
+        min_confidence=min_confidence,
+        use_variance_crop=use_variance_crop
+    )
 
 
 def remediate_pdf_pages_lossless(
     pdf_path: str,
     candidate_pages: Optional[List[int]] = None,
-    margin_threshold: float = DEFAULT_MARGIN_THRESHOLD
+    margin_threshold: float = PAGE_MARGIN_THRESHOLD,
+    min_confidence: float = PAGE_MIN_CONFIDENCE
 ) -> Tuple[str, bool, Optional[str]]:
     """
     Tier 1: 页面级无损顺时针方向校准。
-    在提取管线入口前快速检测 candidate_pages（或前几页与含表声明页）。
+    在提取管线入口前快速检测 candidate_pages（或前几页、含表声明页及扫描/图表候选页）。
     若检测到页面文字处于旋转状态 (90°, 180°, 270°)，通过 page.set_rotation() 进行无损顺时针校准，
     并保存为临时 PDF 文件。
     
@@ -608,33 +715,78 @@ def remediate_pdf_pages_lossless(
         doc.close()
         return pdf_path, False, None
 
-    # 确定检测范围：若有候选页列表则检测候选页；若无，文献页数 <= 15 全检，> 15 检前 5 页及含表声明页
+    # 确定检测范围：
+    # 1. 显式传入的 candidate_pages
+    # 2. 若总页数 <= 15 全检
+    # 3. 若总页数 > 15：
+    #    - 前 5 页 (通常包含封面、摘要、引言与早期图表)
+    #    - 含有 Table Caption / 续表声明的页面
+    #    - 具有图像密度、矢量绘图密度或低文本密度的扫描/图表候选页 (解决长文档后段无 Caption 扫描页遗漏问题)
+    pages_to_check = set()
     if candidate_pages is not None:
-        pages_to_check = [p for p in candidate_pages if 0 <= p < total_pages]
-    elif total_pages <= 15:
-        pages_to_check = list(range(total_pages))
+        pages_to_check.update(p for p in candidate_pages if 0 <= p < total_pages)
+
+    if total_pages <= 15:
+        pages_to_check.update(range(total_pages))
     else:
-        pages_to_check = list(range(min(5, total_pages)))
+        # 前 5 页
+        pages_to_check.update(range(min(5, total_pages)))
+
         # 补充含 Caption 的潜在页面
         try:
-            from table_validator import scan_pdf_table_declarations
+            try:
+                from .table_validator import scan_pdf_table_declarations
+            except ImportError:
+                from table_validator import scan_pdf_table_declarations
             decls = scan_pdf_table_declarations(pdf_path)
             for p in decls.keys():
-                if 0 <= p < total_pages and p not in pages_to_check:
-                    pages_to_check.append(p)
+                if 0 <= p < total_pages:
+                    pages_to_check.add(p)
         except Exception:
             pass
 
+        # 针对长文档后段：低成本检测扫描候选页、高图像密度或低文本密度页
+        for p_idx in range(total_pages):
+            if p_idx in pages_to_check:
+                continue
+            try:
+                page_obj = doc[p_idx]
+                words = page_obj.get_text("words")
+                num_words = len(words)
+
+                # 扫描页 / 全图页特征：文本词数少 (< 80) 且含有图像资源，或纯扫描页 (< 10 词)
+                if num_words < 80:
+                    imgs = page_obj.get_images(full=False)
+                    if len(imgs) > 0 or num_words < 10:
+                        pages_to_check.add(p_idx)
+                        continue
+
+                # 绘图密度特征：若含有较多矢量绘图指令 (如复杂图表或横表)
+                try:
+                    drawings = page_obj.get_drawings()
+                    if isinstance(drawings, (list, tuple)) and len(drawings) >= 15:
+                        pages_to_check.add(p_idx)
+                except Exception:
+                    pass
+            except Exception:
+                continue
+
+    sorted_pages = sorted(list(pages_to_check))
     detector = get_orientation_detector()
     modified = False
 
-    for p_idx in pages_to_check:
+    for p_idx in sorted_pages:
         page = doc[p_idx]
         # 仅针对未经旋转定义 (page.rotation == 0) 的页面进行检测；已设 rotation 的页面已在视口层声明过旋转
         if getattr(page, "rotation", 0) != 0:
             continue
 
-        res = detect_page_orientation(page, detector=detector, margin_threshold=margin_threshold)
+        res = detect_page_orientation(
+            page,
+            detector=detector,
+            margin_threshold=margin_threshold,
+            min_confidence=min_confidence
+        )
         if res.get("needs_rotation") and res.get("correction_angle") in (90, 180, 270):
             deg = res["correction_angle"]
             new_rot = (page.rotation + deg) % 360

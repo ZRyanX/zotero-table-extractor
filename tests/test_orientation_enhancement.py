@@ -42,12 +42,19 @@ from doc_orientation_detector import (
     preprocess_image,
     detect_vector_text_rotation,
     detect_vector_text_details,
+    get_vector_text_distribution,
     get_clockwise_correction_angle,
     detect_page_orientation,
     detect_crop_orientation,
     remediate_pdf_pages_lossless,
     CLASS_TO_DEGREE,
     DEFAULT_MARGIN_THRESHOLD,
+    DEFAULT_MIN_CONFIDENCE,
+    PAGE_MARGIN_THRESHOLD,
+    PAGE_MIN_CONFIDENCE,
+    PAGE_VECTOR_DOMINANT_RATIO,
+    PAGE_VECTOR_MAX_SECONDARY_RATIO,
+    PAGE_VECTOR_MIN_CHARS,
 )
 
 
@@ -559,6 +566,321 @@ class TestSetupAndReleaseIntegration(unittest.TestCase):
 
         if os.path.exists(temp_zip):
             os.remove(temp_zip)
+
+
+class TestOrientationDetectorReviewImprovements(unittest.TestCase):
+    """
+    针对代码审查要点进行的高级自愈与一致性测试：
+    1. 混排页面 (Mixed Text Orientation) 与全页一致性：
+       整页纠偏避免把局部横置大表误当成整页旋转，跳过 Tier 1 整页翻转，交由 Tier 2 表格切图局部纠偏。
+    2. 模型官方标准预处理 (CenterCrop 224x224)：
+       全页级推理严格采用官方 ResizeImage(256) -> CenterCrop(224) -> ImageNet 标准化，方差裁剪仅作为局部切图的可选方案。
+    3. 置信度门限与防误翻策略：
+       全页级结合 Top-1 概率门限 (>= 0.80) 与 Softmax 裕度 (>= 0.35)，“不确定时不旋转”。
+    4. 长文档候选页与无 Caption 扫描页探测：
+       验证 candidate_pages 传递及 > 15 页长文档后段扫描/图表密度页的自动检出与翻转自愈。
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp(prefix="test_ori_review_")
+
+    def tearDown(self):
+        if os.path.exists(self.temp_dir):
+            shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_mixed_text_page_skips_whole_page_rotation_and_delegates_to_crop(self):
+        """测试混排页面 (0° 正文 + 90° 横表) 绝不翻转整页，而表格切图能准确识别 90° 并回正。"""
+        doc = fitz.open()
+        page = doc.new_page(width=600, height=800)
+
+        # 1. 插入 0° 正向正文与标题 (约 200 字符)
+        body_text = (
+            "Section 3. Methodology and Experimental Setup in Deep Neural Architecture Evaluation. "
+            "The baseline models were trained using standard hyperparameters with learning rate decay."
+        )
+        page.insert_text(fitz.Point(50, 80), body_text, fontsize=11)
+
+        # 2. 插入 90° 旋转的嵌套横表 (约 300 字符，Matrix 270: 垂直向下文本，顺时针 90° 旋转)
+        table_rect = [100, 150, 500, 650]
+        table_text = (
+            "Table 2. Quantitative Performance Across Benchmark Datasets and Training Regimes. "
+            "Row 1: Accuracy 92.5%, F1-Score 0.91, Latency 14.2ms. "
+            "Row 2: Accuracy 94.1%, F1-Score 0.93, Latency 16.8ms."
+        )
+        page.insert_text(
+            fitz.Point(300, 200),
+            table_text,
+            fontsize=11,
+            morph=(fitz.Point(300, 200), fitz.Matrix(270))
+        )
+
+        pdf_path = os.path.join(self.temp_dir, "mixed_page.pdf")
+        doc.save(pdf_path)
+        doc.close()
+
+        doc_read = fitz.open(pdf_path)
+        p = doc_read[0]
+
+        # 验证全页方向检测：因为存在混排文字且主导方向未达到 85% 绝对一致性，绝不触发整页旋转！
+        page_res = detect_page_orientation(p)
+        self.assertFalse(page_res["needs_rotation"])
+        self.assertEqual(page_res["detected_angle"], 0)
+        self.assertEqual(page_res["source"], "vector_mixed_skipped")
+        self.assertIn("details", page_res)
+        self.assertLess(page_res["details"]["dominant_ratio"], PAGE_VECTOR_DOMINANT_RATIO)
+
+        # 验证表格切图检测 (Tier 2)：针对局部表格 rect 检测，文字方向纯净 (100% 90°)，准确识别并要求回正
+        dummy_crop_img = Image.new("RGB", (400, 500), color="white")
+        crop_res = detect_crop_orientation(dummy_crop_img, page=p, rect=table_rect)
+        self.assertTrue(crop_res["needs_rotation"])
+        self.assertEqual(crop_res["detected_angle"], 90)
+        self.assertEqual(crop_res["correction_angle"], 270)
+        self.assertEqual(crop_res["source"], "vector_text")
+
+        # 验证整页自愈无损校准 (Tier 1)：绝不对该混排页施加旋转
+        eff_path, modified, tmp_clean = remediate_pdf_pages_lossless(pdf_path)
+        self.assertFalse(modified)
+        self.assertEqual(eff_path, pdf_path)
+        doc_read.close()
+
+    def test_vector_consistency_strict_threshold_and_pure_rotation(self):
+        """测试 85% 主导方向门限：80% 混排拒绝翻转，95% 纯旋转页正常翻转。"""
+        doc = fitz.open()
+
+        # Page 0: 80% 旋转 270° (Matrix 90, 80 字符) + 20% 0° 正文 (20 字符)
+        p0 = doc.new_page(width=500, height=700)
+        p0.insert_text(fitz.Point(50, 50), "12345678901234567890", fontsize=10)  # 20 chars at 0 deg
+        p0.insert_text(
+            fitz.Point(200, 400),
+            "A" * 80,
+            fontsize=10,
+            morph=(fitz.Point(200, 400), fitz.Matrix(90))  # 80 chars at 270 deg
+        )
+
+        # Page 1: 95% 旋转 270° (95 字符) + 5% 0° (5 字符)
+        p1 = doc.new_page(width=500, height=700)
+        p1.insert_text(fitz.Point(50, 50), "12345", fontsize=10)  # 5 chars at 0 deg
+        p1.insert_text(
+            fitz.Point(200, 400),
+            "B" * 95,
+            fontsize=10,
+            morph=(fitz.Point(200, 400), fitz.Matrix(90))  # 95 chars at 270 deg
+        )
+
+        pdf_path = os.path.join(self.temp_dir, "consistency_test.pdf")
+        doc.save(pdf_path)
+        doc.close()
+
+        doc_read = fitz.open(pdf_path)
+        res0 = detect_page_orientation(doc_read[0])
+        self.assertFalse(res0["needs_rotation"])
+        self.assertEqual(res0["source"], "vector_mixed_skipped")
+
+        res1 = detect_page_orientation(doc_read[1])
+        self.assertTrue(res1["needs_rotation"])
+        self.assertEqual(res1["detected_angle"], 270)
+        self.assertEqual(res1["correction_angle"], 90)
+        self.assertEqual(res1["source"], "vector_text")
+        doc_read.close()
+
+    def test_official_centercrop_preprocessing_default(self):
+        """测试图像预处理默认严格遵循官方标准 CenterCrop(224) 规范，且与方差引导模式可独立切换。"""
+        # 创建一个 600x300 的图像 (宽 600, 高 300)
+        # 短边缩放至 256: 新尺寸为 512x256
+        # CenterCrop 224x224 在 512x256 上的位置为:
+        # left = (512 - 224) // 2 = 144, top = (256 - 224) // 2 = 16, right = 368, bottom = 240
+        img = Image.new("RGB", (600, 300), color="white")
+        draw = ImageDraw.Draw(img)
+        # 在中央区域绘制纯红色矩形 (原图坐标对应 200..400)
+        draw.rectangle([200, 50, 400, 250], fill="red")
+        # 在最左边缘绘制纯黑色高方差线条 (用于吸引方差引导裁剪)
+        for x in range(10, 80, 5):
+            draw.line([(x, 10), (x, 290)], fill="black", width=2)
+
+        # 1. 默认模式：必须为官方标准 CenterCrop
+        arr_default = preprocess_image(img)
+        arr_explicit_center = preprocess_image(img, use_variance_crop=False)
+        self.assertTrue(np.allclose(arr_default, arr_explicit_center))
+        self.assertEqual(arr_default.shape, (1, 3, 224, 224))
+
+        # 2. 方差引导模式：应主动滑动窗口至最左侧的高方差黑线区域
+        arr_var = preprocess_image(img, use_variance_crop=True)
+        self.assertEqual(arr_var.shape, (1, 3, 224, 224))
+        # 官方 CenterCrop 区域主要是红色，而方差裁剪包含了大量黑色高方差线条，两者像素分布显著不同
+        self.assertFalse(np.allclose(arr_default, arr_var))
+
+    def test_heightened_confidence_and_margin_thresholds(self):
+        """测试全页级加严门限 (Top-1 >= 0.80, Margin >= 0.35) 与“不确定时不翻转”策略。"""
+        detector = get_orientation_detector()
+        self.assertTrue(detector.is_available())
+
+        dummy_img = Image.new("RGB", (224, 224), color="white")
+
+        # 模拟场景 A：Margin 虽达到 0.40 (> 0.35)，但 Top-1 置信度仅为 0.70 (< 0.80)
+        # Softmax 结果: [0.15, 0.70, 0.15, 0.0] -> Margin = 0.55, Top 1 = 0.70
+        # 命中 min_confidence 门限守卫，安全回退 0°
+        mock_output_low_top1 = np.array([[1.0, 3.0, 1.0, 0.0]], dtype=np.float32)
+        with patch.object(detector.session, "run", return_value=[mock_output_low_top1]):
+            res = detector.predict(dummy_img, margin_threshold=PAGE_MARGIN_THRESHOLD, min_confidence=PAGE_MIN_CONFIDENCE)
+            self.assertLess(res["confidence"], PAGE_MIN_CONFIDENCE)
+            self.assertEqual(res["detected_angle"], 0)
+            self.assertFalse(res["needs_rotation"])
+
+        # 模拟场景 B：Top-1 置信度达标 (0.85)，且 Margin 达标 (0.75 > 0.35)，类别为 90° (class 1)
+        # 应准确触发旋转
+        mock_output_high = np.array([[0.0, 4.0, 1.0, 0.0]], dtype=np.float32)
+        with patch.object(detector.session, "run", return_value=[mock_output_high]):
+            res_high = detector.predict(dummy_img, margin_threshold=PAGE_MARGIN_THRESHOLD, min_confidence=PAGE_MIN_CONFIDENCE)
+            self.assertGreaterEqual(res_high["confidence"], PAGE_MIN_CONFIDENCE)
+            self.assertGreaterEqual(res_high["margin"], PAGE_MARGIN_THRESHOLD)
+            self.assertEqual(res_high["detected_angle"], 90)
+            self.assertEqual(res_high["correction_angle"], 270)
+            self.assertTrue(res_high["needs_rotation"])
+
+        # 模拟场景 C：低置信度模糊预测 [0.28, 0.26, 0.24, 0.22]，Margin < 0.05
+        # 必须安全回退至 0°
+        mock_ambiguous = np.array([[1.0, 0.95, 0.90, 0.85]], dtype=np.float32)
+        with patch.object(detector.session, "run", return_value=[mock_ambiguous]):
+            res_amb = detector.predict(dummy_img, margin_threshold=PAGE_MARGIN_THRESHOLD, min_confidence=PAGE_MIN_CONFIDENCE)
+            self.assertEqual(res_amb["detected_angle"], 0)
+            self.assertFalse(res_amb["needs_rotation"])
+
+    def test_quick_detect_candidate_pages_and_long_document_scanned_inspection(self):
+        """测试长文档 (>15页) 候选页发现、扫描页低文本探测与 candidate_pages 传递自愈。"""
+        import pdf_table_extractor as pte
+
+        doc = fitz.open()
+        # 创建 20 页长文档
+        for i in range(20):
+            p = doc.new_page(width=500, height=700)
+            # 大多数页面是正向正文 (50 词以上)
+            p.insert_text(fitz.Point(50, 100), f"Standard Page {i+1} Normal Document Paragraph Content Words Here Repeated " * 5, fontsize=10)
+
+        # 第 8 页：包含 Caption 声明
+        doc[7].insert_text(fitz.Point(50, 200), "Table 1. Overview of Experimental Conditions", fontsize=12)
+
+        # 第 19 页：模拟后段无 Caption 的扫描页 (仅含图像且词数 < 10)
+        pix_dummy = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 100, 100), 0)
+        p19 = doc.new_page(width=500, height=700)
+        p19.insert_image(fitz.Rect(50, 50, 450, 650), pixmap=pix_dummy)
+
+        pdf_path = os.path.join(self.temp_dir, "long_document.pdf")
+        doc.save(pdf_path)
+        doc.close()
+
+        # 1. 验证 quick_detect_candidate_pages 能够轻量探测到 Caption 页与扫描页
+        candidates = pte.quick_detect_candidate_pages(pdf_path)
+        self.assertIn(7, candidates)   # Page 8 (idx 7)
+        self.assertIn(20, candidates)  # Page 21 (idx 20)
+
+        # 2. 验证 remediate_pdf_pages_lossless 在长文档下自动将后段扫描页纳入检查集合
+        inspected_pages = []
+
+        def mock_detect_page(page, **kwargs):
+            inspected_pages.append(page.number)
+            return {"needs_rotation": False, "detected_angle": 0, "correction_angle": 0}
+
+        with patch("doc_orientation_detector.detect_page_orientation", side_effect=mock_detect_page):
+            remediate_pdf_pages_lossless(pdf_path, candidate_pages=candidates)
+
+        # 前 5 页 (0..4)、Caption 页 (7) 以及扫描页均应被检查
+        for expected in [0, 1, 2, 3, 4, 7, 20]:
+            self.assertIn(expected, inspected_pages)
+
+        # 3. 验证显式传递 candidate_pages 时，指定页必须被检查
+        inspected_explicit = []
+
+        def mock_detect_page_exp(page, **kwargs):
+            inspected_explicit.append(page.number)
+            return {"needs_rotation": False, "detected_angle": 0, "correction_angle": 0}
+
+        with patch("doc_orientation_detector.detect_page_orientation", side_effect=mock_detect_page_exp):
+            remediate_pdf_pages_lossless(pdf_path, candidate_pages=[15])
+
+        self.assertIn(15, inspected_explicit)
+
+    def test_mixed_page_with_dominant_landscape_table_and_body_text_skips_whole_page_rotation(self):
+        """测试横表字符占比虽高 (>=85%) 但同页包含正向正文时，整页绝对不翻转，交由切图局部纠偏。"""
+        doc = fitz.open()
+        p = doc.new_page(width=600, height=800)
+
+        # 1. 插入 0° 正向正文段落 (100 字符)
+        body = "This section introduces the foundational formulation of the model architecture and training regimen."
+        p.insert_text(fitz.Point(50, 50), body, fontsize=10)
+
+        # 2. 插入 270° 旋转横向大表 (10 行 x 60 字符 = 600 字符，Matrix 90)
+        table_rect = [100, 150, 550, 750]
+        for x in range(150, 450, 30):
+            p.insert_text(
+                fitz.Point(x, 700),
+                "A" * 60,
+                fontsize=8,
+                morph=(fitz.Point(x, 700), fitz.Matrix(90))
+            )
+
+        pdf_path = os.path.join(self.temp_dir, "dominant_table_mixed.pdf")
+        doc.save(pdf_path)
+        doc.close()
+
+        doc_read = fitz.open(pdf_path)
+        p_read = doc_read[0]
+
+        # 验证全页级检测：即便旋转文字占比达到 90% (>= 85%)，因存在 0° 正文段落，
+        # 绝不将整页误旋转，必须返回 vector_mixed_skipped 且 needs_rotation=False
+        page_res = detect_page_orientation(p_read)
+        self.assertFalse(page_res["needs_rotation"])
+        self.assertEqual(page_res["detected_angle"], 0)
+        self.assertEqual(page_res["source"], "vector_mixed_skipped")
+        self.assertGreaterEqual(page_res["details"]["dominant_ratio"], PAGE_VECTOR_DOMINANT_RATIO)
+        self.assertGreaterEqual(page_res["details"]["upright_len"], PAGE_VECTOR_MIN_CHARS)
+
+        # 验证切图级检测 (Tier 2)：针对局部表格 rect 检测，文字方向纯净 (100% 270°)，准确识别并回正
+        crop_img = Image.new("RGB", (400, 600), color="white")
+        crop_res = detect_crop_orientation(crop_img, page=p_read, rect=table_rect)
+        self.assertTrue(crop_res["needs_rotation"])
+        self.assertEqual(crop_res["detected_angle"], 270)
+        self.assertEqual(crop_res["correction_angle"], 90)
+
+        # 验证整页自愈无损校准 (Tier 1)：绝不对该混排页施加翻转
+        eff_path, modified, tmp_clean = remediate_pdf_pages_lossless(pdf_path)
+        self.assertFalse(modified)
+        self.assertEqual(eff_path, pdf_path)
+        doc_read.close()
+
+    def test_preprocess_image_float_numpy_array_support(self):
+        """测试 preprocess_image 健壮支持 float32 [0, 1] 与 [0, 255] numpy 数组。"""
+        # 浮点 [0.0, 1.0] 数组
+        arr_float_01 = np.ones((300, 400, 3), dtype=np.float32) * 0.5
+        tensor_01 = preprocess_image(arr_float_01)
+        self.assertEqual(tensor_01.shape, (1, 3, 224, 224))
+        self.assertEqual(tensor_01.dtype, np.float32)
+
+        # 浮点 [0.0, 255.0] 数组
+        arr_float_255 = np.ones((300, 400, 3), dtype=np.float32) * 128.0
+        tensor_255 = preprocess_image(arr_float_255)
+        self.assertEqual(tensor_255.shape, (1, 3, 224, 224))
+        self.assertEqual(tensor_255.dtype, np.float32)
+
+    def test_quick_detect_candidate_pages_with_drawings(self):
+        """测试 quick_detect_candidate_pages 能够通过矢量绘图密度 (drawings >= 15) 发现无标题表格页。"""
+        import pdf_table_extractor as pte
+
+        doc = fitz.open()
+        for i in range(15):
+            p = doc.new_page(width=500, height=700)
+            p.insert_text(fitz.Point(50, 100), "Normal academic text " * 20, fontsize=10)
+
+        # 第 10 页 (index 9)：无 Caption，但包含 20 条表格网格线矢量绘图
+        p9 = doc[9]
+        for y in range(100, 300, 10):
+            p9.draw_line(fitz.Point(50, y), fitz.Point(450, y))
+
+        pdf_path = os.path.join(self.temp_dir, "drawings_doc.pdf")
+        doc.save(pdf_path)
+        doc.close()
+
+        cands = pte.quick_detect_candidate_pages(pdf_path)
+        self.assertIn(9, cands)
 
 
 if __name__ == "__main__":
