@@ -97,7 +97,8 @@ zotero-table-extractor/
 │   ├── zotero_table_extractor_architecture.png
 │   └── zotero_table_extractor_architecture.svg
 ├── models/                          # 本地离线 ONNX 检测模型
-│   └── doclayout_yolo_docstructbench_imgsz1280_2501.onnx
+│   ├── doclayout_yolo_docstructbench_imgsz1280_2501.onnx
+│   └── doc_ori.onnx                 # TurboOCR PP-LCNet 页面与文本方向模型 (~6.47MB)
 ├── scratch/                         # 临时诊断脚本与测试套件
 └── scripts/                         # 核心提取代码库
     ├── updater.py                   # 🛡️ 在线安全更新与智能配置迁移/回滚引擎
@@ -119,6 +120,7 @@ zotero-table-extractor/
     ├── llm_reasoner.py              # LLM 辅助纠错与表格语义重构
     ├── agent_bridge.py              # Agent 交互桥接与进度事件通知
     ├── doclayout_yolo_detector.py   # YOLO 本地版面检测推理器
+    ├── doc_orientation_detector.py  # TurboOCR 方向检测与双轨两阶旋转自愈器
     ├── pdf_page_filter.py           # 页面轻量启发式预过滤（跳过纯正文无表页）
     ├── playwright_utils.py          # 浏览器环境自适应探测与启动辅助
     ├── table_validator.py           # 表格结构完整性与列数/填充率校验器

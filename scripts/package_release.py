@@ -42,11 +42,17 @@ MANDATORY_ENTRIES = [
     "scripts/pdf_table_extractor.py",
     "scripts/ocr_client.py",
     "scripts/table_postprocess.py",
+    "scripts/doc_orientation_detector.py",
     "config.example.json",
     "requirements.txt",
     "setup_paths.py",
     "update.py",
     "models/doclayout_yolo_docstructbench_imgsz1280_2501.onnx",
+]
+
+# 可选增强资产（若存在则识别并打包，未下载时优雅降级）
+OPTIONAL_ENTRIES = [
+    "models/doc_ori.onnx",
 ]
 
 
@@ -100,6 +106,14 @@ def audit_zip_contents(zip_path: str, prefix: str) -> Tuple[bool, List[str]]:
             if expected not in names and mand not in names:
                 violations.append(f"[完整性缺失] 缺少核心必要文件: {mand}")
 
+        # 3. 检查可选增强资产（若存在则确认，若未收录则提示优雅降级）
+        for opt in OPTIONAL_ENTRIES:
+            expected = f"{prefix}{opt}"
+            if expected in names or opt in names:
+                print(f"  [✓] 包含可选增强资产: {opt}")
+            else:
+                print(f"  [-] 未包含可选资产: {opt} (支持运行时按需自动获取与优雅降级)")
+
     return len(violations) == 0, violations
 
 
@@ -127,6 +141,16 @@ def package_release(tag: str, output_dir: str, upload: bool = False) -> Tuple[st
         "-o", str(zip_path)
     ]
     subprocess.check_call(cmd_archive, cwd=str(PROJECT_ROOT))
+
+    # 1.1 若本地存在 doc_ori.onnx 且未被 git archive 收录，增补写入 zip 包
+    doc_ori_local = PROJECT_ROOT / "models" / "doc_ori.onnx"
+    if doc_ori_local.is_file() and doc_ori_local.stat().st_size > 1 * 1024 * 1024:
+        with zipfile.ZipFile(zip_path, "a", compression=zipfile.ZIP_DEFLATED) as zf:
+            target_arcname = f"{prefix}models/doc_ori.onnx"
+            if target_arcname not in zf.namelist():
+                zf.write(doc_ori_local, arcname=target_arcname)
+                print(f"[✓] 检测到本地存在 doc_ori.onnx，已附加至 Release 资产包: {target_arcname}")
+
     size_bytes = os.path.getsize(zip_path)
     size_mb = size_bytes / (1024 * 1024)
     print(f"[✓] 打包完成！大小: {size_mb:.2f} MB ({size_bytes} 字节)")

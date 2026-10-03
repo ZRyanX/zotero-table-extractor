@@ -471,6 +471,56 @@ def show_status():
     els = cfg.get("ELSEVIER_API_KEY", "")
     e_status = f"{COLOR_GREEN}[已配置]{COLOR_RESET}" if els else f"{COLOR_YELLOW}[未配置]{COLOR_RESET}"
     print(f"  • ELSEVIER API KEY          : {e_status}")
+    c_print("─" * 72, COLOR_GRAY)
+    c_print("  【本地离线 AI 视觉与方向模型状态】", COLOR_BOLD + COLOR_CYAN)
+    m_dir = cfg.get("DOCLAYOUT_MODEL_DIR") or os.path.join(ROOT_DIR, "models")
+    yolo_file = os.path.join(m_dir, "doclayout_yolo_docstructbench_imgsz1280_2501.onnx")
+    ori_file = os.path.join(m_dir, "doc_ori.onnx")
+    yolo_stat = format_exist_status(yolo_file, is_dir=False)
+    print(f"  • DocLayout-YOLO 版面模型   : {yolo_file}  {yolo_stat}")
+    if os.path.exists(ori_file):
+        ori_stat = format_exist_status(ori_file, is_dir=False)
+    else:
+        ori_stat = f"{COLOR_GRAY}[未下载 (可选, 运行时按需自动获取与优雅降级)]{COLOR_RESET}"
+    print(f"  • TurboOCR 页面方向模型    : {ori_file}  {ori_stat}")
+    c_print("=" * 72, COLOR_BLUE)
+
+
+def download_models_helper(model_dir: Optional[str] = None):
+    """一键下载或补齐本地视觉与方向检测模型。"""
+    cfg = load_existing_config()
+    target_dir = model_dir or cfg.get("DOCLAYOUT_MODEL_DIR") or os.path.join(ROOT_DIR, "models")
+    os.makedirs(target_dir, exist_ok=True)
+    c_print("=" * 72, COLOR_BLUE)
+    c_print("  📦 正在检测并补齐本地离线 AI 视觉模型...", COLOR_BOLD + COLOR_CYAN)
+    c_print("=" * 72, COLOR_BLUE)
+
+    scripts_dir = os.path.join(ROOT_DIR, "scripts")
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+
+    # 1. DocLayout-YOLO
+    try:
+        from doclayout_yolo_detector import ensure_model_file
+        yolo_path = ensure_model_file(target_dir)
+        c_print(f"  [✓] DocLayout-YOLO 版面模型就绪: {yolo_path}", COLOR_GREEN)
+    except Exception as e:
+        c_print(f"  [✗] DocLayout-YOLO 准备失败: {e}", COLOR_RED)
+
+    # 2. TurboOCR doc_ori
+    try:
+        from doc_orientation_detector import ensure_model_file as ensure_ori_file, download_model as download_ori_model
+        ori_path = ensure_ori_file(target_dir, auto_download=False)
+        if ori_path:
+            c_print(f"  [✓] TurboOCR 页面方向模型就绪: {ori_path}", COLOR_GREEN)
+        else:
+            c_print(f"  [*] 正在从官方源下载 TurboOCR 页面方向模型 (doc_ori.onnx, ~6.47MB)...", COLOR_CYAN)
+            dest = os.path.join(target_dir, "doc_ori.onnx")
+            download_ori_model(dest)
+            c_print(f"  [✓] TurboOCR 页面方向模型下载完成: {dest}", COLOR_GREEN)
+    except Exception as e:
+        c_print(f"  [!] TurboOCR 页面方向模型下载提示: {e} (支持运行时自动降级)", COLOR_YELLOW)
+
     c_print("=" * 72, COLOR_BLUE)
 
 
@@ -509,12 +559,15 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="模拟演练更新全流程，不修改文件")
     parser.add_argument("--force", action="store_true", help="强制在线拉取更新")
     parser.add_argument("--install-deps", action="store_true", help="更新后自动安装/升级 Python 依赖")
+    parser.add_argument("--download-models", action="store_true", help="校验并下载/补齐本地视觉与方向模型 (DocLayout-YOLO 与 doc_ori.onnx)")
     args = parser.parse_args()
 
     if args.reset:
         reset_to_template()
     elif args.show:
         show_status()
+    elif args.download_models:
+        download_models_helper()
     elif args.auto:
         run_auto_defaults()
     elif args.update or args.check_update or args.rollback is not None or args.list_backups:

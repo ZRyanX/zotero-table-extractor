@@ -154,10 +154,24 @@ def process_single_pdf(pdf_path, args, is_batch=False, plan=None):
     print(f"\nProcessing: {pdf_path}")
     
     target_pdf_path = pdf_path
-    temp_pdf_to_clean = None
+    temps_to_clean = []
     try:
         if os.path.exists(pdf_path) and os.path.isfile(pdf_path):
             import pymupdf as fitz
+
+            # Tier 1: 页面级无损顺时针方向校准 (Lossless Page Rotation Remediation)
+            try:
+                try:
+                    from .doc_orientation_detector import remediate_pdf_pages_lossless
+                except ImportError:
+                    from doc_orientation_detector import remediate_pdf_pages_lossless
+
+                lossless_path, was_rotated, tmp_lossless = remediate_pdf_pages_lossless(target_pdf_path)
+                if was_rotated and tmp_lossless:
+                    target_pdf_path = lossless_path
+                    temps_to_clean.append(tmp_lossless)
+            except Exception as e_ori:
+                print(f"[Doc-Ori Tier 1] 无损旋转探测提示: {e_ori}")
 
             try:
                 from .pdf_table_extractor import has_text_layer, quick_classify_pdf
@@ -165,13 +179,13 @@ def process_single_pdf(pdf_path, args, is_batch=False, plan=None):
                 from pdf_table_extractor import has_text_layer, quick_classify_pdf
             
             # 使用 pdf-inspector quick_classify_pdf (5~10ms) 进行超快速预检
-            clf_res = quick_classify_pdf(pdf_path)
+            clf_res = quick_classify_pdf(target_pdf_path)
             if clf_res.get('confidence', 0) >= 0.8 and clf_res.get('pdf_type') in ('text_based', 'scanned'):
                 is_native = (clf_res['pdf_type'] == 'text_based')
             else:
-                is_native = has_text_layer(pdf_path)
+                is_native = has_text_layer(target_pdf_path)
 
-            doc = fitz.open(pdf_path)
+            doc = fitz.open(target_pdf_path)
             page_rotations = [get_page_effective_rotation(p) for p in doc]
             has_rotation = any(r != 0 for r in page_rotations)
             doc.close()
@@ -180,10 +194,11 @@ def process_single_pdf(pdf_path, args, is_batch=False, plan=None):
             if has_rotation and not is_native:
                 print(f"[PDF] 检测到旋转页面或文字方向 (Baking page rotations)...")
                 import tempfile
-                fd, temp_pdf_to_clean = tempfile.mkstemp(prefix="baked_rotated_pdf_", suffix=".pdf")
+                fd, temp_baked_pdf = tempfile.mkstemp(prefix="baked_rotated_pdf_", suffix=".pdf")
                 os.close(fd)
+                temps_to_clean.append(temp_baked_pdf)
                 
-                src = fitz.open(pdf_path)
+                src = fitz.open(target_pdf_path)
                 dst = fitz.open()
                 for i, src_page in enumerate(src):
                     rot = page_rotations[i]
@@ -198,21 +213,22 @@ def process_single_pdf(pdf_path, args, is_batch=False, plan=None):
                     new_page = dst.new_page(width=new_w, height=new_h)
                     new_page.insert_image(new_page.rect, pixmap=pix)
                 
-                dst.save(temp_pdf_to_clean)
+                dst.save(temp_baked_pdf)
                 dst.close()
                 src.close()
-                target_pdf_path = temp_pdf_to_clean
+                target_pdf_path = temp_baked_pdf
                 print(f"[PDF] Baked rotated PDF saved to: {target_pdf_path}")
             elif has_rotation and is_native:
                 print(f"[PDF] Native PDF 有旋转但保留文本层，跳过烘焙（避免破坏文本层）")
 
         return _do_process_single_pdf(target_pdf_path, orig_pdf_path=pdf_path, args=args, is_batch=is_batch, plan=plan)
     finally:
-        if temp_pdf_to_clean and os.path.exists(temp_pdf_to_clean):
-            try:
-                os.remove(temp_pdf_to_clean)
-            except Exception:
-                pass
+        for t_p in temps_to_clean:
+            if t_p and os.path.exists(t_p):
+                try:
+                    os.remove(t_p)
+                except Exception:
+                    pass
 
 
 def is_pre_2020_chinese_paper(pdf_path: str, plan: dict = None) -> bool:

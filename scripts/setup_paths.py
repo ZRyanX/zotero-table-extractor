@@ -6,10 +6,15 @@ import os
 import sys
 
 root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if root_dir not in sys.path:
-    sys.path.insert(0, root_dir)
+if root_dir in sys.path:
+    sys.path.remove(root_dir)
+sys.path.insert(0, root_dir)
 
-from setup_paths import main
+import importlib.util
+_spec = importlib.util.spec_from_file_location("setup_paths_root_entry", os.path.join(root_dir, "setup_paths.py"))
+_mod = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_mod)
+main = _mod.main
 
 if __name__ == "__main__":
     main()

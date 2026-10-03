@@ -2210,20 +2210,52 @@ def extract_via_paddleocr_crops(pdf_path: str, pages: Optional[List[int]] = None
 
     pages_resolved = set()
 
-    for page_idx in pages:
-        if cancel_event is not None and cancel_event.is_set():
-            break
-        page_crops = crops_by_page.get(page_idx, [])
-        if not page_crops:
-            continue
+    doc_for_crops = None
+    try:
+        if os.path.exists(pdf_path):
+            doc_for_crops = fitz.open(pdf_path)
+    except Exception:
+        doc_for_crops = None
 
-        page_success = False
-        for t_idx, crop in enumerate(page_crops):
+    try:
+        for page_idx in pages:
             if cancel_event is not None and cancel_event.is_set():
                 break
-            img = crop.get("image")
-            if img is None:
+            page_crops = crops_by_page.get(page_idx, [])
+            if not page_crops:
                 continue
+
+            page_success = False
+            for t_idx, crop in enumerate(page_crops):
+                if cancel_event is not None and cancel_event.is_set():
+                    break
+                img = crop.get("image")
+                if img is None:
+                    continue
+
+                # Tier 2 (Embedded Landscape Crop Rotation):
+                # 对嵌套在页面中的横置旋转表格切图，通过矢量文本或 doc_ori.onnx 进行方向判定并旋转回正
+                try:
+                    try:
+                        from .doc_orientation_detector import detect_crop_orientation
+                    except ImportError:
+                        from doc_orientation_detector import detect_crop_orientation
+
+                    p_for_crop = None
+                    if doc_for_crops is not None and 0 <= page_idx < len(doc_for_crops):
+                        p_for_crop = doc_for_crops[page_idx]
+
+                    crop_rect = crop.get("pdf_bbox")
+                    ori_res = detect_crop_orientation(img, page=p_for_crop, rect=crop_rect)
+
+                    if ori_res.get("needs_rotation") and ori_res.get("correction_angle") in (90, 180, 270):
+                        deg = ori_res["correction_angle"]
+                        upright_img = img.rotate(360 - deg, expand=True)
+                        print(f"[PaddleOCR-VL Crops] 检测到第 {page_idx+1} 页 Table Crop #{t_idx+1} 存在 {ori_res.get('detected_angle')}° 旋转 ({ori_res.get('source')})，已自动旋转正向 (校正角: {deg}°, 尺寸: {img.size} -> {upright_img.size})")
+                        img = upright_img
+                        crop["image"] = upright_img
+                except Exception as e_crop_ori:
+                    print(f"[PaddleOCR-VL Crops] 切图方向检测与校准提示: {e_crop_ori}")
 
             temp_img_path = None
             try:
@@ -2270,21 +2302,27 @@ def extract_via_paddleocr_crops(pdf_path: str, pages: Optional[List[int]] = None
                     except Exception:
                         pass
 
-        # 统计该页期望表数与实际成功提取数，若提取数少于期望表数（如一页双表只切出一张），整页不可标记为完全 resolved
-        expected_page_tables = 1
-        try:
+            # 统计该页期望表数与实际成功提取数，若提取数少于期望表数（如一页双表只切出一张），整页不可标记为完全 resolved
+            expected_page_tables = 1
             try:
-                from .table_validator import scan_pdf_table_declarations
-            except ImportError:
-                from table_validator import scan_pdf_table_declarations
-            p_decls = scan_pdf_table_declarations(pdf_path).get(page_idx, [])
-            expected_page_tables = max(1, len(crops), len([d for d in p_decls if not d.get('is_continuation')]))
-        except Exception:
-            expected_page_tables = max(1, len(crops))
+                try:
+                    from .table_validator import scan_pdf_table_declarations
+                except ImportError:
+                    from table_validator import scan_pdf_table_declarations
+                p_decls = scan_pdf_table_declarations(pdf_path).get(page_idx, [])
+                expected_page_tables = max(1, len(crops), len([d for d in p_decls if not d.get('is_continuation')]))
+            except Exception:
+                expected_page_tables = max(1, len(crops))
 
-        page_extracted_count = sum(1 for r in results if r.get('page_idx') == page_idx)
-        if page_success and page_extracted_count >= expected_page_tables:
-            pages_resolved.add(page_idx)
+            page_extracted_count = sum(1 for r in results if r.get('page_idx') == page_idx)
+            if page_success and page_extracted_count >= expected_page_tables:
+                pages_resolved.add(page_idx)
+    finally:
+        if doc_for_crops is not None:
+            try:
+                doc_for_crops.close()
+            except Exception:
+                pass
 
     # 2. 检查哪些页面未能通过切图获得表格，对这些页面平滑回退至整页 extract_via_paddleocr_fullpage
     unresolved_pages = [p for p in pages if p not in pages_resolved]
@@ -2510,7 +2548,41 @@ def extract_tables_from_pdf(
     use_ocr_fallback: bool = True,
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
     """
-    统一 PDF 表格提取管线。
+    统一 PDF 表格提取管线入口。
+    内置 Tier 1 页面级无损顺时针旋转自愈与自动临时文件资源回收。
+    """
+    temp_pdf_to_clean = None
+    was_remediated = False
+    try:
+        try:
+            try:
+                from .doc_orientation_detector import remediate_pdf_pages_lossless
+            except ImportError:
+                from doc_orientation_detector import remediate_pdf_pages_lossless
+            eff_pdf_path, was_rotated, tmp_lossless = remediate_pdf_pages_lossless(pdf_path)
+            if was_rotated and tmp_lossless:
+                pdf_path = eff_pdf_path
+                temp_pdf_to_clean = tmp_lossless
+                was_remediated = True
+        except Exception as e_remed:
+            logger.debug(f"[pdf_table_extractor] Tier 1 lossless rotation notice: {e_remed}")
+
+        return _do_extract_tables_from_pdf(pdf_path, use_ocr_fallback=use_ocr_fallback, was_remediated=was_remediated)
+    finally:
+        if temp_pdf_to_clean and os.path.exists(temp_pdf_to_clean):
+            try:
+                os.remove(temp_pdf_to_clean)
+            except Exception:
+                pass
+
+
+def _do_extract_tables_from_pdf(
+    pdf_path: str,
+    use_ocr_fallback: bool = True,
+    was_remediated: bool = False,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """
+    统一 PDF 表格提取核心实现。
 
     管线:
     1. pdf-inspector 分类 + 语义结构树检测 + 启发式 caption / 续表声明扫描 → 识别含表格的候选页面
@@ -2524,6 +2596,8 @@ def extract_tables_from_pdf(
     返回 (results, logs)
     """
     logs = []
+    if was_remediated:
+        logs.append("→ Tier 1 页面方向探测: 检测到旋转页面并完成无损顺时针回正")
     all_results = []
 
     # ── 高精锚定：精准扫描 PDF 全文真实表标题声明 (Captions & Continuations) ──
