@@ -66,6 +66,40 @@ OPTIONAL_PAYLOAD = {
 }
 
 
+def get_optional_payload(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    根据本地文档方向检测器可用性动态生成 optionalPayload。
+    - 当本地 Tier 1/2 doc_orientation_detector 可用时，保持 useDocOrientationClassify=False，
+      避免与本地无损校准发生二次重复翻转；
+    - 当本地模型缺失或 ONNX 运行时不可用 (优雅降级) 时，动态将 useDocOrientationClassify 置为 True，
+      确保旋转扫描页在云端仍有方向纠偏防线。
+    """
+    payload = dict(OPTIONAL_PAYLOAD)
+    if config:
+        if "USE_DOC_ORIENTATION_CLASSIFY" in config:
+            payload["useDocOrientationClassify"] = bool(config["USE_DOC_ORIENTATION_CLASSIFY"])
+            return payload
+        if "useDocOrientationClassify" in config:
+            payload["useDocOrientationClassify"] = bool(config["useDocOrientationClassify"])
+            return payload
+
+    local_available = False
+    try:
+        try:
+            from .doc_orientation_detector import get_orientation_detector
+        except ImportError:
+            from doc_orientation_detector import get_orientation_detector
+        detector = get_orientation_detector()
+        if detector is not None and detector.is_available():
+            local_available = True
+    except Exception:
+        local_available = False
+
+    if not local_available:
+        payload["useDocOrientationClassify"] = True
+    return payload
+
+
 def _sleep_cancel_aware(seconds: float, cancel_event=None) -> bool:
     """可响应取消事件的休眠函数，若收到取消信号返回 True。"""
     steps = max(1, int(seconds * 2))
@@ -425,19 +459,20 @@ def call_paddleocr_job(
         if cancel_event is not None and cancel_event.is_set():
             return {"success": False, "model": model, "error": "cancelled", "combined_markdown": "", "pages": []}
         try:
+            opt_payload = get_optional_payload(config)
             if is_url:
                 h = dict(headers)
                 h["Content-Type"] = "application/json"
                 payload = {
                     "fileUrl": file_path,
                     "model": model,
-                    "optionalPayload": OPTIONAL_PAYLOAD
+                    "optionalPayload": opt_payload
                 }
                 job_response = requests.post(JOB_URL, json=payload, headers=h, timeout=120)
             else:
                 data = {
                     "model": model,
-                    "optionalPayload": json.dumps(OPTIONAL_PAYLOAD)
+                    "optionalPayload": json.dumps(opt_payload)
                 }
                 with open(file_path, "rb") as f:
                     files = {"file": f}

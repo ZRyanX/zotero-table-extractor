@@ -62,7 +62,7 @@ try:
     from .common import format_table_label
     from .table_postprocess import parse_structured_vlm_content
     from .excel_export import make_safe_filename, save_tables_to_excel
-    from .pdf_tables import get_page_effective_rotation, export_crops_to_excel
+    from .pdf_tables import get_page_effective_rotation, export_crops_to_excel, bake_pdf_rotations
     from .pdf_table_extractor import extract_tables_from_pdf
 except ImportError:
     try:
@@ -71,7 +71,7 @@ except ImportError:
         format_table_label = lambda x: str(x).strip() if x else ""
     from table_postprocess import parse_structured_vlm_content
     from excel_export import make_safe_filename, save_tables_to_excel
-    from pdf_tables import get_page_effective_rotation, export_crops_to_excel
+    from pdf_tables import get_page_effective_rotation, export_crops_to_excel, bake_pdf_rotations
     try:
         from pdf_table_extractor import extract_tables_from_pdf
     except ImportError:
@@ -160,6 +160,7 @@ def process_single_pdf(pdf_path, args, is_batch=False, plan=None):
             import pymupdf as fitz
 
             # Tier 1: 页面级无损顺时针方向校准 (Lossless Page Rotation Remediation)
+            was_remediated = False
             try:
                 try:
                     from .doc_orientation_detector import remediate_pdf_pages_lossless
@@ -183,6 +184,7 @@ def process_single_pdf(pdf_path, args, is_batch=False, plan=None):
                 if was_rotated and tmp_lossless:
                     target_pdf_path = lossless_path
                     temps_to_clean.append(tmp_lossless)
+                    was_remediated = True
             except Exception as e_ori:
                 print(f"[Doc-Ori Tier 1] 无损旋转探测提示: {e_ori}")
 
@@ -203,36 +205,18 @@ def process_single_pdf(pdf_path, args, is_batch=False, plan=None):
             has_rotation = any(r != 0 for r in page_rotations)
             doc.close()
 
-            # 仅对扫描版 PDF 做旋转烘焙；native PDF 的文本层方向已正确，烘焙会破坏文本层
+            # 全页像素光栅化烘焙 (baking) 会把页面栅格化为位图图片并彻底抹除原生矢量文本层与 Tagged 结构树。
+            # 因此仅对纯扫描版 PDF 执行旋转烘焙 (以兼容外部 OCR 工具)；
+            # 对 native PDF，保留原生数字化文本层，视口与视觉切图走正向渲染，矢量几何提取已适配 rotation_matrix。
             if has_rotation and not is_native:
                 print(f"[PDF] 检测到旋转页面或文字方向 (Baking page rotations)...")
-                import tempfile
-                fd, temp_baked_pdf = tempfile.mkstemp(prefix="baked_rotated_pdf_", suffix=".pdf")
-                os.close(fd)
-                temps_to_clean.append(temp_baked_pdf)
-                
-                src = fitz.open(target_pdf_path)
-                dst = fitz.open()
-                for i, src_page in enumerate(src):
-                    rot = page_rotations[i]
-                    if rot % 180 != 0:
-                        new_w = src_page.rect.height
-                        new_h = src_page.rect.width
-                    else:
-                        new_w = src_page.rect.width
-                        new_h = src_page.rect.height
-                    
-                    pix = src_page.get_pixmap(dpi=150)
-                    new_page = dst.new_page(width=new_w, height=new_h)
-                    new_page.insert_image(new_page.rect, pixmap=pix)
-                
-                dst.save(temp_baked_pdf)
-                dst.close()
-                src.close()
-                target_pdf_path = temp_baked_pdf
-                print(f"[PDF] Baked rotated PDF saved to: {target_pdf_path}")
+                eff_baked, was_baked, tmp_baked = bake_pdf_rotations(target_pdf_path, dpi=150)
+                if was_baked and tmp_baked:
+                    target_pdf_path = eff_baked
+                    temps_to_clean.append(tmp_baked)
+                    print(f"[PDF] Baked rotated PDF saved to: {target_pdf_path}")
             elif has_rotation and is_native:
-                print(f"[PDF] Native PDF 有旋转但保留文本层，跳过烘焙（避免破坏文本层）")
+                print(f"[PDF] Native PDF 存在旋转页面 (保留原生矢量文本层与 Tagged 结构，视口与视觉切图走正向渲染，矢量几何通过 rotation_matrix 归一化)")
 
         return _do_process_single_pdf(
             target_pdf_path,
@@ -240,7 +224,8 @@ def process_single_pdf(pdf_path, args, is_batch=False, plan=None):
             args=args,
             is_batch=is_batch,
             plan=plan,
-            candidate_pages=cand_pages
+            candidate_pages=cand_pages,
+            remediated=was_remediated,
         )
     finally:
         for t_p in temps_to_clean:
@@ -312,7 +297,7 @@ def call_journal_supp_downloader(doi_or_url: str, output_dir: str) -> bool:
     return False
 
 
-def _do_process_single_pdf(pdf_path, orig_pdf_path, args, is_batch=False, plan=None, candidate_pages=None):
+def _do_process_single_pdf(pdf_path, orig_pdf_path, args, is_batch=False, plan=None, candidate_pages=None, remediated=None):
     output_path = args.output
     filename_base = os.path.splitext(os.path.basename(orig_pdf_path))[0]
     safe_base = make_safe_filename(filename_base)
@@ -452,7 +437,8 @@ def _do_process_single_pdf(pdf_path, orig_pdf_path, args, is_batch=False, plan=N
             results, logs = extract_tables_from_pdf(
                 pdf_path,
                 use_ocr_fallback=True,
-                candidate_pages=candidate_pages
+                candidate_pages=candidate_pages,
+                remediated=remediated,
             )
             for log_line in logs:
                 print(f"  [Pipeline] {log_line}")

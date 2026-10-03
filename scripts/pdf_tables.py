@@ -14,6 +14,7 @@ import os
 import re
 import sys
 import logging
+import tempfile
 from typing import List, Dict, Any, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -68,6 +69,47 @@ def get_page_effective_rotation(page):
     except Exception:
         pass
     return 0
+
+
+def bake_pdf_rotations(pdf_path: str, dpi: int = 150) -> Tuple[str, bool, Optional[str]]:
+    """
+    对包含旋转声明的扫描版 PDF 进行全页栅格化烘焙 (Baking page rotations)。
+    将每个页面的可视视口按正向角度渲染为图像并重新创建为 0 旋转的标准正向页面。
+    直接采用视口点尺寸 (src_page.rect.width, src_page.rect.height)，严禁 swap 宽高。
+
+    返回:
+      (effective_pdf_path, was_baked, temp_pdf_path)
+      - 若无旋转页面或烘焙失败，返回 (pdf_path, False, None)；
+      - 若完成烘焙，返回 (temp_baked_pdf, True, temp_baked_pdf)。
+    """
+    if not os.path.exists(pdf_path) or fitz is None:
+        return pdf_path, False, None
+    try:
+        doc = fitz.open(pdf_path)
+        page_rotations = [get_page_effective_rotation(p) for p in doc]
+        has_rotation = any(r != 0 for r in page_rotations)
+        if not has_rotation:
+            doc.close()
+            return pdf_path, False, None
+
+        fd, temp_baked_pdf = tempfile.mkstemp(prefix="baked_rotated_pdf_", suffix=".pdf")
+        os.close(fd)
+
+        dst = fitz.open()
+        for src_page in doc:
+            new_w = src_page.rect.width
+            new_h = src_page.rect.height
+            pix = src_page.get_pixmap(dpi=dpi)
+            new_page = dst.new_page(width=new_w, height=new_h)
+            new_page.insert_image(new_page.rect, pixmap=pix)
+
+        dst.save(temp_baked_pdf)
+        dst.close()
+        doc.close()
+        return temp_baked_pdf, True, temp_baked_pdf
+    except Exception as e:
+        logger.warning(f"Bake rotations failed: {e}")
+        return pdf_path, False, None
 
 
 def probe_disjoint_native_tables(page) -> int:

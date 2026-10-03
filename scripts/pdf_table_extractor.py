@@ -171,8 +171,17 @@ def extract_via_structure_tree(pdf_path: str, pages: Optional[List[int]] = None)
             continue
 
         page_height = 842.0
+        p_obj = None
         if doc is not None and 0 <= pg - 1 < len(doc):
-            page_height = doc[pg - 1].rect.height
+            p_obj = doc[pg - 1]
+            try:
+                mb = getattr(p_obj, 'mediabox', None)
+                if mb is not None and hasattr(mb, 'height') and isinstance(mb.height, (int, float)):
+                    page_height = float(mb.height)
+                elif hasattr(p_obj, 'rect') and hasattr(p_obj.rect, 'height') and isinstance(p_obj.rect.height, (int, float)):
+                    page_height = float(p_obj.rect.height)
+            except Exception:
+                page_height = 842.0
 
         try:
             items = pdf_inspector.extract_text_with_positions(pdf_path, pages=[pg])
@@ -434,7 +443,20 @@ def extract_via_structure_tree(pdf_path: str, pages: Optional[List[int]] = None)
             b_x1 = max(c['max_x'] for c in cells)
             b_y0 = page_height - tbl_max_y
             b_y1 = page_height - tbl_min_y
-            bbox = [b_x0, min(b_y0, b_y1), b_x1, max(b_y0, b_y1)]
+            try:
+                raw_r = fitz.Rect(b_x0, min(b_y0, b_y1), b_x1, max(b_y0, b_y1))
+                p_rot = getattr(p_obj, 'rotation', 0) if p_obj else 0
+                if isinstance(p_rot, (int, float)) and (p_rot % 360 != 0) and hasattr(p_obj, 'rotation_matrix'):
+                    rot_m = p_obj.rotation_matrix
+                    if isinstance(rot_m, fitz.Matrix):
+                        vis_r = raw_r * rot_m
+                        bbox = [min(vis_r.x0, vis_r.x1), min(vis_r.y0, vis_r.y1), max(vis_r.x0, vis_r.x1), max(vis_r.y0, vis_r.y1)]
+                    else:
+                        bbox = [raw_r.x0, raw_r.y0, raw_r.x1, raw_r.y1]
+                else:
+                    bbox = [raw_r.x0, raw_r.y0, raw_r.x1, raw_r.y1]
+            except Exception:
+                bbox = None
 
             results.append({
                 'df': df,
@@ -672,20 +694,71 @@ def _markdown_lines_to_df(table_lines: List[str]):
         return None
 
 
+def _get_words_visual(page) -> List[Tuple[float, float, float, float, str, int, int, int]]:
+    """
+    获取页面 words 并将其坐标统一归一化为当前页面的视觉视口坐标系。
+    全面适配 page.rotation (0, 90, 180, 270)。
+    """
+    if not page:
+        return []
+    try:
+        raw_words = page.get_text("words")
+    except Exception:
+        return []
+    if not raw_words:
+        return []
+    rot = getattr(page, 'rotation', 0)
+    rot = (rot % 360) if isinstance(rot, int) else 0
+    if rot != 0 and fitz is not None:
+        rot_mat = getattr(page, 'rotation_matrix', None)
+        if rot_mat is not None:
+            words = []
+            for w in raw_words:
+                r = fitz.Rect(w[:4]) * rot_mat
+                words.append((min(r.x0, r.x1), min(r.y0, r.y1), max(r.x0, r.x1), max(r.y0, r.y1), w[4], w[5], w[6], w[7]))
+            return words
+    return list(raw_words)
+
+
+def _search_for_visual(page, term: str) -> List[Any]:
+    """
+    在 page 中搜索文本并将匹配区域统一转换到当前页面的视觉视口坐标系。
+    适配 page.rotation (0, 90, 180, 270)。
+    """
+    if not page or not term:
+        return []
+    try:
+        rects = page.search_for(term)
+    except Exception:
+        return []
+    if not rects:
+        return []
+    rot = getattr(page, 'rotation', 0)
+    rot = (rot % 360) if isinstance(rot, int) else 0
+    if rot != 0 and fitz is not None:
+        rot_mat = getattr(page, 'rotation_matrix', None)
+        if rot_mat is not None:
+            norm_rects = []
+            for r in rects:
+                rv = r * rot_mat
+                norm_rects.append(fitz.Rect(min(rv.x0, rv.x1), min(rv.y0, rv.y1), max(rv.x0, rv.x1), max(rv.y0, rv.y1)))
+            return norm_rects
+    return rects
+
+
 def extract_table_caption_from_page(page, table_bbox: Optional[List[float]] = None) -> Tuple[str, str]:
     """
     从 PDF 页面中提取表格的标签（如 '表1', 'Table 1'）与完整标题（含中英文）。
     优先在 table_bbox 上方区域精确提取；若无 bbox 则在页面文本中搜索。
+    全面适配 page.rotation 坐标归一化。
     """
     if page is None:
         return '', ''
     try:
-        if table_bbox:
+        words = _get_words_visual(page)
+        if table_bbox and words:
             y_top = table_bbox[1]
-            clip_rect = fitz.Rect(0, max(0, y_top - 140), page.rect.width, max(0, y_top - 1))
-            words = page.get_text("words", clip=clip_rect)
-        else:
-            words = page.get_text("words")
+            words = [w for w in words if max(0.0, y_top - 140.0) <= w[1] <= max(0.0, y_top - 1.0)]
 
         if words:
             # 按 y 坐标聚类分行
@@ -1563,7 +1636,7 @@ def reconcile_table_captions(all_results: List[Dict[str, Any]], pdf_path: str) -
                             next_l = lines[idx_l + 1].strip()
                             if not re.search(r'^(?:表|Table|图|Fig|\d+\.)', next_l) and len(next_l) < 90 and not any(p in next_l for p in ['。', '；', '！', '？', ';', '!']):
                                 title = next_l
-                        rect = page.search_for(line.strip()[:15])
+                        rect = _search_for_visual(page, line.strip()[:15])
                         y0 = rect[0].y0 if rect else 0.0
                         full_title = f"{lbl} {title}".strip() if title else lbl
                         caps.append({'label': lbl, 'title': full_title, 'y0': y0})
@@ -2592,31 +2665,37 @@ def extract_tables_from_pdf(
     pdf_path: str,
     use_ocr_fallback: bool = True,
     candidate_pages: Optional[List[int]] = None,
+    remediated: Optional[bool] = None,
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
     """
     统一 PDF 表格提取管线入口。
     内置 Tier 1 页面级无损顺时针旋转自愈与自动临时文件资源回收。
+    remediated: 可选布尔值。若上游 (如 extract_zotero_table) 已执行过 Tier 1 探测与回正，
+                传入布尔值可跳过冗余重测，避免二次重复开销与候选页判断差异。
     """
     temp_pdf_to_clean = None
     was_remediated = False
     try:
-        try:
+        if remediated is None:
             try:
-                from .doc_orientation_detector import remediate_pdf_pages_lossless
-            except ImportError:
-                from doc_orientation_detector import remediate_pdf_pages_lossless
+                try:
+                    from .doc_orientation_detector import remediate_pdf_pages_lossless
+                except ImportError:
+                    from doc_orientation_detector import remediate_pdf_pages_lossless
 
-            cands = candidate_pages
-            if cands is None:
-                cands = quick_detect_candidate_pages(pdf_path)
+                cands = candidate_pages
+                if cands is None:
+                    cands = quick_detect_candidate_pages(pdf_path)
 
-            eff_pdf_path, was_rotated, tmp_lossless = remediate_pdf_pages_lossless(pdf_path, candidate_pages=cands)
-            if was_rotated and tmp_lossless:
-                pdf_path = eff_pdf_path
-                temp_pdf_to_clean = tmp_lossless
-                was_remediated = True
-        except Exception as e_remed:
-            logger.debug(f"[pdf_table_extractor] Tier 1 lossless rotation notice: {e_remed}")
+                eff_pdf_path, was_rotated, tmp_lossless = remediate_pdf_pages_lossless(pdf_path, candidate_pages=cands)
+                if was_rotated and tmp_lossless:
+                    pdf_path = eff_pdf_path
+                    temp_pdf_to_clean = tmp_lossless
+                    was_remediated = True
+            except Exception as e_remed:
+                logger.debug(f"[pdf_table_extractor] Tier 1 lossless rotation notice: {e_remed}")
+        else:
+            was_remediated = bool(remediated)
 
         return _do_extract_tables_from_pdf(pdf_path, use_ocr_fallback=use_ocr_fallback, was_remediated=was_remediated)
     finally:
@@ -3263,8 +3342,13 @@ def _align_table_with_positions(
 
 def _extract_page_via_text_alignment(doc, page_idx: int, pdf_path: str) -> List[Dict[str, Any]]:
     page = doc[page_idx]
+    rot = getattr(page, 'rotation', 0) % 360 if isinstance(getattr(page, 'rotation', 0), (int, float)) else 0
     text = page.get_text("text")
     words = page.get_text("words")  # [(x0, y0, x1, y1, text, ...), ...]
+    page_w = page.rect.width
+    page_h = page.rect.height
+    unrot_h = float(page.mediabox.height) if hasattr(page, 'mediabox') else float(page_h)
+    unrot_w = float(page.mediabox.width) if hasattr(page, 'mediabox') else float(page_w)
 
     if not words:
         return []
@@ -3282,7 +3366,7 @@ def _extract_page_via_text_alignment(doc, page_idx: int, pdf_path: str) -> List[
                 rect = page.search_for(m.group(0))
                 if rect:
                     break
-        caption_y = rect[-1].y1 if rect else page.rect.height * 0.05
+        caption_y = rect[-1].y1 if rect else unrot_h * 0.05
         captions_on_page.append({
             'label': page_label,
             'title': page_caption or page_label,
@@ -3345,24 +3429,88 @@ def _extract_page_via_text_alignment(doc, page_idx: int, pdf_path: str) -> List[
         pos_df = None
         try:
             pos_df = _align_table_with_positions(
-                pdf_path, page_idx, page.rect.height * 0.05, page.rect.height * 0.95, page.rect.height, page.rect.width
+                pdf_path, page_idx, unrot_h * 0.05, unrot_h * 0.95, unrot_h, unrot_w
             )
         except Exception:
             pos_df = None
         if pos_df is not None and not pos_df.empty and pos_df.shape[0] >= 1 and pos_df.shape[1] >= 2 and not is_table_low_quality(pos_df):
+            raw_r = fitz.Rect(0.0, unrot_h * 0.05, unrot_w, unrot_h * 0.95)
+            if rot != 0:
+                vis_r = raw_r * page.rotation_matrix
+                bbox = [min(vis_r.x0, vis_r.x1), min(vis_r.y0, vis_r.y1), max(vis_r.x0, vis_r.x1), max(vis_r.y0, vis_r.y1)]
+            else:
+                bbox = [raw_r.x0, raw_r.y0, raw_r.x1, raw_r.y1]
             pos_df.attrs['extractor'] = 'text_alignment'
             pos_df.attrs['source'] = 'text_alignment'
             pos_df.attrs['page_idx'] = page_idx
             pos_df.attrs['is_uncaptioned'] = True
             return [{
                 'df': pos_df,
-                'bbox': [0.0, page.rect.height * 0.05, page.rect.width, page.rect.height * 0.95],
+                'bbox': bbox,
                 'label': None,
                 'title': None,
                 'page_idx': page_idx,
                 'table_idx': 0,
                 'extractor': 'text_alignment',
             }]
+
+        # 针对旋转页面或负坐标情况下的无线框无表题表格聚类探测
+        vis_words = _get_words_visual(page) if rot != 0 else words
+        if len(vis_words) >= 4:
+            all_x0 = sorted(w[0] for w in vis_words)
+            col_boundaries = [all_x0[0]]
+            for x in all_x0[1:]:
+                if x - col_boundaries[-1] > 15:
+                    col_boundaries.append(x)
+            if len(col_boundaries) >= 2:
+                words_sorted = sorted(vis_words, key=lambda w: (round(w[1] / 6) * 6, w[0]))
+                lines = []
+                current_line = []
+                current_y = None
+                for w in words_sorted:
+                    y_mid = (w[1] + w[3]) / 2
+                    if current_y is None or abs(y_mid - current_y) < 6:
+                        current_line.append(w)
+                        if current_y is None:
+                            current_y = y_mid
+                    else:
+                        lines.append(current_line)
+                        current_line = [w]
+                        current_y = y_mid
+                if current_line:
+                    lines.append(current_line)
+
+                table_rows = []
+                for line in lines:
+                    line_s = sorted(line, key=lambda w: w[0])
+                    cells = [""] * len(col_boundaries)
+                    for w in line_s:
+                        idx_c = 0
+                        for i_b, b in enumerate(col_boundaries):
+                            if w[0] >= b - 10:
+                                idx_c = i_b
+                            else:
+                                break
+                        if idx_c < len(cells):
+                            cells[idx_c] = (cells[idx_c] + " " + w[4]).strip() if cells[idx_c] else w[4]
+                    if any(c.strip() for c in cells):
+                        table_rows.append(cells)
+                if len(table_rows) >= 2:
+                    pos_df = pd.DataFrame(table_rows[1:], columns=make_unique_columns(table_rows[0]))
+                    if pos_df is not None and not pos_df.empty and pos_df.shape[0] >= 1 and pos_df.shape[1] >= 2 and not is_table_low_quality(pos_df):
+                        pos_df.attrs['extractor'] = 'text_alignment'
+                        pos_df.attrs['source'] = 'text_alignment'
+                        pos_df.attrs['page_idx'] = page_idx
+                        pos_df.attrs['is_uncaptioned'] = True
+                        return [{
+                            'df': pos_df,
+                            'bbox': [0.0, page_h * 0.05, page_w, page_h * 0.95],
+                            'label': None,
+                            'title': None,
+                            'page_idx': page_idx,
+                            'table_idx': 0,
+                            'extractor': 'text_alignment',
+                        }]
         return []
 
     page_results = []
@@ -3371,12 +3519,12 @@ def _extract_page_via_text_alignment(doc, page_idx: int, pdf_path: str) -> List[
         if cap['y'] is None:
             continue
 
-        # 确定表格的 y 范围：从 caption 下方到下一个 caption 或下一个章节标题或页面底部
+        # 确定表格的 y 范围：从 caption 下方到下一个 caption 或下一个章节标题或页面底部 (unrotated 坐标系)
         table_y_start = cap['y'] + 5  # caption 下方
         if ci + 1 < len(captions_on_page) and captions_on_page[ci + 1]['y'] is not None:
             table_y_end = captions_on_page[ci + 1]['y'] - 5
         else:
-            table_y_end = page.rect.height * 0.92
+            table_y_end = unrot_h * 0.92
             after_pos = cap.get('text_pos', 0) + len(cap.get('title', ''))
             sec_m = re.search(r'^[ \t]*([1-9]\d*(?:\.[1-9]\d*){1,2}[ \t]+[\u4e00-\u9fa5]{2,})', text[after_pos:], re.MULTILINE)
             if sec_m:
@@ -3388,7 +3536,7 @@ def _extract_page_via_text_alignment(doc, page_idx: int, pdf_path: str) -> List[
         pos_df = None
         try:
             pos_df = _align_table_with_positions(
-                pdf_path, page_idx, table_y_start, table_y_end, page.rect.height, page.rect.width
+                pdf_path, page_idx, table_y_start, table_y_end, unrot_h, unrot_w
             )
         except Exception as e_pos:
             logger.debug(f"[text_alignment] _align_table_with_positions notice: {e_pos}")
@@ -3399,16 +3547,35 @@ def _extract_page_via_text_alignment(doc, page_idx: int, pdf_path: str) -> List[
             if cap.get('title'):
                 pos_df.attrs['table_title'] = cap['title']
             pos_df.attrs['page_idx'] = page_idx
+            
+            raw_r = fitz.Rect(0.0, table_y_start, unrot_w, table_y_end)
+            if rot != 0:
+                vis_r = raw_r * page.rotation_matrix
+                bbox = [min(vis_r.x0, vis_r.x1), min(vis_r.y0, vis_r.y1), max(vis_r.x0, vis_r.x1), max(vis_r.y0, vis_r.y1)]
+            else:
+                bbox = [raw_r.x0, raw_r.y0, raw_r.x1, raw_r.y1]
+                
             page_results.append({
                 'df': pos_df,
                 'page_idx': page_idx,
                 'table_idx': ci,
-                'bbox': [0.0, table_y_start, page.rect.width, table_y_end],
+                'bbox': bbox,
+                'label': cap.get('label'),
+                'title': cap.get('title'),
             })
             continue
 
-        # 过滤出表格区域内的 words（排除页面底部单独页码）
-        table_words = [w for w in words if w[1] >= table_y_start and w[1] < table_y_end and not (w[1] > page.rect.height * 0.90 and w[4].isdigit())]
+        # 回退至基于 words 的视觉分列分行对齐
+        if rot != 0:
+            vis_words = _get_words_visual(page)
+            vis_rect = _search_for_visual(page, cap.get('label') or page_label or '')
+            vis_y_start = (vis_rect[-1].y1 + 5) if vis_rect else page_h * 0.05
+            vis_y_end = page_h * 0.92
+            table_words = [w for w in vis_words if w[1] >= vis_y_start and w[1] < vis_y_end and not (w[1] > page_h * 0.90 and w[4].isdigit())]
+            cur_bbox = [0.0, vis_y_start, page_w, vis_y_end]
+        else:
+            table_words = [w for w in words if w[1] >= table_y_start and w[1] < table_y_end and not (w[1] > page_h * 0.90 and w[4].isdigit())]
+            cur_bbox = [0.0, table_y_start, page_w, table_y_end]
 
         if len(table_words) < 4:
             continue
@@ -3435,29 +3602,28 @@ def _extract_page_via_text_alignment(doc, page_idx: int, pdf_path: str) -> List[
         current_line = []
         current_y = None
         for w in table_words:
-            y_mid = (w[1] + w[3]) / 2
-            if current_y is None or abs(y_mid - current_y) < 5:
+            if current_y is None or abs(w[1] - current_y) < 5:
                 current_line.append(w)
                 if current_y is None:
-                    current_y = y_mid
+                    current_y = w[1]
             else:
                 lines.append(current_line)
                 current_line = [w]
-                current_y = y_mid
+                current_y = w[1]
         if current_line:
             lines.append(current_line)
 
-        # 重建表格行
+        # 构建单元格矩阵
         table_rows = []
         for line in lines:
-            line_str = " ".join(w[4] for w in line).strip()
-            if not line_str:
+            line_text = ' '.join(w[4] for w in line).strip()
+            if not line_text:
                 continue
             # 终止条件：遇到正文段落（含句号且文字较长）或章节标题
-            if (len(line_str) > 25 and '。' in line_str) or re.match(r'^[1-9]\d*(?:\.[1-9]\d*){1,2}\s+[\u4e00-\u9fa5]{2,}', line_str):
+            if (len(line_text) > 25 and '。' in line_text) or re.match(r'^[1-9]\d*(?:\.[1-9]\d*){1,2}\s+[\u4e00-\u9fa5]{2,}', line_text):
                 break
             # 跳过纯页码行
-            if line_str.isdigit() and len(line_str) <= 3:
+            if line_text.isdigit() and len(line_str if 'line_str' in locals() else line_text) <= 3:
                 continue
             cells = [""] * max(len(col_boundaries), 1)
             for w in line:
@@ -3474,8 +3640,10 @@ def _extract_page_via_text_alignment(doc, page_idx: int, pdf_path: str) -> List[
         if len(table_rows) == 1:
             df = pd.DataFrame(table_rows)
         else:
-            # 首行作表头
-            df = pd.DataFrame(table_rows[1:], columns=table_rows[0])
+            # 首行作表头，生成唯一列名
+            raw_cols = [c if c.strip() else f'Col_{j}' for j, c in enumerate(table_rows[0])]
+            unique_cols = make_unique_columns(raw_cols)
+            df = pd.DataFrame(table_rows[1:], columns=unique_cols)
         df.attrs['extractor'] = 'text_alignment'
         df.attrs['label'] = cap['label']
         if cap.get('title'):
@@ -3485,7 +3653,9 @@ def _extract_page_via_text_alignment(doc, page_idx: int, pdf_path: str) -> List[
             'df': df,
             'page_idx': page_idx,
             'table_idx': ci,
-            'bbox': None,
+            'bbox': cur_bbox,
+            'label': cap.get('label'),
+            'title': cap.get('title'),
         })
 
     return page_results

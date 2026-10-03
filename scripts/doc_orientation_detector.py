@@ -676,12 +676,26 @@ def detect_crop_orientation(
             "source": "fallback"
         }
 
-    return det.predict(
+    res = det.predict(
         crop_img,
         margin_threshold=margin_threshold,
         min_confidence=min_confidence,
         use_variance_crop=use_variance_crop
     )
+
+    # ── 针对切图的分布外 (OOD) 安全守卫 ──
+    # PP-LCNet_x1_0_doc_ori 训练分布为全页级文档 (含页眉/页脚/边距)。
+    # 宽扁表格切图缺乏页面级宏观上下文，极易将网格线与对称数字误判为 180° 倒置。
+    # 误判 180° 翻转将导致 VLM 注意力崩溃、串行错乱输出残表并被质量门禁丢弃 (漏检)。
+    # 因此切图模型轨严格仅采纳 90° 与 270° 旋转；180° 倒置仅信任 Track 1 真实矢量文本，
+    # 模型轨若预测 180° 则安全抑制，保持 0° 交由多模态 VLM 原样解析。
+    if res.get("needs_rotation") and res.get("detected_angle") == 180:
+        res["needs_rotation"] = False
+        res["detected_angle"] = 0
+        res["correction_angle"] = 0
+        res["source"] = "model_crop_180_suppressed"
+
+    return res
 
 
 def remediate_pdf_pages_lossless(
