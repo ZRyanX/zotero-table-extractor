@@ -297,6 +297,44 @@ def call_journal_supp_downloader(doi_or_url: str, output_dir: str) -> bool:
     return False
 
 
+def _trigger_zotero_sync(pdf_path, target_output, dfs, args):
+    """触发 Zotero 与 Zotero-Better-Notes 生态联动（若配置或命令行显式开启）。"""
+    try:
+        try:
+            from .zotero_sync import sync_extracted_tables_to_zotero
+        except ImportError:
+            from zotero_sync import sync_extracted_tables_to_zotero
+        try:
+            from .common import load_config
+        except ImportError:
+            from common import load_config
+
+        force_sync = getattr(args, 'sync_zotero', False)
+        excel_target = None
+        if os.path.isfile(target_output) and target_output.endswith('.xlsx'):
+            excel_target = target_output
+        elif os.path.isdir(target_output):
+            import glob
+            xlsxs = sorted(glob.glob(os.path.join(target_output, "*.xlsx")))
+            if xlsxs:
+                excel_target = xlsxs[0]
+
+        if excel_target and os.path.exists(excel_target) and dfs:
+            cfg = load_config() if callable(load_config) else {}
+            if getattr(args, 'zotero_api_key', None):
+                cfg['ZOTERO_API_KEY'] = args.zotero_api_key
+            if getattr(args, 'zotero_user_id', None):
+                cfg['ZOTERO_USER_ID'] = args.zotero_user_id
+            if getattr(args, 'db_path', None):
+                cfg['ZOTERO_DB_PATH'] = args.db_path
+
+            sync_extracted_tables_to_zotero(
+                pdf_path, excel_target, dfs, config=cfg, force_sync=force_sync
+            )
+    except Exception as e_sync:
+        print(f"[ZoteroSync Hook Notice] {e_sync}")
+
+
 def _do_process_single_pdf(pdf_path, orig_pdf_path, args, is_batch=False, plan=None, candidate_pages=None, remediated=None):
     output_path = args.output
     filename_base = os.path.splitext(os.path.basename(orig_pdf_path))[0]
@@ -401,6 +439,7 @@ def _do_process_single_pdf(pdf_path, orig_pdf_path, args, is_batch=False, plan=N
                 if save_ok:
                     print(f"[Online] Successfully extracted tables via online HTML source -> {target_output}")
                     if online_only or is_complete:
+                        _trigger_zotero_sync(orig_pdf_path, target_output, online_dfs, args)
                         return True
                     print(f"[Online -> PDF Supplement] 已保留 {len(online_dfs)} 个在线表格，将由本地 PDF 管线补充剩余缺失表格...")
             else:
@@ -410,6 +449,8 @@ def _do_process_single_pdf(pdf_path, orig_pdf_path, args, is_batch=False, plan=N
 
     if online_only:
         print("[Mode] --online-only set. Skipping PDF fallback.")
+        if extracted_online:
+            _trigger_zotero_sync(orig_pdf_path, target_output, online_dfs, args)
         return extracted_online
 
     # 2. PDF 本地提取模式（结构化优先，OCR 兜底）
@@ -426,6 +467,7 @@ def _do_process_single_pdf(pdf_path, orig_pdf_path, args, is_batch=False, plan=N
                 print(f"[PDF -> Structured] Extracted {len(vlm_dfs)} structured tables from local file.")
                 if save_tables_to_excel(vlm_dfs, target_output, getattr(args, 'headers', None), single_file,
                                         skip_supplementary=getattr(args, 'skip_supplementary', False)):
+                    _trigger_zotero_sync(orig_pdf_path, target_output, vlm_dfs, args)
                     return True
         except Exception as e:
             print(f"[PDF -> Structured Warning] Failed to parse structured file: {e}")
@@ -452,6 +494,7 @@ def _do_process_single_pdf(pdf_path, orig_pdf_path, args, is_batch=False, plan=N
                                         skip_supplementary=getattr(args, 'skip_supplementary', False)):
                     print(f"[PDF] Successfully exported tables to: {target_output}")
                     pdf_extracted = True
+                    _trigger_zotero_sync(orig_pdf_path, target_output, dfs, args)
                     return True
             else:
                 print("[PDF] 结构化管线未提取到表格，尝试 OCR/切图备用管线...")
@@ -470,6 +513,7 @@ def _do_process_single_pdf(pdf_path, orig_pdf_path, args, is_batch=False, plan=N
                                                         skip_labels=online_skip_labels,
                                                         skip_supplementary=getattr(args, 'skip_supplementary', False)):
                         print(f"[PDF -> PaddleOCR-VL-1.6] Successfully exported tables to: {target_output}")
+                        _trigger_zotero_sync(orig_pdf_path, target_output, vlm_dfs, args)
                         return True
             except Exception as e:
                 print(f"[PDF -> VLM Notice] VLM execution note: {e}")
@@ -478,12 +522,14 @@ def _do_process_single_pdf(pdf_path, orig_pdf_path, args, is_batch=False, plan=N
             print("[PDF -> PP-StructureV3] 正在使用 PP-StructureV3 / 切图识别表格并导出 Excel...")
             if export_crops_to_excel(pdf_path, target_output):
                 print(f"[PDF -> PP-StructureV3] 已成功识别并导出表格至: {target_output}")
+                _trigger_zotero_sync(orig_pdf_path, target_output, [], args)
                 return True
         except Exception as e:
             print(f"[PDF -> PP-StructureV3 Notice] Export notice: {e}")
 
     # 如果在线已经提取并保存了部分表格，即使本地补充未抓取到更多表格，也视为任务成功
     if extracted_online:
+        _trigger_zotero_sync(orig_pdf_path, target_output, online_dfs, args)
         return True
 
     return False
@@ -504,6 +550,12 @@ def main():
     parser.add_argument("--single-file", action="store_true", help="Save all extracted tables into a single Excel file with multiple sheets")
     parser.add_argument("--enable-llm", action="store_true", help="Enable LLM table reasoner for complex hierarchical headers and recovery")
     
+    # 生态与增强引擎联动选项 (可选开关，默认关闭或自动)
+    parser.add_argument("--sync-zotero", action="store_true", help="Enable PyZotero & Zotero-Better-Notes ecosystem sync (attach .xlsx and create preview note, default disabled)")
+    parser.add_argument("--zotero-api-key", help="Zotero Web API Key for PyZotero sync")
+    parser.add_argument("--zotero-user-id", help="Zotero User ID / Library ID for PyZotero sync")
+    parser.add_argument("--ocr-engine", choices=["auto", "paddleocr", "docling", "mineru"], default="auto", help="OCR engine preference")
+
     parser.add_argument("--cnki-strategy", choices=["auto", "scrapling", "playwright"], default="auto",
                         help="CNKI extraction strategy: 'auto' (try both), 'scrapling', 'playwright'")
     parser.add_argument("--headed", action="store_true", help="Launch Playwright in headed mode")

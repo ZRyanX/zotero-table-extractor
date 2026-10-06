@@ -60,6 +60,21 @@ try:
 except ImportError:
     from common import format_table_label, TABLE_LABEL_PATTERN, TABLE_LABEL_RE, is_table_squeezed, is_table_low_quality, is_markdown_separator, df_map, make_unique_columns
 
+import sys
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+if _script_dir not in sys.path:
+    sys.path.insert(0, _script_dir)
+
+try:
+    from . import table_postprocess
+except ImportError:
+    import table_postprocess
+
+try:
+    from . import ocr_client
+except ImportError:
+    import ocr_client
+
 logger = logging.getLogger(__name__)
 
 
@@ -595,7 +610,14 @@ def classify_and_extract_via_inspector(pdf_path: str, caption_page_map: Optional
 
     except ImportError:
         result['error'] = 'pdf_inspector not installed'
-        print("[pdf-inspector] 未安装，跳过")
+        has_text = has_text_layer(pdf_path)
+        if has_text:
+            result['pdf_type'] = 'text_based'
+            result['confidence'] = 0.5
+            print("[pdf-inspector] 未安装，PyMuPDF 检测到文本层 → 判定为 text_based")
+        else:
+            result['pdf_type'] = 'scanned'
+            print("[pdf-inspector] 未安装，无文本层 → 判定为 scanned")
     except Exception as e:
         result['error'] = str(e)
         has_text = has_text_layer(pdf_path)
@@ -1090,7 +1112,190 @@ def extract_via_camelot(pdf_path: str, pages: Optional[List[int]] = None) -> Lis
 
 
 # ===========================================================================
-# 5. 三方投票融合
+# 4b. img2table (基于 OpenCV 的纯 Python 免 Ghostscript 表格提取)
+# ===========================================================================
+
+_IMG2TABLE_CHECKED = False
+_IMG2TABLE_AVAILABLE = False
+
+
+def is_img2table_available() -> bool:
+    """检查当前环境中是否安装并可用 img2table。"""
+    global _IMG2TABLE_CHECKED, _IMG2TABLE_AVAILABLE
+    if not _IMG2TABLE_CHECKED:
+        try:
+            from img2table.document import PDF
+            _IMG2TABLE_AVAILABLE = True
+        except ImportError:
+            _IMG2TABLE_AVAILABLE = False
+            logger.debug("[img2table] 未安装，后续调用自动跳过")
+        except Exception:
+            _IMG2TABLE_AVAILABLE = False
+        _IMG2TABLE_CHECKED = True
+    return _IMG2TABLE_AVAILABLE
+
+
+def extract_via_img2table(pdf_path: str, pages: Optional[List[int]] = None) -> List[Dict[str, Any]]:
+    """
+    使用 img2table (基于 OpenCV 形态学算子) 提取表格。
+    完全脱离 Ghostscript 系统依赖，提供有线框表 (lattice) 与无线框表 (borderless) 提取。
+    既作为 Camelot 缺失时的轻量免环境依赖替代，又作为多方投票的高可靠参与方。
+    """
+    if pd is None or not os.path.exists(pdf_path):
+        return []
+
+    try:
+        from common import load_config
+        cfg = load_config() if callable(load_config) else {}
+        if not cfg.get("IMG2TABLE_ENABLED", True):
+            return []
+    except Exception:
+        pass
+
+    if not is_img2table_available():
+        return []
+
+    results = []
+    try:
+        from img2table.document import PDF
+
+        # img2table 接收 0-indexed 页码列表
+        target_pages = [int(p) for p in pages] if pages is not None else None
+        doc = PDF(src=pdf_path, pages=target_pages, detect_rotation=False, pdf_text_extraction=True)
+
+        extracted = doc.extract_tables(borderless_tables=True)
+        if extracted:
+            for p_num, tbl_list in extracted.items():
+                for tbl_idx, tbl in enumerate(tbl_list):
+                    df = tbl.df
+                    if df is None or df.empty or len(df) < 1:
+                        continue
+                    df = df_map(df, lambda x: str(x).strip() if x is not None else "")
+                    df.attrs['extractor'] = 'img2table'
+                    df.attrs['page_idx'] = p_num
+                    if getattr(tbl, 'title', None):
+                        df.attrs['table_title'] = str(tbl.title)
+
+                    bbox = None
+                    if getattr(tbl, 'bbox', None):
+                        b = tbl.bbox
+                        bbox = [getattr(b, 'x1', 0), getattr(b, 'y1', 0), getattr(b, 'x2', 0), getattr(b, 'y2', 0)]
+
+                    results.append({
+                        'df': df,
+                        'page_idx': p_num,
+                        'table_idx': tbl_idx,
+                        'bbox': bbox,
+                    })
+    except Exception as e:
+        logger.debug(f"[img2table] 提取异常: {e}")
+
+    if results:
+        print(f"[img2table] 提取到 {len(results)} 个表格 (免 Ghostscript)")
+    return results
+
+
+# ===========================================================================
+# 4c. GMFT (基于 TATR 深度学习视觉 Transformer 原生 PDF 表格提取)
+# ===========================================================================
+
+_GMFT_CHECKED = False
+_GMFT_AVAILABLE = False
+
+
+def is_gmft_available() -> bool:
+    """检查当前环境中是否安装并可用 GMFT (TATR-based)。"""
+    global _GMFT_CHECKED, _GMFT_AVAILABLE
+    if not _GMFT_CHECKED:
+        try:
+            import tempfile
+            os.environ.setdefault("MPLCONFIGDIR", tempfile.gettempdir())
+            from gmft.auto import AutoTableDetector, AutoTableFormatter
+            from gmft.pdf_bindings import PyPDFium2Document
+            _GMFT_AVAILABLE = True
+        except ImportError:
+            _GMFT_AVAILABLE = False
+            logger.debug("[GMFT] 未安装，后续调用自动跳过")
+        except Exception:
+            _GMFT_AVAILABLE = False
+        _GMFT_CHECKED = True
+    return _GMFT_AVAILABLE
+
+
+def extract_via_gmft(pdf_path: str, pages: Optional[List[int]] = None) -> List[Dict[str, Any]]:
+    """
+    使用 GMFT (Give Me Formatted Tables, 基于 TATR 架构) 提取原生 PDF 表格。
+    擅长解决多级跨行跨列表头、层次对齐以及学术期刊三线表复杂单元格。
+    作为原生 PDF 多方投票的重要权威参选方。
+    """
+    if pd is None or not os.path.exists(pdf_path):
+        return []
+
+    try:
+        from common import load_config
+        cfg = load_config() if callable(load_config) else {}
+        if not cfg.get("GMFT_ENABLED", True):
+            return []
+    except Exception:
+        pass
+
+    if not is_gmft_available():
+        return []
+
+    results = []
+    try:
+        from gmft.auto import AutoTableDetector, AutoTableFormatter
+        from gmft.pdf_bindings import PyPDFium2Document
+
+        doc = PyPDFium2Document(pdf_path)
+        detector = AutoTableDetector()
+        formatter = AutoTableFormatter()
+
+        total_pages = len(doc)
+        target_pages = [p for p in pages if 0 <= p < total_pages] if pages is not None else list(range(total_pages))
+
+        for p_idx in target_pages:
+            try:
+                page = doc.get_page(p_idx)
+                tables = detector.extract(page)
+                if not tables:
+                    continue
+
+                for tbl_idx, tbl in enumerate(tables):
+                    ft = formatter.extract(tbl)
+                    df = ft.df()
+                    if df is None or df.empty or len(df) < 1:
+                        continue
+
+                    df = df_map(df, lambda x: str(x).strip() if x is not None else "")
+                    df.attrs['extractor'] = 'gmft_tatr'
+                    df.attrs['page_idx'] = p_idx
+
+                    bbox = None
+                    if hasattr(tbl, 'rect') and tbl.rect is not None:
+                        r = tbl.rect
+                        bbox = [getattr(r, 'x0', 0), getattr(r, 'y0', 0), getattr(r, 'x1', 0), getattr(r, 'y1', 0)]
+
+                    results.append({
+                        'df': df,
+                        'page_idx': p_idx,
+                        'table_idx': tbl_idx,
+                        'bbox': bbox,
+                    })
+            except Exception as e_page:
+                logger.debug(f"[GMFT] Page {p_idx+1} 提取异常: {e_page}")
+
+        doc.close()
+    except Exception as e:
+        logger.debug(f"[GMFT] GMFT 提取异常: {e}")
+
+    if results:
+        print(f"[GMFT] TATR 提取到 {len(results)} 个表格 (跨列合并/多层表头高保真)")
+    return results
+
+
+# ===========================================================================
+# 5. 三方与多方投票融合
 # ===========================================================================
 
 def _compute_bbox_iou(b1, b2) -> Tuple[float, float]:
@@ -1285,12 +1490,14 @@ def three_way_vote(
     align_tables: Optional[List[Dict[str, Any]]] = None,
     similarity_threshold: float = 0.75,
     structure_tables: Optional[List[Dict[str, Any]]] = None,
+    gmft_tables: Optional[List[Dict[str, Any]]] = None,
+    img2table_tables: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[str], Dict[str, Any]]:
     """
-    多方投票融合: pdf-inspector-structure + pdf-inspector + find_tables + text_alignment + pdfplumber + Camelot。
+    多方投票融合: pdf-inspector-structure + pdf-inspector + gmft + find_tables + img2table + text_alignment + pdfplumber + Camelot。
 
     规则:
-    - 任意两个一致 (相似度 >= similarity_threshold，默认 0.75) → 取一致的版本（优先 pdf_inspector_structure > pdf-inspector > find_tables > text_alignment > pdfplumber > Camelot）
+    - 任意两个一致 (相似度 >= similarity_threshold，默认 0.75) → 取一致的版本（优先 pdf_inspector_structure > pdf-inspector > gmft > find_tables > img2table > text_alignment > pdfplumber > Camelot）
     - 质量检查：若选中的候选表存在列挤压，自动降级切换至无挤压的候选表
     - 多方均不一致 → 取优先级最高的结果（若有出版商语义结构树表格 pdf_inspector_structure，绝对优先保障矢量保真度）
     - 仅一方有结果 → 取该方结果
@@ -1310,7 +1517,9 @@ def three_way_vote(
     sources = {
         'pdf_inspector_structure': structure_tables or [],
         'pdf_inspector': inspector_tables,
+        'gmft': gmft_tables or [],
         'find_tables': find_tables_results,
+        'img2table': img2table_tables or [],
         'text_alignment': align_tables or [],
         'pdfplumber': plumber_tables,
         'camelot': camelot_tables,
@@ -1322,8 +1531,8 @@ def three_way_vote(
         for t in src_tables:
             all_pages.add(t.get('page_idx', 0))
 
-    # 优先级排序：pdf_inspector_structure 出版商结构树绝对优先，pdf_inspector 结构化紧随其后，find_tables 矢量线框与无线框文本对齐紧随其后
-    priority = ['pdf_inspector_structure', 'pdf_inspector', 'find_tables', 'text_alignment', 'pdfplumber', 'camelot']
+    # 优先级排序：结构树绝对优先，pdf_inspector 与 gmft 语义紧随其后，find_tables 与 img2table 矢量形态紧随其后
+    priority = ['pdf_inspector_structure', 'pdf_inspector', 'gmft', 'find_tables', 'img2table', 'text_alignment', 'pdfplumber', 'camelot']
 
     for page in sorted(all_pages):
         page_tables = {}
@@ -1336,7 +1545,7 @@ def three_way_vote(
             continue
 
         # 页面级各主力引擎检测表数的分歧检验 (独立覆盖率感知)
-        active_counts = [len(tbls) for s, tbls in page_tables.items() if tbls and s in ['pdf_inspector_structure', 'pdf_inspector', 'find_tables']]
+        active_counts = [len(tbls) for s, tbls in page_tables.items() if tbls and s in ['pdf_inspector_structure', 'pdf_inspector', 'gmft', 'find_tables']]
         if active_counts and (max(active_counts) - min(active_counts) >= 2):
             logs.append(f"Page {page+1}: 主力引擎检测表数存在较大分歧 (counts={active_counts}) → 标记为低置信度页")
             low_confidence_pages.add(page)
@@ -1402,7 +1611,7 @@ def three_way_vote(
             # 列挤压质量检查与自动纠正：
             # 若选出的候选表存在列挤压（如数值挤在同一单元格），且同页有未挤压的候选表，则自动切换为未挤压版本
             if best_result is not None and is_table_squeezed(best_result['df']):
-                for alt_name in ['pdf_inspector_structure', 'text_alignment', 'pdfplumber', 'camelot', 'pdf_inspector']:
+                for alt_name in ['pdf_inspector_structure', 'gmft', 'img2table', 'text_alignment', 'pdfplumber', 'camelot', 'pdf_inspector']:
                     if alt_name in candidates and not is_table_squeezed(candidates[alt_name]['df']) and not is_table_low_quality(candidates[alt_name]['df']):
                         logs.append(f"Page {page+1} Table {tbl_idx+1}: {best_extractor} 存在列挤压问题 → 自动切换为未挤压的 {alt_name}")
                         best_result = candidates[alt_name]
@@ -1463,12 +1672,14 @@ def extract_via_ocr(pdf_path: str, pages: Optional[List[int]] = None) -> List[Di
 
     # 1. PP-StructureV3 -> PaddleOCR-VL-1.6 两阶段融合管线
     try:
-        import sys
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        if script_dir not in sys.path:
-            sys.path.insert(0, script_dir)
-        import ocr_client
-        from table_postprocess import parse_structured_vlm_content
+        try:
+            from . import ocr_client
+        except ImportError:
+            import ocr_client
+        try:
+            from .table_postprocess import parse_structured_vlm_content
+        except ImportError:
+            from table_postprocess import parse_structured_vlm_content
 
         full_md = ocr_client.run_ppstructure_vlm_pipeline(pdf_path, pages=pages, cancel_event=None)
         if full_md:
@@ -1489,7 +1700,22 @@ def extract_via_ocr(pdf_path: str, pages: Optional[List[int]] = None) -> List[Di
     except Exception as e:
         logger.warning(f"PP-StructureV3 + PaddleOCR-VL error: {e}")
 
-    # 2. 表格切图回退 (PP-StructureV3 / DocLayout-YOLO)
+    # 2. IBM Docling (TableFormer) 离线备用降级
+    if not results:
+        try:
+            try:
+                from . import ocr_client
+            except ImportError:
+                import ocr_client
+            if hasattr(ocr_client, 'extract_via_docling'):
+                docling_results = ocr_client.extract_via_docling(pdf_path, pages=pages)
+                if docling_results:
+                    print(f"[OCR] Docling (TableFormer) 离线备用提取到 {len(docling_results)} 个表格")
+                    results.extend(docling_results)
+        except Exception as e_docling:
+            logger.debug(f"Docling offline fallback error: {e_docling}")
+
+    # 3. 表格切图回退 (PP-StructureV3 / DocLayout-YOLO)
     if not results:
         try:
             import sys
@@ -1515,7 +1741,8 @@ def extract_via_ocr(pdf_path: str, pages: Optional[List[int]] = None) -> List[Di
             logger.warning(f"Table crop fallback error: {e}")
 
     if results:
-        print(f"[OCR] 提取到 {len(results)} 个表格 (PP-StructureV3 + PaddleOCR-VL)")
+        extractors_used = set(r['df'].attrs.get('extractor', 'ocr') for r in results)
+        print(f"[OCR] 提取到 {len(results)} 个表格 ({', '.join(extractors_used)})")
     return results
 
 
@@ -1551,6 +1778,8 @@ def has_text_layer(pdf_path: str, min_chars: int = 100, max_bad_char_ratio: floa
         doc.close()
         
         if total_chars < min_chars:
+            if has_full_images == 0 and total_chars >= 20 and (valid_chars / max(1, total_chars)) >= 0.70:
+                return True
             return False
             
         bad_ratio = bad_chars / total_chars
@@ -3023,11 +3252,20 @@ def _do_extract_tables_from_pdf(
         # ── 扫描版 PDF → 直接整页 PaddleOCR-VL ──
         logs.append("→ Step 2: 扫描版 PDF，整页提交 PaddleOCR-VL-1.6 识别")
         ocr_results = extract_via_paddleocr_fullpage(pdf_path, target_pages)
+        if not ocr_results:
+            try:
+                import ocr_client
+                docling_results = ocr_client.extract_via_docling(pdf_path, pages=target_pages)
+                if docling_results:
+                    logs.append(f"  PaddleOCR 无响应，Docling (TableFormer) 离线备用提取到 {len(docling_results)} 个表格")
+                    ocr_results = docling_results
+            except Exception as e_d:
+                logs.append(f"  Docling 离线备用异常: {e_d}")
         all_results.extend(ocr_results)
-        logs.append(f"  PaddleOCR-VL 提取到 {len(ocr_results)} 个表格")
+        logs.append(f"  OCR 提取到 {len(ocr_results)} 个表格")
     else:
-        # ── native PDF → 三方投票 + 低相似度页面回退 PaddleOCR-VL ──
-        logs.append("→ Step 2: native PDF，启动三方投票 (pdf-inspector + Camelot + pdfplumber + find_tables)")
+        # ── native PDF → 多方投票 + 低相似度页面回退 PaddleOCR-VL ──
+        logs.append("→ Step 2: native PDF，启动多方投票 (pdf-inspector + GMFT + Camelot/img2table + pdfplumber + find_tables)")
 
         native_target_pages = [p for p in target_pages if p not in pure_image_pages] if target_pages is not None else None
 
@@ -3039,6 +3277,8 @@ def _do_extract_tables_from_pdf(
         ft_results = extract_via_find_tables(pdf_path, pages=native_target_pages)
         plumber_results = extract_via_pdfplumber(pdf_path, pages=native_target_pages)
         camelot_results = extract_via_camelot(pdf_path, pages=native_target_pages)
+        img2table_results = extract_via_img2table(pdf_path, pages=native_target_pages)
+        gmft_results = extract_via_gmft(pdf_path, pages=native_target_pages)
         align_results = extract_via_text_alignment(pdf_path, pages=native_target_pages)
 
         # 多方投票融合
@@ -3047,6 +3287,8 @@ def _do_extract_tables_from_pdf(
             inspector_tables, ft_results, plumber_results, camelot_results,
             align_tables=align_results,
             structure_tables=structure_results,
+            gmft_tables=gmft_results,
+            img2table_tables=img2table_results,
         )
         logs.extend(vote_logs)
 
@@ -3055,9 +3297,9 @@ def _do_extract_tables_from_pdf(
             extractors = set(r['df'].attrs.get('vote_extractor', r['df'].attrs.get('extractor', '?')) for r in fused)
             logs.append(f"  投票完成: {len(fused)} 个表格 (extractors: {extractors})")
         else:
-            logs.append("  三方投票未获得表格")
+            logs.append("  多方投票未获得表格")
 
-        # Step 3b: 三方投票综合检验模块（坏损表、表头错位、表序缺失、续表中断、单页多表漏抓检验）
+        # Step 3b: 多方投票综合检验模块（坏损表、表头错位、表序缺失、续表中断、单页多表漏抓检验）
         try:
             from .table_validator import validate_native_extraction_pipeline
         except ImportError:
@@ -3075,11 +3317,20 @@ def _do_extract_tables_from_pdf(
             logs.append(f"→ Step 3b: 检验未通过/待精细识别页面 {[p+1 for p in ocr_candidate_pages]} 优先通过 DocLayout-YOLO 切图送入 PaddleOCR-VL-1.6 独立接管提取")
             
             ocr_results = extract_via_paddleocr_crops(pdf_path, ocr_candidate_pages)
+            if not ocr_results:
+                try:
+                    import ocr_client
+                    docling_results = ocr_client.extract_via_docling(pdf_path, pages=ocr_candidate_pages)
+                    if docling_results:
+                        logs.append(f"  Docling (TableFormer) 离线接管提取到 {len(docling_results)} 个表格")
+                        ocr_results = docling_results
+                except Exception:
+                    pass
             if ocr_results:
-                logs.append(f"  PaddleOCR-VL 独立接管提取到 {len(ocr_results)} 个表格，启动表级精细对齐与安全替换...")
+                logs.append(f"  独立接管提取到 {len(ocr_results)} 个表格，启动表级精细对齐与安全替换...")
                 all_results = reconcile_native_and_ocr_tables(original_native_results, ocr_results, ocr_candidate_pages, logs)
             else:
-                logs.append("  PaddleOCR-VL 未提取到有效表格或执行失败，保留原生解析结果 (降级回填)")
+                logs.append("  独立接管未提取到有效表格或执行失败，保留原生解析结果 (降级回填)")
                 all_results = original_native_results
         else:
             if not use_ocr_fallback and len(valid_fused) < len(original_native_results):
@@ -3434,12 +3685,10 @@ def _extract_page_via_text_alignment(doc, page_idx: int, pdf_path: str) -> List[
         except Exception:
             pos_df = None
         if pos_df is not None and not pos_df.empty and pos_df.shape[0] >= 1 and pos_df.shape[1] >= 2 and not is_table_low_quality(pos_df):
-            raw_r = fitz.Rect(0.0, unrot_h * 0.05, unrot_w, unrot_h * 0.95)
             if rot != 0:
-                vis_r = raw_r * page.rotation_matrix
-                bbox = [min(vis_r.x0, vis_r.x1), min(vis_r.y0, vis_r.y1), max(vis_r.x0, vis_r.x1), max(vis_r.y0, vis_r.y1)]
+                bbox = [0.0, page_h * 0.05, page_w, page_h * 0.95]
             else:
-                bbox = [raw_r.x0, raw_r.y0, raw_r.x1, raw_r.y1]
+                bbox = [0.0, unrot_h * 0.05, unrot_w, unrot_h * 0.95]
             pos_df.attrs['extractor'] = 'text_alignment'
             pos_df.attrs['source'] = 'text_alignment'
             pos_df.attrs['page_idx'] = page_idx
@@ -3548,12 +3797,13 @@ def _extract_page_via_text_alignment(doc, page_idx: int, pdf_path: str) -> List[
                 pos_df.attrs['table_title'] = cap['title']
             pos_df.attrs['page_idx'] = page_idx
             
-            raw_r = fitz.Rect(0.0, table_y_start, unrot_w, table_y_end)
             if rot != 0:
-                vis_r = raw_r * page.rotation_matrix
-                bbox = [min(vis_r.x0, vis_r.x1), min(vis_r.y0, vis_r.y1), max(vis_r.x0, vis_r.x1), max(vis_r.y0, vis_r.y1)]
+                vis_rect = _search_for_visual(page, cap.get('label') or page_label or '')
+                vis_y_start = (vis_rect[-1].y1 + 5) if vis_rect else page_h * 0.05
+                vis_y_end = page_h * 0.92
+                bbox = [0.0, vis_y_start, page_w, vis_y_end]
             else:
-                bbox = [raw_r.x0, raw_r.y0, raw_r.x1, raw_r.y1]
+                bbox = [0.0, table_y_start, page_w, table_y_end]
                 
             page_results.append({
                 'df': pos_df,

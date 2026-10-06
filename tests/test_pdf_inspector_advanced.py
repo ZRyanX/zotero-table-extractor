@@ -21,7 +21,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
-import fitz
+try:
+    import pymupdf as fitz
+except ImportError:
+    import fitz
 import pandas as pd
 from PIL import Image
 

@@ -1022,4 +1022,228 @@ def run_paddleocr_vl(pdf_path: str, pages=None, cancel_event=None, enable_doclay
     except Exception as e:
         print(f"[OCR Notice] 逐页 PaddleOCR-VL 识别提示: {e}")
 
+    # 离线备用降级：当 PaddleOCR 在线服务无结果且配置了 Docling 备用时，启动 Docling TableFormer 兜底
+    if not full_md and config and config.get("DOCLING_OFFLINE_FALLBACK", True):
+        try:
+            print("[OCR Fallback] PaddleOCR 未返回表格，尝试启动 IBM Docling (TableFormer) 离线备用提取...")
+            docling_md = call_docling_table_extractor(pdf_path, pages=pages, config=config, cancel_event=cancel_event)
+            if docling_md:
+                print("[OCR Fallback] ✓ Docling (TableFormer) 离线备用提取成功完成！")
+                return docling_md
+        except Exception as e_d:
+            print(f"[OCR Fallback Notice] Docling 备用提取异常: {e_d}")
+
     return full_md or ""
+
+
+# ===========================================================================
+# 4. IBM Docling (TableFormer) 离线表格提取备用引擎
+# ===========================================================================
+
+_DOCLING_CHECKED = False
+_DOCLING_AVAILABLE = False
+
+
+def is_docling_available() -> bool:
+    """检查当前环境中是否安装并可用 IBM Docling。"""
+    global _DOCLING_CHECKED, _DOCLING_AVAILABLE
+    if not _DOCLING_CHECKED:
+        try:
+            from docling.document_converter import DocumentConverter
+            _DOCLING_AVAILABLE = True
+        except ImportError:
+            _DOCLING_AVAILABLE = False
+        except Exception:
+            _DOCLING_AVAILABLE = False
+        _DOCLING_CHECKED = True
+    return _DOCLING_AVAILABLE
+
+
+def extract_via_docling(
+    pdf_path: str,
+    pages: Optional[List[int]] = None,
+    config: Optional[Dict[str, Any]] = None,
+    cancel_event=None,
+) -> List[Dict[str, Any]]:
+    """
+    使用 IBM Docling (内置 TableFormer) 提取 PDF 表格（离线高精度备用方案）。
+
+    专为以下场景设计：
+    1. 保持 PP-StructureV3 + PaddleOCR-VL 为首选云端主引擎的前提下，
+       将 Docling 作为无网络/无 Token/在线服务限流故障时的离线备用；
+    2. 深度处理跨栏复杂学术表格、合并单元格及跨页续表。
+
+    返回标准化表格列表:
+    [
+        {
+            'df': pd.DataFrame,
+            'page_idx': int (0-indexed),
+            'table_idx': int,
+            'bbox': [x0, y0, x1, y1] or None,
+        },
+        ...
+    ]
+    """
+    if not os.path.exists(pdf_path):
+        return []
+
+    if cancel_event is not None and cancel_event.is_set():
+        return []
+
+    if not is_docling_available():
+        logger.debug("[Docling] docling 未安装，跳过 Docling 离线表格提取")
+        return []
+
+    if config is None:
+        config = load_config() if callable(load_config) else {}
+
+    if not config.get("DOCLING_ENABLED", True):
+        logger.debug("[Docling] DOCLING_ENABLED 为 False，跳过")
+        return []
+
+    results = []
+    effective_pdf = pdf_path
+    temp_slice = None
+
+    try:
+        from docling.document_converter import DocumentConverter, PdfFormatOption
+        from docling.datamodel.base_models import InputFormat
+        from docling.datamodel.pipeline_options import PdfPipelineOptions
+
+        # 若指定了特定候选页面且 fitz 可用，为提升速度生成原子子 PDF 仅解析目标页
+        page_index_map = None
+        if pages is not None and fitz is not None:
+            try:
+                doc = fitz.open(pdf_path)
+                total_p = len(doc)
+                valid_pages = [p for p in pages if 0 <= p < total_p]
+                if valid_pages and len(valid_pages) < total_p:
+                    fd, temp_slice = tempfile.mkstemp(prefix="docling_slice_", suffix=".pdf")
+                    os.close(fd)
+                    sub_doc = fitz.open()
+                    page_index_map = {}
+                    for sub_idx, orig_p in enumerate(valid_pages):
+                        sub_doc.insert_pdf(doc, from_page=orig_p, to_page=orig_p)
+                        page_index_map[sub_idx] = orig_p
+                    sub_doc.save(temp_slice)
+                    sub_doc.close()
+                    effective_pdf = temp_slice
+                doc.close()
+            except Exception as e_slice:
+                logger.debug(f"[Docling] 创建页面切片失败，将全文档解析: {e_slice}")
+                effective_pdf = pdf_path
+
+        pipeline_options = PdfPipelineOptions()
+        pipeline_options.do_table_structure = True
+        pipeline_options.do_ocr = False
+
+        converter = DocumentConverter(
+            format_options={
+                InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
+            }
+        )
+
+        conv_res = converter.convert(effective_pdf)
+        if not conv_res or not conv_res.document:
+            return []
+
+        doc_item = conv_res.document
+        tables = getattr(doc_item, "tables", [])
+        if not tables:
+            return []
+
+        for tbl_idx, tbl in enumerate(tables):
+            if cancel_event is not None and cancel_event.is_set():
+                break
+
+            df = tbl.export_to_dataframe()
+            if df is None or df.empty or len(df) < 1:
+                continue
+
+            # 获取页码与边界框坐标
+            p_idx = 0
+            bbox = None
+            if hasattr(tbl, "prov") and tbl.prov:
+                first_prov = tbl.prov[0]
+                raw_page_no = getattr(first_prov, "page_no", 1)  # 1-indexed
+                sub_page_idx = max(0, raw_page_no - 1)
+                if page_index_map is not None:
+                    p_idx = page_index_map.get(sub_page_idx, sub_page_idx)
+                else:
+                    p_idx = sub_page_idx
+
+                raw_bbox = getattr(first_prov, "bbox", None)
+                if raw_bbox:
+                    bbox = [
+                        getattr(raw_bbox, "l", 0.0),
+                        getattr(raw_bbox, "t", 0.0),
+                        getattr(raw_bbox, "r", 0.0),
+                        getattr(raw_bbox, "b", 0.0)
+                    ]
+
+            # 获取表标题/说明
+            caption = ""
+            try:
+                caption = tbl.caption_text(doc_item) or ""
+            except Exception:
+                caption = ""
+
+            df.attrs["extractor"] = "docling_tableformer"
+            df.attrs["page_idx"] = p_idx
+            if caption:
+                df.attrs["table_title"] = caption
+
+            results.append({
+                "df": df,
+                "page_idx": p_idx,
+                "table_idx": tbl_idx,
+                "bbox": bbox,
+            })
+
+    except Exception as e:
+        logger.warning(f"[Docling] Docling 提取异常: {e}")
+    finally:
+        if temp_slice and os.path.exists(temp_slice):
+            try:
+                os.remove(temp_slice)
+            except Exception:
+                pass
+
+    if results:
+        print(f"[Docling] TableFormer 离线备用成功提取到 {len(results)} 个表格")
+    return results
+
+
+def call_docling_table_extractor(
+    pdf_path: str,
+    pages: Optional[List[int]] = None,
+    config: Optional[Dict[str, Any]] = None,
+    cancel_event=None,
+) -> str:
+    """
+    通过 Docling 离线提取表格并将结果导出为 Markdown 字符串，
+    供上游直接对接 parse_structured_vlm_content 统一后处理管线。
+    """
+    tbls = extract_via_docling(pdf_path, pages=pages, config=config, cancel_event=cancel_event)
+    if not tbls:
+        return ""
+
+    md_blocks = []
+    for idx, item in enumerate(tbls):
+        df = item.get("df")
+        if df is None or df.empty:
+            continue
+        p = item.get("page_idx", 0)
+        title = df.attrs.get("table_title", f"Table {idx+1}")
+        try:
+            table_md = df.to_markdown(index=False)
+        except Exception:
+            cols = [str(c) for c in df.columns]
+            lines = ["| " + " | ".join(cols) + " |", "| " + " | ".join(["---"] * len(cols)) + " |"]
+            for _, r_data in df.iterrows():
+                lines.append("| " + " | ".join(str(v).replace("\n", " ").strip() for v in r_data.values) + " |")
+            table_md = "\n".join(lines)
+        block = f"### Table {idx+1} (Page {p+1}): {title}\n\n{table_md}\n"
+        md_blocks.append(block)
+
+    return "\n\n".join(md_blocks)

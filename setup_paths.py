@@ -471,6 +471,9 @@ def show_status():
     els = cfg.get("ELSEVIER_API_KEY", "")
     e_status = f"{COLOR_GREEN}[已配置]{COLOR_RESET}" if els else f"{COLOR_YELLOW}[未配置]{COLOR_RESET}"
     print(f"  • ELSEVIER API KEY          : {e_status}")
+    z_sync = cfg.get("ZOTERO_SYNC_ENABLED", False)
+    z_status = f"{COLOR_GREEN}[已启用]{COLOR_RESET}" if z_sync else f"{COLOR_GRAY}[已关闭 (默认)]{COLOR_RESET}"
+    print(f"  • ZOTERO / BETTER-NOTES 联动: {z_status}")
     c_print("─" * 72, COLOR_GRAY)
     c_print("  【本地离线 AI 视觉与方向模型状态】", COLOR_BOLD + COLOR_CYAN)
     m_dir = cfg.get("DOCLAYOUT_MODEL_DIR") or os.path.join(ROOT_DIR, "models")
@@ -483,6 +486,23 @@ def show_status():
     else:
         ori_stat = f"{COLOR_GRAY}[未下载 (可选, 运行时按需自动获取与优雅降级)]{COLOR_RESET}"
     print(f"  • TurboOCR 页面方向模型    : {ori_file}  {ori_stat}")
+    
+    # 扩展引擎可用性探针
+    def _probe_mod(mod_name):
+        try:
+            __import__(mod_name)
+            return f"{COLOR_GREEN}[✓ 可用]{COLOR_RESET}"
+        except ImportError:
+            return f"{COLOR_GRAY}[未安装 (可选)]{COLOR_RESET}"
+        except Exception:
+            return f"{COLOR_YELLOW}[! 异常]{COLOR_RESET}"
+
+    c_print("─" * 72, COLOR_GRAY)
+    c_print("  【高级提取引擎与生态组件状态】", COLOR_BOLD + COLOR_CYAN)
+    print(f"  • IBM Docling (TableFormer) : {_probe_mod('docling')} (离线高精备用)")
+    print(f"  • GMFT (TATR 结构 Transformer): {_probe_mod('gmft')} (跨列合并/多层表头)")
+    print(f"  • img2table (OpenCV 纯 Python): {_probe_mod('img2table')} (免 Ghostscript 依赖)")
+    print(f"  • PyZotero (生态自动化挂载) : {_probe_mod('pyzotero')} (附件与 Better-Notes 笔记)")
     c_print("=" * 72, COLOR_BLUE)
 
 

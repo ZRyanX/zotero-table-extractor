@@ -915,57 +915,175 @@ def _normalize_col_name(name: str) -> str:
     return s
 
 
-def align_dataframe_columns(df_to_align: pd.DataFrame, target_cols: List[str]) -> pd.DataFrame:
+def compute_column_profile(series: pd.Series) -> Dict[str, float]:
     """
-    Dynamically aligns columns of df_to_align to target_cols using string similarity,
-    fuzzy element/unit matching, subscript normalization, and data type alignment.
-    Missing target columns are filled with empty string.
-    Constructs columns sequentially via pd.concat to prevent dictionary key collisions
-    on duplicate column names (e.g. repeated uncertainty/error headers like '1σ', '±').
+    计算单列数据的语义与数据类型特征分布向量（借鉴 DeepDoc 与 MinerU 版面投影特征）。
+    包含：数值比例、空值比例、平均文本长度。
+    """
+    total = len(series)
+    if total == 0:
+        return {'num_ratio': 0.0, 'empty_ratio': 1.0, 'avg_len': 0.0}
+    vals = [str(x).strip() for x in series if pd.notna(x)]
+    non_empty = [v for v in vals if v]
+    num_cnt = sum(1 for v in non_empty if is_pure_data_value(v))
+    empty_cnt = total - len(non_empty)
+    avg_l = sum(len(v) for v in non_empty) / max(1, len(non_empty))
+    return {
+        'num_ratio': num_cnt / max(1, len(non_empty)),
+        'empty_ratio': empty_cnt / total,
+        'avg_len': avg_l,
+    }
+
+
+def deepdoc_mineru_align_columns(
+    df_to_align: pd.DataFrame,
+    target_cols: List[str],
+    base_df: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    """
+    基于 DeepDoc / MinerU 版面与列投影机制的多页续表自适应列对齐。
+    
+    核心思想：
+    1. 列名语义对齐：学术规范化、缩写匹配与模糊相似度；
+    2. 列投影分布对齐 (Column Projection Profile)：当续表缺失表头或为 generic 列名时，
+       通过数值比例、文本长度与稀疏度分布投影，计算两表列特征相似度；
+    3. 单调动态规划保序投影 (Monotone DP Assignment)：跨页表格严格维持从左至右的物理与语义列序，
+       杜绝列穿插与乱序投影，并自动处理列省略、列拆分与补齐；
+    4. 空间与相对位置约束：融合相对水平投影中心惩罚，确保局部列与全局列对齐。
     """
     if df_to_align is None or df_to_align.empty:
         return pd.DataFrame(columns=target_cols)
 
     curr_cols = list(df_to_align.columns)
-    if curr_cols == target_cols:
+    if curr_cols == target_cols and base_df is None:
         return df_to_align
 
-    aligned_series = []
-    matched_curr = set()
     num_rows = len(df_to_align)
+    n_curr = len(curr_cols)
+    n_target = len(target_cols)
 
-    for t_col in target_cols:
-        t_clean = _normalize_col_name(t_col)
-        best_match = None
-        best_score = 0.0
+    if n_curr == 0 or n_target == 0:
+        return pd.DataFrame(columns=target_cols)
 
-        for c_idx, c_col in enumerate(curr_cols):
-            if c_idx in matched_curr:
-                continue
-            c_clean = _normalize_col_name(c_col)
-            
-            # Exact or substring match after academic normalization
-            if t_clean == c_clean:
-                best_match = c_idx
-                best_score = 1.0
-                break
-            elif t_clean and c_clean and (t_clean in c_clean or c_clean in t_clean):
-                score = min(len(t_clean), len(c_clean)) / max(len(t_clean), len(c_clean))
-                if score > best_score:
-                    best_score = score
-                    best_match = c_idx
+    # 1. 预计算列特征分布向量
+    curr_profiles = [compute_column_profile(df_to_align.iloc[:, i]) for i in range(n_curr)]
+    base_profiles = []
+    if base_df is not None and not base_df.empty:
+        base_profiles = [compute_column_profile(base_df.iloc[:, min(j, len(base_df.columns)-1)]) for j in range(n_target)]
+    else:
+        base_profiles = [{'num_ratio': 0.8 if any(c.isdigit() or c in '±%' for c in str(tc)) else 0.2, 'empty_ratio': 0.05, 'avg_len': 5.0} for tc in target_cols]
 
-        if best_match is not None and best_score >= 0.40:
-            s = df_to_align.iloc[:, best_match].reset_index(drop=True)
+    # 2. 构建二维相似度矩阵 S[i][j] (curr_cols[i] -> target_cols[j])
+    score_matrix = [[0.0 for _ in range(n_target)] for _ in range(n_curr)]
+
+    for i, c_col in enumerate(curr_cols):
+        c_clean = _normalize_col_name(c_col)
+        c_is_generic = not c_clean or c_clean.startswith(('unnamed', 'col')) or str(c_col).isdigit() or c_clean in ('none', 'nan', 'null')
+        c_prof = curr_profiles[i]
+        c_rel_pos = i / max(1, n_curr - 1)
+
+        for j, t_col in enumerate(target_cols):
+            t_clean = _normalize_col_name(t_col)
+            t_is_generic = not t_clean or t_clean.startswith(('unnamed', 'col')) or str(t_col).isdigit() or t_clean in ('none', 'nan', 'null')
+            t_prof = base_profiles[j]
+            t_rel_pos = j / max(1, n_target - 1)
+
+            # (1) 列名相似度
+            name_sim = 0.0
+            if not c_is_generic and not t_is_generic:
+                if c_clean == t_clean:
+                    name_sim = 1.0
+                elif c_clean in t_clean or t_clean in c_clean:
+                    name_sim = min(len(c_clean), len(t_clean)) / max(len(c_clean), len(t_clean))
+                else:
+                    from difflib import SequenceMatcher
+                    name_sim = SequenceMatcher(None, c_clean, t_clean).ratio()
+
+            # (2) 数据特征投影分布相似度 (DeepDoc / MinerU)
+            num_diff = abs(c_prof['num_ratio'] - t_prof['num_ratio'])
+            empty_diff = abs(c_prof['empty_ratio'] - t_prof['empty_ratio'])
+            len_diff = min(1.0, abs(c_prof['avg_len'] - t_prof['avg_len']) / 15.0)
+            prof_sim = max(0.0, 1.0 - (0.50 * num_diff + 0.30 * empty_diff + 0.20 * len_diff))
+
+            # (3) 物理位置相对跨度单调惩罚
+            pos_penalty = abs(c_rel_pos - t_rel_pos)
+
+            # 综合加权
+            if not c_is_generic and not t_is_generic:
+                score = 0.50 * name_sim + 0.35 * prof_sim + 0.15 * max(0.0, 1.0 - pos_penalty)
+            else:
+                score = 0.70 * prof_sim + 0.30 * max(0.0, 1.0 - pos_penalty)
+
+            score_matrix[i][j] = score
+
+    # 3. 单调动态规划保序对齐 (Monotone Dynamic Programming Alignment)
+    # 支持当前表列跳过 (n_curr > n_target)、目标列省略 (n_curr < n_target) 以及双向单调匹配
+    dp = [[0.0 for _ in range(n_target + 1)] for _ in range(n_curr + 1)]
+    parent = [[None for _ in range(n_target + 1)] for _ in range(n_curr + 1)]
+
+    for i in range(1, n_curr + 1):
+        for j in range(1, n_target + 1):
+            # 选项 1: 跳过当前续表列 curr[i-1] (当前列可能是多余/噪声列)
+            best_val = dp[i - 1][j]
+            best_p = (i - 1, j, None)
+
+            # 选项 2: 目标列 target[j-1] 在续表中未出现 (续表省略了该列)
+            if dp[i][j - 1] > best_val:
+                best_val = dp[i][j - 1]
+                best_p = (i, j - 1, None)
+
+            # 选项 3: 将 curr[i-1] 与 target[j-1] 匹配
+            match_score = score_matrix[i - 1][j - 1]
+            if dp[i - 1][j - 1] + match_score > best_val:
+                best_val = dp[i - 1][j - 1] + match_score
+                best_p = (i - 1, j - 1, (i - 1, j - 1))
+
+            dp[i][j] = best_val
+            parent[i][j] = best_p
+
+    # 回溯最优单调对齐路径
+    curr_to_target = {}
+    target_to_curr = {}
+    ci, cj = n_curr, n_target
+    while ci > 0 and cj > 0:
+        p = parent[ci][cj]
+        if not p:
+            break
+        pi, pj, action = p
+        if action:
+            curr_idx, target_idx = action
+            if score_matrix[curr_idx][target_idx] >= 0.20 or n_curr == n_target:
+                curr_to_target[curr_idx] = target_idx
+                target_to_curr[target_idx] = curr_idx
+        ci, cj = pi, pj
+
+    # 4. 根据单调映射顺序构造对齐列 Series
+    aligned_series = []
+    for j, t_col in enumerate(target_cols):
+        if j in target_to_curr:
+            src_idx = target_to_curr[j]
+            s = df_to_align.iloc[:, src_idx].reset_index(drop=True)
             s.name = t_col
             aligned_series.append(s)
-            matched_curr.add(best_match)
         else:
             aligned_series.append(pd.Series([""] * num_rows, name=t_col))
 
     res_df = pd.concat(aligned_series, axis=1)
     res_df.columns = target_cols
+    res_df.attrs = getattr(df_to_align, 'attrs', {}).copy()
     return res_df
+
+
+def align_dataframe_columns(
+    df_to_align: pd.DataFrame,
+    target_cols: List[str],
+    base_df: Optional[pd.DataFrame] = None
+) -> pd.DataFrame:
+    """
+    基于 DeepDoc / MinerU 列投影机制，将 df_to_align 对齐至目标列。
+    兼容原有签名，支持可选的 base_df 进行数据分布投影。
+    """
+    return deepdoc_mineru_align_columns(df_to_align, target_cols, base_df=base_df)
 
 
 def is_pure_data_value(s_in):
@@ -1096,24 +1214,10 @@ def combine_df_group(group):
         is_data_in_columns = (not is_seq_int) and (data_col_count / max(1, len(next_cols)) >= 0.4)
         
         if is_data_in_columns:
-            # 将 next_df.columns 转回为第一行数据，避免丢失数据首行
-            col_vals = [c for c in next_df.columns]
-            if len(col_vals) > len(base_cols):
-                col_vals = col_vals[:len(base_cols)]
-            elif len(col_vals) < len(base_cols):
-                col_vals = col_vals + [""] * (len(base_cols) - len(col_vals))
-            row_from_cols = pd.DataFrame([col_vals], columns=base_cols)
-            
-            if len(next_df.columns) < len(base_cols):
-                for i in range(len(base_cols) - len(next_df.columns)):
-                    next_df[f"Extra_{i}"] = ""
-                next_df.columns = base_cols
-            elif len(next_df.columns) > len(base_cols):
-                next_df = next_df.iloc[:, :len(base_cols)]
-                next_df.columns = base_cols
-            else:
-                next_df.columns = base_cols
-            next_df = pd.concat([row_from_cols, next_df], ignore_index=True)
+            # 将 next_df.columns 转回为数据首行，并基于 DeepDoc/MinerU 列投影对齐至 base_cols
+            full_data = [list(next_df.columns)] + next_df.values.tolist()
+            temp_df = pd.DataFrame(full_data, columns=[f"Col_{i}" for i in range(len(next_df.columns))])
+            next_df = align_dataframe_columns(temp_df, base_cols, base_df=base_df)
         else:
             # 动态语义对齐：当列数不完全相同或列名略有变动时，执行基于相似度的自适应对齐
             has_named_cols = sum(1 for c in next_df.columns if not str(c).startswith('Unnamed:') and str(c).strip()) >= 2
@@ -1121,27 +1225,22 @@ def combine_df_group(group):
                 pass
             elif len(next_df.columns) == len(base_cols):
                 if has_named_cols:
-                    next_df = align_dataframe_columns(next_df, base_cols)
+                    next_df = align_dataframe_columns(next_df, base_cols, base_df=base_df)
                 else:
                     next_df.columns = base_cols
             elif abs(len(next_df.columns) - len(base_cols)) <= 6:
                 if has_named_cols:
-                    next_df = align_dataframe_columns(next_df, base_cols)
+                    next_df = align_dataframe_columns(next_df, base_cols, base_df=base_df)
                 else:
                     first_row = [str(x).strip() for x in next_df.iloc[0].values if pd.notna(x)] if len(next_df) > 0 else []
                     row_has_named = sum(1 for c in first_row if c and not c.startswith('Unnamed:') and any(_normalize_col_name(c) == _normalize_col_name(b) for b in base_cols)) >= 2
                     if row_has_named:
                         next_df.columns = [str(x).strip() if pd.notna(x) and str(x).strip() else f"Col_{i}" for i, x in enumerate(next_df.iloc[0].values)]
                         next_df = next_df.iloc[1:].reset_index(drop=True)
-                        next_df = align_dataframe_columns(next_df, base_cols)
+                        next_df = align_dataframe_columns(next_df, base_cols, base_df=base_df)
                     else:
-                        if len(next_df.columns) < len(base_cols):
-                            for i in range(len(base_cols) - len(next_df.columns)):
-                                next_df[f"Extra_{i}"] = ""
-                            next_df.columns = base_cols
-                        else:
-                            next_df = next_df.iloc[:, :len(base_cols)]
-                            next_df.columns = base_cols
+                        # 运用 DeepDoc / MinerU 列投影自适应映射不同列数分块
+                        next_df = align_dataframe_columns(next_df, base_cols, base_df=base_df)
             else:
                 # 列数差异过大，跳过合并
                 continue

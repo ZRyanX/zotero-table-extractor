@@ -8,7 +8,10 @@ table_validator.py - 原生提取/三方投票表格质量与完整性深度检�
 
 import os
 import re
-import fitz
+try:
+    import pymupdf as fitz
+except ImportError:
+    import fitz
 import pandas as pd
 from typing import List, Dict, Any, Tuple, Set, Optional
 

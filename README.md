@@ -11,8 +11,8 @@
 
 <p align="center">
   <a href="#-核心能力"><img src="https://img.shields.io/badge/Pipeline-Dual_Track_(Online+PDF)-blue.svg" alt="Pipeline"></a>
-  <a href="#-多方投票仲裁"><img src="https://img.shields.io/badge/Voting-5_Engine_Consensus-orange.svg" alt="Voting"></a>
-  <a href="#-两阶段视觉-ai-接管"><img src="https://img.shields.io/badge/Visual_AI-PP--StructureV3_%2B_PaddleOCR--VL-purple.svg" alt="Visual AI"></a>
+  <a href="#-多方投票仲裁"><img src="https://img.shields.io/badge/Voting-7_Engine_Consensus-orange.svg" alt="Voting"></a>
+  <a href="#-两阶段视觉-ai-接管"><img src="https://img.shields.io/badge/Visual_AI-PP--StructureV3_%2B_PaddleOCR--VL_%2B_Docling-purple.svg" alt="Visual AI"></a>
   <a href="#-环境要求"><img src="https://img.shields.io/badge/Python-3.9%2B-brightgreen.svg" alt="Python Version"></a>
   <a href="#-环境要求"><img src="https://img.shields.io/badge/Platform-macOS_%7C_Linux_%7C_Windows-lightgrey.svg" alt="Platform"></a>
 </p>
@@ -24,12 +24,13 @@
 - [💡 项目简介](#-项目简介)
 - [✨ 核心能力](#-核心能力)
   - [1. 优先在线 HTML/XML 高保真提取](#1-优先在线-htmlxml-高保真提取)
-  - [2. 本地原生 PDF 5 引擎投票共识](#2-本地原生-pdf-5-引擎投票共识)
-  - [3. 复杂扫描件/无框表两阶段视觉 AI 接管](#3-复杂扫描件无框表两阶段视觉-ai-接管)
+  - [2. 本地原生 PDF 7 引擎投票共识](#2-本地原生-pdf-7-引擎投票共识)
+  - [3. 复杂扫描件/无框表两阶段视觉 AI 接管（支持 Docling 离线备用）](#3-复杂扫描件无框表两阶段视觉-ai-接管)
   - [4. 7 阶轻量安全后处理流水线](#4-7-阶轻量安全后处理流水线)
-  - [5. 跨页续表与横向分块自适应拼接](#5-跨页续表与横向分块自适应拼接)
+  - [5. 跨页续表与横向分块自适应拼接 (DeepDoc/MinerU 列对齐)](#5-跨页续表与横向分块自适应拼接)
   - [6. 出版级规范 Excel 导出](#6-出版级规范-excel-导出)
   - [7. 全库批量并发与工业级鲁棒性](#7-全库批量并发与工业级鲁棒性)
+  - [8. PyZotero 与 Zotero-Better-Notes 生态闭环联动 (可选)](#8-pyzotero-与-zotero-better-notes-生态闭环联动-可选)
 - [🏗 架构设计与数据流转图](#-架构设计与数据流转图)
 - [💻 环境要求与安装](#-环境要求与安装)
 - [⚙️ 配置指南](#️-配置指南)
@@ -59,9 +60,10 @@
 
 **Zotero Table Extractor** 是一套端到端的学术表格智能提取与重构引擎：
 1. **双轨驱动**：优先走官方直连 API / 原生 HTML / XML 提取（100% 零误差），若缺失或受阻则无缝降级到本地 PDF 深度流水线；
-2. **多方验证**：原生文本 PDF 采用 5 引擎多方投票与矩阵相似度交叉仲裁；
-3. **视觉多模态大模型**：对于扫描件、低置信度表格或复杂表，采用 **PP-StructureV3 / DocLayout-YOLO** 前置定位与切图，串联 **PaddleOCR-VL-1.6** 多模态大语言模型进行结构化还原；
-4. **精细后处理**：内置 7 阶轻量安全清洗流水线（防 Excel 注入、多行子行展开、紧缩数值拆分、多级表头重塑等），并自动拼接跨页续表，最终交付排版整洁、格式标准、附带规范表号表题的 Excel 产物。
+2. **多方验证**：原生文本 PDF 采用 **7 引擎多方投票与矩阵相似度交叉仲裁**（新增 GMFT 与 img2table）；
+3. **视觉多模态大模型双轨接管**：对于扫描件、低置信度表格或复杂表，采用 **PP-StructureV3 / DocLayout-YOLO** 前置定位与切图，首选 **PaddleOCR-VL-1.6** 在线多模态大模型进行结构化还原，同时支持 **IBM Docling (TableFormer)** 作为本地离线备用接管引擎；
+4. **精细后处理与跨页 DP 对齐**：内置 7 阶轻量安全清洗流水线（防 Excel 注入、多行子行展开、紧缩数值拆分、多级表头重塑等），并融合 DeepDoc / MinerU 启发式三向单调动态规划拼接跨页续表；
+5. **生态闭环联动 (可选)**：可选集成 PyZotero 与 Zotero-Better-Notes，自动将提取出的 `.xlsx` 挂载回文献条目并生成富文本表格预览笔记。
 
 ---
 
@@ -74,23 +76,25 @@
 - **附表 (Supplementary Tables) 自动探测**：自动嗅探并提取论文正文及关联的在线附表。
 - **完备性门禁**：若在线提取得到的表数量低于 PDF 文本层扫描出的表格 caption 数量，系统自动触发增量补偿，防止在线版本漏表。
 
-### 2. 本地原生 PDF 5 引擎投票共识
+### 2. 本地原生 PDF 7 引擎投票共识
 对于含有完整矢量文本层的 Native PDF，启动多算法交叉核验，兼顾极速与极高准确率（单页约 0.1s）：
-- **[`pdf-inspector`](https://github.com/firecrawl/pdf-inspector)**：Rust 编写的高性能检测器，快速判定 PDF 类型并解析 Markdown 表格；
+- **[`pdf-inspector`](https://github.com/firecrawl/pdf-inspector)**：Rust 编写的高性能检测器，快速判定 PDF 类型并解析 Tagged PDF / PDF/UA 语义结构树与 Markdown 表格；
 - **`PyMuPDF find_tables()`**：极速矢量线框表格识别；
+- **[`GMFT`](https://github.com/conjuncts/gmft)**：基于 TATR (Table Transformer) 的深度视觉结构解析，专精学术多层复合表头与跨列单元格对齐；
+- **[`img2table`](https://github.com/xavctn/img2table)**：纯 Python + OpenCV 形态学轮廓方案，**彻底摆脱系统级 Ghostscript 依赖**，稳健支持有框与无框表；
 - **`text_alignment`**：基于文字坐标聚类分列的无线框对齐引擎；
 - **`pdfplumber`**：基于字符空间矩形与相交线框的结构提取；
 - **`Camelot`**：Lattice 网格法与 Stream 文本流双策略识别；
 - **双向相似度投票仲裁**：计算矩阵相似度，任意两方相似度 $\ge 0.75$ 则判定一致并采纳最佳版本；相似度 $< 0.90$ 标记为低置信度并触发视觉 AI 介入。
 
-### 3. 复杂扫描件/无框表两阶段视觉 AI 接管
+### 3. 复杂扫描件/无框表两阶段视觉 AI 接管（双轨弹性保障）
 针对扫描版 PDF、混合排版以及低置信度复杂页：
 - **前置表格定位与切图**：
   - 在线模式：调用百度 **PP-StructureV3** 版面分析模型，毫秒级定位页面内表格 Bounding Box 并高精度裁切；
   - 离线/兜底模式：内置 **DocLayout-YOLO**（DocStructBench 1280x1280 高分辨率 ONNX 权重，内置端到端 NMS，约 73MB），无网环境下本地完成目标检测。
-- **高精度多模态重构**：
-  - 将表格定位区域或全页送入 **PaddleOCR-VL-1.6** 多模态大模型；
-  - 输出精准的 HTML `<table>` 与 Markdown 结构，轻松应对跨行跨列合并单元格、旋转表格与倾斜扫描件。
+- **高精度多模态重构（在线首选 + 离线备用）**：
+  - **首选主引擎（在线）**：将表格定位区域或全页送入百度 **PaddleOCR-VL-1.6** 多模态大模型，输出高精度 HTML `<table>` 与 Markdown 结构，轻松应对跨行跨列合并单元格、旋转表格与倾斜扫描件；
+  - **备用兜底（离线）**：集成 **[IBM Docling (TableFormer)](https://github.com/DS4SD/docling)** 作为离线备用引擎。在无网络、无 Token 或配置纯离线模式时，本地纯 CPU/Metal 运行 TableFormer 还原多行列跨度拓扑，提供永不掉线的离线保障。
 - **严格边界防污染截断**：
   - 提取算法严格隔离相邻表格的 Caption 范围，彻底消除连续表跨表重叠与串表污染；中英文双语表题优先保留真实 Caption。
 
@@ -109,8 +113,10 @@
 6. **阶段 F（噪声与付费墙过滤）**：清除 `Unnamed` 占位符、移除页底版权声明、水印与付费墙截断提示；
 7. **阶段 G（表号与表题规范化）**：统一抽取标准表号（`Table 1`、`表2` 等），并在元数据中保留中英文完整标题。
 
-### 5. 跨页续表与横向分块自适应拼接
-- **纵向跨页续表合并**：自动识别 `Table 1 (continued)`、`表1 (续)` 或紧随其后的同列构型无头表格，自动执行上下拼接，生成单一完整表格；
+### 5. 跨页续表与横向分块自适应拼接 (DeepDoc / MinerU 列对齐)
+- **DeepDoc & MinerU 启发式三向单调动态规划 (DP) 列对齐**：
+  - 重构跨页长表格合并算法，引入包含 `(i-1, j-1)`（投影匹配）、`(i, j-1)`（基准列缺失填空）与 `(i-1, j)`（续表冗余列跳过）的三向状态转移，彻底解决续表列数大于目标列数（`n_curr > n_target`）或存在无头续表时的列错位问题；
+- **纵向跨页续表合并**：自动识别 `Table 1 (continued)`、`表1 (续)`、`Table 2 Continued` 或紧随其后的同列构型无头表格，自适应剥离重复表头，合并为单一完整连续大表；
 - **横向分块表格合并**：自动识别因页面宽度受限而被横向拆分为两部分的数据表（如 `Table 4 Part 1` 与 `Table 4 Part 2`），按行索引精准水平拼接；
 - **对齐与边缘保护**：自适应对齐列名，对于行数 $< 3$ 的小型表开启边缘保护，杜绝误判误删。
 
@@ -126,6 +132,12 @@
 - **只读 SQLite 快照克隆**：在扫描 Zotero 数据库时自动克隆临时副本，彻底消除 SQLite `database is locked` 读写冲突；
 - **子进程完全隔离**：全库遍历采用独立的 Python 子进程并发执行，单篇文献的解析超时（内置熔断机制）或异常绝不波及主进程与其他文献；
 - **断点续传与执行计划**：内置 `batch_planner.py` 预分析文献年份与元数据（自动区分知网老文献直通本地管线），支持断点跳过已提取文献。
+
+### 8. PyZotero 与 Zotero-Better-Notes 生态闭环联动 (可选)
+为了实现科研文献“提取-整理-沉淀”的一站式工作流闭环，系统原生支持与 Zotero 深度联动：
+- **安全开关控制（默认关闭）**：默认配置 `"ZOTERO_SYNC_ENABLED": false`，保持轻量纯本地运行；可通过配置或 `--sync-zotero` 参数一键启用；
+- **自动挂载 Excel 子附件**：提取成功后，自动反向推导 Zotero 条目 ID 并将生成的 `.xlsx` 文件挂载为对应条目的子附件，支持随 Zotero 跨设备同步；
+- **自动生成 Better-Notes 规范富文本笔记**：在对应文献条目下生成名为 `📊 Extracted Tables (N tables)` 的笔记，内置各表格的 HTML 预览与格式化表格，无需打开 Excel 即可在 Zotero 阅读器内即时对比科学数据。
 
 ---
 
@@ -153,14 +165,14 @@ flowchart TD
         PTE --> INSP["PDF 预审 约80ms<br/>pdf-inspector / PyMuPDF"]
         INSP --> TYPE{"PDF 类型判别"}
         
-        TYPE -->|文本版| VOTE["5 引擎多方投票体系<br/>• pdf-inspector<br/>• PyMuPDF find_tables<br/>• text_alignment 坐标对齐<br/>• pdfplumber 线框分析<br/>• Camelot 双策略"]
+        TYPE -->|文本版| VOTE["7 引擎多方投票体系<br/>• pdf-inspector (结构树/MD)<br/>• PyMuPDF find_tables<br/>• GMFT (TATR 复合表头)<br/>• img2table (纯OpenCV免GS)<br/>• text_alignment 坐标对齐<br/>• pdfplumber 线条分析<br/>• Camelot 双策略"]
         VOTE --> CHECK{"双向相似度核验"}
         
         CHECK -->|高置信度共识| IR["Table IR 领域模型<br/>ExtractedTable"]
         CHECK -->|低置信度争议| PP["版面粗定位与切图<br/>PP-StructureV3 / DocLayout-YOLO"]
         
         TYPE -->|扫描版或复杂排版| PP
-        PP --> VL["多模态大模型精细解析<br/>PaddleOCR-VL-1.6"]
+        PP --> VL["视觉多模态大模型重构<br/>• 首选在线: PaddleOCR-VL-1.6<br/>• 离线备用: IBM Docling (TableFormer)"]
         VL --> IR
     end
 
@@ -176,10 +188,11 @@ flowchart TD
         HEAL --> POST
     end
 
-    subgraph S5["5. 跨页续表与成果导出"]
-        POST --> MERGE["跨页续表合并引擎<br/>• 纵向跨页拼接<br/>• 横向分块合并"]
+    subgraph S5["5. 跨页拼接、成果导出与生态联动"]
+        POST --> MERGE["跨页续表合并引擎<br/>• DeepDoc/MinerU 单调DP列对齐<br/>• 纵向跨页拼接 + 横向分块合并"]
         MERGE --> EXP["规范化 Excel 导出 (excel_export.py)<br/>• 自适应列宽采样<br/>• 注入 Dublin Core 预览元数据<br/>• 主题配色与斑马纹排版"]
         EXP --> OUT["🎯 最终出版级 Excel 产物 (.xlsx)<br/>附带标准表号与完整中英文表题"]
+        OUT --> SYNC["🔄 Zotero 生态联动 (可选)<br/>• 挂载 .xlsx 子附件<br/>• 生成 Better-Notes 预览笔记"]
         EXP --> AUDIT["全周期质量审计<br/>verify_tables.py / audit_reporter.py"]
     end
 
@@ -315,6 +328,17 @@ cp config.example.json config.json
 | `PLAYWRIGHT_HEADED` | boolean | `false` | 是否以可见窗口启动浏览器（调试或人工验证时设为 `true`） |
 | `DOCLAYOUT_YOLO_ENABLED` | boolean | `true` | 是否启用本地 DocLayout-YOLO 视觉版面检测兜底 |
 | `DOCLAYOUT_CONF_THRESHOLD` | float | `0.25` | YOLO 目标检测置信度阈值 |
+| `DOCLING_ENABLED` | boolean | `true` | 是否启用 IBM Docling (TableFormer) 深度表格提取引擎 |
+| `DOCLING_OFFLINE_FALLBACK` | boolean | `true` | 是否在 PaddleOCR 离线/受阻时启用 Docling 作为备用降级 |
+| `GMFT_ENABLED` | boolean | `true` | 是否启用 GMFT (TATR Transformer) 参与 Native PDF 多方投票 |
+| `IMG2TABLE_ENABLED` | boolean | `true` | 是否启用 img2table 纯 OpenCV 方案参与 Native PDF 多方投票 |
+| `OCR_ENGINE` | string | `"auto"` | 首选 OCR/VLM 引擎 (`auto`, `paddleocr`, `docling`, `mineru`) |
+| `ZOTERO_SYNC_ENABLED` | boolean | `false` | 是否启用 PyZotero 与 Better-Notes 生态联动（默认严格保持关闭） |
+| `ZOTERO_API_KEY` | string | `""` | Zotero 官方 Web API 访问密钥（用于挂载附件与笔记） |
+| `ZOTERO_USER_ID` | string | `""` | Zotero 个人用户 ID 或群组 ID |
+| `ZOTERO_LIBRARY_TYPE` | string | `"user"` | Zotero 库类型 (`user` 或 `group`) |
+| `ZOTERO_BETTER_NOTES_ENABLED` | boolean | `true` | 生态联动时是否在条目下生成 Better-Notes 规范富文本预览笔记 |
+| `ZOTERO_AUTO_ATTACH_XLSX` | boolean | `true` | 生态联动时是否将导出的 Excel 文件作为子附件挂载至对应条目 |
 | `LLM_ENABLED` | boolean | `false` | 是否启用 LLM 辅助自愈与复杂语义推断 |
 | `LLM_API_BASE` | string | `"https://api.openai.com/v1"` | LLM 服务端点地址（兼容 OpenAI 规范） |
 | `LLM_API_KEY` | string | `""` | LLM 身份认证密钥 |
@@ -419,6 +443,10 @@ python scripts/extract_zotero_table.py \
 - `--table-idx 0`（或 `all`）：仅提取第 1 张表（从 0 开始），或提取全部表格；
 - `--pdf-only`：跳过任何在线探测，强制走本地 PDF 深度提取流水线；
 - `--online-only`：仅尝试在线 HTML/XML 抓取，不回退本地提取；
+- `--sync-zotero`：启用 PyZotero 与 Better-Notes 生态联动（将提取产物自动挂载至 Zotero 条目子附件并生成预览笔记）；
+- `--ocr-engine auto`：指定 OCR/VLM 解析引擎首选项（可选 `auto`, `paddleocr`, `docling`, `mineru`）；
+- `--zotero-api-key <key>`：命令行覆盖注入 Zotero Web API Key；
+- `--zotero-user-id <id>`：命令行覆盖注入 Zotero 用户/群组 ID；
 - `--skip-supplementary`：跳过附表/附录表格，仅提取正文核心表格；
 - `--headed`：使用有头浏览器排查知网等在线渲染问题。
 
@@ -516,12 +544,13 @@ zotero-table-extractor/
     ├── extract_zotero_table.py       # 🚀 CLI 主入口：单篇/批量/清单表格提取总调度
     ├── batch_run.py                  # 🚀 Zotero 全库并发提取调度器（子进程隔离）
     ├── batch_planner.py              # 批量文献元数据与年份预分析规划器
-    ├── pdf_table_extractor.py        # 核心本地 PDF 提取流水线（分类+5引擎投票+VLM接管）
+    ├── pdf_table_extractor.py        # 核心本地 PDF 提取流水线（分类+7引擎投票+双轨AI接管）
     ├── pdf_tables.py                 # PDF 表格切图定位、坐标计算与旋转校准
-    ├── ocr_client.py                 # 百度 AIStudio 在线客户端（PP-StructureV3 & PaddleOCR-VL）
+    ├── ocr_client.py                 # 百度 AIStudio 在线客户端（PP-StructureV3 & PaddleOCR-VL）与 Docling 本地离线引擎
     ├── doclayout_yolo_detector.py    # 基于 ONNX Runtime 的本地 DocLayout-YOLO 推理器
-    ├── table_postprocess.py          # 7 阶轻量表格后处理（公式防注入/类型推断/续表合并）
+    ├── table_postprocess.py          # 7 阶轻量表格后处理（公式防注入/类型推断/续表合并与单调DP对齐）
     ├── excel_export.py               # 出版级 Excel 导出器（列宽自适应/样式主题/Dublin Core）
+    ├── zotero_sync.py                # 🔄 PyZotero 与 Better-Notes 生态联动（附件挂载与笔记生成）
     ├── models.py                     # Table IR 统一领域模型 (ExtractedTable & TableCell)
     ├── table_validator.py            # 表格结构完整性、列数一致性与有效填充率校验器
     ├── system_detector.py            # 跨平台环境自适应探测器（macOS/Linux/Windows）
@@ -585,6 +614,16 @@ zotero-table-extractor/
     - 强大的 Excel 读写库，本项目依赖其实现出版级单元格排版、交替斑马纹、自适应列宽与 Dublin Core 属性注入。
 13. **[Microsoft / ONNX Runtime](https://github.com/microsoft/onnxruntime)**  
     - 高性能跨平台深度学习推理引擎，保障了 DocLayout-YOLO 在 CPU 与各类 GPU 环境下的轻快运行。
+14. **[DS4SD / IBM Docling & TableFormer](https://github.com/DS4SD/docling)**  
+    - IBM 开源的现代化文档与表格解析标杆项目，为本项目提供了强大的本地离线表格拓扑结构识别（TSR）备用兜底能力。
+15. **[conjuncts / GMFT](https://github.com/conjuncts/gmft)**  
+    - 范德堡大学团队基于 Microsoft PubTables-1M / Table Transformer (TATR) 打造的轻量级学术表格提取器，为原生 PDF 投票体系提供了深度视觉多层表头与跨列对齐支持。
+16. **[xavctn / img2table](https://github.com/xavctn/img2table)**  
+    - 纯 Python + OpenCV 的高精形态学表格提取器，帮助本项目彻底摆脱系统级 Ghostscript 依赖，实现了更纯净的开箱即用体验。
+17. **[urschrei / pyzotero](https://github.com/urschrei/pyzotero) & [windingwind / zotero-better-notes](https://github.com/windingwind/zotero-better-notes)**  
+    - 卓越的 Zotero 生态库与笔记扩展，赋能本项目实现了学术表格“提取-挂载-预览”的一体化文献知识管理闭环。
+18. **[OpenDataLab / MinerU](https://github.com/opendatalab/MinerU) & [infiniflow / RAGFlow DeepDoc](https://github.com/infiniflow/ragflow)**  
+    - 业界领先的科研文献与文档理解项目，其跨页长表垂直投影与单调列对齐思想为本项目的续表拼接算法提供了宝贵启发。
 
 ---
 

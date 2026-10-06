@@ -1,6 +1,6 @@
 ---
 name: zotero-table-extractor
-description: 从 Zotero 选中条目（依赖 ai4paper-zotero MCP 获取物理路径）或指定本地 PDF / CNKI / 期刊网页中批量/单篇自动抓取并提取结构化表格，支持 PP-StructureV3 定位 + 多方投票 + PaddleOCR-VL-1.6 多模态解析，导出 Excel (.xlsx)。
+description: 从 Zotero 选中条目（依赖 ai4paper-zotero MCP 获取物理路径）或指定本地 PDF / CNKI / 期刊网页中批量/单篇自动抓取并提取结构化表格，支持 7 引擎多方投票、PP-StructureV3 定位 + PaddleOCR-VL-1.6 在线多模态解析、IBM Docling (TableFormer) 本地离线备用降级，以及可选 PyZotero / Better-Notes 生态联动，导出出版级 Excel (.xlsx)。
 ---
 
 # Zotero Table Extractor
@@ -35,35 +35,43 @@ description: 从 Zotero 选中条目（依赖 ai4paper-zotero MCP 获取物理�
            Native     Scanned            Mixed
               │          │                  │
               ▼          ▼                  ▼
-         多方投票:   DocLayout-YOLO     多方投票(文本页)
+         7 引擎投票:  DocLayout-YOLO     多方投票(文本页)
          pdf-inspector + PP-StructureV3  + OCR/VLM(扫描页)
-         + find_tables 局部切图与补扫
-         + text_align  + PaddleOCR-VL-1.6
-         + pdfplumber  多模态精细解析
-         + Camelot
+         + find_tables 局部切图与补扫     (在线 PaddleOCR-VL
+         + text_align  首选在线 PaddleOCR-VL  离线 Docling TableFormer)
+         + pdfplumber  离线 Docling TableFormer
+         + Camelot     多模态精细解析
+         + GMFT (TATR)
+         + img2table (OpenCV)
               │
               ├─ 2D bbox 空间重叠 (IoU/IoM) + 表号标签防冲突聚类，杜绝同页多表误合并
               ├─ 任意两方相似度 >= 0.75 → 判定一致并采用投票结果 (结构树绝对优先)
-              ├─ 低置信度 (<0.90) 或检验瑕疵页 → DocLayout-YOLO 切图 (Caption缺失/多表覆盖不足时原生信号校验 + PP-Structure 补扫) + PaddleOCR-VL 接管
+              ├─ 低置信度 (<0.90) 或检验瑕疵页 → DocLayout-YOLO 切图 + PP-Structure 补扫 → PaddleOCR-VL (在线) / Docling TableFormer (离线备用) 接管
               ├─ 表级精细对齐与替换策略：精准替换瑕疵表，保留同页未受干扰的有效原生表
-              ├─ 7 阶轻量直通安全后处理（公式注入防御、数值类型推断、多级表头展平、付费墙过滤）
+              ├─ 7 阶轻量直通安全后处理（公式注入防御、数值类型推断、多级表头展平、DeepDoc/MinerU 跨页单调 DP 对齐）
               └─ 跨页续表与多分页自适应合并
               │
               ▼
-         Excel (每表独立文件，带标准化表号 label，支持单文件多 Sheet 或分表输出)
+         Excel 导出 (每表独立文件或单文件多 Sheet) ──► 可选自动回写挂载至 Zotero & Better-Notes 笔记
 ```
 
-## 关键组件（6 种协同提取器）
+## 关键组件（多模态与多引擎协同体系）
 
 | 组件 | 作用 |
 |---|---|
 | [`pdf-inspector`](https://github.com/firecrawl/pdf-inspector) | Rust 库，PDF 分类 + 表格定位 + Markdown 结构化提取，~80ms 高性能 |
 | `PyMuPDF find_tables()` | PDF 矢量线框与无框文本表格提取（零 OCR，高保真），支持全篇网格线分析 |
+| [`GMFT`](https://github.com/conjuncts/gmft) | 基于 TATR (Table Transformer) 的深度视觉提取，擅长多层复合表头与跨列单元格对齐 |
+| [`img2table`](https://github.com/xavctn/img2table) | 基于 OpenCV 形态学的纯 Python 方案，零 Ghostscript 系统依赖，支持有框/无框表 |
 | `text_alignment` | 无线框表格的文本坐标对齐与自适应重组（支持学位论文/无网格线表） |
 | `Camelot` | 基于 OpenCV 的晶格 (lattice) 与流式 (stream) 结构化表格提取 |
 | `pdfplumber` | 基于字符精细包围盒与视觉线条的表格抽取，参与多方交叉验证 |
-| `PaddleOCR-VL-1.6` / `PP-StructureV3` | 在线多模态大模型与版面切图 API，复杂/跨行跨列与扫描页结构化多模态解析 |
-| `DocLayout-YOLO` | 本地 ONNX 版面检测（离线/无网络时的备用切图定位兜底） |
+| `PaddleOCR-VL-1.6` / `PP-StructureV3` | 在线多模态大模型与版面切图 API，复杂/跨行跨列与扫描页结构化多模态解析（首选在线主引擎） |
+| [`IBM Docling (TableFormer)`](https://github.com/DS4SD/docling) | IBM 开源高保真表格结构模型，作为离线/无网络/Token耗尽时的多云本地容灾备用引擎 |
+| `DocLayout-YOLO` | 本地 ONNX 版面检测（~15ms 本地超快切图定位，零 Token 消耗） |
+| `DeepDoc / MinerU 跨页续表投影` | 动态规划单调对齐与列特征分布投影，高保真拼接跨页长表与剥离重复表头 |
+| [`PyZotero & Better-Notes`](https://github.com/urschrei/pyzotero) | 生态联动扩展（默认关闭），自动将导出 Excel 挂载为附件并生成 Better-Notes 概览卡片 |
+
 
 ## 漏检自查与完整性保障 (Self-Audit)
 
@@ -118,6 +126,7 @@ zotero-table-extractor/
     ├── verify_tables.py             # 表格产物批量校验与空表/坏表清理
     ├── login.py                     # 期刊出版社 Cookie 注入与交互式登录向导
     ├── llm_reasoner.py              # LLM 辅助纠错与表格语义重构
+    ├── zotero_sync.py               # 🔄 PyZotero 与 Better-Notes 生态联动（附件挂载与笔记生成）
     ├── agent_bridge.py              # Agent 交互桥接与进度事件通知
     ├── doclayout_yolo_detector.py   # YOLO 本地版面检测推理器
     ├── doc_orientation_detector.py  # TurboOCR 方向检测与双轨两阶旋转自愈器
@@ -175,6 +184,19 @@ python scripts/extract_zotero_table.py --pdf /path/to/pdfs_dir --output /path/to
 | `--skip-supplementary` | 标志 | `False` | 跳过 Supplementary Material 附录表格 |
 | `--workers` | 整数 | `4` | 目录批量提取时的并发工作线程数 |
 | `--headers` | 字符串 | `None` | 自定义强制表头列名（逗号分隔） |
+| `--sync-zotero` | 标志 | `False` | 启用 PyZotero 与 Better-Notes 生态联动（自动挂载 Excel 并生成预览卡片） |
+| `--zotero-api-key` | 字符串 | `None` | 覆盖 Zotero Web API 访问密钥 |
+| `--zotero-user-id` | 字符串 | `None` | 覆盖 Zotero 用户/库 ID |
+| `--ocr-engine` | 字符串 | `"auto"` | OCR 引擎首选项：`"auto"`, `"paddleocr"`, `"docling"`, `"mineru"` |
+
+> [!NOTE]
+> **新引擎与生态联动配置项 (`config.json`)**：
+> - `DOCLING_ENABLED` (布尔, 默认 `true`): 启用 IBM Docling (TableFormer) 深度表格结构提取引擎。
+> - `DOCLING_OFFLINE_FALLBACK` (布尔, 默认 `true`): 当首选云端主引擎 (PP-StructureV3 / PaddleOCR-VL) 队列已满、网络受阻或无 Token 时，无缝启动本地 Docling 离线备用降级。
+> - `GMFT_ENABLED` (布尔, 默认 `true`): 启用 GMFT (TATR-based 结构 Transformer) 作为原生 PDF 多方投票的权威参选方，专精多层表头与跨列合并。
+> - `IMG2TABLE_ENABLED` (布尔, 默认 `true`): 启用 img2table 纯 Python OpenCV 提取方案，完全解耦外部 Ghostscript 依赖。
+> - `ZOTERO_SYNC_ENABLED` (布尔, **默认关闭 `false`**): 可选生态联动总开关。开启后自动反向追溯本地条目 Key，将导出的 `.xlsx` 作为子附件挂载至 Zotero 条目，并生成符合 Zotero-Better-Notes 规范的独立富文本概览笔记。
+
 
 ### 2. 批量并发总控 (`batch_run.py`)
 
@@ -261,6 +283,17 @@ python update.py --check --json
 | `LLM_API_KEY` | string | `""` | LLM 鉴权密钥 |
 | `LLM_MODEL` | string | `"gpt-4o-mini"` | 语义处理选用的 LLM 模型 |
 | `LLM_TIMEOUT` | int | `60` | LLM 调用超时秒数 |
+| `DOCLING_ENABLED` | boolean | `true` | 是否启用 IBM Docling (TableFormer) 深度表格提取引擎 |
+| `DOCLING_OFFLINE_FALLBACK` | boolean | `true` | 是否启用 Docling 作为 PaddleOCR-VL 离线备用降级引擎 |
+| `GMFT_ENABLED` | boolean | `true` | 是否启用 GMFT (TATR Transformer) 参与 Native PDF 多方投票 |
+| `IMG2TABLE_ENABLED` | boolean | `true` | 是否启用 img2table 纯 OpenCV 方案参与 Native PDF 多方投票 |
+| `OCR_ENGINE` | string | `"auto"` | 首选 OCR 引擎 (`auto`, `paddleocr`, `docling`, `mineru`) |
+| `ZOTERO_SYNC_ENABLED` | boolean | `false` | 是否启用 PyZotero 与 Better-Notes 生态联动（默认严格关闭） |
+| `ZOTERO_API_KEY` | string | `""` | Zotero 官方 Web API 访问密钥 |
+| `ZOTERO_USER_ID` | string | `""` | Zotero 用户 ID 或群组 ID |
+| `ZOTERO_LIBRARY_TYPE` | string | `"user"` | Zotero 库类型 (`user` 或 `group`) |
+| `ZOTERO_BETTER_NOTES_ENABLED` | boolean | `true` | 同步时是否生成 Better-Notes 规范的富文本预览笔记 |
+| `ZOTERO_AUTO_ATTACH_XLSX` | boolean | `true` | 同步时是否将导出的 Excel 文件作为子附件挂载至对应条目 |
 
 ## 目录与版本控制规范
 

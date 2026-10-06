@@ -107,6 +107,26 @@ def load_config():
         data["MINERU_API_BASE"] = "https://mineru.net"
     if "OCR_ENGINE" not in data:
         data["OCR_ENGINE"] = "auto"
+    if "DOCLING_ENABLED" not in data:
+        data["DOCLING_ENABLED"] = True
+    if "DOCLING_OFFLINE_FALLBACK" not in data:
+        data["DOCLING_OFFLINE_FALLBACK"] = True
+    if "GMFT_ENABLED" not in data:
+        data["GMFT_ENABLED"] = True
+    if "IMG2TABLE_ENABLED" not in data:
+        data["IMG2TABLE_ENABLED"] = True
+    if "ZOTERO_SYNC_ENABLED" not in data:
+        data["ZOTERO_SYNC_ENABLED"] = False
+    if "ZOTERO_BETTER_NOTES_ENABLED" not in data:
+        data["ZOTERO_BETTER_NOTES_ENABLED"] = True
+    if "ZOTERO_AUTO_ATTACH_XLSX" not in data:
+        data["ZOTERO_AUTO_ATTACH_XLSX"] = True
+    if "ZOTERO_API_KEY" not in data:
+        data["ZOTERO_API_KEY"] = ""
+    if "ZOTERO_USER_ID" not in data:
+        data["ZOTERO_USER_ID"] = ""
+    if "ZOTERO_LIBRARY_TYPE" not in data:
+        data["ZOTERO_LIBRARY_TYPE"] = "user"
 
     # 环境变量覆盖敏感配置
     env_overrides = {
@@ -116,11 +136,26 @@ def load_config():
         'MINERU_API_KEY': 'MINERU_API_KEY',
         'MINERU_API_BASE': 'MINERU_API_BASE',
         'OCR_ENGINE': 'OCR_ENGINE',
+        'DOCLING_ENABLED': 'DOCLING_ENABLED',
+        'DOCLING_OFFLINE_FALLBACK': 'DOCLING_OFFLINE_FALLBACK',
+        'GMFT_ENABLED': 'GMFT_ENABLED',
+        'IMG2TABLE_ENABLED': 'IMG2TABLE_ENABLED',
+        'ZOTERO_SYNC_ENABLED': 'ZOTERO_SYNC_ENABLED',
+        'ZOTERO_BETTER_NOTES_ENABLED': 'ZOTERO_BETTER_NOTES_ENABLED',
+        'ZOTERO_AUTO_ATTACH_XLSX': 'ZOTERO_AUTO_ATTACH_XLSX',
+        'ZOTERO_API_KEY': 'ZOTERO_API_KEY',
+        'ZOTERO_USER_ID': 'ZOTERO_USER_ID',
+        'ZOTERO_LIBRARY_TYPE': 'ZOTERO_LIBRARY_TYPE',
     }
     for config_key, env_key in env_overrides.items():
         env_val = os.getenv(env_key)
         if env_val:
-            data[config_key] = env_val
+            if env_val.lower() in ('true', '1'):
+                data[config_key] = True
+            elif env_val.lower() in ('false', '0'):
+                data[config_key] = False
+            else:
+                data[config_key] = env_val
 
     return data
 
