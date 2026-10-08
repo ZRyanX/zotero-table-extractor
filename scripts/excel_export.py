@@ -19,9 +19,9 @@ except ImportError:
 
 # Table post-processing helpers
 try:
-    from .table_postprocess import postprocess_dataframe, merge_continuation_tables, is_paywall_table
+    from .table_postprocess import postprocess_dataframe, merge_continuation_tables, is_paywall_table, parse_academic_runs, convert_latex_math_to_unicode
 except ImportError:
-    from table_postprocess import postprocess_dataframe, merge_continuation_tables, is_paywall_table
+    from table_postprocess import postprocess_dataframe, merge_continuation_tables, is_paywall_table, parse_academic_runs, convert_latex_math_to_unicode
 
 
 def make_safe_filename(name):
@@ -31,6 +31,51 @@ def make_safe_filename(name):
     # Remove extra spaces
     safe = re.sub(r'\s+', ' ', safe)
     return safe[:120].strip().strip('.') # Limit length to prevent path length issues
+
+
+def format_academic_rich_text(val):
+    """
+    将包含学术上下标 (如 ^{...}, _{...}, 10^{-3}, CaCO_3, H_2O, Fe^{3+})
+    或 Unicode 上下标 (如 10⁻³, CO₂) 的单元格转换为 openpyxl 原生 CellRichText。
+    保留数值型单元格 (int, float) 毫发无损，确保计算与统计公式不被破坏。
+    若不支持 rich text 或无格式标记，平滑回退为原值或标准字符串。
+    """
+    if val is None or not isinstance(val, str):
+        return val
+
+    s = val.strip()
+    if not s:
+        return val
+
+    # 保护公式 (=SUM(...) 等)、纯数值和带逗号的数值表达 (避免破坏公式与计算)
+    if s.startswith('=') or re.match(r'^[+-]?(?:\d+(?:,\d+)*(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?$', s):
+        return val
+
+    try:
+        from openpyxl.cell.rich_text import CellRichText, TextBlock
+        from openpyxl.cell.text import InlineFont
+    except ImportError:
+        return val
+
+    try:
+        runs = parse_academic_runs(s)
+        has_scripts = any(align in ('superscript', 'subscript') for _, align in runs)
+        if not has_scripts:
+            converted = convert_latex_math_to_unicode(s)
+            return converted
+
+        rt = CellRichText()
+        for chunk, align in runs:
+            if not chunk:
+                continue
+            if align in ('superscript', 'subscript'):
+                rt.append(TextBlock(InlineFont(vertAlign=align), chunk))
+            else:
+                rt.append(TextBlock(InlineFont(), chunk))
+        return rt
+    except Exception:
+        return val
+
 
 def autofit_excel_columns(file_path, title=None):
     """Auto-fit column widths in the output Excel sheet and ensure full macOS QuickLook / Office metadata compatibility."""
@@ -45,6 +90,16 @@ def autofit_excel_columns(file_path, title=None):
             wb.properties.title = str(title)[:100]
             
         for sheet in wb.worksheets:
+            # 应用学术上下标富文本渲染
+            for row in sheet.iter_rows():
+                for cell in row:
+                    if cell.value is not None and isinstance(cell.value, str):
+                        if getattr(cell, 'data_type', None) == 'f' or cell.value.startswith('='):
+                            continue
+                        new_val = format_academic_rich_text(cell.value)
+                        if new_val is not cell.value:
+                            cell.value = new_val
+
             for col in sheet.columns:
                 max_len = 0
                 col_letter = col[0].column_letter
@@ -60,6 +115,7 @@ def autofit_excel_columns(file_path, title=None):
         wb.save(file_path)
     except Exception as e:
         print(f"Warning: Failed to auto-fit column widths: {e}")
+
 
 
 def _load_excel_with_attrs(tbl_path, output_path=None):

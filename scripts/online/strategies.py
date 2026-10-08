@@ -955,7 +955,334 @@ def _parse_elsevier_xocs_tables(xml_content, table_idx="all"):
         return []
 
 
+def _parse_jats_xml_tables(xml_content, table_idx="all"):
+    """
+    解析 NCBI PMC / NISO JATS XML 中的 <table-wrap> 表格元素为 DataFrames。
+    支持 XHTML table 规范 (thead, tbody, tr, th, td) 与 CALS 规范 (oasis:table, tgroup)。
+    完美保留 rowspan, colspan 拓扑结构、caption 标题以及 table-wrap-foot 尾注。
+    保真度 100%，无 OCR 误差。
+    """
+    import xml.etree.ElementTree as ET
+    try:
+        root = ET.fromstring(xml_content)
+    except Exception as e:
+        print(f"[NCBI PMC JATS] XML 解析失败: {e}")
+        return []
+
+    tables_found = []
+    table_wraps = root.findall('.//{*}table-wrap')
+    if not table_wraps:
+        table_wraps = [el for el in root.iter() if el.tag.split('}')[-1] == 'table-wrap']
+
+    for tw_idx, tw in enumerate(table_wraps):
+        label_elem = tw.find('.//{*}label')
+        label_text = "".join(label_elem.itertext()).strip() if label_elem is not None else ""
+
+        cap_elem = tw.find('.//{*}caption')
+        caption_text = "".join(cap_elem.itertext()).strip() if cap_elem is not None else ""
+
+        footnotes = []
+        foot_elem = tw.find('.//{*}table-wrap-foot')
+        if foot_elem is not None:
+            fn_nodes = foot_elem.findall('.//{*}fn') or foot_elem.findall('.//{*}p')
+            for fn in fn_nodes:
+                fn_text = "".join(fn.itertext()).strip()
+                if fn_text:
+                    footnotes.append(fn_text)
+            if not footnotes:
+                combined_foot = "".join(foot_elem.itertext()).strip()
+                if combined_foot:
+                    footnotes.append(combined_foot)
+
+        tbl_node = tw.find('.//{*}table')
+        if tbl_node is not None:
+            rows = tbl_node.findall('.//{*}tr')
+            if rows:
+                grid = []
+                for r_idx, tr in enumerate(rows):
+                    if len(grid) <= r_idx:
+                        grid.append([])
+                    cells = [c for c in tr if c.tag.split('}')[-1] in ('th', 'td')]
+                    c_idx = 0
+                    for cell in cells:
+                        while c_idx < len(grid[r_idx]) and grid[r_idx][c_idx] is not None:
+                            c_idx += 1
+                        try:
+                            colspan = int(cell.attrib.get('colspan', 1))
+                        except Exception:
+                            colspan = 1
+                        try:
+                            rowspan = int(cell.attrib.get('rowspan', 1))
+                        except Exception:
+                            rowspan = 1
+
+                        text = "".join(cell.itertext()).strip()
+
+                        while len(grid) < r_idx + rowspan:
+                            grid.append([])
+
+                        for dr in range(rowspan):
+                            curr_r = r_idx + dr
+                            while len(grid[curr_r]) < c_idx + colspan:
+                                grid[curr_r].append(None)
+                            for dc in range(colspan):
+                                grid[curr_r][c_idx + dc] = text
+                        c_idx += colspan
+
+                if grid:
+                    max_cols = max(len(r) for r in grid)
+                    clean_grid = []
+                    for r in grid:
+                        row_vals = [c if c is not None else "" for c in r]
+                        if len(row_vals) < max_cols:
+                            row_vals.extend([""] * (max_cols - len(row_vals)))
+                        clean_grid.append(row_vals)
+
+                    df = _rows_to_dataframe(clean_grid)
+                    if not df.empty and df.shape[0] >= 1 and df.shape[1] >= 1:
+                        if label_text:
+                            df.attrs['label'] = label_text
+                        if caption_text:
+                            df.attrs['table_title'] = f"{label_text} {caption_text}".strip()
+                        elif label_text:
+                            df.attrs['table_title'] = label_text
+                        df.attrs['extractor'] = 'ncbi_pmc_jats'
+                        df.attrs['source'] = 'ncbi_pmc_jats'
+                        if footnotes:
+                            df.attrs['footnotes'] = footnotes
+                        tables_found.append(df)
+                        continue
+
+        tgroups = tw.findall('.//{*}tgroup')
+        if tgroups:
+            cals_dfs = _parse_elsevier_xocs_tables(ET.tostring(tw, encoding='unicode'))
+            for c_df in cals_dfs:
+                if label_text:
+                    c_df.attrs['label'] = label_text
+                if caption_text:
+                    c_df.attrs['table_title'] = f"{label_text} {caption_text}".strip()
+                c_df.attrs['extractor'] = 'ncbi_pmc_jats'
+                c_df.attrs['source'] = 'ncbi_pmc_jats'
+                if footnotes:
+                    c_df.attrs['footnotes'] = footnotes
+                tables_found.append(c_df)
+
+    if not tables_found:
+        print("[NCBI PMC JATS] XML 中未找到可解析的表格。")
+        return []
+
+    print(f"[NCBI PMC JATS] 从 JATS XML 中提取到 {len(tables_found)} 张高保真表格。")
+    if table_idx == "all":
+        return tables_found
+    elif table_idx == "first":
+        return [tables_found[0]]
+    else:
+        try:
+            idx = int(table_idx)
+            return [tables_found[idx]] if idx < len(tables_found) else tables_found
+        except ValueError:
+            return tables_found
+
+
+def extract_tables_via_ncbi_pmc(pmcid_or_doi, table_idx="all"):
+    """
+    通过 NCBI PMC Open Access API 获取正文 JATS XML 并提取高保真表格。
+    支持输入 PMCID (如 PMC1234567) 或 DOI (如 10.1371/journal.pone.0251234)。
+    免费开放获取，无需任何付费 API Key。
+    """
+    if not pmcid_or_doi:
+        return []
+
+    cfg = load_config() if callable(load_config) else {}
+    if not cfg.get("NCBI_PMC_ENABLED", True):
+        return []
+
+    from .doi_resolver import resolve_pmcid_from_doi, extract_pmcid
+
+    pmcid = extract_pmcid(pmcid_or_doi)
+    if not pmcid and ("10." in pmcid_or_doi or "/" in pmcid_or_doi):
+        pmcid = resolve_pmcid_from_doi(pmcid_or_doi)
+
+    if not pmcid:
+        return []
+
+    clean_pmc = pmcid.upper()
+    print(f"[NCBI PMC] 正在获取 JATS XML: {clean_pmc}")
+    efetch_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=pmc&id={clean_pmc}&retmode=xml"
+    headers = {
+        "User-Agent": "zotero-table-extractor/1.6.0 (mailto:extractor@zotero.org)"
+    }
+    try:
+        r = requests.get(efetch_url, headers=headers, timeout=15)
+        if r.status_code == 200 and ("<table-wrap" in r.text or "<table" in r.text):
+            return _parse_jats_xml_tables(r.text, table_idx=table_idx)
+        else:
+            print(f"[NCBI PMC] 获取失败或无正文表格: HTTP {r.status_code}")
+    except Exception as e:
+        print(f"[NCBI PMC] 获取 JATS XML 异常: {e}")
+    return []
+
+
+def extract_tables_via_arxiv_html(arxiv_id_or_url, table_idx="all"):
+    """
+    通过 arXiv 官方 HTML (arXiv LaTeXML) 或 ar5iv 获取论文 HTML 并提取高保真表格。
+    arXiv 官方自 2024 年起提供高保真 HTML 渲染 (https://arxiv.org/html/<id>)，
+    并可通过 ar5iv (https://ar5iv.labs.arxiv.org/html/<id>) 兜底。
+    保真度 100%，无 OCR 误差。
+    """
+    if not arxiv_id_or_url:
+        return []
+
+    cfg = load_config() if callable(load_config) else {}
+    if not cfg.get("ARXIV_HTML_ENABLED", True):
+        return []
+
+    from .doi_resolver import extract_arxiv_id
+    arxiv_id = extract_arxiv_id(arxiv_id_or_url)
+    if not arxiv_id:
+        return []
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+    }
+
+    urls_to_try = [
+        f"https://arxiv.org/html/{arxiv_id}",
+        f"https://ar5iv.labs.arxiv.org/html/{arxiv_id}"
+    ]
+
+    html_content = ""
+    source_name = ""
+    for url in urls_to_try:
+        try:
+            print(f"[arXiv HTML] 正在请求论文原生 HTML: {url}")
+            r = requests.get(url, headers=headers, timeout=15)
+            if r.status_code == 200 and ("ltx_table" in r.text or "<table" in r.text):
+                html_content = r.text
+                source_name = "arxiv_html" if "arxiv.org" in url else "ar5iv_html"
+                break
+        except Exception as e:
+            print(f"[arXiv HTML] 请求 {url} 失败: {e}")
+
+    if not html_content:
+        print(f"[arXiv HTML] 无法获取论文 {arxiv_id} 的 HTML 版本。")
+        return []
+
+    tables_found = []
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html_content, "html.parser")
+
+        figures = soup.find_all("figure", class_="ltx_table")
+        if not figures:
+            figures = soup.find_all("figure")
+            figures = [f for f in figures if f.find("table")]
+
+        if figures:
+            for fig in figures:
+                cap_el = fig.find("figcaption")
+                caption_text = cap_el.get_text(" ", strip=True) if cap_el else ""
+                tag_el = fig.find("span", class_="ltx_tag_table")
+                label_text = tag_el.get_text(strip=True).rstrip(":") if tag_el else ""
+
+                if not label_text and caption_text:
+                    m_lbl = re.search(r'^(?:Table|表)\s*\d+(?:\.\d+)?', caption_text, re.IGNORECASE)
+                    if m_lbl:
+                        label_text = m_lbl.group(0)
+
+                footnotes = []
+                notes_div = fig.find("div", class_=re.compile(r'ltx_(?:table_)?notes?'))
+                if notes_div:
+                    fn_str = notes_div.get_text(" ", strip=True)
+                    if fn_str:
+                        footnotes.append(fn_str)
+
+                tbl = fig.find("table")
+                if not tbl:
+                    continue
+
+                rows = tbl.find_all("tr")
+                if not rows:
+                    continue
+
+                grid = []
+                for r_idx, tr in enumerate(rows):
+                    if len(grid) <= r_idx:
+                        grid.append([])
+                    cells = tr.find_all(["th", "td"])
+                    c_idx = 0
+                    for cell in cells:
+                        while c_idx < len(grid[r_idx]) and grid[r_idx][c_idx] is not None:
+                            c_idx += 1
+                        try:
+                            colspan = int(cell.get("colspan", 1))
+                        except Exception:
+                            colspan = 1
+                        try:
+                            rowspan = int(cell.get("rowspan", 1))
+                        except Exception:
+                            rowspan = 1
+
+                        text = cell.get_text(" ", strip=True)
+
+                        while len(grid) < r_idx + rowspan:
+                            grid.append([])
+
+                        for dr in range(rowspan):
+                            curr_r = r_idx + dr
+                            while len(grid[curr_r]) < c_idx + colspan:
+                                grid[curr_r].append(None)
+                            for dc in range(colspan):
+                                grid[curr_r][c_idx + dc] = text
+                        c_idx += colspan
+
+                if grid:
+                    max_cols = max(len(r) for r in grid)
+                    clean_grid = []
+                    for r in grid:
+                        row_vals = [c if c is not None else "" for c in r]
+                        if len(row_vals) < max_cols:
+                            row_vals.extend([""] * (max_cols - len(row_vals)))
+                        clean_grid.append(row_vals)
+
+                    df = _rows_to_dataframe(clean_grid)
+                    if not df.empty and df.shape[0] >= 1 and df.shape[1] >= 1:
+                        if label_text:
+                            df.attrs['label'] = label_text
+                        if caption_text:
+                            df.attrs['table_title'] = caption_text
+                        elif label_text:
+                            df.attrs['table_title'] = label_text
+                        df.attrs['extractor'] = source_name
+                        df.attrs['source'] = source_name
+                        if footnotes:
+                            df.attrs['footnotes'] = footnotes
+                        tables_found.append(df)
+        else:
+            tables_found = parse_tables_from_html(html_content, table_idx=table_idx)
+            for df in tables_found:
+                df.attrs['extractor'] = source_name
+                df.attrs['source'] = source_name
+
+    except Exception as e:
+        print(f"[arXiv HTML] 解析 HTML 异常: {e}")
+        return []
+
+    print(f"[arXiv HTML] 成功提取到 {len(tables_found)} 张高保真表格。")
+    if table_idx == "all":
+        return tables_found
+    elif table_idx == "first":
+        return [tables_found[0]]
+    else:
+        try:
+            idx = int(table_idx)
+            return [tables_found[idx]] if idx < len(tables_found) else tables_found
+        except ValueError:
+            return tables_found
+
+
 def extract_tables_via_direct_http(url, table_idx="all", cancel_event=None):
+
     """
     Attempts to fetch HTML directly via requests from the local network/IP.
     If the user is within an institutional IP network, this direct access

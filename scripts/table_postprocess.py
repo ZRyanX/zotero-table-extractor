@@ -264,7 +264,210 @@ def clean_latex_and_ocr(val):
     return '\n'.join([l for l in lines if l])
 
 
+UNICODE_SUP_MAP = {
+    '⁰': '0', '¹': '1', '²': '2', '³': '3', '⁴': '4',
+    '⁵': '5', '⁶': '6', '⁷': '7', '⁸': '8', '⁹': '9',
+    '⁺': '+', '⁻': '-', '⁼': '=', '⁽': '(', '⁾': ')',
+    'ⁿ': 'n', 'ⁱ': 'i'
+}
+UNICODE_SUB_MAP = {
+    '₀': '0', '₁': '1', '₂': '2', '₃': '3', '₄': '4',
+    '₅': '5', '₆': '6', '₇': '7', '₈': '8', '₉': '9',
+    '₊': '+', '₋': '-', '₌': '=', '₍': '(', '₎': ')',
+    'ₐ': 'a', 'ₑ': 'e', 'ₒ': 'o', 'ₓ': 'x', 'ₕ': 'h',
+    'ₖ': 'k', 'ₗ': 'l', 'ₘ': 'm', 'ₙ': 'n', 'ₚ': 'p',
+    'ₛ': 's', 'ₜ': 't'
+}
+
+def convert_latex_math_to_unicode(text: str) -> str:
+    """将常见学术 LaTeX 数学符号转换为标准 Unicode 符号。"""
+    if not isinstance(text, str) or not text:
+        return text
+    t = text
+    t = t.replace(r'\pm', '±').replace(r'\times', '×').replace(r'\cdot', '·')
+    t = t.replace(r'^\circ', '°').replace(r'^{\circ}', '°').replace(r'\circ', '°').replace(r'\degree', '°')
+    t = t.replace(r'\leq', '≤').replace(r'\geq', '≥').replace(r'\neq', '≠').replace(r'\sim', '~')
+    t = t.replace(r'\Delta', 'Δ').replace(r'\delta', 'δ').replace(r'\mu', 'μ')
+    t = t.replace(r'\alpha', 'α').replace(r'\beta', 'β').replace(r'\gamma', 'γ')
+    t = t.replace(r'\theta', 'θ').replace(r'\sigma', 'σ').replace(r'\omega', 'ω').replace(r'\phi', 'φ')
+    return t
+
+
+def parse_academic_runs(text: str) -> List[Tuple[str, Optional[str]]]:
+    """
+    将包含 LaTeX 上标/下标 (如 10^{-3}, CaCO_3, H_2O, Fe^{3+}) 或 Unicode 上下标 (如 10⁻³, CO₂)
+    的学术字符串拆解为可供富文本渲染的文本段列表: [(chunk, vertAlign), ...]
+    vertAlign 为 None, 'superscript', 或 'subscript'。
+    严格保护 snake_case 变量标识符 (如 sample_id, station_name, table_1) 不被误认为上下标。
+    """
+    if not isinstance(text, str) or not text:
+        return [(text or "", None)]
+
+    t = convert_latex_math_to_unicode(text)
+    if t.startswith('$') and t.endswith('$') and len(t) >= 2:
+        t = t[1:-1]
+
+    pattern = re.compile(
+        r'(\^\{[^}]+\})|'
+        r'(_\{[^}]+\})|'
+        r'(\^(?:[+-]?\d+[+-]?|[+-]|[a-zA-Z]))|'
+        r'(_\d+[+-]?)|'
+        r'([⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ⁿⁱ]+)|'
+        r'([₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎ₐₑₒₓₕₖₗₘₙₚₛₜ]+)'
+    )
+
+    runs = []
+    last_idx = 0
+    for m in pattern.finditer(t):
+        start, end = m.span()
+        sup1, sub1, sup2, sub2, uni_sup, uni_sub = m.groups()
+
+        # Guard for sub2 (_digits): only treat as subscript if preceding text looks like a chemical symbol,
+        # single variable, or bracket, NOT an identifier word like table_1, sample_1, group_1
+        if sub2:
+            prefix = t[:start]
+            pre_match = re.search(r'([a-zA-Z0-9]+)$', prefix)
+            if pre_match:
+                pre_word = pre_match.group(1)
+                if re.match(r'^[a-z]{3,}$', pre_word):
+                    continue
+
+        if start > last_idx:
+            runs.append((t[last_idx:start], None))
+
+        if sup1:
+            runs.append((sup1[2:-1], 'superscript'))
+        elif sub1:
+            runs.append((sub1[2:-1], 'subscript'))
+        elif sup2:
+            runs.append((sup2[1:], 'superscript'))
+        elif sub2:
+            runs.append((sub2[1:], 'subscript'))
+        elif uni_sup:
+            converted = ''.join(UNICODE_SUP_MAP.get(c, c) for c in uni_sup)
+            runs.append((converted, 'superscript'))
+        elif uni_sub:
+            converted = ''.join(UNICODE_SUB_MAP.get(c, c) for c in uni_sub)
+            runs.append((converted, 'subscript'))
+        last_idx = end
+
+    if last_idx < len(t):
+        runs.append((t[last_idx:], None))
+
+    return [(r[0], r[1]) for r in runs if r[0]]
+
+
+NOTE_PREFIX_PATTERN = re.compile(
+    r'^(?:'
+    r'\*+|\†|\‡|\§|\#|\¶|'
+    r'Note\s*[:：]|Notes\s*[:：]|Footnote\s*[:：]|Source\s*[:：]|Sources\s*[:：]|'
+    r'Legend\s*[:：]|Abbreviations?\s*[:：]|Abbr\s*[:：]|Remarks?\s*[:：]|'
+    r'注\s*[:：]|说明\s*[:：]|数据来源\s*[:：]|附注\s*[:：]|本表\s*[:：]|'
+    r'(?:\([a-z0-9]+\)|\[[a-z0-9]+\]|[a-e1-9]\))\s+|'
+    r'(?:[a-e1-9])\s+(?=[A-Z\u4e00-\u9fa5])'
+    r')',
+    re.IGNORECASE
+)
+
+STAT_NOTE_PATTERN = re.compile(
+    r'(\*+\s*p\s*[<>=]|\bp\s*<\s*0\.\d+|\bp\s*>\s*0\.\d+|\bmean\s*±|\bvalues\s+(?:in\s+parentheses|represent)|\bdiffer\s+significantly|\bnot\s+detected|\bbdl\b|\bna\b|\bp-value\b)',
+    re.IGNORECASE
+)
+
+def is_academic_footnote_row(row_values: list, col_count: int) -> Tuple[bool, str]:
+    """
+    判断单行是否为学术表格尾注/注释行 (olmOCR 2 启发式特征)。
+    返回 (is_note, note_text)。
+    """
+    non_empty = []
+    for v in row_values:
+        if v is None:
+            continue
+        s = str(v).strip()
+        if s and s.lower() not in ('nan', 'none', '-', '--', '—', ''):
+            non_empty.append(s)
+
+    if not non_empty:
+        return False, ""
+
+    all_same = (len(set(non_empty)) == 1)
+    full_text = " ".join(dict.fromkeys(non_empty)) if all_same else " ".join(non_empty)
+    full_text_clean = full_text.strip()
+
+    # 1. 明确的尾注前缀 (Note:, 注:, * 等)
+    if NOTE_PREFIX_PATTERN.search(full_text_clean):
+        if len(non_empty) <= 2 or all_same or len(full_text_clean) > 20:
+            return True, full_text_clean
+
+    # 2. 显著性检验与统计学说明 (* p < 0.05, mean ± SD 等)
+    if STAT_NOTE_PATTERN.search(full_text_clean):
+        if len(non_empty) <= 2 or all_same or len(full_text_clean) > 15:
+            return True, full_text_clean
+
+    # 3. 散文解释句：当整行仅 1 个有效单元格（或所有单元格相同），且字符长 (>=25) 且无数字或纯描述
+    if (len(non_empty) == 1 or all_same) and len(full_text_clean) >= 25:
+        num_words = len(full_text_clean.split())
+        chinese_count = len(re.findall(r'[\u4e00-\u9fa5]', full_text_clean))
+        if num_words >= 5 or chinese_count >= 10:
+            num_tokens = sum(1 for tok in re.split(r'[\s,]+', full_text_clean) if re.match(r'^-?\d+(?:\.\d+)?$', tok))
+            if num_tokens <= 2:
+                return True, full_text_clean
+
+    return False, ""
+
+
+def separate_table_footnotes(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    olmOCR 2 启发的学术表格边界与尾注分离启发式算法。
+    从表格底部向上扫描并剥离附注/注释行（如 '* p < 0.05', 'Note: ...', 'Source: ...', '注：...'），
+    防止其污染数据矩阵，并将提取到的注释存入 df.attrs['footnotes']。
+    同时检测第 0 行是否误将表题纳入数据体。
+    """
+    if df is None or df.empty or len(df) < 2:
+        return df
+
+    working_df = df.copy()
+    extracted_notes = []
+
+    # 1. 从底部向上剥离尾注
+    while len(working_df) > 1:
+        last_row_idx = len(working_df) - 1
+        last_row_vals = working_df.iloc[last_row_idx].tolist()
+        is_note, note_text = is_academic_footnote_row(last_row_vals, working_df.shape[1])
+        if is_note:
+            extracted_notes.append(note_text)
+            working_df = working_df.iloc[:-1].reset_index(drop=True)
+        else:
+            break
+
+    # 2. 检查顶行 (Row 0) 误包含表题边界
+    if len(working_df) > 1:
+        row0_vals = [str(v).strip() for v in working_df.iloc[0].tolist() if v is not None and str(v).strip() and str(v).lower() not in ('nan', 'none', '')]
+        if len(row0_vals) == 1 or (len(row0_vals) > 1 and len(set(row0_vals)) == 1):
+            r0_text = row0_vals[0]
+            if TABLE_LABEL_RE.search(r0_text) or re.match(r'^(?:Table|表|Tab\.|Supplementary\s+Table|附表)\s*\d+', r0_text, re.IGNORECASE):
+                if not working_df.attrs.get('table_title'):
+                    working_df.attrs['table_title'] = r0_text
+                if not working_df.attrs.get('label'):
+                    m_lbl = TABLE_LABEL_RE.search(r0_text)
+                    if m_lbl:
+                        working_df.attrs['label'] = format_table_label(m_lbl.group(0))
+                working_df = working_df.iloc[1:].reset_index(drop=True)
+
+    # 3. 同步属性
+    if extracted_notes:
+        extracted_notes.reverse()
+        existing = working_df.attrs.get('footnotes', [])
+        if isinstance(existing, list):
+            working_df.attrs['footnotes'] = existing + extracted_notes
+        else:
+            working_df.attrs['footnotes'] = [str(existing)] + extracted_notes
+
+    return working_df
+
+
 def expand_squeezed_columns(df):
+
     """
     检测并拆分因 PDF 提取器列边界合并而挤入单个单元格的空格分隔数值/元素列。
     例如：表头为 'Tb Dy Ho Er Tm Yb Lu Y ΣREE ΣREE+Y'，单元格数据为 '0.03 0.17 0.06 0.14 0.03 0.13 0.03 2.47 1.16 3.64'。
@@ -557,6 +760,9 @@ def _clean_vlm_dataframe(df: pd.DataFrame, original_attrs: dict) -> pd.DataFrame
     # 4. 去除完全空白行与列
     df = df.dropna(how='all', axis=0).dropna(how='all', axis=1)
 
+    # 4b. olmOCR 2 学术尾注与注释分离
+    df = separate_table_footnotes(df)
+
     # 5. 数值类型安全推断（使数值列在 Excel 中呈现为可计算的真实数值，同时保护文本标签与前导零编号）
     for col in df.columns:
         vals = df[col].tolist()
@@ -589,7 +795,14 @@ def _clean_vlm_dataframe(df: pd.DataFrame, original_attrs: dict) -> pd.DataFrame
     df = df_map(df, escape_formula)
 
     if hasattr(df, 'attrs'):
+        current_fn = df.attrs.get('footnotes', [])
         df.attrs.update(original_attrs)
+        if current_fn:
+            existing_fn = df.attrs.get('footnotes', [])
+            if not existing_fn:
+                df.attrs['footnotes'] = current_fn
+            elif isinstance(existing_fn, list) and current_fn != existing_fn:
+                df.attrs['footnotes'] = list(dict.fromkeys(existing_fn + current_fn))
     return df
 
 
@@ -727,7 +940,9 @@ def _filter_noise_and_placeholders(df: pd.DataFrame) -> pd.DataFrame:
         return False
 
     df = df[~df.apply(_is_table_noise_row, axis=1)]
+    df = separate_table_footnotes(df)
     return df
+
 
 
 def is_paywall_table(df) -> bool:
@@ -840,8 +1055,12 @@ def postprocess_dataframe(df, headers=None):
     df = expand_multiline_subrows(df)
     df = populate_section_categories(df)
 
+    # 步骤 C2: olmOCR 2 启发式学术表格边界与尾注分离
+    df = separate_table_footnotes(df)
+
     # 步骤 D: 噪声过滤与占位列清理
     df = _filter_noise_and_placeholders(df)
+
 
     # 步骤 E: 数值类型推断与公式转义
     df = df_map(df, try_numeric)

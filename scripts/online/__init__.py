@@ -48,6 +48,9 @@ from .doi_resolver import (
     resolve_chinese_doi,
     resolve_doi_canonical_url,
     get_cnki_url_from_pdf_content,
+    extract_arxiv_id,
+    extract_pmcid,
+    resolve_pmcid_from_doi,
 )
 from .strategies import (
     clean_text,
@@ -69,6 +72,9 @@ from .strategies import (
     extract_cnki_tables_via_playwright,
     extract_tables_via_crawl4ai,
     extract_tables_via_unpaywall,
+    extract_tables_via_arxiv_html,
+    extract_tables_via_ncbi_pmc,
+    _parse_jats_xml_tables,
 )
 from .graph import (
     ExtractionNode,
@@ -77,6 +83,8 @@ from .graph import (
     DirectHTTPNode,
     ImpersonatedHTTPNode,
     ElsevierXMLNode,
+    ArxivHTMLNode,
+    NCBIPMCNode,
     PlaywrightCNKINode,
     ScraplingCNKINode,
     PlaywrightGeneralNode,
@@ -90,4 +98,25 @@ from .graph import (
     extract_tables_online,
 )
 
-__all__ = ['AcademicSearchGraphNode', 'BrowserActBypassNode', 'Crawl4AICNKINode', 'Crawl4AIGeneralNode', 'DirectHTTPNode', 'ElsevierXMLNode', 'ExtractionGraph', 'ExtractionNode', 'FirecrawlNode', 'ImpersonatedHTTPNode', 'PaperFetchNode', 'PlaywrightCNKINode', 'PlaywrightGeneralNode', 'ResolveMetadataNode', 'ScraplingCNKINode', 'ScraplingGeneralNode', '_parse_elsevier_xocs_tables', '_resolve_pii_to_doi', 'clean_text', 'extract_cnki_tables_via_playwright', 'extract_cnki_tables_via_scrapling', 'extract_elsevier_supplementary_tables', 'extract_general_supplementary_tables', 'extract_tables_online', 'extract_tables_via_crawl4ai', 'extract_tables_via_direct_http', 'extract_tables_via_elsevier_api', 'extract_tables_via_firecrawl', 'extract_tables_via_paper_fetch', 'extract_tables_via_playwright', 'extract_tables_via_scrapling', 'extract_tables_via_unpaywall', 'find_playwright_chromium', 'get_cnki_cookies_path', 'get_cnki_url_from_pdf_content', 'get_crawl4ai_cookies_path', 'get_doi_by_title', 'get_doi_by_title_firecrawl', 'get_doi_from_pdf_content', 'get_doi_from_zotero_db', 'get_domain_profile_dir', 'has_image_based_tables', 'interactive_cnki_cookie_capture', 'load_config', 'load_cookies_from_file', 'parse_tables_from_html', 'parse_tables_from_markdown', 'requests_impersonate', 'resolve_chinese_doi', 'resolve_doi_canonical_url']
+__all__ = [
+    'AcademicSearchGraphNode', 'ArxivHTMLNode', 'BrowserActBypassNode', 'Crawl4AICNKINode',
+    'Crawl4AIGeneralNode', 'DirectHTTPNode', 'ElsevierXMLNode', 'ExtractionGraph',
+    'ExtractionNode', 'FirecrawlNode', 'ImpersonatedHTTPNode', 'NCBIPMCNode',
+    'PaperFetchNode', 'PlaywrightCNKINode', 'PlaywrightGeneralNode', 'ResolveMetadataNode',
+    'ScraplingCNKINode', 'ScraplingGeneralNode', '_parse_elsevier_xocs_tables',
+    '_parse_jats_xml_tables', '_resolve_pii_to_doi', 'clean_text',
+    'extract_arxiv_id', 'extract_cnki_tables_via_playwright', 'extract_cnki_tables_via_scrapling',
+    'extract_elsevier_supplementary_tables', 'extract_general_supplementary_tables',
+    'extract_pmcid', 'extract_tables_online', 'extract_tables_via_arxiv_html',
+    'extract_tables_via_crawl4ai', 'extract_tables_via_direct_http', 'extract_tables_via_elsevier_api',
+    'extract_tables_via_firecrawl', 'extract_tables_via_ncbi_pmc', 'extract_tables_via_paper_fetch',
+    'extract_tables_via_playwright', 'extract_tables_via_scrapling', 'extract_tables_via_unpaywall',
+    'find_playwright_chromium', 'get_cnki_cookies_path', 'get_cnki_url_from_pdf_content',
+    'get_crawl4ai_cookies_path', 'get_doi_by_title', 'get_doi_by_title_firecrawl',
+    'get_doi_from_pdf_content', 'get_doi_from_zotero_db', 'get_domain_profile_dir',
+    'has_image_based_tables', 'interactive_cnki_cookie_capture', 'load_config',
+    'load_cookies_from_file', 'parse_tables_from_html', 'parse_tables_from_markdown',
+    'requests_impersonate', 'resolve_chinese_doi', 'resolve_doi_canonical_url',
+    'resolve_pmcid_from_doi'
+]
+

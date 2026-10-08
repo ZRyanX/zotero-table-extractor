@@ -59,33 +59,38 @@
 学术文献（尤其是地学、材料、化学、生物、医学等自然科学领域）中的表格往往存在**无边框/三线表、跨行跨列单元格、多数值挤压排版、上下标与正负公差、多级复合表头以及跨页续表（Continued tables）**等极为复杂的排版特征。传统的单一工具（如纯 Camelot 或单纯 OCR）在面对上述排版时极易发生串行、漏列、公式错乱或数据缺失。
 
 **Zotero Table Extractor** 是一套端到端的学术表格智能提取与重构引擎：
-1. **双轨驱动**：优先走官方直连 API / 原生 HTML / XML 提取（100% 零误差），若缺失或受阻则无缝降级到本地 PDF 深度流水线；
-2. **多方验证**：原生文本 PDF 采用 **7 引擎多方投票与矩阵相似度交叉仲裁**（新增 GMFT 与 img2table）；
+1. **双轨驱动**：优先走官方直连 API / 原生 HTML / JATS XML 提取（涵盖 arXiv 官方 HTML、NCBI PMC Open Access JATS XML 与 Elsevier XOCS XML，100% 零 OCR 误差），若缺失或受阻则无缝降级到本地 PDF 深度流水线；
+2. **多方验证与 TEDS 拓扑度量**：原生文本 PDF 采用 **8 引擎多方投票与 IBM TEDS (树编辑距离) 拓扑度量交叉仲裁**（包含 PyMuPDF4LLM、GMFT 与 img2table）；
 3. **视觉多模态大模型双轨接管**：对于扫描件、低置信度表格或复杂表，采用 **PP-StructureV3 / DocLayout-YOLO** 前置定位与切图，首选 **PaddleOCR-VL-1.6** 在线多模态大模型进行结构化还原，同时支持 **IBM Docling (TableFormer)** 作为本地离线备用接管引擎；
-4. **精细后处理与跨页 DP 对齐**：内置 7 阶轻量安全清洗流水线（防 Excel 注入、多行子行展开、紧缩数值拆分、多级表头重塑等），并融合 DeepDoc / MinerU 启发式三向单调动态规划拼接跨页续表；
-5. **生态闭环联动 (可选)**：可选集成 PyZotero 与 Zotero-Better-Notes，自动将提取出的 `.xlsx` 挂载回文献条目并生成富文本表格预览笔记。
+4. **精细后处理与 olmOCR 2 边界分离**：内置 7 阶轻量安全清洗流水线（防 Excel 注入、多行子行展开、紧缩数值拆分、多级表头重塑等），融合 AllenAI olmOCR 2 尾注分离启发式（将 `* p < 0.05`、`Note:`、`注:` 等剥离存入 `footnotes` 属性），并融合 DeepDoc / MinerU 启发式三向单调动态规划拼接跨页续表；
+5. **Excel 富文本原生保真导出**：集成 openpyxl `CellRichText` 原生导出学术上下标（`10^{-3}`, `CaCO_3`, `H_2O`, `Fe^{3+}`）并严密保护数值单元格计算属性；
+6. **生态闭环联动 (可选)**：可选集成 PyZotero 与 Zotero-Better-Notes，自动将提取出的 `.xlsx` 挂载回文献条目并生成富文本表格预览笔记。
 
 ---
 
 ## ✨ 核心能力
 
 ### 1. 优先在线 HTML/XML 高保真提取
+- **arXiv 官方 HTML 与 ar5iv (LaTeXML) 原生直取**：针对 arXiv 论文直取官方 HTML / ar5iv 结构化表格，100% 保真免除 OCR 误差。
+- **NCBI PMC (PubMed Central) Open Access JATS XML 直连**：针对医学与生命科学论文，通过 NCBI API 直接获取标准 NISO JATS XML 正文字段，原生解析行列、合并单元格与尾注。
 - **Elsevier 官方 XOCS XML 直连**：通过官方 API 直取原生 XML 数据节点，数学符号与行列结构保真度达 100%。
 - **多出版商自适应分流**：原生覆盖 Elsevier / ScienceDirect、Springer Link、Wiley、Nature、IEEE Xplore、Taylor & Francis、MDPI、ACS、RSC、GeoSciWorld 等。
 - **中国知网 (CNKI) 专属适配**：内置 Scrapling 极速爬取与 Playwright 动态渲染引擎，支持滑块验证码绕过、地质特殊符号还原及文献 HTML 阅读页表格提取。
 - **附表 (Supplementary Tables) 自动探测**：自动嗅探并提取论文正文及关联的在线附表。
 - **完备性门禁**：若在线提取得到的表数量低于 PDF 文本层扫描出的表格 caption 数量，系统自动触发增量补偿，防止在线版本漏表。
 
-### 2. 本地原生 PDF 7 引擎投票共识
+### 2. 本地原生 PDF 8 引擎投票与 IBM TEDS 拓扑共识
 对于含有完整矢量文本层的 Native PDF，启动多算法交叉核验，兼顾极速与极高准确率（单页约 0.1s）：
 - **[`pdf-inspector`](https://github.com/firecrawl/pdf-inspector)**：Rust 编写的高性能检测器，快速判定 PDF 类型并解析 Tagged PDF / PDF/UA 语义结构树与 Markdown 表格；
+- **[`PyMuPDF4LLM`](https://github.com/pymupdf/PyMuPDF4LLM)**：Artifex 出品，原生将 PDF 转化为 LLM-ready Markdown 表格参与共识投票；
 - **`PyMuPDF find_tables()`**：极速矢量线框表格识别；
 - **[`GMFT`](https://github.com/conjuncts/gmft)**：基于 TATR (Table Transformer) 的深度视觉结构解析，专精学术多层复合表头与跨列单元格对齐；
 - **[`img2table`](https://github.com/xavctn/img2table)**：纯 Python + OpenCV 形态学轮廓方案，**彻底摆脱系统级 Ghostscript 依赖**，稳健支持有框与无框表；
 - **`text_alignment`**：基于文字坐标聚类分列的无线框对齐引擎；
 - **`pdfplumber`**：基于字符空间矩形与相交线框的结构提取；
 - **`Camelot`**：Lattice 网格法与 Stream 文本流双策略识别；
-- **双向相似度投票仲裁**：计算矩阵相似度，任意两方相似度 $\ge 0.75$ 则判定一致并采纳最佳版本；相似度 $< 0.90$ 标记为低置信度并触发视觉 AI 介入。
+- **IBM TEDS 拓扑度量与多方仲裁**：集成纯 Python IBM TEDS (Tree-Edit-Distance) 树编辑距离算法，综合 DOM 树拓扑、单元格跨度与矩阵内容相似度计算综合得分，任意两方相似度 $\ge 0.75$ 则判定一致并采纳最佳版本；相似度 $< 0.90$ 标记为低置信度并触发视觉 AI 介入。
+
 
 ### 3. 复杂扫描件/无框表两阶段视觉 AI 接管（双轨弹性保障）
 针对扫描版 PDF、混合排版以及低置信度复杂页：

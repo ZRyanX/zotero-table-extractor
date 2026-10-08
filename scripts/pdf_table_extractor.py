@@ -56,9 +56,10 @@ except ImportError:
     pd = None
 
 try:
-    from .common import format_table_label, TABLE_LABEL_PATTERN, TABLE_LABEL_RE, is_table_squeezed, is_table_low_quality, is_markdown_separator, df_map, make_unique_columns
+    from .common import format_table_label, TABLE_LABEL_PATTERN, TABLE_LABEL_RE, is_table_squeezed, is_table_low_quality, is_markdown_separator, df_map, make_unique_columns, teds_similarity
 except ImportError:
-    from common import format_table_label, TABLE_LABEL_PATTERN, TABLE_LABEL_RE, is_table_squeezed, is_table_low_quality, is_markdown_separator, df_map, make_unique_columns
+    from common import format_table_label, TABLE_LABEL_PATTERN, TABLE_LABEL_RE, is_table_squeezed, is_table_low_quality, is_markdown_separator, df_map, make_unique_columns, teds_similarity
+
 
 import sys
 _script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1295,8 +1296,107 @@ def extract_via_gmft(pdf_path: str, pages: Optional[List[int]] = None) -> List[D
 
 
 # ===========================================================================
+# 4c. Artifex PyMuPDF4LLM 原生表格提取
+# ===========================================================================
+
+_PYMUPDF4LLM_CHECKED = False
+_PYMUPDF4LLM_AVAILABLE = False
+
+def is_pymupdf4llm_available() -> bool:
+    """检查当前环境中是否安装并可用 Artifex PyMuPDF4LLM。"""
+    global _PYMUPDF4LLM_CHECKED, _PYMUPDF4LLM_AVAILABLE
+    if not _PYMUPDF4LLM_CHECKED:
+        try:
+            import pymupdf4llm
+            _PYMUPDF4LLM_AVAILABLE = hasattr(pymupdf4llm, "to_markdown")
+        except ImportError:
+            _PYMUPDF4LLM_AVAILABLE = False
+            logger.debug("[PyMuPDF4LLM] 未安装，后续调用自动跳过")
+        except Exception:
+            _PYMUPDF4LLM_AVAILABLE = False
+        _PYMUPDF4LLM_CHECKED = True
+    return _PYMUPDF4LLM_AVAILABLE
+
+
+def extract_via_pymupdf4llm(pdf_path: str, pages: Optional[List[int]] = None) -> List[Dict[str, Any]]:
+    """
+    使用 Artifex PyMuPDF4LLM 提取原生 PDF 表格。
+    针对原生排版文献将 PDF 页面解析为 LLM-ready Markdown 并提取高保真表格。
+    作为原生 PDF 多方投票的重要参选方。
+    """
+    if pd is None or not os.path.exists(pdf_path):
+        return []
+
+    try:
+        from common import load_config
+        cfg = load_config() if callable(load_config) else {}
+        if not cfg.get("PYMUPDF4LLM_ENABLED", True):
+            return []
+    except Exception:
+        pass
+
+    if not is_pymupdf4llm_available():
+        return []
+
+    results = []
+    try:
+        import pymupdf4llm
+
+        doc = fitz.open(pdf_path)
+        total_pages = len(doc)
+        target_pages = [p for p in pages if 0 <= p < total_pages] if pages is not None else list(range(total_pages))
+
+        for p_idx in target_pages:
+            try:
+                md_text = pymupdf4llm.to_markdown(doc, pages=[p_idx])
+                if not md_text or "|" not in md_text:
+                    continue
+
+                try:
+                    from .table_postprocess import parse_structured_markdown_tables
+                except ImportError:
+                    from table_postprocess import parse_structured_markdown_tables
+                dfs = parse_structured_markdown_tables(md_text)
+                if not dfs:
+                    try:
+                        from .online.strategies import parse_tables_from_markdown
+                    except ImportError:
+                        try:
+                            from online.strategies import parse_tables_from_markdown
+                        except ImportError:
+                            parse_tables_from_markdown = None
+                    if parse_tables_from_markdown:
+                        dfs = parse_tables_from_markdown(md_text)
+
+                for tbl_idx, df in enumerate(dfs or []):
+                    if df is None or df.empty or len(df) < 1:
+                        continue
+                    df = df_map(df, lambda x: str(x).strip() if x is not None else "")
+                    df.attrs['extractor'] = 'pymupdf4llm'
+                    df.attrs['page_idx'] = p_idx
+                    results.append({
+                        'df': df,
+                        'page_idx': p_idx,
+                        'table_idx': tbl_idx,
+                        'bbox': None,
+                        'label': df.attrs.get('label'),
+                    })
+            except Exception as e_page:
+                logger.debug(f"[PyMuPDF4LLM] Page {p_idx+1} 提取异常: {e_page}")
+
+        doc.close()
+    except Exception as e:
+        logger.debug(f"[PyMuPDF4LLM] 提取异常: {e}")
+
+    if results:
+        print(f"[PyMuPDF4LLM] 提取到 {len(results)} 个表格 (LLM Markdown 原生解析)")
+    return results
+
+
+# ===========================================================================
 # 5. 三方与多方投票融合
 # ===========================================================================
+
 
 def _compute_bbox_iou(b1, b2) -> Tuple[float, float]:
     """计算两个 bbox [x0, y0, x1, y1] 的 2D IoU 与 IoM (Intersection over Minimum)"""
@@ -1382,8 +1482,22 @@ def _table_similarity(df1, df2) -> float:
     if best_content_sim < 0.10 and jaccard < 0.10:
         return 0.0
 
-    # 综合相似度：对齐比对权重 0.55，Jaccard 权重 0.25，形状权重 0.20
+    # 结合 IBM TEDS (Tree-Edit-Distance-based Similarity) 进行树拓扑结构与内容融合度量
+    try:
+        from common import load_config
+        cfg = load_config() if callable(load_config) else {}
+    except Exception:
+        cfg = {}
+    if cfg.get("TEDS_METRIC_ENABLED", True) and teds_similarity is not None:
+        try:
+            teds_val = teds_similarity(df1, df2, structure_only=False, max_sample_rows=15, max_sample_cols=10)
+            return 0.30 * teds_val + 0.40 * best_content_sim + 0.15 * jaccard + 0.15 * shape_sim
+        except Exception:
+            pass
+
+    # 综合相似度回退：对齐比对权重 0.55，Jaccard 权重 0.25，形状权重 0.20
     return 0.20 * shape_sim + 0.55 * best_content_sim + 0.25 * jaccard
+
 
 
 def _align_page_tables(
@@ -1492,12 +1606,13 @@ def three_way_vote(
     structure_tables: Optional[List[Dict[str, Any]]] = None,
     gmft_tables: Optional[List[Dict[str, Any]]] = None,
     img2table_tables: Optional[List[Dict[str, Any]]] = None,
+    pymupdf4llm_tables: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[str], Dict[str, Any]]:
     """
-    多方投票融合: pdf-inspector-structure + pdf-inspector + gmft + find_tables + img2table + text_alignment + pdfplumber + Camelot。
+    多方投票融合: pdf-inspector-structure + pdf-inspector + pymupdf4llm + gmft + find_tables + img2table + text_alignment + pdfplumber + Camelot。
 
     规则:
-    - 任意两个一致 (相似度 >= similarity_threshold，默认 0.75) → 取一致的版本（优先 pdf_inspector_structure > pdf-inspector > gmft > find_tables > img2table > text_alignment > pdfplumber > Camelot）
+    - 任意两个一致 (相似度 >= similarity_threshold，默认 0.75) → 取一致的版本（优先 pdf_inspector_structure > pdf-inspector > pymupdf4llm > gmft > find_tables > img2table > text_alignment > pdfplumber > Camelot）
     - 质量检查：若选中的候选表存在列挤压，自动降级切换至无挤压的候选表
     - 多方均不一致 → 取优先级最高的结果（若有出版商语义结构树表格 pdf_inspector_structure，绝对优先保障矢量保真度）
     - 仅一方有结果 → 取该方结果
@@ -1517,6 +1632,7 @@ def three_way_vote(
     sources = {
         'pdf_inspector_structure': structure_tables or [],
         'pdf_inspector': inspector_tables,
+        'pymupdf4llm': pymupdf4llm_tables or [],
         'gmft': gmft_tables or [],
         'find_tables': find_tables_results,
         'img2table': img2table_tables or [],
@@ -1531,8 +1647,8 @@ def three_way_vote(
         for t in src_tables:
             all_pages.add(t.get('page_idx', 0))
 
-    # 优先级排序：结构树绝对优先，pdf_inspector 与 gmft 语义紧随其后，find_tables 与 img2table 矢量形态紧随其后
-    priority = ['pdf_inspector_structure', 'pdf_inspector', 'gmft', 'find_tables', 'img2table', 'text_alignment', 'pdfplumber', 'camelot']
+    # 优先级排序：结构树绝对优先，pdf_inspector 与 pymupdf4llm/gmft 语义紧随其后，find_tables 与 img2table 矢量形态紧随其后
+    priority = ['pdf_inspector_structure', 'pdf_inspector', 'pymupdf4llm', 'gmft', 'find_tables', 'img2table', 'text_alignment', 'pdfplumber', 'camelot']
 
     for page in sorted(all_pages):
         page_tables = {}
@@ -1545,10 +1661,11 @@ def three_way_vote(
             continue
 
         # 页面级各主力引擎检测表数的分歧检验 (独立覆盖率感知)
-        active_counts = [len(tbls) for s, tbls in page_tables.items() if tbls and s in ['pdf_inspector_structure', 'pdf_inspector', 'gmft', 'find_tables']]
+        active_counts = [len(tbls) for s, tbls in page_tables.items() if tbls and s in ['pdf_inspector_structure', 'pdf_inspector', 'pymupdf4llm', 'gmft', 'find_tables']]
         if active_counts and (max(active_counts) - min(active_counts) >= 2):
             logs.append(f"Page {page+1}: 主力引擎检测表数存在较大分歧 (counts={active_counts}) → 标记为低置信度页")
             low_confidence_pages.add(page)
+
 
         # 逐个对齐表格簇进行投票
         for tbl_idx, candidates in enumerate(aligned_clusters):
@@ -3265,7 +3382,7 @@ def _do_extract_tables_from_pdf(
         logs.append(f"  OCR 提取到 {len(ocr_results)} 个表格")
     else:
         # ── native PDF → 多方投票 + 低相似度页面回退 PaddleOCR-VL ──
-        logs.append("→ Step 2: native PDF，启动多方投票 (pdf-inspector + GMFT + Camelot/img2table + pdfplumber + find_tables)")
+        logs.append("→ Step 2: native PDF，启动多方投票 (pdf-inspector + PyMuPDF4LLM + GMFT + Camelot/img2table + pdfplumber + find_tables)")
 
         native_target_pages = [p for p in target_pages if p not in pure_image_pages] if target_pages is not None else None
 
@@ -3279,6 +3396,9 @@ def _do_extract_tables_from_pdf(
         camelot_results = extract_via_camelot(pdf_path, pages=native_target_pages)
         img2table_results = extract_via_img2table(pdf_path, pages=native_target_pages)
         gmft_results = extract_via_gmft(pdf_path, pages=native_target_pages)
+        pymupdf4llm_results = extract_via_pymupdf4llm(pdf_path, pages=native_target_pages)
+        if pymupdf4llm_results:
+            logs.append(f"  PyMuPDF4LLM 提取到 {len(pymupdf4llm_results)} 个表格 (LLM-ready Markdown)")
         align_results = extract_via_text_alignment(pdf_path, pages=native_target_pages)
 
         # 多方投票融合
@@ -3289,7 +3409,9 @@ def _do_extract_tables_from_pdf(
             structure_tables=structure_results,
             gmft_tables=gmft_results,
             img2table_tables=img2table_results,
+            pymupdf4llm_tables=pymupdf4llm_results,
         )
+
         logs.extend(vote_logs)
 
         if fused:

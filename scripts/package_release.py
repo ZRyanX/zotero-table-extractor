@@ -73,7 +73,7 @@ def get_latest_tag() -> str:
         ).strip().splitlines()
         if tags:
             return tags[0].strip()
-        return "v1.6.0"
+        return "v1.7.0"
 
 
 def compute_sha256(filepath: str) -> str:

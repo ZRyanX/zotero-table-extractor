@@ -430,3 +430,92 @@ def get_cnki_url_from_pdf_content(pdf_path):
     except Exception as e:
         print(f"Warning: Failed to extract CNKI URL from PDF content: {e}")
     return None
+
+
+def extract_arxiv_id(url_or_doi_or_str):
+    """
+    从 DOI、URL 或文本中解析出标准的 arXiv ID (例如 '2301.12345' 或 'math/0211159')。
+    支持:
+    - 10.48550/arXiv.2301.12345
+    - https://arxiv.org/abs/2301.12345
+    - https://arxiv.org/html/2301.12345v1
+    - https://ar5iv.labs.arxiv.org/html/2301.12345
+    - arXiv:2301.12345
+    - 经典格式: math/0211159, cs/0112017, quant-ph/0501001
+    """
+    if not url_or_doi_or_str:
+        return None
+    s = str(url_or_doi_or_str).strip()
+
+    # 1. DOI 格式: 10.48550/arXiv.YYMM.NNNNN
+    m_doi = re.search(r'10\.48550/arXiv\.([0-9]{4}\.[0-9]{4,5}(?:v[0-9]+)?)', s, re.IGNORECASE)
+    if m_doi:
+        return m_doi.group(1)
+
+    # 2. arXiv URL 格式 (abs, html, pdf)
+    m_url = re.search(r'(?:arxiv\.org|ar5iv(?:\.labs)?\.arxiv\.org)/(?:abs|html|pdf)/([0-9]{4}\.[0-9]{4,5}(?:v[0-9]+)?|[a-z\-]+/[0-9]{7}(?:v[0-9]+)?)', s, re.IGNORECASE)
+    if m_url:
+        val = m_url.group(1)
+        if val.endswith('.pdf'):
+            val = val[:-4]
+        return val
+
+    # 3. 显式 arXiv: 前缀
+    m_prefix = re.search(r'\barXiv:\s*([0-9]{4}\.[0-9]{4,5}(?:v[0-9]+)?|[a-z\-]+/[0-9]{7}(?:v[0-9]+)?)\b', s, re.IGNORECASE)
+    if m_prefix:
+        return m_prefix.group(1)
+
+    # 4. 纯现代 arXiv ID (YYMM.NNNNN) 或 经典格式 (math/0211159)
+    m_pure = re.match(r'^([0-9]{4}\.[0-9]{4,5}(?:v[0-9]+)?|[a-z\-]+/[0-9]{7}(?:v[0-9]+)?)$', s, re.IGNORECASE)
+    if m_pure:
+        return m_pure.group(1)
+
+
+    return None
+
+
+def extract_pmcid(url_or_doi_or_str):
+    """
+    从字符串或 URL 中提取 PMCID (如 PMC1234567)。
+    """
+    if not url_or_doi_or_str:
+        return None
+    s = str(url_or_doi_or_str).strip()
+    m = re.search(r'\b(PMC\d{5,9})\b', s, re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
+    return None
+
+
+def resolve_pmcid_from_doi(doi, timeout=8):
+    """
+    通过 NCBI PMC ID Converter API 将 DOI 解析为 PMCID。
+    API: https://www.ncbi.nlm.nih.gov/pmc/utils/idconv/v1.0/?ids={doi}&format=json
+    成功返回 'PMCxxxxxxx'，若不在 PMC 开放获取库中返回 None。
+    """
+    if not doi:
+        return None
+    clean_doi = doi.strip()
+    if clean_doi.lower().startswith("doi:"):
+        clean_doi = clean_doi[4:].strip()
+
+    pmc_self = extract_pmcid(clean_doi)
+    if pmc_self:
+        return pmc_self
+
+    url = f"https://www.ncbi.nlm.nih.gov/pmc/utils/idconv/v1.0/?ids={urllib.parse.quote(clean_doi)}&format=json&tool=zotero-table-extractor&email=extractor@zotero.org"
+    try:
+        r = requests.get(url, timeout=timeout)
+        if r.status_code == 200:
+            data = r.json()
+            records = data.get("records", [])
+            for rec in records:
+                pmcid = rec.get("pmcid")
+                if pmcid and str(pmcid).upper().startswith("PMC"):
+                    res = str(pmcid).strip().upper()
+                    print(f"[NCBI PMC] DOI {clean_doi} 解析为 PMCID: {res}")
+                    return res
+    except Exception as e:
+        print(f"[NCBI PMC] ID 转换接口调用失败: {e}")
+    return None
+

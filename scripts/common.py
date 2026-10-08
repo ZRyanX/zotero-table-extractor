@@ -29,6 +29,18 @@ except ImportError:
         ExtractedTable = None
         TableCell = None
 
+try:
+    from .teds import teds_similarity, dataframe_to_table_tree, parse_html_to_tree, TableNode
+except ImportError:
+    try:
+        from teds import teds_similarity, dataframe_to_table_tree, parse_html_to_tree, TableNode
+    except ImportError:
+        teds_similarity = None
+        dataframe_to_table_tree = None
+        parse_html_to_tree = None
+        TableNode = None
+
+
 
 try:
     from .system_detector import (

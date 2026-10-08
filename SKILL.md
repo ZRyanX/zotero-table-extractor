@@ -1,6 +1,6 @@
 ---
 name: zotero-table-extractor
-description: 从 Zotero 选中条目（依赖 ai4paper-zotero MCP 获取物理路径）或指定本地 PDF / CNKI / 期刊网页中批量/单篇自动抓取并提取结构化表格，支持 7 引擎多方投票、PP-StructureV3 定位 + PaddleOCR-VL-1.6 在线多模态解析、IBM Docling (TableFormer) 本地离线备用降级，以及可选 PyZotero / Better-Notes 生态联动，导出出版级 Excel (.xlsx)。
+description: 从 Zotero 选中条目（依赖 ai4paper-zotero MCP 获取物理路径）或指定本地 PDF / CNKI / 期刊网页中批量/单篇自动抓取并提取结构化表格，支持 8 引擎多方投票与 IBM TEDS 拓扑度量、arXiv HTML / NCBI PMC JATS XML 100% 原生直取、PP-StructureV3 定位 + PaddleOCR-VL-1.6 在线多模态解析、IBM Docling (TableFormer) 本地离线备用降级、openpyxl CellRichText 学术上下标渲染、olmOCR 2 边界与尾注分离，以及可选 PyZotero / Better-Notes 生态联动，导出出版级 Excel (.xlsx)。
 ---
 
 # Zotero Table Extractor
@@ -15,7 +15,9 @@ description: 从 Zotero 选中条目（依赖 ai4paper-zotero MCP 获取物理�
 ```text
 论文.pdf / 论文网页
        │
-       ├─ 1. 在线 HTML 提取（最优先，速度快/原生数字保真）
+       ├─ 1. 在线 HTML / XML 原生直取（最优先，100% 零 OCR 误差）
+       │     arXiv 官方 HTML / ar5iv LaTeXML
+       │     NCBI PMC (PubMed Central) Open Access JATS XML
        │     Elsevier XOCS XML / CNKI / Springer / 通用出版社
        │     核验在线提取表号集合与数量；若存在缺失表号 → 保留已抓取在线高保真表，由本地 PDF 管线精准补漏
        │
@@ -35,32 +37,38 @@ description: 从 Zotero 选中条目（依赖 ai4paper-zotero MCP 获取物理�
            Native     Scanned            Mixed
               │          │                  │
               ▼          ▼                  ▼
-         7 引擎投票:  DocLayout-YOLO     多方投票(文本页)
+         8 引擎投票:  DocLayout-YOLO     多方投票(文本页)
          pdf-inspector + PP-StructureV3  + OCR/VLM(扫描页)
-         + find_tables 局部切图与补扫     (在线 PaddleOCR-VL
-         + text_align  首选在线 PaddleOCR-VL  离线 Docling TableFormer)
-         + pdfplumber  离线 Docling TableFormer
-         + Camelot     多模态精细解析
+         + PyMuPDF4LLM 局部切图与补扫     (在线 PaddleOCR-VL
+         + find_tables 首选在线 PaddleOCR-VL 离线 Docling TableFormer)
+         + text_align  离线 Docling TableFormer
+         + pdfplumber  多模态精细解析
+         + Camelot
          + GMFT (TATR)
          + img2table (OpenCV)
               │
               ├─ 2D bbox 空间重叠 (IoU/IoM) + 表号标签防冲突聚类，杜绝同页多表误合并
-              ├─ 任意两方相似度 >= 0.75 → 判定一致并采用投票结果 (结构树绝对优先)
+              ├─ IBM TEDS (树编辑距离拓扑度量) + 矩阵相似度加权判定一致性 (结构树绝对优先)
               ├─ 低置信度 (<0.90) 或检验瑕疵页 → DocLayout-YOLO 切图 + PP-Structure 补扫 → PaddleOCR-VL (在线) / Docling TableFormer (离线备用) 接管
               ├─ 表级精细对齐与替换策略：精准替换瑕疵表，保留同页未受干扰的有效原生表
               ├─ 7 阶轻量直通安全后处理（公式注入防御、数值类型推断、多级表头展平、DeepDoc/MinerU 跨页单调 DP 对齐）
+              ├─ AllenAI olmOCR 2 边界与尾注分离启发式：隔离表题/数据矩阵/尾注 (* p < 0.05, Note: ..., 注: ...)
               └─ 跨页续表与多分页自适应合并
               │
               ▼
-         Excel 导出 (每表独立文件或单文件多 Sheet) ──► 可选自动回写挂载至 Zotero & Better-Notes 笔记
+         Excel 导出 (openpyxl CellRichText 学术上下标与化学式保真) ──► 可选自动回写挂载至 Zotero & Better-Notes 笔记
 ```
 
 ## 关键组件（多模态与多引擎协同体系）
 
 | 组件 | 作用 |
 |---|---|
+| [`arXiv HTML (LaTeXML)`](https://arxiv.org/html/) | arXiv 官方 HTML 与 ar5iv 结构化表格原生抓取，100% 保真免除 OCR 误差 |
+| [`NCBI PMC (JATS XML)`](https://eutils.ncbi.nlm.nih.gov/) | PubMed Central 开放获取 JATS XML 原生全文字段解析，含完整 colspan/rowspan 与尾注 |
 | [`pdf-inspector`](https://github.com/firecrawl/pdf-inspector) | Rust 库，PDF 分类 + 表格定位 + Markdown 结构化提取，~80ms 高性能 |
+| [`PyMuPDF4LLM`](https://github.com/pymupdf/PyMuPDF4LLM) | Artifex 出品，原生将 PDF 转化为 LLM-ready Markdown 表格，8 引擎投票主力候选方 |
 | `PyMuPDF find_tables()` | PDF 矢量线框与无框文本表格提取（零 OCR，高保真），支持全篇网格线分析 |
+| [`IBM TEDS`](https://github.com/ibm-aur-nlp/PubTabNet) | 纯 Python 实现的经典树编辑距离拓扑相似度算法，评估 DOM 树与跨行跨列结构保真度 |
 | [`GMFT`](https://github.com/conjuncts/gmft) | 基于 TATR (Table Transformer) 的深度视觉提取，擅长多层复合表头与跨列单元格对齐 |
 | [`img2table`](https://github.com/xavctn/img2table) | 基于 OpenCV 形态学的纯 Python 方案，零 Ghostscript 系统依赖，支持有框/无框表 |
 | `text_alignment` | 无线框表格的文本坐标对齐与自适应重组（支持学位论文/无网格线表） |
@@ -69,8 +77,11 @@ description: 从 Zotero 选中条目（依赖 ai4paper-zotero MCP 获取物理�
 | `PaddleOCR-VL-1.6` / `PP-StructureV3` | 在线多模态大模型与版面切图 API，复杂/跨行跨列与扫描页结构化多模态解析（首选在线主引擎） |
 | [`IBM Docling (TableFormer)`](https://github.com/DS4SD/docling) | IBM 开源高保真表格结构模型，作为离线/无网络/Token耗尽时的多云本地容灾备用引擎 |
 | `DocLayout-YOLO` | 本地 ONNX 版面检测（~15ms 本地超快切图定位，零 Token 消耗） |
+| `olmOCR 2 边界与尾注分离` | 学术表格边界与注释行智能剥离算法，将 `* p < 0.05` / `Note:` 等抽离存入 `footnotes` 属性 |
+| `openpyxl CellRichText` | 原生 Excel 单元格富文本渲染，高保真呈现 `10^{-3}`、`CaCO_3`、`H_2O` 等学术上下标，保持数值计算兼容 |
 | `DeepDoc / MinerU 跨页续表投影` | 动态规划单调对齐与列特征分布投影，高保真拼接跨页长表与剥离重复表头 |
 | [`PyZotero & Better-Notes`](https://github.com/urschrei/pyzotero) | 生态联动扩展（默认关闭），自动将导出 Excel 挂载为附件并生成 Better-Notes 概览卡片 |
+
 
 
 ## 漏检自查与完整性保障 (Self-Audit)

@@ -67,6 +67,13 @@ class ExtractedTable:
             elif self.df.attrs.get("extractor"):
                 self.source = str(self.df.attrs.get("extractor"))
 
+            if self.footnotes:
+                self.df.attrs["footnotes"] = self.footnotes
+            elif self.df.attrs.get("footnotes"):
+                fn = self.df.attrs.get("footnotes")
+                self.footnotes = fn if isinstance(fn, list) else [str(fn)]
+
+
     def to_dataframe(self) -> pd.DataFrame:
         """返回带有同步 attrs 的 DataFrame。"""
         self.sync_attrs()

@@ -24,6 +24,8 @@ websockets>=11.0
 img2table>=2.0.0
 gmft>=0.4.0
 docling>=2.0.0
+pymupdf4llm>=0.0.17
+
 
 # Ecosystem Integration (Zotero & Better-Notes Sync)
 pyzotero>=1.15.0

@@ -51,6 +51,9 @@ from .doi_resolver import (
     get_doi_from_zotero_db,
     resolve_chinese_doi,
     resolve_doi_canonical_url,
+    extract_arxiv_id,
+    extract_pmcid,
+    resolve_pmcid_from_doi,
 )
 
 from .strategies import (
@@ -64,9 +67,12 @@ from .strategies import (
     extract_tables_via_paper_fetch,
     extract_tables_via_scrapling,
     extract_tables_via_unpaywall,
+    extract_tables_via_arxiv_html,
+    extract_tables_via_ncbi_pmc,
     get_domain_profile_dir,
     parse_tables_from_html,
 )
+
 
 class ExtractionNode:
     def __init__(self, name, fallback_node=None):
@@ -228,13 +234,30 @@ class ResolveMetadataNode(ExtractionNode):
                 
             state["url"] = url
             state["is_cnki"] = is_cnki
+
+        # 检查 arXiv 与 PMC
+        arxiv_cand = extract_arxiv_id(state.get("url") or state.get("doi"))
+        if arxiv_cand:
+            state["arxiv_id"] = arxiv_cand
+            state["is_arxiv"] = True
+
+        pmc_cand = extract_pmcid(state.get("url") or state.get("doi"))
+        if pmc_cand:
+            state["pmcid"] = pmc_cand
+            state["is_pmc"] = True
         
-        print(f"[Graph] Resolved metadata: URL={state.get('url')}, DOI={state.get('doi')}, Title={state.get('title')}, is_cnki={state.get('is_cnki')}")
+        print(f"[Graph] Resolved metadata: URL={state.get('url')}, DOI={state.get('doi')}, Title={state.get('title')}, is_cnki={state.get('is_cnki')}, arxiv={state.get('arxiv_id')}, pmc={state.get('pmcid')}")
         
-        if state["is_cnki"]:
+        cfg = load_config() if callable(load_config) else {}
+        if state.get("is_cnki"):
             return state, "Crawl4AICNKINode"
+        elif state.get("is_arxiv") and cfg.get("ARXIV_HTML_ENABLED", True):
+            return state, "ArxivHTMLNode"
+        elif state.get("is_pmc") and cfg.get("NCBI_PMC_ENABLED", True):
+            return state, "NCBIPMCNode"
         else:
             return state, "DirectHTTPNode"
+
 
 
 class DirectHTTPNode(ExtractionNode):
@@ -319,6 +342,56 @@ class ElsevierXMLNode(ExtractionNode):
                 return state, None
                 
         return state, self.fallback_node
+
+
+class ArxivHTMLNode(ExtractionNode):
+    def __init__(self, fallback_node="DirectHTTPNode"):
+        super().__init__("ArxivHTMLNode", fallback_node)
+
+    def execute(self, state):
+        cfg = load_config() if callable(load_config) else {}
+        if not cfg.get("ARXIV_HTML_ENABLED", True):
+            return state, self.fallback_node
+
+        url = state.get("url")
+        doi = state.get("doi")
+        table_idx = state.get("table_idx", "all")
+        arxiv_id = state.get("arxiv_id") or extract_arxiv_id(url or doi)
+        if not arxiv_id:
+            return state, self.fallback_node
+
+        print(f"[ArxivHTMLNode] 尝试直接从 arXiv HTML/ar5iv 提取高保真表格: {arxiv_id}")
+        dfs = extract_tables_via_arxiv_html(arxiv_id, table_idx)
+        if dfs:
+            state["dfs"] = dfs
+            return state, None
+        return state, self.fallback_node
+
+
+class NCBIPMCNode(ExtractionNode):
+    def __init__(self, fallback_node="DirectHTTPNode"):
+        super().__init__("NCBIPMCNode", fallback_node)
+
+    def execute(self, state):
+        cfg = load_config() if callable(load_config) else {}
+        if not cfg.get("NCBI_PMC_ENABLED", True):
+            return state, self.fallback_node
+
+        doi = state.get("doi")
+        url = state.get("url")
+        pmcid = state.get("pmcid") or extract_pmcid(url or doi)
+        table_idx = state.get("table_idx", "all")
+        target = pmcid or doi
+        if not target:
+            return state, self.fallback_node
+
+        print(f"[NCBIPMCNode] 尝试直接从 NCBI PMC 获取 JATS XML 提取高保真表格: {target}")
+        dfs = extract_tables_via_ncbi_pmc(target, table_idx)
+        if dfs:
+            state["dfs"] = dfs
+            return state, None
+        return state, self.fallback_node
+
 
 
 class PlaywrightCNKINode(ExtractionNode):
@@ -807,6 +880,16 @@ def _race_extract(state, cancel_event=None):
 
     # Tier-1: 纯 HTTP / API 渠道并发竞速
     tier1 = []
+    cfg = load_config() if callable(load_config) else {}
+    arxiv_enabled = cfg.get("ARXIV_HTML_ENABLED", True)
+    pmc_enabled = cfg.get("NCBI_PMC_ENABLED", True)
+
+    arxiv_cand = state.get("arxiv_id") or extract_arxiv_id(url or doi)
+    if arxiv_cand and arxiv_enabled:
+        tier1.append(("ArxivHTML", lambda: extract_tables_via_arxiv_html(arxiv_cand, table_idx)))
+    pmc_cand = state.get("pmcid") or extract_pmcid(url or doi)
+    if pmc_enabled and (pmc_cand or doi):
+        tier1.append(("NCBIPMC", lambda: extract_tables_via_ncbi_pmc(pmc_cand or doi, table_idx)))
     if url:
         tier1.append(("DirectHTTP", lambda: extract_tables_via_direct_http(url, table_idx, cancel_event=cancel_event)))
         tier1.append(("ImpersonatedHTTP", _impersonated))
@@ -815,6 +898,7 @@ def _race_extract(state, cancel_event=None):
     if doi:
         tier1.append(("Unpaywall", lambda: extract_tables_via_unpaywall(doi, table_idx, cancel_event=cancel_event)))
     dfs, winner = _race_candidates(tier1, cancel_event)
+
     history.append(f"general-tier1:{winner or 'none'}")
     if dfs:
         return dfs, history
@@ -907,9 +991,12 @@ def extract_tables_online(pdf_path, table_idx="all", db_path=None, api_key=None,
 
     # Add nodes to graph
     graph.add_node("ResolveMetadataNode", ResolveMetadataNode())
+    graph.add_node("ArxivHTMLNode", ArxivHTMLNode(fallback_node="DirectHTTPNode"))
+    graph.add_node("NCBIPMCNode", NCBIPMCNode(fallback_node="DirectHTTPNode"))
     graph.add_node("DirectHTTPNode", DirectHTTPNode(fallback_node="ImpersonatedHTTPNode"))
     graph.add_node("ImpersonatedHTTPNode", ImpersonatedHTTPNode(fallback_node="Crawl4AIGeneralNode"))
     graph.add_node("ElsevierXMLNode", ElsevierXMLNode(fallback_node="Crawl4AIGeneralNode"))
+
 
     graph.add_node("Crawl4AICNKINode", Crawl4AICNKINode(fallback_node="PlaywrightCNKINode"))
     graph.add_node("PlaywrightCNKINode", PlaywrightCNKINode(fallback_node="ScraplingCNKINode"))
@@ -927,8 +1014,13 @@ def extract_tables_online(pdf_path, table_idx="all", db_path=None, api_key=None,
     if pre_resolved and state.get("url"):
         # 跳过元数据解析节点，从已解析状态直接进入对应分支
         # （url 缺失时仍从 ResolveMetadataNode 进入做 URL 解析，节点对已有 doi 幂等）
+        cfg = load_config() if callable(load_config) else {}
         if state.get("is_cnki"):
             graph.set_entry_point("Crawl4AICNKINode")
+        elif state.get("is_arxiv") and cfg.get("ARXIV_HTML_ENABLED", True):
+            graph.set_entry_point("ArxivHTMLNode")
+        elif state.get("is_pmc") and cfg.get("NCBI_PMC_ENABLED", True):
+            graph.set_entry_point("NCBIPMCNode")
         else:
             graph.set_entry_point("DirectHTTPNode")
     else:
