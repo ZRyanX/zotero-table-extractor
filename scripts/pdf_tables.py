@@ -42,6 +42,7 @@ try:
     from .pdf_page_filter import page_may_contain_tables
     from .doclayout_yolo_detector import DocLayoutYoloDetector
     from .excel_export import save_tables_to_excel
+    from .table_postprocess import smart_flatten_headers
 except ImportError:
     try:
         from common import load_config, make_unique_columns
@@ -49,6 +50,7 @@ except ImportError:
         from pdf_page_filter import page_may_contain_tables
         from doclayout_yolo_detector import DocLayoutYoloDetector
         from excel_export import save_tables_to_excel
+        from table_postprocess import smart_flatten_headers
     except ImportError:
         load_config = lambda: {}
         make_unique_columns = lambda cols: [str(c) for c in cols]
@@ -56,6 +58,7 @@ except ImportError:
         page_may_contain_tables = None
         DocLayoutYoloDetector = None
         save_tables_to_excel = None
+        smart_flatten_headers = None
 
 
 def get_page_effective_rotation(page):
@@ -772,21 +775,22 @@ def rebuild_df_with_style_hierarchy(
     if not table_lines:
         return None, caption, " ".join(footnote_parts)
 
-    # 复合多行表头识别：若前 1~2 行全为加粗或括号单位，合并为复合表头
+    # 复合多行表头识别：若前 1~3 行具有加粗、单位或纯分类文本属性，合并为复合多级表头
     header_rows = [table_lines[0]]
     data_start_idx = 1
-    if len(table_lines) >= 3:
-        l0 = table_lines[0]
-        l1 = table_lines[1]
-        b0 = sum(1 for it in l0 if it.is_bold) / len(l0) if l0 else 0
-        b1 = sum(1 for it in l1 if it.is_bold) / len(l1) if l1 else 0
+    for row_idx in range(1, min(4, len(table_lines) - 1)):
+        curr_l = table_lines[row_idx]
+        b_curr = sum(1 for it in curr_l if getattr(it, 'is_bold', False)) / len(curr_l) if curr_l else 0
         is_units = all(
-            re.match(r'^\(.*\)$', it.text.strip()) or it.text.strip() in ('%', 'wt.%', 'MPa', 'g/t', 'm', 'km', '°C')
-            for it in l1 if it.text.strip()
+            re.match(r'^\(.*\)$', it.text.strip()) or it.text.strip() in ('%', 'wt.%', 'wt%', 'MPa', 'g/t', 'm', 'km', '°C', 'ppm', 'ppb', '‰')
+            for it in curr_l if it.text.strip()
         )
-        if (b0 >= 0.4 and b1 >= 0.4) or is_units:
-            header_rows.append(l1)
-            data_start_idx = 2
+        non_num = sum(1 for it in curr_l if len(it.text.strip()) > 0 and not it.text.strip().replace('.', '').replace('-', '').replace(',', '').replace('%', '').replace('+', '').isdigit())
+        if (b_curr >= 0.4) or is_units or (non_num >= len(curr_l) * 0.7 and len(curr_l) <= max(3, len(table_lines[0]) * 1.5)):
+            header_rows.append(curr_l)
+            data_start_idx = row_idx + 1
+        else:
+            break
 
     # 动态自适应列聚类容差：根据表头内部最小非零水平间距确定，杜绝密集多列表格将相邻两列误合并
     all_header_xs = sorted(it.x for h_row in header_rows for it in h_row)
@@ -797,18 +801,14 @@ def rebuild_df_with_style_hierarchy(
     else:
         cluster_tol = 16.0
 
-    # 基于表头项的 x 坐标聚类列边界
-    col_clusters = []
-    for h_row in header_rows:
-        for it in h_row:
+    # 基于表头项的 x 坐标聚类列边界（若存在多层表头，采用 Docling TableFormer 层次恢复与跨列传播）
+    if len(header_rows) >= 2:
+        # 以底层表头作为叶子列边界基准
+        leaf_row = header_rows[-1]
+        col_clusters = []
+        for it in leaf_row:
             matched = False
             for clust in col_clusters:
-                # 检查该 cluster 中是否已存在本行的其他不同 item（防止同行两列误合）
-                same_row_items = [x for x in clust if any(x is item for item in h_row)]
-                if same_row_items:
-                    # 同行中只有紧挨着的连贯词（距离 < 8pt）才允许归入同一列头
-                    if any(abs(it.x - (x.x + getattr(x, 'width', 0))) > 8.0 and abs(it.x - x.x) > 10.0 for x in same_row_items):
-                        continue
                 avg_cx = sum(x.x for x in clust) / len(clust)
                 if abs(it.x - avg_cx) < cluster_tol:
                     clust.append(it)
@@ -816,17 +816,67 @@ def rebuild_df_with_style_hierarchy(
                     break
             if not matched:
                 col_clusters.append([it])
+        
+        col_clusters = sorted(col_clusters, key=lambda cl: sum(x.x for x in cl) / len(cl))
+        col_centers = [sum(it.x for it in cl) / len(cl) for cl in col_clusters]
+        leaf_headers = [" ".join(it.text.strip() for it in sorted(cl, key=lambda it: it.x) if it.text.strip()) for cl in col_clusters]
+        
+        # 针对上层所有父表头，依据水平跨度 (colspan) 分别投影至受辖子列
+        all_flatten_layers = []
+        for p_row_idx in range(len(header_rows) - 1):
+            parent_row = header_rows[p_row_idx]
+            parent_headers = [""] * len(col_clusters)
+            for p_it in parent_row:
+                p_text = p_it.text.strip()
+                if not p_text:
+                    continue
+                p_x = p_it.x
+                p_w = getattr(p_it, 'width', 0)
+                p_x_end = p_x + max(p_w, 20.0)
+                assigned = False
+                for c_i, c_center in enumerate(col_centers):
+                    if p_x - cluster_tol <= c_center <= p_x_end + cluster_tol:
+                        parent_headers[c_i] = (parent_headers[c_i] + " " + p_text).strip() if parent_headers[c_i] else p_text
+                        assigned = True
+                if not assigned:
+                    best_c = min(range(len(col_centers)), key=lambda i: abs(col_centers[i] - p_x))
+                    parent_headers[best_c] = (parent_headers[best_c] + " " + p_text).strip() if parent_headers[best_c] else p_text
+            all_flatten_layers.append(parent_headers)
 
-    if not col_clusters:
-        return None, caption, " ".join(footnote_parts)
+        all_flatten_layers.append(leaf_headers)
+        if smart_flatten_headers is not None:
+            col_headers = smart_flatten_headers(all_flatten_layers)
+        else:
+            col_headers = [f"{p}_{l}".strip('_') if p and l else (p or l or f"Col_{i+1}") for i, (p, l) in enumerate(zip(all_flatten_layers[0], leaf_headers))]
+    else:
+        # 单行表头标准聚类
+        col_clusters = []
+        for h_row in header_rows:
+            for it in h_row:
+                matched = False
+                for clust in col_clusters:
+                    same_row_items = [x for x in clust if any(x is item for item in h_row)]
+                    if same_row_items:
+                        if any(abs(it.x - (x.x + getattr(x, 'width', 0))) > 8.0 and abs(it.x - x.x) > 10.0 for x in same_row_items):
+                            continue
+                    avg_cx = sum(x.x for x in clust) / len(clust)
+                    if abs(it.x - avg_cx) < cluster_tol:
+                        clust.append(it)
+                        matched = True
+                        break
+                if not matched:
+                    col_clusters.append([it])
 
-    col_clusters = sorted(col_clusters, key=lambda cl: sum(x.x for x in cl) / len(cl))
-    col_headers = []
-    col_centers = []
-    for cl in col_clusters:
-        cl_sorted = sorted(cl, key=lambda it: (mb_height - it.y, it.x))
-        col_headers.append(" ".join(it.text.strip() for it in cl_sorted if it.text.strip()))
-        col_centers.append(sum(it.x for it in cl) / len(cl))
+        if not col_clusters:
+            return None, caption, " ".join(footnote_parts)
+
+        col_clusters = sorted(col_clusters, key=lambda cl: sum(x.x for x in cl) / len(cl))
+        col_headers = []
+        col_centers = []
+        for cl in col_clusters:
+            cl_sorted = sorted(cl, key=lambda it: (mb_height - it.y, it.x))
+            col_headers.append(" ".join(it.text.strip() for it in cl_sorted if it.text.strip()))
+            col_centers.append(sum(it.x for it in cl) / len(cl))
 
     col_headers = [c if c else f"Col_{i+1}" for i, c in enumerate(col_headers)]
     col_headers = make_unique_columns(col_headers)

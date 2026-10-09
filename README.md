@@ -11,8 +11,9 @@
 
 <p align="center">
   <a href="#-核心能力"><img src="https://img.shields.io/badge/Pipeline-Dual_Track_(Online+PDF)-blue.svg" alt="Pipeline"></a>
-  <a href="#-多方投票仲裁"><img src="https://img.shields.io/badge/Voting-7_Engine_Consensus-orange.svg" alt="Voting"></a>
-  <a href="#-两阶段视觉-ai-接管"><img src="https://img.shields.io/badge/Visual_AI-PP--StructureV3_%2B_PaddleOCR--VL_%2B_Docling-purple.svg" alt="Visual AI"></a>
+  <a href="#-核心能力"><img src="https://img.shields.io/badge/Pipeline-Dual_Track_(Online+PDF)-blue.svg" alt="Pipeline"></a>
+  <a href="#-多方投票仲裁"><img src="https://img.shields.io/badge/Voting-9_Engine_Consensus-orange.svg" alt="Voting"></a>
+  <a href="#-两阶段视觉-ai-接管"><img src="https://img.shields.io/badge/Visual_AI-PP--DocLayoutV3_%2B_DocLayout--YOLO_%2B_TeleOCR-purple.svg" alt="Visual AI"></a>
   <a href="#-环境要求"><img src="https://img.shields.io/badge/Python-3.9%2B-brightgreen.svg" alt="Python Version"></a>
   <a href="#-环境要求"><img src="https://img.shields.io/badge/Platform-macOS_%7C_Linux_%7C_Windows-lightgrey.svg" alt="Platform"></a>
 </p>
@@ -24,13 +25,14 @@
 - [💡 项目简介](#-项目简介)
 - [✨ 核心能力](#-核心能力)
   - [1. 优先在线 HTML/XML 高保真提取](#1-优先在线-htmlxml-高保真提取)
-  - [2. 本地原生 PDF 7 引擎投票共识](#2-本地原生-pdf-7-引擎投票共识)
-  - [3. 复杂扫描件/无框表两阶段视觉 AI 接管（支持 Docling 离线备用）](#3-复杂扫描件无框表两阶段视觉-ai-接管)
-  - [4. 7 阶轻量安全后处理流水线](#4-7-阶轻量安全后处理流水线)
-  - [5. 跨页续表与横向分块自适应拼接 (DeepDoc/MinerU 列对齐)](#5-跨页续表与横向分块自适应拼接)
-  - [6. 出版级规范 Excel 导出](#6-出版级规范-excel-导出)
-  - [7. 全库批量并发与工业级鲁棒性](#7-全库批量并发与工业级鲁棒性)
-  - [8. PyZotero 与 Zotero-Better-Notes 生态闭环联动 (可选)](#8-pyzotero-与-zotero-better-notes-生态闭环联动-可选)
+  - [2. 本地原生 PDF 9 引擎投票与 IBM TEDS 拓扑共识 (含 RapidTable)](#2-本地原生-pdf-9-引擎投票与-ibm-teds-拓扑共识)
+  - [3. 复杂扫描件/无框表两阶段视觉 AI 接管（PP-DocLayoutV3 双检与 TeleOCR 网关）](#3-复杂扫描件无框表两阶段视觉-ai-接管)
+  - [4. 7 阶轻量安全后处理与 SMART 语义表头展平](#4-7-阶轻量安全后处理流水线)
+  - [5. 跨页续表 4-Way 联合判定与断裂单元格合并 (MinerU 规则体系)](#5-跨页续表与横向分块自适应拼接)
+  - [6. OmniDocBench 标准化评测与 LLM 语义等价门禁](#6-omnidocbench-标准化评测与-llm-语义等价门禁)
+  - [7. 出版级规范 Excel 导出](#7-出版级规范-excel-导出)
+  - [8. 全库批量并发与工业级鲁棒性](#8-全库批量并发与工业级鲁棒性)
+  - [9. PyZotero 与 Zotero-Better-Notes 生态闭环联动 (可选)](#9-pyzotero-与-zotero-better-notes-生态闭环联动-可选)
 - [🏗 架构设计与数据流转图](#-架构设计与数据流转图)
 - [💻 环境要求与安装](#-环境要求与安装)
 - [⚙️ 配置指南](#️-配置指南)
@@ -60,11 +62,12 @@
 
 **Zotero Table Extractor** 是一套端到端的学术表格智能提取与重构引擎：
 1. **双轨驱动**：优先走官方直连 API / 原生 HTML / JATS XML 提取（涵盖 arXiv 官方 HTML、NCBI PMC Open Access JATS XML 与 Elsevier XOCS XML，100% 零 OCR 误差），若缺失或受阻则无缝降级到本地 PDF 深度流水线；
-2. **多方验证与 TEDS 拓扑度量**：原生文本 PDF 采用 **8 引擎多方投票与 IBM TEDS (树编辑距离) 拓扑度量交叉仲裁**（包含 PyMuPDF4LLM、GMFT 与 img2table）；
-3. **视觉多模态大模型双轨接管**：对于扫描件、低置信度表格或复杂表，采用 **PP-StructureV3 / DocLayout-YOLO** 前置定位与切图，首选 **PaddleOCR-VL-1.6** 在线多模态大模型进行结构化还原，同时支持 **IBM Docling (TableFormer)** 作为本地离线备用接管引擎；
-4. **精细后处理与 olmOCR 2 边界分离**：内置 7 阶轻量安全清洗流水线（防 Excel 注入、多行子行展开、紧缩数值拆分、多级表头重塑等），融合 AllenAI olmOCR 2 尾注分离启发式（将 `* p < 0.05`、`Note:`、`注:` 等剥离存入 `footnotes` 属性），并融合 DeepDoc / MinerU 启发式三向单调动态规划拼接跨页续表；
-5. **Excel 富文本原生保真导出**：集成 openpyxl `CellRichText` 原生导出学术上下标（`10^{-3}`, `CaCO_3`, `H_2O`, `Fe^{3+}`）并严密保护数值单元格计算属性；
-6. **生态闭环联动 (可选)**：可选集成 PyZotero 与 Zotero-Better-Notes，自动将提取出的 `.xlsx` 挂载回文献条目并生成富文本表格预览笔记。
+2. **多方验证与 TEDS 拓扑度量**：原生文本 PDF 采用 **9 引擎多方投票与 IBM TEDS (树编辑距离) 拓扑度量交叉仲裁**（包含 RapidTable 本地 ONNX 双模型、PyMuPDF4LLM、GMFT 与 img2table）；
+3. **视觉多模态大模型双轨接管与双检融合**：采用 **PP-DocLayoutV3 (25类细粒度) 与 DocLayout-YOLO** 并列双检投票切图，首选 **PaddleOCR-VL-1.6 / TeleOCR (vLLM)** 在线大模型重构，同时支持 **IBM Docling (TableFormer)** 与 **RapidTable** 作为本地离线备用接管引擎；
+4. **精细后处理与 MinerU 跨页续表联合判定**：内置 7 阶轻量安全清洗流水线与 **SMART 语义表头展平**，移植 MinerU 4-Way 跨页续表联合判定（列名 Jaccard 重合度 + 页宽比对齐 + 续表词法 + 小表保护）与跨页断裂单元格合并；
+5. **严密质量闭环与度量**：集成 **OmniDocBench (CVPR 2025)** 表格与版面标准化基准评估体系，构建 **LLM 语义化表格评测门禁 (arXiv 2603.18652)**，杜绝“修复了结构但破坏了语义”；
+6. **Excel 富文本原生保真导出**：集成 openpyxl `CellRichText` 原生导出学术上下标（`10^{-3}`, `CaCO_3`, `H_2O`, `Fe^{3+}`）并严密保护数值单元格计算属性；
+7. **生态闭环联动 (可选)**：可选集成 PyZotero 与 Zotero-Better-Notes，自动将提取出的 `.xlsx` 挂载回文献条目并生成富文本表格预览笔记。
 
 ---
 

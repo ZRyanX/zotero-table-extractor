@@ -76,6 +76,15 @@ try:
 except ImportError:
     import ocr_client
 
+try:
+    from .rapid_table_extractor import extract_via_rapid_table, is_rapid_table_available
+except ImportError:
+    try:
+        from rapid_table_extractor import extract_via_rapid_table, is_rapid_table_available
+    except ImportError:
+        extract_via_rapid_table = lambda *args, **kwargs: []
+        is_rapid_table_available = lambda: False
+
 logger = logging.getLogger(__name__)
 
 
@@ -1607,12 +1616,13 @@ def three_way_vote(
     gmft_tables: Optional[List[Dict[str, Any]]] = None,
     img2table_tables: Optional[List[Dict[str, Any]]] = None,
     pymupdf4llm_tables: Optional[List[Dict[str, Any]]] = None,
+    rapid_table_tables: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[str], Dict[str, Any]]:
     """
-    多方投票融合: pdf-inspector-structure + pdf-inspector + pymupdf4llm + gmft + find_tables + img2table + text_alignment + pdfplumber + Camelot。
+    多方投票融合: pdf-inspector-structure + pdf-inspector + pymupdf4llm + gmft + rapid_table + find_tables + img2table + text_alignment + pdfplumber + Camelot。
 
     规则:
-    - 任意两个一致 (相似度 >= similarity_threshold，默认 0.75) → 取一致的版本（优先 pdf_inspector_structure > pdf-inspector > pymupdf4llm > gmft > find_tables > img2table > text_alignment > pdfplumber > Camelot）
+    - 任意两个一致 (相似度 >= similarity_threshold，默认 0.75) → 取一致的版本（优先 pdf_inspector_structure > pdf-inspector > pymupdf4llm > gmft > rapid_table > find_tables > img2table > text_alignment > pdfplumber > Camelot）
     - 质量检查：若选中的候选表存在列挤压，自动降级切换至无挤压的候选表
     - 多方均不一致 → 取优先级最高的结果（若有出版商语义结构树表格 pdf_inspector_structure，绝对优先保障矢量保真度）
     - 仅一方有结果 → 取该方结果
@@ -1634,6 +1644,7 @@ def three_way_vote(
         'pdf_inspector': inspector_tables,
         'pymupdf4llm': pymupdf4llm_tables or [],
         'gmft': gmft_tables or [],
+        'rapid_table': rapid_table_tables or [],
         'find_tables': find_tables_results,
         'img2table': img2table_tables or [],
         'text_alignment': align_tables or [],
@@ -1647,8 +1658,8 @@ def three_way_vote(
         for t in src_tables:
             all_pages.add(t.get('page_idx', 0))
 
-    # 优先级排序：结构树绝对优先，pdf_inspector 与 pymupdf4llm/gmft 语义紧随其后，find_tables 与 img2table 矢量形态紧随其后
-    priority = ['pdf_inspector_structure', 'pdf_inspector', 'pymupdf4llm', 'gmft', 'find_tables', 'img2table', 'text_alignment', 'pdfplumber', 'camelot']
+    # 优先级排序：结构树绝对优先，pdf_inspector 与 pymupdf4llm/gmft 语义紧随其后，rapid_table 结构紧随其后，find_tables 与 img2table 矢量形态紧随其后
+    priority = ['pdf_inspector_structure', 'pdf_inspector', 'pymupdf4llm', 'gmft', 'rapid_table', 'find_tables', 'img2table', 'text_alignment', 'pdfplumber', 'camelot']
 
     for page in sorted(all_pages):
         page_tables = {}
@@ -1831,6 +1842,46 @@ def extract_via_ocr(pdf_path: str, pages: Optional[List[int]] = None) -> List[Di
                     results.extend(docling_results)
         except Exception as e_docling:
             logger.debug(f"Docling offline fallback error: {e_docling}")
+
+    # 3. OCR-Hub 多引擎注册表动态调度 (TeleOCR / MinerU / RapidTable)
+    if not results:
+        try:
+            try:
+                from . import ocr_client
+            except ImportError:
+                import ocr_client
+            registry = ocr_client.get_ocr_registry()
+            for backend_name in ["teleocr", "mineru", "rapid_table"]:
+                b = registry.get_backend(backend_name)
+                if b and b.probe_health().get("status") == "healthy":
+                    res_out = b.extract(pdf_path, pages=pages)
+                    if isinstance(res_out, str) and res_out.strip():
+                        try:
+                            from .table_postprocess import parse_structured_vlm_content
+                        except ImportError:
+                            from table_postprocess import parse_structured_vlm_content
+                        dfs = parse_structured_vlm_content(res_out)
+                        for i, df in enumerate(dfs):
+                            if df is not None and not df.empty:
+                                df.attrs['extractor'] = backend_name
+                                p_idx = pages[i] if (pages and i < len(pages)) else (pages[0] if pages else 0)
+                                df.attrs['page_idx'] = p_idx
+                                results.append({
+                                    'df': df,
+                                    'page_idx': p_idx,
+                                    'table_idx': i,
+                                    'bbox': None,
+                                    'extractor': backend_name,
+                                })
+                        if results:
+                            print(f"[OCR] OCR-Hub 动态调度成功: {backend_name} 提取到 {len(results)} 个表格")
+                            break
+                    elif isinstance(res_out, list) and res_out:
+                        results.extend(res_out)
+                        print(f"[OCR] OCR-Hub 动态调度成功: {backend_name} 提取到 {len(res_out)} 个表格")
+                        break
+        except Exception as e_hub:
+            logger.debug(f"[OCR-Hub] 动态调度异常: {e_hub}")
 
     # 3. 表格切图回退 (PP-StructureV3 / DocLayout-YOLO)
     if not results:
@@ -3399,6 +3450,9 @@ def _do_extract_tables_from_pdf(
         pymupdf4llm_results = extract_via_pymupdf4llm(pdf_path, pages=native_target_pages)
         if pymupdf4llm_results:
             logs.append(f"  PyMuPDF4LLM 提取到 {len(pymupdf4llm_results)} 个表格 (LLM-ready Markdown)")
+        rapid_table_results = extract_via_rapid_table(pdf_path, pages=native_target_pages) if is_rapid_table_available() else []
+        if rapid_table_results:
+            logs.append(f"  RapidTable 提取到 {len(rapid_table_results)} 个表格 (ONNX 结构识别)")
         align_results = extract_via_text_alignment(pdf_path, pages=native_target_pages)
 
         # 多方投票融合
@@ -3410,6 +3464,7 @@ def _do_extract_tables_from_pdf(
             gmft_tables=gmft_results,
             img2table_tables=img2table_results,
             pymupdf4llm_tables=pymupdf4llm_results,
+            rapid_table_tables=rapid_table_results,
         )
 
         logs.extend(vote_logs)
@@ -3436,9 +3491,23 @@ def _do_extract_tables_from_pdf(
         # 若检验发现任何问题、缺陷或低置信度页面，优先通过 DocLayout-YOLO 目标切图送入 PaddleOCR-VL 独立接管提取
         if pages_requiring_ocr and use_ocr_fallback:
             ocr_candidate_pages = sorted(list(pages_requiring_ocr))
-            logs.append(f"→ Step 3b: 检验未通过/待精细识别页面 {[p+1 for p in ocr_candidate_pages]} 优先通过 DocLayout-YOLO 切图送入 PaddleOCR-VL-1.6 独立接管提取")
-            
-            ocr_results = extract_via_paddleocr_crops(pdf_path, ocr_candidate_pages)
+            logs.append(f"→ Step 3b: 检验未通过/待精细识别页面 {[p+1 for p in ocr_candidate_pages]} 启动接管修复")
+
+            ocr_results = []
+            # 本地先试一把中间层：优先尝试 RapidTable ONNX 结构识别快速挽救
+            if is_rapid_table_available():
+                try:
+                    rapid_res = extract_via_rapid_table(pdf_path, pages=ocr_candidate_pages)
+                    if rapid_res and any(not is_table_low_quality(r['df']) for r in rapid_res):
+                        logs.append(f"  RapidTable 本地中间层试跑成功提取到 {len(rapid_res)} 个表格 (免调用在线 VLM)")
+                        ocr_results = rapid_res
+                except Exception as e_rr:
+                    logger.debug(f"[RapidTable] 本地中间层接管试跑跳过: {e_rr}")
+
+            if not ocr_results:
+                logs.append(f"  优先通过 DocLayout-YOLO 切图送入 PaddleOCR-VL-1.6 独立接管提取")
+                ocr_results = extract_via_paddleocr_crops(pdf_path, ocr_candidate_pages)
+
             if not ocr_results:
                 try:
                     import ocr_client
@@ -3537,6 +3606,175 @@ def _do_extract_tables_from_pdf(
 # 5b. 文本对齐提取（无线框表格）
 # ===========================================================================
 
+def pdf_extract_kit_align_tokens(
+    data_lines: List[List[Any]],
+    header_rows: Optional[List[List[Any]]] = None,
+    mb_height: float = 800.0,
+    body_start_idx: int = 1
+) -> Optional[pd.DataFrame]:
+    """
+    OpenDataLab / PDF-Extract-Kit 启发式无边框表格对齐算法。
+    
+    核心机制:
+    1. 行起始 x 坐标分布 (Row Start X Distribution): 分析左边距基线与缩进，识别首列换行与层级缩进;
+    2. 基于字号/加粗特征加权与自适应 1D 边界聚类 (Weighted 1D K-Means Clustering);
+    3. 全局列边界区间 [col_start, col_end] 与语义一致性校验 (Semantic Consistency Verification)。
+    """
+    if not data_lines or len(data_lines) < 2:
+        return None
+
+    if header_rows is None:
+        header_rows = [data_lines[0]]
+
+    # 1. 行起始 x 坐标分布 (Row Start X Distribution)
+    row_start_xs = [line[0].x for line in data_lines if line]
+    base_margin_x = min(row_start_xs) if row_start_xs else 0.0
+
+    # 2. 收集全表 tokens，应用字号与加粗特征加权 (Weighting Tokens)
+    token_weights: List[Tuple[float, float, Any]] = []
+    for r_idx, line in enumerate(data_lines):
+        is_header = r_idx < body_start_idx
+        for it in line:
+            w = 1.0
+            if is_header:
+                w += 1.5
+            if getattr(it, 'is_bold', False):
+                w += 1.0
+            if getattr(it, 'font_size', 0.0) > 10.5:
+                w += 0.5
+            token_weights.append((it.x, w, it))
+
+    if not token_weights:
+        return None
+
+    # 3. 估计列数 K 与自适应 1D 加权 K-Means 聚类
+    header_xs = sorted(it.x for h_row in header_rows for it in h_row)
+    max_row_len = max(len(l) for l in data_lines)
+    k_cand = max(len(header_xs), max_row_len)
+    k = max(2, min(k_cand, 25))
+
+    # 初始化质心
+    if len(header_xs) >= 2:
+        init_centers = list(dict.fromkeys([round(x, 1) for x in header_xs]))
+        if len(init_centers) < k:
+            all_xs = sorted(t[0] for t in token_weights)
+            step = len(all_xs) / k
+            init_centers = [all_xs[int(i * step)] for i in range(k)]
+    else:
+        all_xs = sorted(t[0] for t in token_weights)
+        step = len(all_xs) / k
+        init_centers = [all_xs[int(i * step)] for i in range(k)]
+
+    init_centers = sorted(list(set(init_centers)))
+    if len(init_centers) < 2:
+        init_centers = [min(t[0] for t in token_weights), max(t[0] for t in token_weights)]
+
+    centroids = list(init_centers)
+    # 迭代优化 1D 加权 K-Means (最多 12 轮)
+    for _ in range(12):
+        clusters: Dict[int, List[Tuple[float, float, Any]]] = {i: [] for i in range(len(centroids))}
+        for tw in token_weights:
+            x_val = tw[0]
+            closest_idx = min(range(len(centroids)), key=lambda i: abs(centroids[i] - x_val))
+            clusters[closest_idx].append(tw)
+
+        new_centroids = []
+        for i, c_x in enumerate(centroids):
+            items_in_c = clusters[i]
+            if items_in_c:
+                weighted_sum = sum(x * w for x, w, _ in items_in_c)
+                total_w = sum(w for _, w, _ in items_in_c)
+                new_c = weighted_sum / max(1e-6, total_w)
+                new_centroids.append(new_c)
+            else:
+                new_centroids.append(c_x)
+
+        new_centroids.sort()
+        # 消除过近的合并质心
+        merged_centroids = []
+        for c in new_centroids:
+            if not merged_centroids or (c - merged_centroids[-1]) >= 8.0:
+                merged_centroids.append(c)
+        if len(merged_centroids) >= 2 and abs(sum(merged_centroids) - sum(centroids)) < 1.0:
+            centroids = merged_centroids
+            break
+        centroids = merged_centroids if len(merged_centroids) >= 2 else centroids
+
+    centroids.sort()
+    # 4. 构建列边界区间 [left_bound, right_bound]
+    col_bounds = []
+    for i, c in enumerate(centroids):
+        left_bound = (centroids[i-1] + c) / 2.0 if i > 0 else (c - 16.0)
+        right_bound = (c + centroids[i+1]) / 2.0 if i + 1 < len(centroids) else (c + 30.0)
+        col_bounds.append((left_bound, right_bound))
+
+    # 提取表头
+    col_headers = [""] * len(centroids)
+    for h_row in header_rows:
+        for it in h_row:
+            matched_ci = -1
+            for ci, (lb, rb) in enumerate(col_bounds):
+                if lb <= it.x < rb:
+                    matched_ci = ci
+                    break
+            if matched_ci == -1:
+                matched_ci = min(range(len(centroids)), key=lambda i: abs(centroids[i] - it.x))
+            col_headers[matched_ci] = (col_headers[matched_ci] + " " + it.text.strip()).strip()
+
+    col_names = [c if c else f"Col_{i+1}" for i, c in enumerate(col_headers)]
+    col_names = make_unique_columns(col_names)
+
+    # 5. 数据行投影与缩进换行关联
+    table_rows: List[List[str]] = []
+    for l in data_lines[body_start_idx:]:
+        row_cells = [""] * len(col_names)
+        for it in l:
+            matched_col = -1
+            for ci, (lb, rb) in enumerate(col_bounds):
+                if lb <= it.x < rb:
+                    matched_col = ci
+                    break
+            if matched_col == -1:
+                matched_col = min(range(len(centroids)), key=lambda i: abs(centroids[i] - it.x))
+
+            if row_cells[matched_col]:
+                row_cells[matched_col] += " " + it.text.strip()
+            else:
+                row_cells[matched_col] = it.text.strip()
+
+        # 检查是否为前一行的缩进子项/换行续接
+        non_empty = [c for c in row_cells if c]
+        if len(non_empty) == 1 and table_rows and l[0].x > base_margin_x + 10.0:
+            # 缩进换行，并入上一行首列
+            table_rows[-1][0] = (table_rows[-1][0] + " " + non_empty[0]).strip()
+        elif any(c for c in row_cells):
+            table_rows.append(row_cells)
+
+    if not table_rows:
+        return None
+
+    # 6. 语义一致性校验 (Semantic Consistency Verification)
+    df = pd.DataFrame(table_rows, columns=col_names)
+    # 清洗全空列
+    non_empty_cols = [c for c in df.columns if any(str(val).strip() for val in df[c])]
+    if non_empty_cols:
+        df = df[non_empty_cols]
+
+    # 列数值一致性探测
+    for col in df.columns:
+        vals = [str(x).strip() for x in df[col] if str(x).strip()]
+        if not vals:
+            continue
+        num_count = sum(1 for v in vals if v.replace('.', '').replace('-', '').replace('%', '').replace('+', '').isdigit())
+        num_ratio = num_count / len(vals)
+        if num_ratio >= 0.70:
+            # 标记为高置信度数值列
+            df[col].attrs = {"data_type": "numeric", "numeric_ratio": round(num_ratio, 2)}
+
+    df.attrs['alignment_engine'] = 'pdf_extract_kit'
+    return df
+
+
 def _align_table_with_positions(
     pdf_path: str,
     page_idx: int,
@@ -3549,7 +3787,7 @@ def _align_table_with_positions(
     基于 pdf_inspector.extract_text_with_positions 的样式感知对齐提取：
     - 精确利用字号识别与剔除底部小字号附注/Footnote (font_size < data_font_size)
     - 结合 is_bold 样式感知合并多行复合表头
-    - 基于物理坐标区间投影聚类分列
+    - 采用 OpenDataLab / PDF-Extract-Kit 启发式列边界与行起始分布对齐
     """
     if pd is None:
         return None
@@ -3665,7 +3903,12 @@ def _align_table_with_positions(
             header_rows.append(l1)
             body_start_idx = 2
 
-    # 列边界聚类 (基于表头水平区间与 x 坐标聚类)
+    # 优先使用 OpenDataLab / PDF-Extract-Kit 启发式列边界与行分布对齐
+    df_aligned = pdf_extract_kit_align_tokens(data_lines, header_rows, mb_height, body_start_idx)
+    if df_aligned is not None and not df_aligned.empty:
+        return df_aligned
+
+    # 降级回退标准聚类
     col_clusters = []
     for h_row in header_rows:
         for it in h_row:

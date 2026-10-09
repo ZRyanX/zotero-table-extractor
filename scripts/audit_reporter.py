@@ -103,6 +103,17 @@ def generate_report():
     lines.append(f"| **捕获需关注/异常文献** | **{anomaly_papers} 篇** | {100-pass_rate:.1f}% |")
     lines.append(f"| **检测到文献内真实声明表格** | **{total_declared_tables} 个** | 原文声明基准 |")
     lines.append(f"| **最终成功导出独立 Excel 表** | **{total_extracted_tables} 个** | 结构化交付物 |")
+    
+    try:
+        from .omnidocbench import compute_omission_recall
+    except ImportError:
+        try:
+            from omnidocbench import compute_omission_recall
+        except ImportError:
+            compute_omission_recall = None
+    if compute_omission_recall:
+        r_info = compute_omission_recall(total_declared_tables, total_extracted_tables)
+        lines.append(f"| **OmniDocBench 端到端表格召回率** | **{r_info['recall']*100:.2f}%** | 漏检率: {r_info['omission_rate']*100:.2f}% |")
     lines.append("\n### 文献类型分布\n")
     lines.append("| 文献排版类型 | 篇数 | 特征挑战 |")
     lines.append("| :--- | :--- | :--- |")

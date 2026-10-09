@@ -1247,3 +1247,285 @@ def call_docling_table_extractor(
         md_blocks.append(block)
 
     return "\n\n".join(md_blocks)
+
+
+# ===========================================================================
+# OCR-Hub 多引擎聚合网关与可插拔后端注册表 (Backend Registry)
+# ===========================================================================
+
+class OCRBackend:
+    """抽象 OCR 提取后端基类。"""
+    name: str = "base"
+
+    def get_capabilities(self) -> Dict[str, bool]:
+        return {
+            "tables": True,
+            "formulas": False,
+            "autorotate": False,
+            "crops": False,
+        }
+
+    def probe_health(self) -> Dict[str, Any]:
+        return {"status": "healthy", "latency_ms": 0.0, "message": "OK"}
+
+    def extract(self, file_path: str, **kwargs) -> Any:
+        raise NotImplementedError
+
+
+class PaddleOCRVLBackend(OCRBackend):
+    name = "paddleocr_vl"
+
+    def get_capabilities(self) -> Dict[str, bool]:
+        return {"tables": True, "formulas": True, "autorotate": True, "crops": True}
+
+    def probe_health(self) -> Dict[str, Any]:
+        token = os.getenv("PADDLEOCR_MCP_AISTUDIO_ACCESS_TOKEN", "")
+        if not token:
+            try:
+                cfg = load_config()
+                token = cfg.get("PADDLEOCR_MCP_AISTUDIO_ACCESS_TOKEN", "")
+            except Exception:
+                pass
+        healthy = bool(token)
+        return {
+            "status": "healthy" if healthy else "unauthenticated",
+            "message": "Token configured" if healthy else "Missing AIStudio token"
+        }
+
+    def extract(self, file_path: str, **kwargs) -> str:
+        return call_paddleocr_vl_online_api(file_path, **kwargs)
+
+
+class MinerUBackend(OCRBackend):
+    name = "mineru"
+
+    def get_capabilities(self) -> Dict[str, bool]:
+        return {
+            "tables": True,
+            "formulas": True,
+            "autorotate": True,
+            "crops": False,
+            "dense_tables": True,
+            "wireless_tables": True,
+        }
+
+    def probe_health(self) -> Dict[str, Any]:
+        try:
+            cfg = load_config()
+            key = os.getenv("MINERU_API_KEY", "") or cfg.get("MINERU_API_KEY", "")
+        except Exception:
+            key = os.getenv("MINERU_API_KEY", "")
+        healthy = bool(key)
+        return {
+            "status": "healthy" if healthy else "unauthenticated",
+            "message": "API key configured" if healthy else "Missing MINERU_API_KEY"
+        }
+
+    def extract(self, file_path: str, **kwargs) -> str:
+        return call_mineru_api(file_path, **kwargs)
+
+
+class TeleOCRClient:
+    """TeleOCR (vLLM / OpenAI-compatible Vision API) 客户端。"""
+
+    def __init__(self, api_base: str = "", model: str = "TeleOCR", api_key: str = ""):
+        try:
+            cfg = load_config()
+        except Exception:
+            cfg = {}
+        self.api_base = (api_base or os.getenv("TELEOCR_API_BASE", "") or cfg.get("TELEOCR_API_BASE", "")).rstrip("/")
+        self.model = model or os.getenv("TELEOCR_MODEL", "") or cfg.get("TELEOCR_MODEL", "TeleOCR")
+        self.api_key = api_key or os.getenv("TELEOCR_API_KEY", "") or cfg.get("TELEOCR_API_KEY", "")
+
+    def is_available(self) -> bool:
+        return bool(self.api_base)
+
+    def extract_from_image(self, img_bytes: bytes) -> str:
+        if not self.is_available() or not img_bytes:
+            return ""
+        import base64
+        b64 = base64.b64encode(img_bytes).decode("utf-8")
+        url = f"{self.api_base}/chat/completions"
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        payload = {
+            "model": self.model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Extract all tables from this image as Markdown tables."},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}
+                    ]
+                }
+            ],
+            "temperature": 0.0,
+        }
+        try:
+            resp = requests.post(url, json=payload, headers=headers, timeout=60)
+            if resp.status_code == 200:
+                data = resp.json()
+                return data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        except Exception as e:
+            logger.debug(f"[TeleOCR] 请求异常: {e}")
+        return ""
+
+
+class TeleOCRBackend(OCRBackend):
+    name = "teleocr"
+
+    def __init__(self):
+        self.client = TeleOCRClient()
+
+    def get_capabilities(self) -> Dict[str, bool]:
+        return {"tables": True, "formulas": False, "autorotate": True, "crops": True}
+
+    def probe_health(self) -> Dict[str, Any]:
+        healthy = self.client.is_available()
+        return {
+            "status": "healthy" if healthy else "offline",
+            "message": "Endpoint configured" if healthy else "TELEOCR_API_BASE not set"
+        }
+
+    def extract(self, file_path: str, **kwargs) -> str:
+        if not self.client.is_available() or not os.path.exists(file_path):
+            return ""
+        low = file_path.lower()
+        if low.endswith((".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".webp")):
+            try:
+                with open(file_path, "rb") as f:
+                    return self.client.extract_from_image(f.read())
+            except Exception as e:
+                logger.debug(f"[TeleOCR] 图像提取异常: {e}")
+                return ""
+        if low.endswith(".pdf") and fitz is not None:
+            pages = kwargs.get("pages")
+            cancel_event = kwargs.get("cancel_event")
+            try:
+                doc = fitz.open(file_path)
+                target_pages = pages if pages is not None else range(len(doc))
+                md_blocks = []
+                for p_idx in target_pages:
+                    if cancel_event is not None and cancel_event.is_set():
+                        break
+                    if 0 <= p_idx < len(doc):
+                        pix = doc[p_idx].get_pixmap(dpi=200)
+                        img_bytes = pix.tobytes("png")
+                        page_md = self.client.extract_from_image(img_bytes)
+                        if page_md:
+                            md_blocks.append(f"### Page {p_idx+1}\n\n{page_md}")
+                doc.close()
+                return "\n\n".join(md_blocks)
+            except Exception as e_pdf:
+                logger.debug(f"[TeleOCR] PDF 提取异常: {e_pdf}")
+                return ""
+        return ""
+
+
+class DoclingBackend(OCRBackend):
+    name = "docling"
+
+    def get_capabilities(self) -> Dict[str, bool]:
+        return {"tables": True, "formulas": False, "autorotate": False, "crops": False}
+
+    def probe_health(self) -> Dict[str, Any]:
+        avail = is_docling_available()
+        return {
+            "status": "healthy" if avail else "uninstalled",
+            "message": "docling installed" if avail else "docling library not installed"
+        }
+
+    def extract(self, file_path: str, **kwargs) -> str:
+        return call_docling_table_extractor(file_path, **kwargs)
+
+
+class RapidTableBackend(OCRBackend):
+    name = "rapid_table"
+
+    def get_capabilities(self) -> Dict[str, bool]:
+        return {"tables": True, "formulas": False, "autorotate": False, "crops": True, "offline": True}
+
+    def probe_health(self) -> Dict[str, Any]:
+        try:
+            from .rapid_table_extractor import is_rapid_table_available
+        except ImportError:
+            try:
+                from rapid_table_extractor import is_rapid_table_available
+            except ImportError:
+                is_rapid_table_available = lambda: False
+        avail = is_rapid_table_available()
+        return {
+            "status": "healthy" if avail else "uninstalled",
+            "message": "rapid_table available" if avail else "rapid_table not installed"
+        }
+
+    def extract(self, file_path: str, **kwargs) -> Any:
+        try:
+            from .rapid_table_extractor import extract_via_rapid_table
+        except ImportError:
+            try:
+                from rapid_table_extractor import extract_via_rapid_table
+            except ImportError:
+                extract_via_rapid_table = lambda *args, **kwargs: []
+        return extract_via_rapid_table(file_path, **kwargs)
+
+
+class OCRBackendRegistry:
+    """OCR-Hub 引擎聚合注册表与能力探测总控。"""
+
+    def __init__(self):
+        self.backends: Dict[str, OCRBackend] = {
+            "paddleocr_vl": PaddleOCRVLBackend(),
+            "mineru": MinerUBackend(),
+            "teleocr": TeleOCRBackend(),
+            "docling": DoclingBackend(),
+            "rapid_table": RapidTableBackend(),
+        }
+
+    def register(self, backend: OCRBackend):
+        self.backends[backend.name] = backend
+
+    def get_backend(self, name: str) -> Optional[OCRBackend]:
+        return self.backends.get(name)
+
+    def get_capabilities(self, name: Optional[str] = None) -> Dict[str, Any]:
+        """动态发现并返回 capabilities 清单。"""
+        if name:
+            b = self.backends.get(name)
+            return b.get_capabilities() if b else {}
+        return {k: v.get_capabilities() for k, v in self.backends.items()}
+
+    def probe_health(self, name: Optional[str] = None) -> Dict[str, Any]:
+        """对各引擎执行健康探测。"""
+        if name:
+            b = self.backends.get(name)
+            return b.probe_health() if b else {"status": "unknown"}
+        return {k: v.probe_health() for k, v in self.backends.items()}
+
+    def dispatch(self, capability: str = "tables", prefer: Optional[str] = None) -> Optional[OCRBackend]:
+        """根据需求能力动态调度可用且健康的最佳后端。"""
+        if prefer and prefer in self.backends:
+            b = self.backends[prefer]
+            h = b.probe_health()
+            if h.get("status") == "healthy" and b.get_capabilities().get(capability, False):
+                return b
+
+        for name, b in self.backends.items():
+            if b.get_capabilities().get(capability, False):
+                h = b.probe_health()
+                if h.get("status") == "healthy":
+                    return b
+
+        return None
+
+
+# 全局注册表单例
+_ocr_registry = None
+
+def get_ocr_registry() -> OCRBackendRegistry:
+    global _ocr_registry
+    if _ocr_registry is None:
+        _ocr_registry = OCRBackendRegistry()
+    return _ocr_registry
+

@@ -75,11 +75,18 @@ description: 从 Zotero 选中条目（依赖 ai4paper-zotero MCP 获取物理�
 | `Camelot` | 基于 OpenCV 的晶格 (lattice) 与流式 (stream) 结构化表格提取 |
 | `pdfplumber` | 基于字符精细包围盒与视觉线条的表格抽取，参与多方交叉验证 |
 | `PaddleOCR-VL-1.6` / `PP-StructureV3` | 在线多模态大模型与版面切图 API，复杂/跨行跨列与扫描页结构化多模态解析（首选在线主引擎） |
-| [`IBM Docling (TableFormer)`](https://github.com/DS4SD/docling) | IBM 开源高保真表格结构模型，作为离线/无网络/Token耗尽时的多云本地容灾备用引擎 |
-| `DocLayout-YOLO` | 本地 ONNX 版面检测（~15ms 本地超快切图定位，零 Token 消耗） |
+| [`IBM Docling (TableFormer)`](https://github.com/DS4SD/docling) | IBM 开源高保真表格结构模型，输出完整 DOM 树，恢复父子层级与跨列分组，兼作离线容灾备用 |
+| [`RapidAI RapidTable`](https://github.com/RapidAI/TableStructureRec) | 有线/无线双模型串联（UNet+SLANet-Plus 与 UniTable），全 ONNX 轻量 CPU 毫秒级多方投票参选方 |
+| [`PDF-Extract-Kit 无框表对齐`](https://github.com/opendatalab/PDF-Extract-Kit) | 行起始 x 分布 + K-Means 列边界自适应聚类 + 字号/加粗样式加权与语义一致性校验 |
+| [`PP-DocLayoutV3`](https://github.com/PaddlePaddle/PaddleOCR) | PaddleOCR 第三代版面检测模型，25 类细粒度（含 table_title/table_footnote/number）+ 多边形贴合防截断 |
+| `DocLayout-YOLO` | 本地 ONNX 版面检测（~15ms 本地超快切图定位，支持与 PP-DocLayoutV3 双检融合） |
 | `olmOCR 2 边界与尾注分离` | 学术表格边界与注释行智能剥离算法，将 `* p < 0.05` / `Note:` 等抽离存入 `footnotes` 属性 |
 | `openpyxl CellRichText` | 原生 Excel 单元格富文本渲染，高保真呈现 `10^{-3}`、`CaCO_3`、`H_2O` 等学术上下标，保持数值计算兼容 |
-| `DeepDoc / MinerU 跨页续表投影` | 动态规划单调对齐与列特征分布投影，高保真拼接跨页长表与剥离重复表头 |
+| `MinerU 4-Way 跨页续表联合判定` | 列名 Jaccard + 页宽比 + 表头一致性 + (续)标记命中，搭配小表独立保护与列宽比对校正错位 |
+| [`OmniDocBench (CVPR 2025)`](https://github.com/opendatalab/OmniDocBench) | 标准化表格 TEDS、表格检测 mAP 与端到端召回率评测基准，支持学术/教材/财报类型细分 |
+| `LLM 语义化表格评测 (arXiv 2603.18652)` | 单元格数值完整性、表头语义一致性与元组关联性判分，用于大模型修复验收与语义等价判定 |
+| `OCR-Hub 后端注册表与多云容灾` | 可插拔统一后端（PaddleOCR-VL / MinerU 2.5 / TeleOCR / Docling / RapidTable），动态能力发现与健康探测 |
+| `SMART 语义表头展平` | 伪代码推理与层级路径格式 (`Category > Subcategory > Field [Unit]`)，保留完整上下文血缘 |
 | [`PyZotero & Better-Notes`](https://github.com/urschrei/pyzotero) | 生态联动扩展（默认关闭），自动将导出 Excel 挂载为附件并生成 Better-Notes 概览卡片 |
 
 
@@ -142,7 +149,8 @@ zotero-table-extractor/
     ├── doclayout_yolo_detector.py   # YOLO 本地版面检测推理器
     ├── doc_orientation_detector.py  # TurboOCR 方向检测与双轨两阶旋转自愈器
     ├── pdf_page_filter.py           # 页面轻量启发式预过滤（跳过纯正文无表页）
-    ├── playwright_utils.py          # 浏览器环境自适应探测与启动辅助
+    ├── rapid_table_extractor.py     # RapidAI TableStructureRec + RapidTable 本地双模型表格结构识别引擎
+    ├── omnidocbench.py              # OmniDocBench (CVPR 2025) 表格与版面标准化评测度量体系
     ├── table_validator.py           # 表格结构完整性与列数/填充率校验器
     ├── export_drawio_diagram.py     # 原生 draw.io 矢量架构图自动化渲染与导出
     ├── audit/                       # 质量审查与诊断工具包统一导出命名空间
@@ -305,6 +313,14 @@ python update.py --check --json
 | `ZOTERO_LIBRARY_TYPE` | string | `"user"` | Zotero 库类型 (`user` 或 `group`) |
 | `ZOTERO_BETTER_NOTES_ENABLED` | boolean | `true` | 同步时是否生成 Better-Notes 规范的富文本预览笔记 |
 | `ZOTERO_AUTO_ATTACH_XLSX` | boolean | `true` | 同步时是否将导出的 Excel 文件作为子附件挂载至对应条目 |
+| `RAPID_TABLE_ENABLED` | boolean | `true` | 是否启用 RapidAI RapidTable 本地 ONNX 结构识别引擎参与多方投票 |
+| `DOCLAYOUT_ENGINE` | string | `"ensemble"` | 本地版面检测引擎选择 (`yolo`, `pp_doclayoutv3`, `ensemble`) |
+| `PP_DOCLAYOUT_ENABLED` | boolean | `true` | 是否启用 PP-DocLayoutV3 25 类细粒度版面识别与多边形贴合 |
+| `MINERU_TABLE_MERGE_ENABLE` | boolean | `true` | 是否启用 MinerU 4-way 联合判定与小表保护跨页续表合并总开关 |
+| `TELEOCR_API_BASE` | string | `""` | TeleOCR vLLM / OpenAI-compatible 视觉推理服务 URL |
+| `TELEOCR_MODEL` | string | `"TeleOCR"` | TeleOCR 模型标识符 |
+| `OMNIDOCBENCH_ENABLED` | boolean | `true` | 是否开启 OmniDocBench (CVPR 2025) 标准化度量自检 |
+| `SMART_HEADER_FLATTEN_ENABLED` | boolean | `true` | 是否启用 SMART 多级表头语义展平与伪代码推理模式 |
 
 ## 目录与版本控制规范
 

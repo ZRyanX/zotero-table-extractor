@@ -806,6 +806,97 @@ def _clean_vlm_dataframe(df: pd.DataFrame, original_attrs: dict) -> pd.DataFrame
     return df
 
 
+def smart_flatten_headers(
+    header_rows: List[List[str]],
+    delimiter: str = " > ",
+    unit_brackets: bool = True
+) -> List[str]:
+    """
+    SMART (Semantic Header Flattening) 启发式多级表头语义展平算法。
+    参考: SMART: Semantic Header Flattening and Pseudo-Code-Style Reasoning for LLM-based Complex Table QA
+    
+    核心机制:
+    1. 跨列前向填充 (Colspan Forward-Fill): 顶级表头跨多列时自动延展覆盖其辖下子列;
+    2. 语义层级保真拼接 (Hierarchical Lineage): 使用语义层级符号 (' > ' 或 '/') 拼接路径;
+    3. 语义冗余消解 (Deduplication): 当子列名已包含父列核心词时自动消解冗余前缀;
+    4. 科学单位/计量括号保护: 将尾部单位规范化绑定至叶子节点 (如 '[wt%]' 或 '(g/t)')。
+    """
+    if not header_rows:
+        return []
+    if len(header_rows) == 1:
+        return [str(c).strip() if str(c).strip() and str(c).lower() != 'nan' else f"Col_{i+1}" for i, c in enumerate(header_rows[0])]
+
+    num_cols = max(len(r) for r in header_rows)
+    padded_rows = []
+    for r in header_rows:
+        row_str = [str(c).strip() if c is not None and str(c).strip().lower() != 'nan' else '' for c in r]
+        if len(row_str) < num_cols:
+            row_str.extend([''] * (num_cols - len(row_str)))
+        padded_rows.append(row_str[:num_cols])
+
+    # 1. 跨列前向填充 (Colspan Forward-Fill，严格受限于上层父分类边界)
+    filled_rows = []
+    for r_idx, r in enumerate(padded_rows):
+        if r_idx < len(padded_rows) - 1:
+            filled = []
+            curr_parent = ""
+            for c_idx, c in enumerate(r):
+                # 若存在上层表头，检查当前列的上层父分类是否发生边界切换
+                if r_idx > 0 and c_idx > 0:
+                    upper_prev = filled_rows[r_idx - 1][c_idx - 1]
+                    upper_curr = filled_rows[r_idx - 1][c_idx]
+                    if upper_prev != upper_curr:
+                        curr_parent = ""
+                if c:
+                    curr_parent = c
+                filled.append(curr_parent if curr_parent else c)
+            filled_rows.append(filled)
+        else:
+            filled_rows.append(r)
+
+    # 2. 逐列语义层级拼接与冗余消解
+    flattened_cols = []
+    for c_idx in range(num_cols):
+        col_hierarchy = []
+        for r in filled_rows:
+            val = r[c_idx]
+            if not val or val.lower() == 'nan':
+                continue
+            val_clean = clean_latex_and_ocr(clean_text(val)).strip()
+            if not val_clean or val_clean.lower() == 'nan':
+                continue
+            if col_hierarchy and col_hierarchy[-1].lower() == val_clean.lower():
+                continue
+            col_hierarchy.append(val_clean)
+
+        if not col_hierarchy:
+            flattened_cols.append(f"Col_{c_idx+1}")
+            continue
+
+        if len(col_hierarchy) == 1:
+            flattened_cols.append(col_hierarchy[0])
+            continue
+
+        # 3. 语义冗余消解 (例如 父="SiO2 (wt%)", 子="SiO2" -> "SiO2 (wt%)")
+        deduped = []
+        for level in col_hierarchy:
+            if not deduped:
+                deduped.append(level)
+            else:
+                prev = deduped[-1]
+                if prev.lower() in level.lower() and len(level) > len(prev):
+                    deduped[-1] = level
+                elif level.lower() in prev.lower():
+                    pass
+                else:
+                    deduped.append(level)
+
+        joined_name = delimiter.join(deduped)
+        flattened_cols.append(joined_name)
+
+    return flattened_cols
+
+
 def _detect_and_promote_header(df: pd.DataFrame) -> pd.DataFrame:
     """启发式探测并重塑表头，消除正文污染与多层子表头粘连。"""
     first_col_str = str(df.columns[0]).strip()
@@ -860,25 +951,21 @@ def _detect_and_promote_header(df: pd.DataFrame) -> pd.DataFrame:
         if best_header_idx != -1:
             new_headers = [str(x).strip() for x in df.iloc[best_header_idx]]
             header_consumed = 1
-            # 检查是否有第二层子表头
-            has_repeated_parents = (len(new_headers) != len(set(new_headers))) or any(not h or h == 'nan' for h in new_headers)
-            if has_repeated_parents and best_header_idx + 1 < len(df):
-                sub_cells = [str(val).strip() for val in df.iloc[best_header_idx + 1]]
-                sub_non_num = sum(1 for c in sub_cells if len(c) > 0 and not c.replace('.', '').replace('-', '').replace(',', '').replace('%', '').replace('+', '').replace('~', '').isdigit())
-                max_sub_len = max((len(c) for c in sub_cells), default=0)
-                if sub_non_num >= len(sub_cells) * 0.5 and max_sub_len <= 25:
-                    combined_headers = []
-                    for h1, h2 in zip(new_headers, sub_cells):
-                        h1_c = clean_latex_and_ocr(clean_text(h1)).strip()
-                        h2_c = clean_latex_and_ocr(clean_text(h2)).strip()
-                        if h1_c == h2_c or not h2_c or h2_c == 'nan':
-                            combined_headers.append(h1_c if h1_c and h1_c != 'nan' else "")
-                        elif not h1_c or h1_c == 'nan':
-                            combined_headers.append(h2_c)
-                        else:
-                            combined_headers.append(f"{h1_c}_{h2_c}")
-                    new_headers = combined_headers
-                    header_consumed = 2
+            # 检查是否有第二层或更多层子表头/单位行 (最高支持 3 层)
+            header_layers = [new_headers]
+            for extra_offset in range(1, 3):
+                if best_header_idx + extra_offset < len(df):
+                    sub_cells = [str(val).strip() for val in df.iloc[best_header_idx + extra_offset]]
+                    sub_non_num = sum(1 for c in sub_cells if len(c) > 0 and not c.replace('.', '').replace('-', '').replace(',', '').replace('%', '').replace('+', '').replace('~', '').isdigit())
+                    max_sub_len = max((len(c) for c in sub_cells), default=0)
+                    is_all_units = all(re.match(r'^\(.*\)$', c) or c in ('%', 'wt%', 'wt.%', 'ppm', 'ppb', 'g/t', 'MPa', '°C', '‰') for c in sub_cells if c)
+                    if (sub_non_num >= len(sub_cells) * 0.4 and max_sub_len <= 30) or is_all_units:
+                        header_layers.append(sub_cells)
+                        header_consumed += 1
+                    else:
+                        break
+            if len(header_layers) > 1:
+                new_headers = smart_flatten_headers(header_layers)
 
             df.columns = [h if h and h != 'nan' else f"Col_{i+1}" for i, h in enumerate(new_headers)]
             df = df.iloc[best_header_idx + header_consumed:].reset_index(drop=True)
@@ -1341,6 +1428,64 @@ def is_pure_data_value(s_in):
     return False
 
 
+def merge_cross_page_split_cells(prev_df: pd.DataFrame, next_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    MinerU 跨页断裂单元格合并检测与拼接 (Cross-Page Broken Cell / Split Row Merge)。
+    当跨页换行导致最后一行数据被切为两半时（例如：上一页末行文本未完或仅有前几列，下一页首行无键名且仅为续接描述），
+    将拆分的单元格内容无损合并至上一页末行，并剔除下一页冗余残行。
+    """
+    if prev_df.empty or next_df.empty or len(prev_df) < 1 or len(next_df) < 1:
+        return prev_df, next_df
+
+    last_row = [str(x).strip() if pd.notna(x) else "" for x in prev_df.iloc[-1].values]
+    first_row = [str(x).strip() if pd.notna(x) else "" for x in next_df.iloc[0].values]
+
+    # 判定特征 1: 下表首行第一列为空白/无新键名，而后序列存在内容
+    col0_empty_in_next = not first_row[0] or first_row[0].lower() in ('nan', 'none', '-', '—')
+    
+    # 若下表首列具有独立的键名/样本名（且上表末行首列未以连字符截断），则绝对是完整独立数据行，不得误并
+    if not col0_empty_in_next:
+        if not (last_row[0].endswith(('-', '—')) and first_row[0] and first_row[0][0].islower()):
+            return prev_df, next_df
+
+    # 判定特征 2: 上表末行文本以连字符 '-' 或逗号等未完标点结尾，或下表首行文本以小写字母/连续词开头
+    text_split = False
+    for c_i in range(min(len(last_row), len(first_row))):
+        c_prev, c_next = last_row[c_i], first_row[c_i]
+        if c_prev and c_next:
+            if c_prev.endswith(('-', '—', ',', 'and', 'with', 'of', 'in', '±', '~', '(', '（')):
+                text_split = True
+                break
+            if len(c_next) > 0 and c_next[0].islower() and c_next not in ('b.d.', 'n.d.', 'wt%', 'ppm', 'ppb'):
+                text_split = True
+                break
+
+    # 判定特征 3: 上表末行部分列为空，下表首行相应列有填充（互补断行）
+    complementary = False
+    if col0_empty_in_next and any(first_row[1:]):
+        complementary = True
+
+    if text_split or (col0_empty_in_next and complementary):
+        merged_last = list(last_row)
+        for i in range(min(len(merged_last), len(first_row))):
+            p_val = merged_last[i]
+            n_val = first_row[i]
+            if n_val:
+                if p_val and p_val.endswith(('-', '—')):
+                    merged_last[i] = p_val[:-1] + n_val
+                elif p_val:
+                    merged_last[i] = p_val + " " + n_val
+                else:
+                    merged_last[i] = n_val
+
+        prev_df_copy = prev_df.copy()
+        prev_df_copy.iloc[-1] = merged_last
+        next_df_copy = next_df.iloc[1:].reset_index(drop=True)
+        return prev_df_copy, next_df_copy
+
+    return prev_df, next_df
+
+
 def combine_df_group(group):
     if not group:
         return None
@@ -1482,7 +1627,10 @@ def combine_df_group(group):
                     break
             
         if not next_df.empty:
-            concat_rows.append(next_df)
+            if concat_rows and len(concat_rows) > 0 and len(next_df) > 0:
+                concat_rows[-1], next_df = merge_cross_page_split_cells(concat_rows[-1], next_df)
+            if not next_df.empty:
+                concat_rows.append(next_df)
         
     def make_df_columns_unique(df_in):
         seen_cols = {}
@@ -1543,6 +1691,10 @@ def merge_continuation_tables(dfs):
 
     if not normalized_dfs:
         return []
+
+    # 环境变量与配置开关检查 (MinerU cross-page table merge switch)
+    if os.getenv("MINERU_TABLE_MERGE_ENABLE", "true").lower() in ("0", "false", "no", "off"):
+        return normalized_dfs
 
     def norm_label(lbl):
         if not lbl:
@@ -1609,7 +1761,13 @@ def merge_continuation_tables(dfs):
         combined_hint = f"{raw_lbl} {title_str}"
         is_explicit_cont = bool(re.search(r'(?:续表|接上表|续上表|（续）|\(续\)|continued|cont\'?d|\(cont\b|cont\.)', combined_hint) or df.attrs.get('is_continuation')) and page_nearby
         
-        # 列匹配：对于续表合并，要求列名实质重合或为明确续表数据行
+        # MinerU 跨页续表判定 1: 列名归一化与集合重合度 (Jaccard)
+        norm_curr_cols = set(_normalize_col_name(c) for c in df.columns if c and not str(c).startswith(('Unnamed', 'Col')))
+        norm_prev_cols = set(_normalize_col_name(c) for c in prev_df.columns if c and not str(c).startswith(('Unnamed', 'Col')))
+        inter_cols = norm_curr_cols & norm_prev_cols
+        union_cols = norm_curr_cols | norm_prev_cols
+        col_jaccard = len(inter_cols) / max(1, len(union_cols)) if union_cols else 0.0
+
         common_cols = set(_normalize_col_name(c) for c in df.columns) & set(_normalize_col_name(c) for c in prev_df.columns)
         has_common_cols = len(common_cols - {'', 'unnamed', 'unnamed0', 'unnamed1', 'unnamed2', 'col1', 'col2', 'col3'}) >= 2
 
@@ -1621,15 +1779,33 @@ def merge_continuation_tables(dfs):
         )
         cols_are_data = (not is_seq_int) and (sum(1 for c in df.columns if is_pure_data_value(c)) / max(1, len(df.columns)) >= 0.3)
 
-        # 若后表有明确独立表头但与前表列名几乎无交集，即使列数相近也绝非续表
+        # MinerU 跨页续表判定 2: 表格页宽/宽度比例对齐 (Page Width Ratio Alignment)
+        prev_bbox = prev_df.attrs.get('bbox')
+        curr_bbox = df.attrs.get('bbox')
+        width_aligned = True
+        if prev_bbox and curr_bbox and len(prev_bbox) >= 4 and len(curr_bbox) >= 4:
+            w_prev = abs(prev_bbox[2] - prev_bbox[0])
+            w_curr = abs(curr_bbox[2] - curr_bbox[0])
+            if max(w_prev, w_curr) > 0 and (min(w_prev, w_curr) / max(w_prev, w_curr) < 0.60):
+                width_aligned = False
+
+        # MinerU 跨页续表判定 3: 表头独立性与联合条件判定
         has_distinct_header = (not cols_are_data) and any(not str(c).startswith(('Unnamed', 'Col')) for c in df.columns)
         if has_distinct_header and not has_common_cols and not is_explicit_cont:
             cols_match = False
         else:
-            cols_match = has_common_cols or (abs(df.shape[1] - prev_df.shape[1]) <= 2 and (is_explicit_cont or cols_are_data))
+            if is_explicit_cont or cols_are_data:
+                cols_match = has_common_cols or (abs(df.shape[1] - prev_df.shape[1]) <= 2 and width_aligned)
+            else:
+                cols_match = (col_jaccard >= 0.35 or has_common_cols) and width_aligned and (abs(df.shape[1] - prev_df.shape[1]) <= 2)
 
-        # 小表独立性保护：后表若只有 1~5 行且无明确续表标识、且非数据行列名且列集合差异大，坚决独立保留，杜绝前大后小误合并
-        is_small_unlabeled_independent = (df.shape[0] < 6 and not is_explicit_cont and not cols_are_data and not has_common_cols)
+        # MinerU 跨页续表判定 4: 小表独立性保护——后表若只有 1~5 行且无明确续表标识、且非数据行列名且列集合差异大，坚决独立保留，杜绝前大后小误合并
+        is_small_unlabeled_independent = (
+            df.shape[0] < 6 and 
+            not is_explicit_cont and 
+            not cols_are_data and 
+            (col_jaccard < 0.40 or not has_common_cols)
+        )
 
         is_unlabeled_cont = (
             (not lbl or is_explicit_cont or cols_are_data) and
