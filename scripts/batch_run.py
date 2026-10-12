@@ -230,10 +230,78 @@ def generate_batch_tasks(paper_tables_dir, pdf_records, resume=False, recheck=Fa
         if resume and has_xlsx:
             continue
 
-        # --recheck: 仅重新检查已有目录但结果为空/未完成的文献
+        # --recheck: 重新检查已有目录但结果为空或提取未完成（少于预期声明表数）的文献
         if recheck:
-            if not os.path.exists(folder_path) or has_xlsx:
+            if not os.path.exists(folder_path):
                 continue
+            if has_xlsx:
+                is_incomplete = False
+                pdf_p = r.get('pdf_path', '')
+                if pdf_p and os.path.exists(pdf_p):
+                    try:
+                        from extract_zotero_table import scan_pdf_table_expected_labels
+                        try:
+                            from common import format_table_label
+                        except ImportError:
+                            try:
+                                from .common import format_table_label
+                            except ImportError:
+                                format_table_label = lambda x: x.strip()
+
+                        exp_labels, exp_count = scan_pdf_table_expected_labels(pdf_p)
+                        if exp_count > 0 and exp_labels:
+                            actual_labels = set()
+                            for fn in os.listdir(folder_path):
+                                if fn.lower().endswith(".xlsx") and not fn.startswith("~$"):
+                                    fpath = os.path.join(folder_path, fn)
+                                    file_labels = set()
+                                    stem = os.path.splitext(fn)[0]
+                                    m_fn = re.match(r'^(?:(Table|表|Supplementary\s+Table)\s*([A-Za-z0-9\.\-]+))', stem.strip(), re.IGNORECASE)
+                                    fn_label = format_table_label(f"{m_fn.group(1)} {m_fn.group(2)}") if m_fn else format_table_label(stem)
+
+                                    try:
+                                        import openpyxl
+                                        wb = openpyxl.load_workbook(fpath, read_only=True)
+                                        if wb.sheetnames:
+                                            # 验证工作簿中至少有一个工作表包含有效数据行
+                                            has_content = False
+                                            for sname in wb.sheetnames:
+                                                sheet = wb[sname]
+                                                for row in sheet.iter_rows(values_only=True):
+                                                    if any(c is not None and str(c).strip() != "" for c in row):
+                                                        has_content = True
+                                                        break
+                                                if has_content:
+                                                    break
+
+                                            if has_content:
+                                                if fn_label:
+                                                    file_labels.add(fn_label)
+                                                for sname in wb.sheetnames:
+                                                    m_sn = re.match(r'^(?:(Table|表|Supplementary\s+Table)\s*([A-Za-z0-9\.\-]+))', sname.strip(), re.IGNORECASE)
+                                                    if m_sn:
+                                                        file_labels.add(format_table_label(f"{m_sn.group(1)} {m_sn.group(2)}"))
+                                                    else:
+                                                        lbl = format_table_label(sname)
+                                                        if lbl:
+                                                            file_labels.add(lbl)
+                                                actual_labels.update(file_labels)
+                                        wb.close()
+                                    except Exception:
+                                        # 打开或读取损坏/空文件失败，绝不计入覆盖集合
+                                        pass
+                            # 核验唯一表号覆盖率，绝不凭单纯工作表数量跳过
+                            if (not actual_labels) or (not exp_labels.issubset(actual_labels)) or (len(actual_labels) < exp_count):
+                                is_incomplete = True
+                        else:
+                            # 无法读取预期表数的扫描件或未确定状态：重检模式下必须纳入任务
+                            is_incomplete = True
+                    except Exception:
+                        is_incomplete = True
+                else:
+                    is_incomplete = False
+                if not is_incomplete:
+                    continue
 
         tasks.append({
             "folder": matched_folder,

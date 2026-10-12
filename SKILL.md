@@ -1,6 +1,6 @@
 ---
 name: zotero-table-extractor
-description: 从 Zotero 选中条目（依赖 ai4paper-zotero MCP 获取物理路径）或指定本地 PDF / CNKI / 期刊网页中批量/单篇自动抓取并提取结构化表格，支持 8 引擎多方投票与 IBM TEDS 拓扑度量、arXiv HTML / NCBI PMC JATS XML 100% 原生直取、PP-StructureV3 定位 + PaddleOCR-VL-1.6 在线多模态解析、IBM Docling (TableFormer) 本地离线备用降级、openpyxl CellRichText 学术上下标渲染、olmOCR 2 边界与尾注分离，以及可选 PyZotero / Better-Notes 生态联动，导出出版级 Excel (.xlsx)。
+description: 从 Zotero 选中条目（依赖 ai4paper-zotero MCP 获取物理路径）或指定本地 PDF / CNKI / 期刊网页中批量/单篇自动抓取并提取结构化表格，支持多引擎投票与 IBM TEDS 拓扑度量、arXiv HTML / NCBI PMC JATS XML 原生直取、DocLayout 版面切图 + PaddleOCR-VL-1.6 在线多模态解析、IBM Docling (TableFormer) 本地离线备用降级、openpyxl CellRichText 学术上下标渲染、边界与尾注分离启发式，以及可选 PyZotero / Better-Notes 生态联动，导出出版级 Excel (.xlsx)。
 ---
 
 # Zotero Table Extractor
@@ -15,7 +15,7 @@ description: 从 Zotero 选中条目（依赖 ai4paper-zotero MCP 获取物理�
 ```text
 论文.pdf / 论文网页
        │
-       ├─ 1. 在线 HTML / XML 原生直取（最优先，100% 零 OCR 误差）
+       ├─ 1. 在线 HTML / XML 原生直取（最优先，免除 OCR 误差）
        │     arXiv 官方 HTML / ar5iv LaTeXML
        │     NCBI PMC (PubMed Central) Open Access JATS XML
        │     Elsevier XOCS XML / CNKI / Springer / 通用出版社
@@ -24,12 +24,12 @@ description: 从 Zotero 选中条目（依赖 ai4paper-zotero MCP 获取物理�
        └─ 2. 本地 PDF 提取
               │
               ▼
-         多信号候选表格页挖掘（全覆盖防漏）
+         多信号候选表格页挖掘（高覆盖防漏检）
               ├─ 文本 Caption / 续表声明扫描
               ├─ Tagged PDF / PDF/UA 语义结构树检测
               ├─ pdf-inspector 分类与 Markdown 表格定位
               ├─ 全图扫描页 / 图像密集页检测
-              ├─ 矢量线框 (find_tables) 全篇自适应分块探测 (绘图轻量预检，无页数硬上限)
+              ├─ 矢量线框与文本表格全篇自适应探测 (有绘图页线框未检出时继续跑文本与离散列探测)
               └─ 跨页续表多模态追溯 (关键词/纯数据密度/网格线/图片/无框稀疏多列对齐)
               │
               ├──────────┬──────────────────┐
@@ -45,49 +45,49 @@ description: 从 Zotero 选中条目（依赖 ai4paper-zotero MCP 获取物理�
          + pdfplumber  多模态精细解析
          + Camelot
          + GMFT (TATR)
-         + img2table (OpenCV)
+         + img2table (OpenCV, 200->72 DPI 点坐标归一)
               │
               ├─ 2D bbox 空间重叠 (IoU/IoM) + 表号标签防冲突聚类，杜绝同页多表误合并
-              ├─ IBM TEDS (树编辑距离拓扑度量) + 矩阵相似度加权判定一致性 (结构树绝对优先)
+              ├─ IBM TEDS (树编辑距离拓扑度量) + 矩阵相似度加权判定一致性 (结构树优先)
               ├─ 低置信度 (<0.90) 或检验瑕疵页 → DocLayout-YOLO 切图 + PP-Structure 补扫 → PaddleOCR-VL (在线) / Docling TableFormer (离线备用) 接管
-              ├─ 表级精细对齐与替换策略：精准替换瑕疵表，保留同页未受干扰的有效原生表
-              ├─ 7 阶轻量直通安全后处理（公式注入防御、数值类型推断、多级表头展平、DeepDoc/MinerU 跨页单调 DP 对齐）
-              ├─ AllenAI olmOCR 2 边界与尾注分离启发式：隔离表题/数据矩阵/尾注 (* p < 0.05, Note: ..., 注: ...)
-              └─ 跨页续表与多分页自适应合并
+              ├─ 表级精细对齐与替换策略：精准替换瑕疵表，保留同页未受干扰的有效原生表并正确标记已处理
+              ├─ 7 阶轻量直通安全后处理（公式注入防御、数值类型推断、多级表头展平、DeepDoc/MinerU 启发式对齐）
+              ├─ 参考 olmOCR 2 设计的边界与尾注分离启发式：隔离表题/数据矩阵/尾注 (* p < 0.05, Note: ..., 注: ...)
+              └─ 跨页续表与多分页自适应合并（严格位置与单调序列证据校验）
               │
               ▼
-         Excel 导出 (openpyxl CellRichText 学术上下标与化学式保真) ──► 可选自动回写挂载至 Zotero & Better-Notes 笔记
+         Excel 导出 (openpyxl CellRichText 学术上下标与化学式保真，补漏合并写入原子替换) ──► 可选自动回写挂载至 Zotero & Better-Notes 笔记
 ```
 
 ## 关键组件（多模态与多引擎协同体系）
 
-| 组件 | 作用 |
-|---|---|
-| [`arXiv HTML (LaTeXML)`](https://arxiv.org/html/) | arXiv 官方 HTML 与 ar5iv 结构化表格原生抓取，100% 保真免除 OCR 误差 |
-| [`NCBI PMC (JATS XML)`](https://eutils.ncbi.nlm.nih.gov/) | PubMed Central 开放获取 JATS XML 原生全文字段解析，含完整 colspan/rowspan 与尾注 |
-| [`pdf-inspector`](https://github.com/firecrawl/pdf-inspector) | Rust 库，PDF 分类 + 表格定位 + Markdown 结构化提取，~80ms 高性能 |
-| [`PyMuPDF4LLM`](https://github.com/pymupdf/PyMuPDF4LLM) | Artifex 出品，原生将 PDF 转化为 LLM-ready Markdown 表格，8 引擎投票主力候选方 |
-| `PyMuPDF find_tables()` | PDF 矢量线框与无框文本表格提取（零 OCR，高保真），支持全篇网格线分析 |
-| [`IBM TEDS`](https://github.com/ibm-aur-nlp/PubTabNet) | 纯 Python 实现的经典树编辑距离拓扑相似度算法，评估 DOM 树与跨行跨列结构保真度 |
-| [`GMFT`](https://github.com/conjuncts/gmft) | 基于 TATR (Table Transformer) 的深度视觉提取，擅长多层复合表头与跨列单元格对齐 |
-| [`img2table`](https://github.com/xavctn/img2table) | 基于 OpenCV 形态学的纯 Python 方案，零 Ghostscript 系统依赖，支持有框/无框表 |
-| `text_alignment` | 无线框表格的文本坐标对齐与自适应重组（支持学位论文/无网格线表） |
-| `Camelot` | 基于 OpenCV 的晶格 (lattice) 与流式 (stream) 结构化表格提取 |
-| `pdfplumber` | 基于字符精细包围盒与视觉线条的表格抽取，参与多方交叉验证 |
-| `PaddleOCR-VL-1.6` / `PP-StructureV3` | 在线多模态大模型与版面切图 API，复杂/跨行跨列与扫描页结构化多模态解析（首选在线主引擎） |
-| [`IBM Docling (TableFormer)`](https://github.com/DS4SD/docling) | IBM 开源高保真表格结构模型，输出完整 DOM 树，恢复父子层级与跨列分组，兼作离线容灾备用 |
-| [`RapidAI RapidTable`](https://github.com/RapidAI/TableStructureRec) | 有线/无线双模型串联（UNet+SLANet-Plus 与 UniTable），全 ONNX 轻量 CPU 毫秒级多方投票参选方 |
-| [`PDF-Extract-Kit 无框表对齐`](https://github.com/opendatalab/PDF-Extract-Kit) | 行起始 x 分布 + K-Means 列边界自适应聚类 + 字号/加粗样式加权与语义一致性校验 |
-| [`PP-DocLayoutV3`](https://github.com/PaddlePaddle/PaddleOCR) | PaddleOCR 第三代版面检测模型，25 类细粒度（含 table_title/table_footnote/number）+ 多边形贴合防截断 |
-| `DocLayout-YOLO` | 本地 ONNX 版面检测（~15ms 本地超快切图定位，支持与 PP-DocLayoutV3 双检融合） |
-| `olmOCR 2 边界与尾注分离` | 学术表格边界与注释行智能剥离算法，将 `* p < 0.05` / `Note:` 等抽离存入 `footnotes` 属性 |
-| `openpyxl CellRichText` | 原生 Excel 单元格富文本渲染，高保真呈现 `10^{-3}`、`CaCO_3`、`H_2O` 等学术上下标，保持数值计算兼容 |
-| `MinerU 4-Way 跨页续表联合判定` | 列名 Jaccard + 页宽比 + 表头一致性 + (续)标记命中，搭配小表独立保护与列宽比对校正错位 |
-| [`OmniDocBench (CVPR 2025)`](https://github.com/opendatalab/OmniDocBench) | 标准化表格 TEDS、表格检测 mAP 与端到端召回率评测基准，支持学术/教材/财报类型细分 |
-| `LLM 语义化表格评测 (arXiv 2603.18652)` | 单元格数值完整性、表头语义一致性与元组关联性判分，用于大模型修复验收与语义等价判定 |
-| `OCR-Hub 后端注册表与多云容灾` | 可插拔统一后端（PaddleOCR-VL / MinerU 2.5 / TeleOCR / Docling / RapidTable），动态能力发现与健康探测 |
-| `SMART 语义表头展平` | 伪代码推理与层级路径格式 (`Category > Subcategory > Field [Unit]`)，保留完整上下文血缘 |
-| [`PyZotero & Better-Notes`](https://github.com/urschrei/pyzotero) | 生态联动扩展（默认关闭），自动将导出 Excel 挂载为附件并生成 Better-Notes 概览卡片 |
+| 组件 | 类别与作用 | 说明 |
+|---|---|---|
+| [`arXiv HTML (LaTeXML)`](https://arxiv.org/html/) | 原生网络解析 | arXiv 官方 HTML 与 ar5iv 结构化表格原生抓取，免除 OCR 误差 |
+| [`NCBI PMC (JATS XML)`](https://eutils.ncbi.nlm.nih.gov/) | 原生网络解析 | PubMed Central 开放获取 JATS XML 原生全文字段解析，含完整 colspan/rowspan 与尾注 |
+| [`pdf-inspector`](https://github.com/firecrawl/pdf-inspector) | 外部库调用 | Rust 库，PDF 分类 + 表格定位 + Markdown 结构化提取，~80ms 高性能 |
+| [`PyMuPDF4LLM`](https://github.com/pymupdf/PyMuPDF4LLM) | 外部库调用 | Artifex 出品，原生将 PDF 转化为 LLM-ready Markdown 表格，8 引擎投票主力候选方 |
+| `PyMuPDF find_tables()` | 外部库调用 | PDF 矢量线框与无框文本表格提取（零 OCR，高保真），支持全篇网格线分析 |
+| [`IBM TEDS`](https://github.com/ibm-aur-nlp/PubTabNet) | 评测度量实现 | 树编辑距离拓扑相似度算法与标准评估类，完整保留 colspan/rowspan 拓扑对比 |
+| [`GMFT`](https://github.com/conjuncts/gmft) | 外部库适配 | 基于 TATR (Table Transformer) 的深度视觉提取，擅长多层复合表头与跨列单元格对齐 |
+| [`img2table`](https://github.com/xavctn/img2table) | 外部库适配 | 基于 OpenCV 形态学的纯 Python 方案，已统一 200 DPI 像素坐标至 72 DPI PDF 点坐标 |
+| `text_alignment` | 本地算法实现 | 无线框表格的文本坐标对齐与自适应重组（支持学位论文/无网格线表） |
+| `Camelot` | 外部库调用 | 基于 OpenCV 的晶格 (lattice) 与流式 (stream) 结构化表格提取 |
+| `pdfplumber` | 外部库调用 | 基于字符精细包围盒与视觉线条的表格抽取，参与多方交叉验证 |
+| `PaddleOCR-VL-1.6` / `PP-StructureV3` | 在线 API / 切图 | 在线多模态大模型与版面切图 API，复杂/跨行跨列与扫描页结构化多模态解析（首选在线主引擎） |
+| [`IBM Docling (TableFormer)`](https://github.com/DS4SD/docling) | 外部库适配 | IBM 开源高保真表格结构模型，按页面文字层动态启闭 OCR，保留 HTML 结构并归一化坐标 |
+| [`RapidAI RapidTable`](https://github.com/RapidAI/TableStructureRec) | 外部库适配 | 适配官方接口与 `pred_htmls`，支持 SLANet-Plus 与 UniTable，作为多方投票参选方 |
+| `PDF-Extract-Kit 启发式对齐` | 思想借鉴与本地实现 | 参考 PDF-Extract-Kit 设计思路的轻量启发式：行起始 x 分布 + K-Means 列边界自适应聚类 |
+| [`PP-DocLayoutV3`](https://github.com/PaddlePaddle/PaddleOCR) | 本地 ONNX 适配 | 25 类细粒度版面识别，真实 ONNX 推理并与 YOLO 双检融合互补 |
+| `DocLayout-YOLO` | 本地 ONNX 推理 | 本地超快切图定位，支持与 PP-DocLayoutV3 双检融合 |
+| `olmOCR 2 边界与尾注分离` | 思想借鉴与本地实现 | 参考 olmOCR 设计思想的学术表格边界与注释行剥离算法，将 `* p < 0.05` / `Note:` 等抽离存入 `footnotes` 属性 |
+| `openpyxl CellRichText` | 本地格式渲染 | 原生 Excel 单元格富文本渲染，高保真呈现 `10^{-3}`、`CaCO_3`、`H_2O` 等学术上下标 |
+| `MinerU 4-Way 跨页续表判定` | 思想借鉴与本地实现 | 参考 MinerU/DeepDoc 启发式多维判定：列名 Jaccard + 页宽比 + 表头一致性 + (续)标记命中 |
+| [`OmniDocBench (CVPR 2025)`](https://github.com/opendatalab/OmniDocBench) | 评测度量体系 | 标准化表格 TEDS、表格检测 mAP (严格 PR 曲线面积) 与端到端召回率评测 |
+| `LLM 语义化表格评测` | 本地评估算法 | 单元格数值完整性、表头语义一致性与元组关联性判分，用于大模型修复验收与语义等价判定 |
+| `OCR-Hub 后端注册表与多云容灾` | 框架机制 | 可插拔统一后端（PaddleOCR-VL / MinerU 2.5 / TeleOCR / Docling / RapidTable），动态能力发现与健康探测 |
+| `SMART 语义表头展平` | 本地算法实现 | 伪代码推理与层级路径格式 (`Category > Subcategory > Field [Unit]`)，保留完整上下文血缘 |
+| [`PyZotero & Better-Notes`](https://github.com/urschrei/pyzotero) | 生态联动扩展 | 生态联动扩展（默认关闭），自动将导出 Excel 挂载为附件并生成 Better-Notes 概览卡片 |
 
 
 

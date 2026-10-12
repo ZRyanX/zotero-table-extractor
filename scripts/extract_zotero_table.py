@@ -5,6 +5,8 @@ extract_zotero_table.py — 主入口（CLI）：Zotero/本地 PDF 表格提取�
 批量模式两阶段执行（预分析 → 并行提取）；单篇任务内 HTML ∥ Paddle 竞速。
 整合 DocLayout-YOLO 本地 AI 视觉版面提取与回退保障。
 """
+from __future__ import annotations
+
 try:
     from .system_detector import (
         IS_MACOS, IS_WINDOWS, get_paper_tables_dir, get_zotero_db_path,
@@ -26,6 +28,7 @@ import json
 import argparse
 import threading
 import concurrent.futures
+from typing import Tuple, Set, Optional, List, Dict, Any, Union
 
 try:
     import pymupdf as fitz
@@ -367,7 +370,9 @@ def _do_process_single_pdf(pdf_path, orig_pdf_path, args, is_batch=False, plan=N
     extracted_online = False
     online_only = getattr(args, 'online_only', False)
     pdf_only = getattr(args, 'pdf_only', False)
-    online_skip_labels = None  # 已由在线提取的表标签，PDF 补充时跳过
+    online_dfs = []
+    online_labels = set()
+    online_skip_labels = set()
 
     # 1. 检查是否为 2020 年之前的中文文献 -> 直接跳过网页抓取，直通 PDF 管线
     if is_pre_2020_chinese_paper(orig_pdf_path, plan):
@@ -375,7 +380,7 @@ def _do_process_single_pdf(pdf_path, orig_pdf_path, args, is_batch=False, plan=N
     elif not pdf_only and online is not None:
         try:
             print("[Online] Attempting online HTML table extraction...")
-            online_dfs, online_title = online.extract_tables_online(
+            res = online.extract_tables_online(
                 pdf_path=orig_pdf_path,
                 table_idx=getattr(args, 'table_idx', 'all'),
                 db_path=getattr(args, 'db_path', None),
@@ -387,8 +392,13 @@ def _do_process_single_pdf(pdf_path, orig_pdf_path, args, is_batch=False, plan=N
                 race=not getattr(args, 'sequential', False),
                 cancel_event=None,
             )
+            if res and isinstance(res, tuple):
+                online_dfs = list(res[0] or [])
+                online_title = res[1]
+            elif isinstance(res, list):
+                online_dfs = list(res)
+                online_title = None
             if online_dfs:
-                extracted_online = True
                 expected_labels, expected_count = scan_pdf_table_expected_labels(orig_pdf_path)
 
                 # 收集已获取的在线表格标签
@@ -403,29 +413,53 @@ def _do_process_single_pdf(pdf_path, orig_pdf_path, args, is_batch=False, plan=N
                             online_skip_labels.add(make_safe_filename(check_lbl))
 
                 missing_labels = (expected_labels - online_labels) if expected_labels else set()
+
+                # 检查 PDF 是否为扫描件/含扫描页，以及是否有潜在表格线框或矢量结构
+                has_pdf_table_cues = False
+                has_scanned_page = False
+                try:
+                    try:
+                        from .pdf_table_extractor import has_text_layer
+                    except ImportError:
+                        from pdf_table_extractor import has_text_layer
+                    if not has_text_layer(orig_pdf_path):
+                        has_scanned_page = True
+                except Exception:
+                    pass
+
+                try:
+                    import pymupdf as fitz
+                    doc = fitz.open(orig_pdf_path)
+                    for page in doc:
+                        txt = page.get_text("text").strip()
+                        imgs = page.get_images()
+                        # 扫描页缺少文本层，无法通过字符排查表格，属于“完整性未知”
+                        if len(txt) <= 50 and (len(imgs) > 0 or not txt):
+                            has_scanned_page = True
+                        tabs = page.find_tables()
+                        text_tabs = page.find_tables(strategy="text") if not (tabs and tabs.tables) else None
+                        if (tabs and tabs.tables) or (text_tabs and text_tabs.tables) or len(page.get_drawings()) > 5:
+                            has_pdf_table_cues = True
+                    doc.close()
+                except Exception:
+                    has_scanned_page = True
+
                 is_complete = False
-                if expected_labels:
+                if has_scanned_page:
+                    # 扫描页缺少有效文本层，完整性未知，严禁提前判定为完整，必须由本地管线补充核查
+                    is_complete = False
+                elif expected_labels:
                     is_complete = (len(missing_labels) == 0 and len(online_dfs) >= expected_count)
                 elif expected_count > 0:
                     is_complete = (len(online_dfs) >= expected_count)
                 else:
-                    # expected_count == 0: PDF 文本扫描未检出明确表题声明
-                    # 检查 PDF 是否有潜在表格线框或矢量结构
-                    has_pdf_table_cues = False
-                    try:
-                        import pymupdf as fitz
-                        doc = fitz.open(orig_pdf_path)
-                        for page in doc:
-                            if page.find_tables().tables or len(page.get_drawings()) > 5:
-                                has_pdf_table_cues = True
-                                break
-                        doc.close()
-                    except Exception:
-                        pass
+                    # expected_count == 0 且无扫描页：若既无明确表声明也无矢量表格线索，视为完整
                     is_complete = (not has_pdf_table_cues and len(online_dfs) > 0)
 
                 if not is_complete:
-                    if missing_labels:
+                    if has_scanned_page:
+                        print(f"[Online Warning] PDF 包含扫描页或无文本层，表格完整性未知，将由本地管线补充核查。")
+                    elif missing_labels:
                         print(f"[Online Warning] 在线提取获得 {len(online_dfs)} 个表，缺失预期表号: {sorted(list(missing_labels))} (全文共检测到 {expected_count} 个表声明)。")
                     else:
                         print(f"[Online Warning] 在线提取获得 {len(online_dfs)} 个表，少于全文预期数量 {expected_count} 个表。")
@@ -437,6 +471,7 @@ def _do_process_single_pdf(pdf_path, orig_pdf_path, args, is_batch=False, plan=N
                                               getattr(args, 'headers', None), single_file,
                                               skip_supplementary=getattr(args, 'skip_supplementary', False))
                 if save_ok:
+                    extracted_online = True
                     print(f"[Online] Successfully extracted tables via online HTML source -> {target_output}")
                     if online_only or is_complete:
                         _trigger_zotero_sync(orig_pdf_path, target_output, online_dfs, args)
@@ -465,9 +500,16 @@ def _do_process_single_pdf(pdf_path, orig_pdf_path, args, is_batch=False, plan=N
             vlm_dfs = parse_structured_vlm_content(content)
             if vlm_dfs:
                 print(f"[PDF -> Structured] Extracted {len(vlm_dfs)} structured tables from local file.")
-                if save_tables_to_excel(vlm_dfs, target_output, getattr(args, 'headers', None), single_file,
+                combined_struct_dfs = list(online_dfs) if online_dfs else []
+                for s_df in vlm_dfs:
+                    s_lbl = s_df.attrs.get('label') or s_df.attrs.get('table_title')
+                    fmt_s_lbl = format_table_label(s_lbl) if s_lbl else None
+                    if not fmt_s_lbl or (fmt_s_lbl not in (online_labels or set()) and make_safe_filename(fmt_s_lbl) not in (online_skip_labels or set())):
+                        combined_struct_dfs.append(s_df)
+
+                if save_tables_to_excel(combined_struct_dfs, target_output, getattr(args, 'headers', None), single_file,
                                         skip_supplementary=getattr(args, 'skip_supplementary', False)):
-                    _trigger_zotero_sync(orig_pdf_path, target_output, vlm_dfs, args)
+                    _trigger_zotero_sync(orig_pdf_path, target_output, combined_struct_dfs, args)
                     return True
         except Exception as e:
             print(f"[PDF -> Structured Warning] Failed to parse structured file: {e}")
@@ -489,12 +531,20 @@ def _do_process_single_pdf(pdf_path, orig_pdf_path, args, is_batch=False, plan=N
                 dfs = [r['df'] for r in results]
                 extractors = [r['df'].attrs.get('extractor', 'unknown') for r in results]
                 print(f"[PDF] 提取到 {len(dfs)} 个表格 (extractors: {set(extractors)})")
-                if save_tables_to_excel(dfs, target_output, getattr(args, 'headers', None), single_file,
-                                        skip_labels=online_skip_labels,
+                
+                # 在线高保真表格与 PDF 补漏表格先合并去重
+                combined_dfs = list(online_dfs) if online_dfs else []
+                for p_df in dfs:
+                    p_lbl = p_df.attrs.get('label') or p_df.attrs.get('table_title')
+                    fmt_p_lbl = format_table_label(p_lbl) if p_lbl else None
+                    if not fmt_p_lbl or (fmt_p_lbl not in (online_labels or set()) and make_safe_filename(fmt_p_lbl) not in (online_skip_labels or set())):
+                        combined_dfs.append(p_df)
+
+                if save_tables_to_excel(combined_dfs, target_output, getattr(args, 'headers', None), single_file,
                                         skip_supplementary=getattr(args, 'skip_supplementary', False)):
                     print(f"[PDF] Successfully exported tables to: {target_output}")
                     pdf_extracted = True
-                    _trigger_zotero_sync(orig_pdf_path, target_output, dfs, args)
+                    _trigger_zotero_sync(orig_pdf_path, target_output, combined_dfs, args)
                     return True
             else:
                 print("[PDF] 结构化管线未提取到表格，尝试 OCR/切图备用管线...")
@@ -509,20 +559,27 @@ def _do_process_single_pdf(pdf_path, orig_pdf_path, args, is_batch=False, plan=N
                 full_md = ocr_client.run_paddleocr_vl(pdf_path, pages=None, cancel_event=None)
                 if full_md:
                     vlm_dfs = parse_structured_vlm_content(full_md)
-                    if vlm_dfs and save_tables_to_excel(vlm_dfs, target_output, getattr(args, 'headers', None), single_file,
-                                                        skip_labels=online_skip_labels,
-                                                        skip_supplementary=getattr(args, 'skip_supplementary', False)):
+                    combined_vlm_dfs = list(online_dfs) if online_dfs else []
+                    for v_df in (vlm_dfs or []):
+                        v_lbl = v_df.attrs.get('label') or v_df.attrs.get('table_title')
+                        fmt_v_lbl = format_table_label(v_lbl) if v_lbl else None
+                        if not fmt_v_lbl or (fmt_v_lbl not in (online_labels or set()) and make_safe_filename(fmt_v_lbl) not in (online_skip_labels or set())):
+                            combined_vlm_dfs.append(v_df)
+
+                    if combined_vlm_dfs and save_tables_to_excel(combined_vlm_dfs, target_output, getattr(args, 'headers', None), single_file,
+                                                                        skip_supplementary=getattr(args, 'skip_supplementary', False)):
                         print(f"[PDF -> PaddleOCR-VL-1.6] Successfully exported tables to: {target_output}")
-                        _trigger_zotero_sync(orig_pdf_path, target_output, vlm_dfs, args)
+                        _trigger_zotero_sync(orig_pdf_path, target_output, combined_vlm_dfs, args)
                         return True
             except Exception as e:
                 print(f"[PDF -> VLM Notice] VLM execution note: {e}")
 
         try:
             print("[PDF -> PP-StructureV3] 正在使用 PP-StructureV3 / 切图识别表格并导出 Excel...")
-            if export_crops_to_excel(pdf_path, target_output):
+            if export_crops_to_excel(pdf_path, target_output, existing_dfs=online_dfs):
                 print(f"[PDF -> PP-StructureV3] 已成功识别并导出表格至: {target_output}")
-                _trigger_zotero_sync(orig_pdf_path, target_output, [], args)
+                exported_dfs = list(online_dfs) if online_dfs else []
+                _trigger_zotero_sync(orig_pdf_path, target_output, exported_dfs, args)
                 return True
         except Exception as e:
             print(f"[PDF -> PP-StructureV3 Notice] Export notice: {e}")

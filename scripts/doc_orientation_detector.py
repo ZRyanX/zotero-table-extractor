@@ -454,11 +454,14 @@ class DocOrientationDetector:
 
         try:
             arr = preprocess_image(img, use_variance_crop=use_variance_crop)
-            logits = self.session.run([self.output_name], {self.input_name: arr})[0][0]
+            raw_out = np.asarray(self.session.run([self.output_name], {self.input_name: arr})[0][0])
 
-            # Softmax
-            exp = np.exp(logits - np.max(logits))
-            probs = (exp / np.sum(exp)).tolist()
+            # 若模型输出已是 Softmax 归一化概率分布 (如 TurboOCR doc_ori.onnx)，直接使用，避免二次 softmax 导致置信度上限被压制在 0.475 以下
+            if np.all(raw_out >= 0) and np.isclose(float(np.sum(raw_out)), 1.0, atol=1e-2):
+                probs = [float(x) for x in raw_out]
+            else:
+                exp = np.exp(raw_out - np.max(raw_out))
+                probs = (exp / np.sum(exp)).tolist()
 
             ranked = sorted(enumerate(probs), key=lambda x: x[1], reverse=True)
             top1_cls, top1_prob = ranked[0]

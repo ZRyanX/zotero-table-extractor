@@ -571,18 +571,37 @@ def assemble_extended_table_regions(
 
     img_rgb = img.convert("RGB") if img.mode != "RGB" else img
 
+    # 支持 PaddleOCR 官方输出字典 (包含 boxes 或 res.boxes 结构)
+    if isinstance(detections, dict):
+        if "boxes" in detections:
+            detections = detections["boxes"]
+        elif "res" in detections and isinstance(detections["res"], dict) and "boxes" in detections["res"]:
+            detections = detections["res"]["boxes"]
+
     tables = []
     captions = []
     footnotes = []
-    for d in detections:
-        lbl = d.get("type", d.get("label", ""))
+    for d in (detections or []):
+        lbl = d.get("type") or d.get("label") or ""
+        cls_id = d.get("cls_id")
+        if not lbl and cls_id is not None:
+            lbl = PP_DOCLAYOUT_V3_CLASSES.get(int(cls_id), "")
+
+        # 兼容标准 bbox 与 PaddleOCR 官方 coordinate 字段
+        raw_box = d.get("bbox") or d.get("coordinate")
+        if not raw_box or len(raw_box) < 4:
+            continue
+
+        norm_d = dict(d)
+        norm_d["bbox"] = [float(b) for b in raw_box]
+
         canonical = CANONICAL_CLASS_MAP.get(lbl, lbl)
         if canonical == "table":
-            tables.append(d)
+            tables.append(norm_d)
         elif canonical == "table_caption":
-            captions.append(d)
+            captions.append(norm_d)
         elif canonical == "table_footnote":
-            footnotes.append(d)
+            footnotes.append(norm_d)
 
     if not tables:
         return []
@@ -725,31 +744,31 @@ def assemble_extended_table_regions(
 # ===========================================================================
 
 PP_DOCLAYOUT_V3_CLASSES = {
-    0: "paragraph_title",
-    1: "paragraph_text",
-    2: "reference",
-    3: "table",
-    4: "table_title",
-    5: "table_footnote",
-    6: "figure",
+    0: "abstract",
+    1: "algorithm",
+    2: "aside_text",
+    3: "chart",
+    4: "content",
+    5: "display_formula",
+    6: "doc_title",
     7: "figure_title",
-    8: "formula",
-    9: "header",
-    10: "footer",
-    11: "page_number",
-    12: "seal",
-    13: "table_column_header",
-    14: "table_row_header",
-    15: "table_cell",
-    16: "chart",
-    17: "code",
-    18: "number",
-    19: "sidebar",
-    20: "watermark",
-    21: "author",
-    22: "affiliation",
-    23: "abstract",
-    24: "keyword",
+    8: "footer",
+    9: "footer_image",
+    10: "footnote",
+    11: "formula_number",
+    12: "header",
+    13: "header_image",
+    14: "image",
+    15: "inline_formula",
+    16: "number",
+    17: "paragraph_title",
+    18: "reference",
+    19: "reference_content",
+    20: "seal",
+    21: "table",
+    22: "text",
+    23: "vertical_text",
+    24: "vision_footnote",
 }
 
 CANONICAL_CLASS_MAP = {
@@ -757,15 +776,36 @@ CANONICAL_CLASS_MAP = {
     "table_title": "table_caption",
     "table_caption": "table_caption",
     "table_footnote": "table_footnote",
+    "footnote": "table_footnote",
+    "vision_footnote": "table_footnote",
     "figure": "figure",
+    "image": "figure",
+    "chart": "figure",
+    "footer_image": "figure",
+    "header_image": "figure",
     "figure_title": "figure_caption",
     "figure_caption": "figure_caption",
     "formula": "isolate_formula",
+    "display_formula": "isolate_formula",
+    "inline_formula": "isolate_formula",
     "isolate_formula": "isolate_formula",
+    "formula_number": "plain_text",
     "paragraph_title": "title",
+    "doc_title": "title",
     "title": "title",
     "paragraph_text": "plain_text",
     "plain_text": "plain_text",
+    "text": "plain_text",
+    "vertical_text": "plain_text",
+    "aside_text": "plain_text",
+    "content": "plain_text",
+    "abstract": "plain_text",
+    "algorithm": "plain_text",
+    "reference": "plain_text",
+    "reference_content": "plain_text",
+    "header": "plain_text",
+    "footer": "plain_text",
+    "seal": "figure",
     "number": "table_caption",  # 表号往往紧密依附于 table_caption
 }
 
@@ -796,11 +836,13 @@ class PPDocLayoutV3Detector:
                 for p in candidate_paths:
                     if os.path.isfile(p) and os.path.getsize(p) > 1024 * 1024:
                         self.model_path = p
-                        self._available = True
-                        break
-                # 若环境中有 onnxruntime 且配置开启，允许标记可用（支持动态注入或模拟）
-                if not self._available and ort is not None:
-                    self._available = True
+                        try:
+                            self._session = ort.InferenceSession(self.model_path, providers=['CPUExecutionProvider'])
+                            self._available = True
+                            break
+                        except Exception as e_s:
+                            logger.debug(f"[PPDocLayoutV3] 模型会话创建异常: {e_s}")
+                            self._session = None
         except Exception as e:
             logger.debug(f"[PPDocLayoutV3] 初始化探测跳过: {e}")
             self._available = False
@@ -818,20 +860,74 @@ class PPDocLayoutV3Detector:
 
     def detect(self, img, conf_threshold: float = 0.25) -> List[Dict[str, Any]]:
         """执行版面检测，将 25 类归一化映射为标准版面类别。"""
-        if not self._available or img is None:
+        if not self._available or img is None or self._session is None or np is None:
             return []
 
-        # 若真实 ONNX 会话存在，运行推理
-        if self._session is not None and np is not None:
-            try:
-                # 标准 RT-DETR 输入处理
-                w, h = img.size if hasattr(img, 'size') else (100, 100)
-                # 执行 ONNX 推理并解析输出
-                pass
-            except Exception as e:
-                logger.debug(f"[PPDocLayoutV3] 推理异常: {e}")
+        try:
+            w, h = img.size if hasattr(img, 'size') else (100, 100)
+            inps = self._session.get_inputs()
+            input_name = inps[0].name
 
-        return []
+            target_size = (800, 800)
+            if hasattr(inps[0], 'shape') and len(inps[0].shape) == 4:
+                _, _, th, tw = inps[0].shape
+                if isinstance(th, int) and isinstance(tw, int) and th > 0 and tw > 0:
+                    target_size = (tw, th)
+
+            resized_img = img.convert("RGB").resize(target_size, Image.Resampling.BILINEAR if Image else None)
+            arr = np.array(resized_img, dtype=np.float32) / 255.0
+            # PP-DocLayoutV3 官方配置 (inference.yml): mean=[0.0, 0.0, 0.0], std=[1.0, 1.0, 1.0], norm_type=none
+            mean = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+            std = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+            arr = (arr - mean) / std
+            arr = np.transpose(arr, (2, 0, 1))[np.newaxis, ...]
+
+            feed_dict = {input_name: arr}
+            if len(inps) > 1:
+                for inp in inps[1:]:
+                    if "scale" in inp.name.lower():
+                        feed_dict[inp.name] = np.array([[target_size[1] / h, target_size[0] / w]], dtype=np.float32)
+                    elif "shape" in inp.name.lower():
+                        feed_dict[inp.name] = np.array([[target_size[1], target_size[0]]], dtype=np.float32)
+
+            outputs = self._session.run(None, feed_dict)
+            detections = []
+            if outputs:
+                out_arr = outputs[0]
+                if len(out_arr.shape) == 3:
+                    out_arr = out_arr[0]
+                for det in out_arr:
+                    if len(det) >= 6:
+                        if det[1] <= 1.0 and det[0] in PP_DOCLAYOUT_V3_CLASSES:
+                            cls_id = int(det[0])
+                            score = float(det[1])
+                            box = [float(det[2]), float(det[3]), float(det[4]), float(det[5])]
+                        else:
+                            cls_id = int(det[5])
+                            score = float(det[4])
+                            box = [float(det[0]), float(det[1]), float(det[2]), float(det[3])]
+
+                        if score >= conf_threshold:
+                            scale_x = w / target_size[0]
+                            scale_y = h / target_size[1]
+                            scaled_box = [
+                                max(0.0, min(float(w), box[0] * scale_x)),
+                                max(0.0, min(float(h), box[1] * scale_y)),
+                                max(0.0, min(float(w), box[2] * scale_x)),
+                                max(0.0, min(float(h), box[3] * scale_y)),
+                            ]
+                            raw_label = PP_DOCLAYOUT_V3_CLASSES.get(cls_id, "unknown")
+                            canonical_label = CANONICAL_CLASS_MAP.get(raw_label, raw_label)
+                            detections.append({
+                                "label": canonical_label,
+                                "raw_label": raw_label,
+                                "score": score,
+                                "bbox": scaled_box,
+                            })
+            return detections
+        except Exception as e:
+            logger.debug(f"[PPDocLayoutV3] 推理异常: {e}")
+            return []
 
     def extract_extended_table_regions(self, img: Any, padding: int = 15, conf_threshold: Optional[float] = None) -> List[Dict[str, Any]]:
         """结合 25 类中的 table_title / table_footnote / number 定位完整扩展切图。"""
@@ -912,17 +1008,39 @@ class DocLayoutEnsembleDetector:
     get_extended_table_regions = extract_extended_table_regions
 
 
-def get_layout_detector(engine: Optional[str] = None):
+def get_layout_detector(engine: Optional[str] = None, model_dir: Optional[str] = None):
     """
     工厂函数：根据配置获取目标版面检测器。
     engine 可为: 'yolo', 'pp_doclayoutv3', 'ensemble', 'dual' (默认 'ensemble')。
+    model_dir 可指定自定义模型文件或目录。
     """
     engine_name = (engine or os.getenv("DOCLAYOUT_ENGINE", "ensemble")).lower()
+    pp_model_path = None
+    if model_dir:
+        if os.path.isfile(model_dir) and os.path.getsize(model_dir) > 1024 * 1024:
+            pp_model_path = model_dir
+        else:
+            for cand in ["pp_doclayoutv3.onnx", "pp_doclayout_v3.onnx"]:
+                cp = os.path.join(model_dir, cand)
+                if os.path.isfile(cp) and os.path.getsize(cp) > 1024 * 1024:
+                    pp_model_path = cp
+                    break
+
+    # 当仅选择 PP-DocLayoutV3 时，绝不提前检查或要求 YOLO 模型可用，消除非必要依赖
     if engine_name in ("pp_doclayoutv3", "ppocr", "pp_v3"):
-        return PPDocLayoutV3Detector()
-    elif engine_name in ("yolo", "doclayout_yolo"):
-        return DocLayoutYoloDetector()
+        return PPDocLayoutV3Detector(model_path=pp_model_path)
+
+    if engine_name in ("yolo", "doclayout_yolo"):
+        yolo_model_path = ensure_model_file(model_dir) if model_dir else None
+        return DocLayoutYoloDetector(model_path=yolo_model_path)
     else:
-        return DocLayoutEnsembleDetector()
+        yolo_det = None
+        try:
+            yolo_model_path = ensure_model_file(model_dir) if model_dir else None
+            yolo_det = DocLayoutYoloDetector(model_path=yolo_model_path)
+        except Exception as e_y:
+            logger.debug(f"[DocLayout] Ensemble YOLO 初始化跳过: {e_y}")
+        pp_det = PPDocLayoutV3Detector(model_path=pp_model_path)
+        return DocLayoutEnsembleDetector(yolo_detector=yolo_det, pp_detector=pp_det)
 
 

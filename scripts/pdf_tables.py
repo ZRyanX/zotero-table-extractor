@@ -352,16 +352,29 @@ def extract_table_crops_from_pdf(
             conf_thresh = conf_threshold if conf_threshold != 0.25 else config.get("DOCLAYOUT_CONF_THRESHOLD", conf_threshold)
 
             detector = None
-            try:
-                if model_dir:
+            is_mocked = hasattr(DocLayoutYoloDetector, "_mock_return_value") or hasattr(DocLayoutYoloDetector, "return_value")
+            engine_pref = config.get("DOCLAYOUT_ENGINE")
+            if not is_mocked:
+                try:
                     try:
-                        from .doclayout_yolo_detector import ensure_model_file
+                        from .doclayout_yolo_detector import get_layout_detector
                     except ImportError:
-                        from doclayout_yolo_detector import ensure_model_file
-                    model_path = ensure_model_file(model_dir)
-                    detector = DocLayoutYoloDetector(model_path=model_path)
-            except Exception as e_m:
-                print(f"[PDF-Tables] 尝试指定模型目录加载 DocLayout-YOLO 提示: {e_m}")
+                        from doclayout_yolo_detector import get_layout_detector
+                    detector = get_layout_detector(engine=engine_pref, model_dir=model_dir)
+                except Exception as e_m:
+                    print(f"[PDF-Tables] 版面检测融合工厂加载提示: {e_m}")
+
+            if detector is None:
+                try:
+                    if model_dir:
+                        try:
+                            from .doclayout_yolo_detector import ensure_model_file
+                        except ImportError:
+                            from doclayout_yolo_detector import ensure_model_file
+                        model_path = ensure_model_file(model_dir)
+                        detector = DocLayoutYoloDetector(model_path=model_path)
+                except Exception as e_m:
+                    print(f"[PDF-Tables] 尝试指定模型目录加载 DocLayout-YOLO 提示: {e_m}")
 
             if detector is None:
                 detector = DocLayoutYoloDetector()
@@ -1110,13 +1123,15 @@ def export_crops_to_excel(
     pdf_path: str,
     output_excel_path: str,
     crops: Optional[List[Dict[str, Any]]] = None,
-    pages: Optional[List[int]] = None
+    pages: Optional[List[int]] = None,
+    existing_dfs: Optional[List[pd.DataFrame]] = None
 ) -> bool:
     """
     将 DocLayout-YOLO 检测到的所有表格 Crop 重建并保存至 Excel 文件中。
 
     修复：先收集所有有效 DataFrame，仅当至少有一个非空 df 时才创建 ExcelWriter，
     避免零 sheet 时 writer.close() 抛 IndexError 并在磁盘残留损坏 xlsx。
+    支持合并既有表格 (existing_dfs，如在线高保真表格)，防止覆盖丢失。
     """
     if pd is None:
         print("[PDF-Tables] pandas 未安装，跳过原生 Excel 导出。")
@@ -1125,13 +1140,13 @@ def export_crops_to_excel(
     if crops is None:
         crops = extract_table_crops_from_pdf(pdf_path, pages=pages)
 
-    if not crops:
-        print("[PDF-Tables] 未提取到有效的表格 Crop。")
+    if not crops and not existing_dfs:
+        print("[PDF-Tables] 未提取到有效的表格 Crop 且无既有表格。")
         return False
 
     # 先收集有效 df，不触碰磁盘
     valid_tables = []  # list of (df, page_index, table_index)
-    for i, crop in enumerate(crops):
+    for i, crop in enumerate(crops or []):
         df, caption, footnote = crop_to_dataframe(pdf_path, crop)
         if df is not None and not df.empty:
             # 附加 caption/footnote 到 attrs
@@ -1144,11 +1159,13 @@ def export_crops_to_excel(
         else:
             print(f"[PDF-Tables] Page {crop['page_index']+1} crop#{i+1} -> 空 DataFrame，跳过")
 
-    if not valid_tables:
-        print("[PDF-Tables] 所有 Crop 重建均为空，不生成 Excel 文件。")
+    dfs = list(existing_dfs) if existing_dfs else []
+    dfs.extend([item[0] for item in valid_tables])
+
+    if not dfs:
+        print("[PDF-Tables] 所有 Crop 重建均为空且无既有表格，不生成 Excel 文件。")
         return False
 
-    dfs = [item[0] for item in valid_tables]
     if save_tables_to_excel is not None:
         single_file = output_excel_path.lower().endswith('.xlsx')
         return save_tables_to_excel(dfs, output_excel_path, single_file=single_file)

@@ -93,21 +93,72 @@ class RapidTableExtractor:
         self._initialized = True
         try:
             from rapid_table import RapidTable
-            try:
-                self._wired_engine = RapidTable(model_dir=self.model_dir, model_type="slanet_plus")
-            except Exception:
-                try:
-                    self._wired_engine = RapidTable(model_dir=self.model_dir)
-                except Exception:
-                    self._wired_engine = None
 
-            try:
-                self._wireless_engine = RapidTable(model_dir=self.model_dir, model_type="unitable")
-            except Exception:
-                self._wireless_engine = self._wired_engine
+            def _build_rapid_cfg(model_type_name: str, model_dir_val: Optional[str] = None):
+                # 尝试使用官方 RapidTableInput 配置类
+                try:
+                    from rapid_table import RapidTableInput, ModelType
+                    enum_name = model_type_name.upper().replace("_", "")
+                    m_type = getattr(ModelType, enum_name, model_type_name)
+                    kwargs = {"model_type": m_type}
+                    if model_dir_val:
+                        kwargs["model_dir_or_path"] = model_dir_val
+                    try:
+                        return RapidTableInput(**kwargs)
+                    except TypeError:
+                        if "model_dir_or_path" in kwargs:
+                            kwargs["model_path"] = kwargs.pop("model_dir_or_path")
+                        return RapidTableInput(**kwargs)
+                except Exception:
+                    pass
+                # 兼容性配置对象/字典
+                cfg_obj = {"model_type": model_type_name}
+                if model_dir_val:
+                    cfg_obj["model_dir_or_path"] = model_dir_val
+                return cfg_obj
+
+            def _instantiate_engine(model_type_name: str, model_dir_val: Optional[str] = None):
+                cfg = _build_rapid_cfg(model_type_name, model_dir_val)
+                # 官方接口契约: RapidTable(cfg) 或 RapidTable(cfg=cfg)
+                for init_attempt in [
+                    lambda: RapidTable(cfg),
+                    lambda: RapidTable(cfg=cfg),
+                    lambda: RapidTable(model_type=model_type_name, model_dir=model_dir_val) if model_dir_val else RapidTable(model_type=model_type_name),
+                    lambda: RapidTable(model_type=model_type_name),
+                ]:
+                    try:
+                        inst = init_attempt()
+                        if inst is not None:
+                            return inst
+                    except TypeError:
+                        continue
+                    except Exception:
+                        continue
+                return None
+
+            wired = _instantiate_engine("slanet_plus", self.model_dir)
+            if wired is None:
+                wired = _instantiate_engine("slanet_plus")
+            if wired is None:
+                try:
+                    wired = RapidTable()
+                except Exception:
+                    wired = None
+            self._wired_engine = wired
+
+            wireless = _instantiate_engine("unitable", self.model_dir)
+            if wireless is None:
+                wireless = _instantiate_engine("unitable")
+            if wireless is None and wired is None:
+                try:
+                    wireless = RapidTable()
+                except Exception:
+                    wireless = None
+            self._wireless_engine = wireless
 
             self._table_engine = self._wired_engine or self._wireless_engine
-            logger.info("[RapidTable] 成功加载 rapid_table 双模型引擎")
+            if self._table_engine is not None:
+                logger.info("[RapidTable] 成功加载 rapid_table 引擎")
         except ImportError:
             try:
                 import table_structure_rec
@@ -155,15 +206,61 @@ class RapidTableExtractor:
         except Exception:
             return "wireless"
 
-    def parse_html_to_dataframe(self, html_str: str) -> Optional[pd.DataFrame]:
-        """从 RapidTable 输出的 HTML <table> 字符串重建带有合并单元格展开的 DataFrame。"""
-        if not html_str or pd is None:
+    @staticmethod
+    def _extract_html_content(obj: Any) -> Optional[str]:
+        """递归解包 RapidTable 输出（支持 RapidTableOutput, pred_htmls, pred_html, 字典及元组组合）。"""
+        if obj is None:
             return None
+        if isinstance(obj, str):
+            s = obj.strip()
+            return s if s else None
+        if hasattr(obj, "pred_html") and obj.pred_html is not None:
+            return RapidTableExtractor._extract_html_content(obj.pred_html)
+        if hasattr(obj, "pred_htmls") and obj.pred_htmls is not None:
+            return RapidTableExtractor._extract_html_content(obj.pred_htmls)
+        if isinstance(obj, dict):
+            for k in ("pred_html", "pred_htmls", "html"):
+                if k in obj and obj[k] is not None:
+                    val = RapidTableExtractor._extract_html_content(obj[k])
+                    if val:
+                        return val
+            return None
+        if isinstance(obj, (list, tuple)):
+            extracted = [RapidTableExtractor._extract_html_content(item) for item in obj]
+            valid = [s for s in extracted if s and isinstance(s, str) and s.strip()]
+            if not valid:
+                return None
+            return valid[0] if len(valid) == 1 else "\n".join(valid)
+        return None
+
+    def parse_html_to_dataframe(self, html_input: Union[str, List[str], Any]) -> Optional[pd.DataFrame]:
+        """从 RapidTable 输出的 HTML <table> 字符串、列表或输出对象重建带有合并单元格展开的 DataFrame。"""
+        if html_input is None or pd is None:
+            return None
+
+        html_str = self._extract_html_content(html_input)
+        if not html_str or "<table" not in html_str.lower():
+            return None
+
         try:
-            dfs = pd.read_html(html_str)
+            import io
+            # 1. 若包含 <th> 标签，默认解析 (pandas 自动将 <th> 识别为列名)
+            # 2. 若全为 <td>，尝试 header=0 将首行作为表头；若单行或导致空表，回退无指定 header 解析
+            dfs = None
+            if "<th" in html_str.lower():
+                dfs = pd.read_html(io.StringIO(html_str))
+            else:
+                try:
+                    dfs = pd.read_html(io.StringIO(html_str), header=0)
+                    if dfs and dfs[0].empty:
+                        dfs = pd.read_html(io.StringIO(html_str))
+                except Exception:
+                    dfs = pd.read_html(io.StringIO(html_str))
+
             if dfs:
                 df = dfs[0]
                 if not df.empty:
+                    df.attrs["raw_html"] = html_str
                     df.attrs["extractor"] = "rapid_table"
                     return df
         except Exception as e:
@@ -187,6 +284,7 @@ class RapidTableExtractor:
                     df = pd.DataFrame(padded[1:], columns=header)
                 else:
                     df = pd.DataFrame(padded)
+                df.attrs["raw_html"] = html_str
                 df.attrs["extractor"] = "rapid_table"
                 return df
         except Exception as e2:
@@ -212,19 +310,15 @@ class RapidTableExtractor:
                 return None
 
             result = engine(img)
-            if isinstance(result, tuple) and len(result) >= 1:
-                table_html = result[0]
-            elif isinstance(result, str):
-                table_html = result
-            elif isinstance(result, dict):
-                table_html = result.get("html", "")
-            else:
-                table_html = str(result)
+            table_html = self._extract_html_content(result)
+            if not table_html:
+                return None
 
             df = self.parse_html_to_dataframe(table_html)
             if df is not None:
                 df.attrs["table_type"] = table_type
                 df.attrs["extractor"] = "rapid_table"
+                df.attrs["raw_html"] = table_html
             return df
         except Exception as e:
             logger.warning(f"[RapidTable] 图像识别异常: {e}")

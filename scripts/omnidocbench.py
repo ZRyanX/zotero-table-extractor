@@ -57,27 +57,87 @@ def compute_iou(box_a: List[float], box_b: List[float]) -> float:
     return inter_area / union_area
 
 
+def _compute_standard_ap(tp_flags: List[int], n_gt: int) -> float:
+    """
+    标准 VOC / COCO 全点插值 Average Precision (AP) 计算 (PR 曲线下面积积分)。
+    tp_flags: 按置信度/匹配顺序给出的检测判定 (1 为 TP, 0 为 FP)。
+    n_gt: 标注目标真实数量。
+    """
+    if n_gt <= 0 or not tp_flags:
+        return 0.0
+
+    tp_cum = []
+    fp_cum = []
+    cur_tp = 0
+    cur_fp = 0
+    for f in tp_flags:
+        if f:
+            cur_tp += 1
+        else:
+            cur_fp += 1
+        tp_cum.append(cur_tp)
+        fp_cum.append(cur_fp)
+
+    recalls = [tp / n_gt for tp in tp_cum]
+    precisions = [tp / (tp + fp) for tp, fp in zip(tp_cum, fp_cum)]
+
+    # 全点插值: 两端插入哨兵值
+    mrec = [0.0] + recalls + [1.0]
+    mpre = [0.0] + precisions + [0.0]
+
+    for i in range(len(mpre) - 2, -1, -1):
+        mpre[i] = max(mpre[i], mpre[i + 1])
+
+    ap = 0.0
+    for i in range(len(mrec) - 1):
+        if mrec[i + 1] != mrec[i]:
+            ap += (mrec[i + 1] - mrec[i]) * mpre[i + 1]
+    return float(ap)
+
+
 def compute_layout_detection_map(
     pred_boxes: List[List[float]],
     gt_boxes: List[List[float]],
     iou_thresholds: Optional[List[float]] = None
 ) -> Dict[str, float]:
     """
-    计算版面表格检测框的平均精度 (mAP)。
+    计算版面表格检测框的标准平均精度 (mAP)。
     默认覆盖 COCO 规范的 IoU 0.50, 0.75 以及 0.50:0.95 (step 0.05)。
+    无真实标注目标时返回 0.0，不虚标为满分。
     """
     if iou_thresholds is None:
         iou_thresholds = [0.50, 0.75]
 
     if not gt_boxes:
-        return {f"mAP@{int(t*100)}": 1.0 if not pred_boxes else 0.0 for t in iou_thresholds}
+        val = 0.0
+        res = {"mAP@50:95": val}
+        for t in iou_thresholds:
+            pct = int(t * 100)
+            res[f"precision@{pct}"] = val
+            res[f"recall@{pct}"] = val
+            res[f"f1@{pct}"] = val
+            res[f"mAP@{pct}"] = val
+        return res
+
+    # 严格按照预测置信度降序排序；未提供置信度时视为等置信度并保留原顺序，严禁按真实标注 (GT) 重叠度作弊排序
+    def _extract_confidence(p):
+        if isinstance(p, dict):
+            return float(p.get("score", p.get("confidence", 0.0)))
+        if isinstance(p, (list, tuple)) and len(p) > 4:
+            return float(p[4])
+        return 0.0
+
+    sorted_pred_boxes = sorted(
+        pred_boxes,
+        key=_extract_confidence,
+        reverse=True
+    )
 
     metrics = {}
     for iou_thresh in iou_thresholds:
         matched_gt = set()
-        tp = 0
-        fp = 0
-        for p in pred_boxes:
+        tp_flags = []
+        for p in sorted_pred_boxes:
             best_iou = 0.0
             best_gt_idx = -1
             for g_idx, g in enumerate(gt_boxes):
@@ -89,28 +149,31 @@ def compute_layout_detection_map(
                     best_gt_idx = g_idx
 
             if best_iou >= iou_thresh and best_gt_idx >= 0:
-                tp += 1
+                tp_flags.append(1)
                 matched_gt.add(best_gt_idx)
             else:
-                fp += 1
+                tp_flags.append(0)
 
+        tp = sum(tp_flags)
+        fp = len(tp_flags) - tp
         fn = len(gt_boxes) - len(matched_gt)
-        precision = tp / max(1, tp + fp)
-        recall = tp / max(1, tp + fn)
-        f1 = (2 * precision * recall) / max(1e-6, precision + recall)
+        precision = tp / max(1, tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / max(1, tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = (2 * precision * recall) / max(1e-6, precision + recall) if (precision + recall) > 0 else 0.0
+        
+        ap = _compute_standard_ap(tp_flags, len(gt_boxes))
         metrics[f"precision@{int(iou_thresh*100)}"] = round(precision, 4)
         metrics[f"recall@{int(iou_thresh*100)}"] = round(recall, 4)
         metrics[f"f1@{int(iou_thresh*100)}"] = round(f1, 4)
-        metrics[f"mAP@{int(iou_thresh*100)}"] = round(precision, 4)
+        metrics[f"mAP@{int(iou_thresh*100)}"] = round(ap, 4)
 
-    # 计算 0.50:0.95 均值 (COCO 规范严格一一匹配)
+    # 计算 0.50:0.95 均值 (COCO 规范严格逐级匹配与插值积分)
     steps = [0.50 + 0.05 * i for i in range(10)]
     ap_steps = []
     for st in steps:
         matched_gt_step = set()
-        tp_step = 0
-        fp_step = 0
-        for p in pred_boxes:
+        tp_step_flags = []
+        for p in sorted_pred_boxes:
             best_iou = 0.0
             best_gt_idx = -1
             for g_idx, g in enumerate(gt_boxes):
@@ -122,33 +185,33 @@ def compute_layout_detection_map(
                     best_gt_idx = g_idx
 
             if best_iou >= st and best_gt_idx >= 0:
-                tp_step += 1
+                tp_step_flags.append(1)
                 matched_gt_step.add(best_gt_idx)
             else:
-                fp_step += 1
-        prec_step = tp_step / max(1, tp_step + fp_step)
-        ap_steps.append(prec_step)
+                tp_step_flags.append(0)
+        ap_steps.append(_compute_standard_ap(tp_step_flags, len(gt_boxes)))
 
     metrics["mAP@50:95"] = round(float(np.mean(ap_steps)) if np else float(sum(ap_steps) / len(ap_steps)), 4)
     return metrics
 
 
 def compute_table_teds(pred: Union[str, Any], gt: Union[str, Any]) -> float:
-    """计算单个表格的 OmniDocBench 标准 TEDS 拓扑度量。"""
-    if TEDS is None:
-        return 1.0
+    """计算单个表格的 TEDS 拓扑度量（自动优先保留 DataFrame attrs['raw_html'] 中的合并单元格拓扑结构）。"""
+    evaluator_cls = TEDS
+    if evaluator_cls is None:
+        try:
+            from teds import TEDS as evaluator_cls
+        except ImportError:
+            try:
+                from .teds import TEDS as evaluator_cls
+            except ImportError:
+                evaluator_cls = None
+    if evaluator_cls is None:
+        return 0.0
 
-    evaluator = TEDS(structure_only=False)
-    pred_html = pred if isinstance(pred, str) else (pred.to_html() if hasattr(pred, "to_html") else str(pred))
-    gt_html = gt if isinstance(gt, str) else (gt.to_html() if hasattr(gt, "to_html") else str(gt))
-
-    if not pred_html.strip().startswith("<table"):
-        pred_html = f"<table><tbody><tr><td>{pred_html}</td></tr></tbody></table>"
-    if not gt_html.strip().startswith("<table"):
-        gt_html = f"<table><tbody><tr><td>{gt_html}</td></tr></tbody></table>"
-
+    evaluator = evaluator_cls(structure_only=False)
     try:
-        score = evaluator.evaluate(pred_html, gt_html)
+        score = evaluator.evaluate(pred, gt)
         return round(float(score), 4)
     except Exception as e:
         logger.debug(f"[OmniDocBench] TEDS 计算异常: {e}")
@@ -161,7 +224,7 @@ def compute_omission_recall(declared_count: int, extracted_count: int) -> Dict[s
         return {
             "declared_count": declared_count,
             "extracted_count": extracted_count,
-            "recall": 1.0,
+            "recall": 0.0,
             "omission_rate": 0.0,
         }
 
@@ -193,7 +256,7 @@ class OmniDocBenchEvaluator:
     ):
         det_metrics = compute_layout_detection_map(pred_boxes or [], gt_boxes or []) if gt_boxes else {}
         recall_metrics = compute_omission_recall(num_declared, num_extracted)
-        avg_teds = float(np.mean(teds_scores)) if (teds_scores and np) else (sum(teds_scores)/len(teds_scores) if teds_scores else 1.0)
+        avg_teds = float(np.mean(teds_scores)) if (teds_scores and np) else (sum(teds_scores)/len(teds_scores) if teds_scores else 0.0)
 
         self.records.append({
             "paper_id": paper_id,
@@ -202,8 +265,8 @@ class OmniDocBenchEvaluator:
             "omission_rate": recall_metrics["omission_rate"],
             "num_declared": num_declared,
             "num_extracted": num_extracted,
-            "map_50": det_metrics.get("precision@50", 1.0),
-            "map_50_95": det_metrics.get("mAP@50:95", 1.0),
+            "map_50": det_metrics.get("mAP@50", 0.0),
+            "map_50_95": det_metrics.get("mAP@50:95", 0.0),
             "teds": round(avg_teds, 4),
         })
 
@@ -214,8 +277,8 @@ class OmniDocBenchEvaluator:
 
         total_declared = sum(r["num_declared"] for r in self.records)
         total_extracted = sum(r["num_extracted"] for r in self.records)
-        overall_recall = total_extracted / max(1, total_declared) if total_declared > 0 else 1.0
-        avg_teds = sum(r["teds"] for r in self.records) / len(self.records)
+        overall_recall = total_extracted / max(1, total_declared) if total_declared > 0 else 0.0
+        avg_teds = sum(r["teds"] for r in self.records) / len(self.records) if self.records else 0.0
 
         by_type = {}
         for r in self.records:
@@ -228,7 +291,7 @@ class OmniDocBenchEvaluator:
             t_ext = sum(x["num_extracted"] for x in recs)
             stratified[t] = {
                 "count": len(recs),
-                "recall": round(t_ext / max(1, t_decl), 4) if t_decl > 0 else 1.0,
+                "recall": round(t_ext / max(1, t_decl), 4) if t_decl > 0 else 0.0,
                 "avg_teds": round(sum(x["teds"] for x in recs) / len(recs), 4),
             }
 
@@ -248,12 +311,12 @@ class OmniDocBenchEvaluator:
             return "暂无评测数据"
 
         lines = [
-            "### OmniDocBench 表格提取与版面评测基准",
+            "### OmniDocBench 表格提取与版面评测基准 (本地拓扑对齐)",
             "",
             f"- **评测文献总数**: {summary['total_papers']} 篇",
             f"- **声明表格总数**: {summary['total_declared']} 张 | **成功提取总数**: {summary['total_extracted']} 张",
             f"- **端到端总召回率 (Recall)**: {summary['overall_recall'] * 100:.2f}%",
-            f"- **全局结构保真度 (TEDS)**: {summary['avg_teds'] * 100:.2f}%",
+            f"- **全局结构保真度 (TEDS 拓扑对齐度量)**: {summary['avg_teds'] * 100:.2f}%",
             "",
             "| 文档类型 | 文献篇数 | 表格召回率 (Recall) | 结构保真度 (TEDS) |",
             "|---|---|---|---|",
@@ -261,4 +324,8 @@ class OmniDocBenchEvaluator:
         for dt, data in summary.get("stratified", {}).items():
             lines.append(f"| {dt} | {data['count']} | {data['recall'] * 100:.2f}% | {data['avg_teds'] * 100:.2f}% |")
 
+        lines.extend([
+            "",
+            "> *注: 本评测 TEDS 基于纯 Python 树编辑距离算法对齐实现，非 IBM 官方 APTED C 库认证标准测试结果。*",
+        ])
         return "\n".join(lines)

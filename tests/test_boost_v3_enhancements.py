@@ -142,9 +142,10 @@ class TestPPDocLayoutV3AndEnsemble(unittest.TestCase):
 
     def test_pp_doclayout_classes_and_mapping(self):
         """测试 25 类规范映射。"""
-        self.assertIn(4, doclayout_yolo_detector.PP_DOCLAYOUT_V3_CLASSES)
-        self.assertEqual(doclayout_yolo_detector.PP_DOCLAYOUT_V3_CLASSES[4], "table_title")
-        self.assertEqual(doclayout_yolo_detector.CANONICAL_CLASS_MAP["table_title"], "table_caption")
+        self.assertIn(21, doclayout_yolo_detector.PP_DOCLAYOUT_V3_CLASSES)
+        self.assertEqual(doclayout_yolo_detector.PP_DOCLAYOUT_V3_CLASSES[21], "table")
+        self.assertEqual(doclayout_yolo_detector.PP_DOCLAYOUT_V3_CLASSES[3], "chart")
+        self.assertEqual(doclayout_yolo_detector.CANONICAL_CLASS_MAP["chart"], "figure")
 
     def test_polygon_to_tight_bbox(self):
         """测试多边形边缘拟合转紧致外接矩形。"""

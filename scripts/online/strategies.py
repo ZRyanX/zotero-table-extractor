@@ -241,7 +241,7 @@ def parse_tables_from_html(html_content, table_idx="all"):
         
         valid_dfs = []
         for idx, df in enumerate(dfs):
-            if df.empty or len(df.columns) < 2 or len(df) < 1:
+            if df.empty or len(df.columns) < 1 or len(df) < 1:
                 continue
             # Basic cleanup of columns
             df.columns = [clean_text(c) for c in df.columns]

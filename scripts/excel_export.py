@@ -8,6 +8,7 @@ excel_export.py — 表格 Excel 导出（自 extract_zotero_table.py 拆出）�
 
 import os
 import re
+import tempfile
 
 import pandas as pd
 
@@ -81,7 +82,7 @@ def autofit_excel_columns(file_path, title=None):
     """Auto-fit column widths in the output Excel sheet and ensure full macOS QuickLook / Office metadata compatibility."""
     try:
         from openpyxl import load_workbook
-        wb = load_workbook(file_path)
+        wb = load_workbook(file_path, rich_text=True)
         
         # Ensure Dublin Core & Office core properties are populated for macOS QuickLook / Finder preview
         wb.properties.creator = "Zotero Table Extractor"
@@ -119,19 +120,35 @@ def autofit_excel_columns(file_path, title=None):
 
 
 def _load_excel_with_attrs(tbl_path, output_path=None):
-    """从磁盘加载 Excel 表格，并尽可能恢复其 .attrs 元数据 (标题、页码等)。"""
-    existing_df = pd.read_excel(tbl_path)
-    if not hasattr(existing_df, 'attrs'):
-        existing_df.attrs = {}
+    """从磁盘加载 Excel 表格，并尽可能恢复其 .attrs 元数据 (标题、页码等)，避免 pandas 重读导致 001 变 1、NA 变 NaN、公式丢失。"""
+    existing_df = None
     try:
         from openpyxl import load_workbook
-        wb = load_workbook(tbl_path, read_only=True)
+        wb = load_workbook(tbl_path, data_only=False, rich_text=True)
+        ws = wb.active
+        rows = list(ws.iter_rows(values_only=True))
+        if rows:
+            headers = [str(c) if c is not None else "" for c in rows[0]]
+            data = rows[1:]
+            existing_df = pd.DataFrame(data, columns=headers)
+        else:
+            existing_df = pd.DataFrame()
+        if not hasattr(existing_df, 'attrs'):
+            existing_df.attrs = {}
         if wb.properties and wb.properties.title:
             existing_df.attrs['table_title'] = wb.properties.title
             existing_df.attrs['label'] = wb.properties.title
         wb.close()
     except Exception:
-        pass
+        existing_df = None
+
+    if existing_df is None:
+        try:
+            existing_df = pd.read_excel(tbl_path, keep_default_na=False)
+        except Exception:
+            existing_df = pd.DataFrame()
+        if not hasattr(existing_df, 'attrs'):
+            existing_df.attrs = {}
     if output_path:
         cap_file = os.path.join(output_path, "table_captions.txt")
         if os.path.exists(cap_file):
@@ -211,7 +228,7 @@ def save_tables_to_excel(dataframes, output_path, headers=None, single_file=True
         active_dfs.append(df)
 
     if not active_dfs:
-        return paywall_rej_count > 0
+        return False
 
     # 1. 预先合并跨页未命名续表/同名续表，避免未命名 1 行续表被 postprocess 当作空表过滤
     merged_raw_dfs = merge_continuation_tables(active_dfs)
@@ -255,37 +272,44 @@ def save_tables_to_excel(dataframes, output_path, headers=None, single_file=True
             if is_metadata_table(proc):
                 print(f"[Filter] 过滤非数据表/元数据表: {proc.attrs.get('table_title') or proc.attrs.get('label') or '未命名'}")
                 continue
-            is_vlm = (proc.attrs.get('extractor') == 'paddleocr_vl' or proc.attrs.get('source') == 'paddleocr_vl')
-            if not is_vlm:
-                proc = proc.drop_duplicates(keep='first').reset_index(drop=True)
             cleaned_dfs.append(proc)
 
     if not cleaned_dfs:
-        return paywall_rej_count > 0
+        return False
         
     if single_file:
-        # Ensure parent directory exists
-        parent_dir = os.path.dirname(output_path)
-        if parent_dir and not os.path.exists(parent_dir):
-            os.makedirs(parent_dir, exist_ok=True)
-            
-        if len(cleaned_dfs) == 1:
-            cleaned_dfs[0].to_excel(output_path, index=False)
-            autofit_excel_columns(output_path)
-        else:
-            with pd.ExcelWriter(output_path) as writer:
-                main_count = 0
-                supp_count = 0
-                unlabelled_count = 0
+        # Ensure target directory exists (use absolute path to avoid cross-device link issues)
+        target_dir = os.path.dirname(os.path.abspath(output_path))
+        if target_dir and not os.path.exists(target_dir):
+            os.makedirs(target_dir, exist_ok=True)
+
+        fd, temp_xlsx = tempfile.mkstemp(dir=target_dir, prefix="tbl_export_", suffix=".xlsx")
+        os.close(fd)
+
+        try:
+            # 补漏模式：若既有工作簿存在，使用 openpyxl 原生读取并追加，
+            # 严格保留既有 Sheet 的原样数据 (如 '001' 不被转为 1、'NA' 保留、公式 =SUM(...) 不丢失)
+            wb_existing = None
+            if skip_labels and os.path.exists(output_path) and os.path.isfile(output_path):
+                try:
+                    from openpyxl import load_workbook
+                    wb_existing = load_workbook(output_path, data_only=False, rich_text=True)
+                except Exception:
+                    wb_existing = None
+
+            if wb_existing is not None:
                 has_chapter_labels = any(
                     bool(re.match(r'^(?:附表|附录表|表|Supplementary\s+Table|Table)\s*\d+[\-–—\.]\d+', str(d.attrs.get('label', '')).strip(), re.IGNORECASE))
                     for d in cleaned_dfs
                 )
-                for idx, df in enumerate(cleaned_dfs):
+                main_count = 0
+                supp_count = 0
+                unlabelled_count = 0
+                for df in cleaned_dfs:
                     label = df.attrs.get('label')
                     title = df.attrs.get('table_title')
                     is_supp = is_supplementary(label or title)
-                    
+
                     if label:
                         sheet_name = re.sub(r'[\\/*?:\[\]]', '_', label)[:31].strip()
                     else:
@@ -298,16 +322,74 @@ def save_tables_to_excel(dataframes, output_path, headers=None, single_file=True
                         else:
                             main_count += 1
                             sheet_name = f"Table {main_count}"
-                            
-                    # De-duplicate sheet names
+
+                    used_sheet_names = set(wb_existing.sheetnames)
                     orig_sheet_name = sheet_name
                     suffix = 1
-                    while sheet_name in writer.sheets:
+                    while sheet_name in used_sheet_names:
                         sheet_name = f"{orig_sheet_name[:27]}_{suffix}"
                         suffix += 1
-                        
-                    df.to_excel(writer, sheet_name=sheet_name, index=False)
-            autofit_excel_columns(output_path)
+
+                    ws = wb_existing.create_sheet(title=sheet_name)
+                    ws.append([str(c) for c in df.columns])
+                    for row in df.itertuples(index=False):
+                        ws.append([None if pd.isnull(val) else val for val in row])
+
+                wb_existing.save(temp_xlsx)
+                wb_existing.close()
+            else:
+                sheets_to_write = []
+                main_count = 0
+                supp_count = 0
+                unlabelled_count = 0
+                has_chapter_labels = any(
+                    bool(re.match(r'^(?:附表|附录表|表|Supplementary\s+Table|Table)\s*\d+[\-–—\.]\d+', str(d.attrs.get('label', '')).strip(), re.IGNORECASE))
+                    for d in cleaned_dfs
+                )
+                for idx, df in enumerate(cleaned_dfs):
+                    label = df.attrs.get('label')
+                    title = df.attrs.get('table_title')
+                    is_supp = is_supplementary(label or title)
+
+                    if label:
+                        sheet_name = re.sub(r'[\\/*?:\[\]]', '_', label)[:31].strip()
+                    else:
+                        if has_chapter_labels:
+                            unlabelled_count += 1
+                            sheet_name = f"unlabelled_{unlabelled_count}"
+                        elif is_supp:
+                            supp_count += 1
+                            sheet_name = f"Supplementary Table {supp_count}"
+                        else:
+                            main_count += 1
+                            sheet_name = f"Table {main_count}"
+
+                    used_sheet_names = [s[0] for s in sheets_to_write]
+                    orig_sheet_name = sheet_name
+                    suffix = 1
+                    while sheet_name in used_sheet_names:
+                        sheet_name = f"{orig_sheet_name[:27]}_{suffix}"
+                        suffix += 1
+
+                    sheets_to_write.append((sheet_name, df))
+
+                with pd.ExcelWriter(temp_xlsx) as writer:
+                    for s_name, s_df in sheets_to_write:
+                        s_df.to_excel(writer, sheet_name=s_name, index=False)
+
+            autofit_excel_columns(temp_xlsx)
+            try:
+                os.replace(temp_xlsx, output_path)
+            except OSError:
+                import shutil
+                shutil.move(temp_xlsx, output_path)
+        except Exception:
+            if os.path.exists(temp_xlsx):
+                try:
+                    os.remove(temp_xlsx)
+                except Exception:
+                    pass
+            raise
         print(f"Saved {len(cleaned_dfs)} tables to Excel file: {output_path}")
     else:
         # Output is a directory, save individual Table X.xlsx files
@@ -459,12 +541,6 @@ def save_tables_to_excel(dataframes, output_path, headers=None, single_file=True
                             print("-> Keeping existing higher-quality table...")
                             df_to_save = existing_df
                             
-                    # Drop duplicate rows if any got appended/merged while strictly preserving natural top-to-bottom row order
-                    try:
-                        df_to_save = df_to_save.drop_duplicates(keep='first').reset_index(drop=True)
-                    except Exception as e:
-                        print(f"Warning during duplicate row cleaning: {e}")
-                        
                     # 严格保留并合并 .attrs 元数据，避免覆写丢失
                     saved_attrs = dict(getattr(existing_df, 'attrs', {}))
                     saved_attrs.update({k: v for k, v in getattr(df, 'attrs', {}).items() if v is not None})

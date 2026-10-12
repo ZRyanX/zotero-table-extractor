@@ -374,11 +374,13 @@ STAT_NOTE_PATTERN = re.compile(
     re.IGNORECASE
 )
 
-def is_academic_footnote_row(row_values: list, col_count: int) -> Tuple[bool, str]:
+def is_academic_footnote_row(row_values: list, col_count: Optional[int] = None) -> Tuple[bool, str]:
     """
     判断单行是否为学术表格尾注/注释行 (olmOCR 2 启发式特征)。
     返回 (is_note, note_text)。
     """
+    if col_count is None:
+        col_count = len(row_values) if row_values else 1
     non_empty = []
     for v in row_values:
         if v is None:
@@ -404,8 +406,10 @@ def is_academic_footnote_row(row_values: list, col_count: int) -> Tuple[bool, st
         if len(non_empty) <= 2 or all_same or len(full_text_clean) > 15:
             return True, full_text_clean
 
-    # 3. 散文解释句：当整行仅 1 个有效单元格（或所有单元格相同），且字符长 (>=25) 且无数字或纯描述
-    if (len(non_empty) == 1 or all_same) and len(full_text_clean) >= 25:
+    # 3. 散文解释句：多列表 (col_count > 1) 底部的单单元格/全跨列说明
+    # 注意：单列表 (col_count <= 1) 本身每个单元格就是 1 个有效单元格且为正文数据，
+    # 严禁在无明确注记前缀 (Note:, 注:, * 等) 时将正文长句误判为尾注
+    if col_count > 1 and (len(non_empty) == 1 or all_same) and len(full_text_clean) >= 25:
         num_words = len(full_text_clean.split())
         chinese_count = len(re.findall(r'[\u4e00-\u9fa5]', full_text_clean))
         if num_words >= 5 or chinese_count >= 10:
@@ -702,8 +706,14 @@ def strip_embedded_duplicate_headers(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty or len(df) <= 3:
         return df
 
-    cols = [str(c).strip().lower() for c in df.columns if str(c).strip() and not str(c).startswith('Unnamed') and not str(c).startswith('Col_')]
-    if not cols:
+    real_cols = [
+        str(c).strip().lower() for c in df.columns
+        if str(c).strip()
+        and not str(c).strip().isdigit()
+        and not str(c).startswith(('Unnamed', 'Col_', 'col', 'unnamed'))
+        and str(c).strip().lower() not in ('nan', 'none', 'null')
+    ]
+    if not real_cols:
         return df
 
     rows_to_drop = []
@@ -716,11 +726,14 @@ def strip_embedded_duplicate_headers(df: pd.DataFrame) -> pd.DataFrame:
             rows_to_drop.append(r_idx)
             continue
         # 2. 检查是否为跨页重复打印的表头行 (列名匹配率 >= 40%)
+        # 真实表头应由非纯数据文本构成，严禁把包含合法数据值的行误删为重复表头
         if len(row_vals) >= 2:
-            matches = sum(1 for v in row_vals if any(v == c or (len(v) >= 2 and v in c) for c in cols))
-            if (matches / max(1, len(row_vals))) >= 0.40 and matches >= 2:
-                rows_to_drop.append(r_idx)
-                continue
+            non_data_vals = [v for v in row_vals if not is_pure_data_value(v)]
+            if non_data_vals:
+                matches = sum(1 for v in non_data_vals if any(v == c or (len(v) >= 2 and v in c) for c in real_cols))
+                if (matches / max(1, len(row_vals))) >= 0.40 and matches >= 2:
+                    rows_to_drop.append(r_idx)
+                    continue
 
     if rows_to_drop:
         print(f"[Postprocess] 自动剥离跨页重复表头/续表标记行 (共 {len(rows_to_drop)} 行: {rows_to_drop})")
@@ -980,53 +993,83 @@ def _filter_noise_and_placeholders(df: pd.DataFrame) -> pd.DataFrame:
     df = df.loc[:, ~df.columns.astype(str).str.lower().str.endswith('_nan')]
     df = df.loc[:, ~df.columns.astype(str).str.lower().str.endswith('_none')]
     
-    # Drop any 'Unnamed', 'nan', integer, or placeholder column that has no real data or is sparse
+    # Drop any 'Unnamed', 'nan', integer, or placeholder column that has no real data
     cols_to_drop = []
-    # 确保在合并杂乱列前使用 object 类型，防止写入文本时触发 float64 类型异常
+    # 确保在处理前使用 object 类型，防止写入文本时触发 float64 类型异常
     df = df.astype(object)
     for c_idx, col in enumerate(df.columns):
         col_str = str(col).strip().lower()
         is_placeholder_col = (
             col_str in ['', 'nan', 'none', 'null', 'unnamed'] or
             col_str.isdigit() or
-            col_str.startswith(('unnamed', 'col'))
+            bool(re.match(r'^(?:unnamed(?:[\s_:]*\d+)?|col(?:umn)?(?:[\s_:]*\d+)?)$', col_str))
         )
         if is_placeholder_col:
             valid_vals = [str(x).strip() for x in df[col] if pd.notnull(x) and str(x).strip() not in ['', 'nan', 'none', 'null']]
-            if len(valid_vals) <= max(1, int(len(df) * 0.15)):
-                # Merge any stray values into previous column if previous is text
-                if c_idx > 0:
-                    for r in range(len(df)):
-                        val = df.iat[r, c_idx]
-                        if pd.notnull(val) and str(val).strip() not in ['', 'nan', 'none', 'null']:
-                            prev_val = df.iat[r, c_idx - 1]
-                            df.iat[r, c_idx - 1] = f"{prev_val} {val}".strip() if pd.notnull(prev_val) else str(val).strip()
+            # 严格保障数据完整性：仅当占位列完全不含任何有效数据 (len(valid_vals) == 0) 时才安全移除；
+            # 绝不把低密度测量列误判为冗余，更不能将其合并到相邻列
+            if len(valid_vals) == 0 and (len(df.columns) - len(cols_to_drop) > 1):
                 cols_to_drop.append(col)
     if cols_to_drop:
         df = df.drop(columns=cols_to_drop)
 
-    # Clean up noise rows (e.g. standalone "Table 2 (continued)", index rows, or embedded repeated header rows)
-    def _is_table_noise_row(row):
+    # 识别并过滤噪声行与列索引行（严格依据位置、序列与表头证据）
+    rows_to_drop = set()
+    prev_was_repeated_header = False
+    col_names_lower = [str(c).strip().lower() for c in df.columns]
+    real_col_names = {
+        c for c in col_names_lower
+        if not c.isdigit() and c not in ['', 'nan', 'none', 'null', 'unnamed']
+        and not re.match(r'^(?:unnamed|col(?:umn)?)(?:[\s_:]*\d+)?$', c)
+    }
+
+    for r_idx in range(len(df)):
+        row = df.iloc[r_idx]
         cells = [str(x).strip() for x in row.values if pd.notnull(x) and str(x).strip() != '']
         if not cells:
-            return False
+            continue
         row_text = " ".join(cells)
+
+        # 1. 独立续表标题横幅行 (e.g. "Table 2 (continued)")
         if re.search(r'^\s*(?:Table|表)\s*\d+(?:\.\d+)?.*|\b(?:continued|cont\'d|contd)\b|\bTable\s*\(cont', row_text, re.IGNORECASE):
             num_cells = len(cells)
             non_text_cells = sum(1 for c in cells if re.search(r'\d', c))
             if num_cells <= 2 or non_text_cells == 0:
-                return True
-        # 识别跨页合并后残留的纯数字列索引行（如 0 1 2.00 3 4.0 5 ...）
-        if len(cells) >= 3 and all(bool(re.match(r'^\d+(?:\.0+)?$', c)) for c in cells):
-            return True
-        # 识别跨页合并后残留的重复表头行（列名与 DataFrame 顶层列名高度重合）
-        col_names_lower = [str(c).strip().lower() for c in df.columns]
-        matching_header_cells = sum(1 for c in cells if c.lower() in col_names_lower)
-        if len(cells) >= 3 and (matching_header_cells / len(cells) >= 0.4):
-            return True
-        return False
+                rows_to_drop.add(r_idx)
+                continue
 
-    df = df[~df.apply(_is_table_noise_row, axis=1)]
+        # 2. 识别跨页合并后残留的重复表头行 (仅针对真实文本表头，严禁对数字或占位列名匹配)
+        matching_header_cells = sum(1 for c in cells if c.lower() in real_col_names) if real_col_names else 0
+        is_repeat_header = len(cells) >= 3 and bool(real_col_names) and (matching_header_cells / len(cells) >= 0.4)
+        if is_repeat_header and r_idx > 0:
+            rows_to_drop.add(r_idx)
+            prev_was_repeated_header = True
+            continue
+
+        # 3. 识别列索引行 (必须具有明确的显式语法证据如 (1), (2) 或 [1], [2]，绝不凭单纯裸整数误删合法数据)
+        is_valid_position = (r_idx == 0) or prev_was_repeated_header
+        if is_valid_position and len(cells) >= 3 and len(cells) == len(df.columns):
+            raw_ints = []
+            has_explicit_syntax = False
+            for c in cells:
+                m_idx = re.match(r'^(?:[\(\[]\s*(\d+)\s*[\)\]]|(\d+)(?:\.0+)?)$', c)
+                if m_idx:
+                    raw_ints.append(int(m_idx.group(1) or m_idx.group(2)))
+                    if m_idx.group(1) is not None:
+                        has_explicit_syntax = True
+                else:
+                    break
+            if len(raw_ints) == len(cells):
+                is_seq = (raw_ints == list(range(len(cells))) or raw_ints == list(range(1, len(cells) + 1)))
+                if is_seq and has_explicit_syntax:
+                    rows_to_drop.add(r_idx)
+                    prev_was_repeated_header = False
+                    continue
+
+        prev_was_repeated_header = False
+
+    if rows_to_drop:
+        df = df.drop(index=df.index[list(rows_to_drop)]).reset_index(drop=True)
     df = separate_table_footnotes(df)
     return df
 
@@ -1613,8 +1656,28 @@ def combine_df_group(group):
             while len(next_df) > 0:
                 first_row = [str(x).strip() for x in next_df.iloc[0].values if pd.notna(x)]
                 row_str = " ".join(first_row).lower()
-                is_index_row = len(first_row) >= 3 and all(re.match(r'^\d+$', c) for c in first_row if c)
+                raw_first_ints = []
+                has_exp_idx = False
+                for c in first_row:
+                    m = re.match(r'^(?:[\(\[]\s*(\d+)\s*[\)\]]|(\d+)(?:\.0+)?)$', c)
+                    if m:
+                        raw_first_ints.append(int(m.group(1) or m.group(2)))
+                        if m.group(1) is not None:
+                            has_exp_idx = True
+                    else:
+                        break
+                is_seq = len(raw_first_ints) == len(first_row) and (
+                    raw_first_ints == list(range(len(first_row))) or
+                    raw_first_ints == list(range(1, len(first_row) + 1))
+                )
                 first_row_is_data = sum(1 for c in first_row if is_pure_data_value(c)) / max(1, len(first_row)) >= 0.3
+                is_subsequent_text = False
+                if len(next_df) > 1:
+                    for val in next_df.iloc[1].values:
+                        if pd.notnull(val) and not is_pure_data_value(val) and len(str(val).strip()) > 1:
+                            is_subsequent_text = True
+                            break
+                is_index_row = len(first_row) >= 3 and is_seq and (has_exp_idx or (is_subsequent_text and not first_row_is_data))
                 is_repeat_header = (not first_row_is_data) and sum(1 for c in first_row if c and any(_normalize_col_name(c) == _normalize_col_name(b) for b in base_cols)) / max(1, len(base_cols)) >= 0.25
                 is_unit_row = len(first_row) > 0 and all(any(u in c.lower() for u in ['wt%', 'ppm', 'ppb', '%', '‰', 'ma', 'ga', 'ka', '℃', '°c']) or c.startswith('(') for c in first_row if c)
                 # 续表标题横幅行 (如 "Table 1 (continued)", "Table 1 Continued", "接上表", "Table 1 (cont'd)")

@@ -45,10 +45,6 @@ def _levenshtein_ratio(s1: str, s2: str) -> float:
     if max_len == 0:
         return 1.0
 
-    # 长度差异悬殊直接短路
-    if abs(len1 - len2) / max_len > 0.8:
-        return 0.0
-
     prev = list(range(len2 + 1))
     for i, c1 in enumerate(s1):
         curr = [i + 1] * (len2 + 1)
@@ -63,23 +59,23 @@ def _levenshtein_ratio(s1: str, s2: str) -> float:
     return max(0.0, 1.0 - dist / max_len)
 
 
-def dataframe_to_table_tree(df: pd.DataFrame, max_rows: int = 100, max_cols: int = 15) -> TableNode:
+def dataframe_to_table_tree(df: pd.DataFrame, max_rows: Optional[int] = None, max_cols: Optional[int] = None) -> TableNode:
     """
     将 pandas DataFrame 转换为结构化 TableNode 树。
-    支持行与列的双向自适应采样，确保在宽表与长表下的高效评估。
+    若指定 max_rows/max_cols，支持行与列的双向自适应采样；默认对全量行列进行完整树转换。
     """
     if df is None or df.empty:
         return TableNode("table")
 
     # 1. 列采样 (保留前部与后部主要列拓扑)
     sampled_df = df
-    if sampled_df.shape[1] > max_cols:
+    if max_cols and sampled_df.shape[1] > max_cols:
         head_c = max_cols // 2
         tail_c = max_cols - head_c
         sampled_df = pd.concat([sampled_df.iloc[:, :head_c], sampled_df.iloc[:, -tail_c:]], axis=1)
 
     # 2. 行采样
-    if len(sampled_df) > max_rows:
+    if max_rows and len(sampled_df) > max_rows:
         head_n = max_rows // 2
         tail_n = max_rows - head_n
         sampled_df = pd.concat([sampled_df.iloc[:head_n], sampled_df.iloc[-tail_n:]])
@@ -109,10 +105,10 @@ def dataframe_to_table_tree(df: pd.DataFrame, max_rows: int = 100, max_cols: int
     return root
 
 
-def parse_html_to_tree(html_content: str, max_rows: int = 100) -> TableNode:
+def parse_html_to_tree(html_content: str, max_rows: Optional[int] = None) -> TableNode:
     """
     将 HTML 中的 <table> 转换为结构化 TableNode 树。
-    保留 rowspan, colspan 属性。
+    保留 rowspan, colspan 属性。默认无截断解析全量行。
     """
     if not html_content or "<table" not in html_content.lower():
         return TableNode("table")
@@ -126,7 +122,7 @@ def parse_html_to_tree(html_content: str, max_rows: int = 100) -> TableNode:
 
         root = TableNode("table")
         rows = tbl.find_all("tr")
-        if len(rows) > max_rows:
+        if max_rows and len(rows) > max_rows:
             head_n = max_rows // 2
             tail_n = max_rows - head_n
             rows = rows[:head_n] + rows[-tail_n:]
@@ -155,7 +151,11 @@ def parse_html_to_tree(html_content: str, max_rows: int = 100) -> TableNode:
         # Fallback to regex-based parser
         root = TableNode("table")
         tr_matches = re.findall(r'<tr[^>]*>(.*?)</tr>', html_content, re.DOTALL | re.IGNORECASE)
-        for tr_html in tr_matches[:max_rows]:
+        if max_rows and len(tr_matches) > max_rows:
+            head_n = max_rows // 2
+            tail_n = max_rows - head_n
+            tr_matches = tr_matches[:head_n] + tr_matches[-tail_n:]
+        for tr_html in tr_matches:
             tr_node = TableNode("tr")
             cells = re.findall(r'<(td|th)([^>]*)>(.*?)</\1>', tr_html, re.DOTALL | re.IGNORECASE)
             for tag, attr_str, cell_content in cells:
@@ -233,19 +233,13 @@ def zhang_shasha_ted(t1: TableNode, t2: TableNode, structure_only: bool = False)
             kr2.add(i)
 
     def match_cost(u_node: TableNode, v_node: TableNode) -> float:
-        # 标签完全不同 (如 tr 对比 td)
+        # 对齐 IBM TEDS (PubTabNet metric.py CustomConfig.rename) 官方标准编辑代价:
+        # 1. 标签不同 (如 tr 对比 td, th 对比 td 等) 直接返回代价 1.0
         if u_node.tag != v_node.tag:
-            # 允许 th 与 td 之间低惩罚对齐
-            if {u_node.tag, v_node.tag} == {"th", "td"}:
-                base = 0.2
-            else:
-                return 1.0
-        else:
-            base = 0.0
+            return 1.0
 
         if u_node.tag in ("th", "td"):
-            c_cost = base
-            # 拓扑属性对齐 (colspan, rowspan)
+            # 2. 拓扑属性 (colspan, rowspan) 不匹配返回代价 1.0
             try:
                 u_cs = int(u_node.attrs.get("colspan", 1) or 1)
             except Exception:
@@ -264,18 +258,20 @@ def zhang_shasha_ted(t1: TableNode, t2: TableNode, structure_only: bool = False)
                 v_rs = 1
 
             if u_cs != v_cs or u_rs != v_rs:
-                c_cost += 0.3
+                return 1.0
 
-            # 内容对齐
+            # 3. 单元格内容对齐 (区分大小写，归一化编辑距离 0.0 ~ 1.0，完全遵循 IBM 规范)
             if not structure_only:
-                s1 = u_node.text.strip().lower()
-                s2 = v_node.text.strip().lower()
-                sim = _levenshtein_ratio(s1, s2)
-                c_cost += (1.0 - sim) * 0.5
+                s1 = u_node.text.strip()
+                s2 = v_node.text.strip()
+                if s1 or s2:
+                    sim = _levenshtein_ratio(s1, s2)
+                    return 1.0 - sim
+                return 0.0
 
-            return min(1.0, c_cost)
+            return 0.0
 
-        return base
+        return 0.0
 
     treedist = [[0.0] * (n2 + 1) for _ in range(n1 + 1)]
 
@@ -319,8 +315,8 @@ def teds_similarity(
     table1: Union[pd.DataFrame, str, TableNode],
     table2: Union[pd.DataFrame, str, TableNode],
     structure_only: bool = False,
-    max_sample_rows: int = 25,
-    max_sample_cols: int = 15
+    max_sample_rows: Optional[int] = None,
+    max_sample_cols: Optional[int] = None
 ) -> float:
     """
     计算两个表格对象间的 IBM TEDS (Tree-Edit-Distance-based Similarity) 相似度 (0.0 ~ 1.0)。
@@ -328,14 +324,17 @@ def teds_similarity(
     参数:
         table1, table2: 可以是 pd.DataFrame, HTML 字符串, 或 TableNode 树对象
         structure_only: 若为 True，仅评估 DOM 结构与跨行跨列拓扑，忽略单元格纯文字差异
-        max_sample_rows: 针对超大表采样的行数上限，默认 25 行保障毫秒级计算
-        max_sample_cols: 针对宽表采样的列数上限，默认 15 列
+        max_sample_rows: 针对超大表采样的行数上限，默认 None 进行全量无截断评估
+        max_sample_cols: 针对宽表采样的列数上限，默认 None
     """
-    # 1. 规范化为 TableNode
+    # 1. 规范化为 TableNode (优先保留 raw_html/html 中的 colspan 与 rowspan 跨行跨列拓扑)
     def _to_node(tbl):
         if isinstance(tbl, TableNode):
             return tbl
         if isinstance(tbl, pd.DataFrame):
+            raw_html = tbl.attrs.get("raw_html") or tbl.attrs.get("html") if hasattr(tbl, "attrs") else None
+            if raw_html and isinstance(raw_html, str) and "<table" in raw_html.lower():
+                return parse_html_to_tree(raw_html, max_rows=max_sample_rows)
             return dataframe_to_table_tree(tbl, max_rows=max_sample_rows, max_cols=max_sample_cols)
         if isinstance(tbl, str):
             return parse_html_to_tree(tbl, max_rows=max_sample_rows)
@@ -356,3 +355,32 @@ def teds_similarity(
     max_nodes = max(len1, len2)
     score = 1.0 - (ted / max_nodes)
     return max(0.0, min(1.0, float(score)))
+
+
+class TEDS:
+    """
+    TEDS (Tree-Edit-Distance-based Similarity) 表格拓扑与内容相似度度量类。
+    基于纯 Python Zhang-Shasha 树编辑距离算法实现，编辑代价定义对齐 IBM PubTabNet (CustomConfig.rename) 语义
+    (标签差异与跨行跨列不匹配代价均为 1.0，单元格文本差异按归一化编辑距离计算)。
+    注意：本模块为本地纯 Python 树编辑距离拓扑对齐实现，非 IBM APTED 原生 C 库绑定环境，评测数值用于拓扑对比与一致性仲裁，非 IBM 官方认证标准测试结果。
+    """
+    def __init__(self, structure_only: bool = False, n_jobs: int = 1):
+        self.structure_only = structure_only
+        self.n_jobs = n_jobs
+
+    def evaluate(self, pred: Union[str, pd.DataFrame, TableNode, Any], gt: Union[str, pd.DataFrame, TableNode, Any]) -> float:
+        """评估预测表格与标注表格的 TEDS 得分 (0.0 ~ 1.0)。若任意一方为空表/无目标则返回 0.0。全表无采样评估。"""
+        if pred is None or gt is None:
+            return 0.0
+        if isinstance(pred, pd.DataFrame) and pred.empty:
+            return 0.0
+        if isinstance(gt, pd.DataFrame) and gt.empty:
+            return 0.0
+        if isinstance(pred, str) and (not pred.strip() or "<table" not in pred.lower()):
+            return 0.0
+        if isinstance(gt, str) and (not gt.strip() or "<table" not in gt.lower()):
+            return 0.0
+        return teds_similarity(pred, gt, structure_only=self.structure_only, max_sample_rows=None, max_sample_cols=None)
+
+    def batch_evaluate(self, preds: List[Any], gts: List[Any]) -> List[float]:
+        return [self.evaluate(p, g) for p, g in zip(preds, gts)]

@@ -1133,9 +1133,21 @@ def extract_via_docling(
                 logger.debug(f"[Docling] 创建页面切片失败，将全文档解析: {e_slice}")
                 effective_pdf = pdf_path
 
+        # 根据页面文字层智能决定是否启用 OCR (扫描件/无文本层兜底启用 OCR，有文字层则禁用 OCR 以加速)
+        # 只要存在任一缺少充分文字层的页面 (扫描页/纯图页)，必须启用 OCR 以免漏识别
+        has_scanned_page = False
+        try:
+            with fitz.open(effective_pdf) as check_doc:
+                for p_check in check_doc:
+                    if len(p_check.get_text("text").strip()) <= 50:
+                        has_scanned_page = True
+                        break
+        except Exception:
+            has_scanned_page = True
+
         pipeline_options = PdfPipelineOptions()
         pipeline_options.do_table_structure = True
-        pipeline_options.do_ocr = False
+        pipeline_options.do_ocr = has_scanned_page
 
         converter = DocumentConverter(
             format_options={
@@ -1160,7 +1172,19 @@ def extract_via_docling(
             if df is None or df.empty or len(df) < 1:
                 continue
 
-            # 获取页码与边界框坐标
+            # 导出官方 HTML 以完整保留 rowspan / colspan 跨行跨列结构
+            if hasattr(tbl, "export_to_html"):
+                try:
+                    raw_html = tbl.export_to_html(doc_item)
+                except Exception:
+                    try:
+                        raw_html = tbl.export_to_html()
+                    except Exception:
+                        raw_html = None
+                if isinstance(raw_html, str):
+                    df.attrs["raw_html"] = raw_html
+
+            # 获取页码与边界框坐标并归一化坐标原点
             p_idx = 0
             bbox = None
             if hasattr(tbl, "prov") and tbl.prov:
@@ -1174,12 +1198,26 @@ def extract_via_docling(
 
                 raw_bbox = getattr(first_prov, "bbox", None)
                 if raw_bbox:
-                    bbox = [
-                        getattr(raw_bbox, "l", 0.0),
-                        getattr(raw_bbox, "t", 0.0),
-                        getattr(raw_bbox, "r", 0.0),
-                        getattr(raw_bbox, "b", 0.0)
-                    ]
+                    l = getattr(raw_bbox, "l", 0.0)
+                    t = getattr(raw_bbox, "t", 0.0)
+                    r = getattr(raw_bbox, "r", 0.0)
+                    b = getattr(raw_bbox, "b", 0.0)
+                    coord_origin = getattr(raw_bbox, "coord_origin", "BOTTOMLEFT")
+                    page_h = 792.0
+                    try:
+                        with fitz.open(pdf_path) as orig_doc:
+                            if 0 <= p_idx < len(orig_doc):
+                                page_h = orig_doc[p_idx].rect.height
+                    except Exception:
+                        pass
+
+                    coord_origin_name = getattr(coord_origin, "name", str(coord_origin))
+                    if "BOTTOMLEFT" in str(coord_origin).upper() or str(coord_origin_name).upper() == "BOTTOMLEFT":
+                        y0 = min(page_h - t, page_h - b)
+                        y1 = max(page_h - t, page_h - b)
+                        bbox = [float(l), float(y0), float(r), float(y1)]
+                    else:
+                        bbox = [float(l), float(min(t, b)), float(r), float(max(t, b))]
 
             # 获取表标题/说明
             caption = ""
@@ -1235,14 +1273,18 @@ def call_docling_table_extractor(
             continue
         p = item.get("page_idx", 0)
         title = df.attrs.get("table_title", f"Table {idx+1}")
-        try:
-            table_md = df.to_markdown(index=False)
-        except Exception:
-            cols = [str(c) for c in df.columns]
-            lines = ["| " + " | ".join(cols) + " |", "| " + " | ".join(["---"] * len(cols)) + " |"]
-            for _, r_data in df.iterrows():
-                lines.append("| " + " | ".join(str(v).replace("\n", " ").strip() for v in r_data.values) + " |")
-            table_md = "\n".join(lines)
+        raw_html = df.attrs.get("raw_html")
+        if raw_html and isinstance(raw_html, str) and "<table" in raw_html.lower():
+            table_md = raw_html
+        else:
+            try:
+                table_md = df.to_markdown(index=False)
+            except Exception:
+                cols = [str(c) for c in df.columns]
+                lines = ["| " + " | ".join(cols) + " |", "| " + " | ".join(["---"] * len(cols)) + " |"]
+                for _, r_data in df.iterrows():
+                    lines.append("| " + " | ".join(str(v).replace("\n", " ").strip() for v in r_data.values) + " |")
+                table_md = "\n".join(lines)
         block = f"### Table {idx+1} (Page {p+1}): {title}\n\n{table_md}\n"
         md_blocks.append(block)
 

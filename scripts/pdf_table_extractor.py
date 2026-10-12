@@ -36,6 +36,7 @@ pdf_table_extractor.py — 三方投票 PDF 表格提取引擎。
        ▼
   原 PDF + 页码 + bbox + 提取器 → 可追溯元数据
 """
+from __future__ import annotations
 
 import os
 import re
@@ -43,7 +44,7 @@ import io
 import time
 import tempfile
 import logging
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Set
 
 try:
     import pymupdf as fitz
@@ -1145,7 +1146,11 @@ def is_img2table_available() -> bool:
     return _IMG2TABLE_AVAILABLE
 
 
-def extract_via_img2table(pdf_path: str, pages: Optional[List[int]] = None) -> List[Dict[str, Any]]:
+def extract_via_img2table(
+    pdf_path: str,
+    pages: Optional[List[int]] = None,
+    candidate_pages: Optional[List[int]] = None,
+) -> List[Dict[str, Any]]:
     """
     使用 img2table (基于 OpenCV 形态学算子) 提取表格。
     完全脱离 Ghostscript 系统依赖，提供有线框表 (lattice) 与无线框表 (borderless) 提取。
@@ -1170,7 +1175,8 @@ def extract_via_img2table(pdf_path: str, pages: Optional[List[int]] = None) -> L
         from img2table.document import PDF
 
         # img2table 接收 0-indexed 页码列表
-        target_pages = [int(p) for p in pages] if pages is not None else None
+        raw_pages = pages if pages is not None else candidate_pages
+        target_pages = [int(p) for p in raw_pages] if raw_pages is not None else None
         doc = PDF(src=pdf_path, pages=target_pages, detect_rotation=False, pdf_text_extraction=True)
 
         extracted = doc.extract_tables(borderless_tables=True)
@@ -1187,15 +1193,27 @@ def extract_via_img2table(pdf_path: str, pages: Optional[List[int]] = None) -> L
                         df.attrs['table_title'] = str(tbl.title)
 
                     bbox = None
+                    pdf_bbox = None
                     if getattr(tbl, 'bbox', None):
                         b = tbl.bbox
-                        bbox = [getattr(b, 'x1', 0), getattr(b, 'y1', 0), getattr(b, 'x2', 0), getattr(b, 'y2', 0)]
+                        raw_bbox = [getattr(b, 'x1', 0), getattr(b, 'y1', 0), getattr(b, 'x2', 0), getattr(b, 'y2', 0)]
+                        # img2table 默认按 200 DPI 渲染 PDF 页面提取表格，
+                        # 需按 72 / 200 = 0.36 将像素坐标统一缩放至标准 PDF point 点坐标以支持空间匹配
+                        pt_scale = 72.0 / 200.0
+                        pdf_bbox = [
+                            getattr(b, 'x1', 0) * pt_scale,
+                            getattr(b, 'y1', 0) * pt_scale,
+                            getattr(b, 'x2', 0) * pt_scale,
+                            getattr(b, 'y2', 0) * pt_scale,
+                        ]
+                        bbox = raw_bbox
 
                     results.append({
                         'df': df,
                         'page_idx': p_num,
                         'table_idx': tbl_idx,
                         'bbox': bbox,
+                        'pdf_bbox': pdf_bbox,
                     })
     except Exception as e:
         logger.debug(f"[img2table] 提取异常: {e}")
@@ -2727,50 +2745,50 @@ def extract_via_paddleocr_crops(pdf_path: str, pages: Optional[List[int]] = None
                 except Exception as e_crop_ori:
                     print(f"[PaddleOCR-VL Crops] 切图方向检测与校准提示: {e_crop_ori}")
 
-            temp_img_path = None
-            try:
-                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f_tmp:
-                    temp_img_path = f_tmp.name
-                img.save(temp_img_path, format="PNG")
+                temp_img_path = None
+                try:
+                    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f_tmp:
+                        temp_img_path = f_tmp.name
+                    img.save(temp_img_path, format="PNG")
 
-                print(f"[PaddleOCR-VL Crops] 正在提交第 {page_idx+1} 页 Table Crop #{t_idx+1} (尺寸: {img.size}) 至 VLM...")
-                crop_md = ocr_client.call_paddleocr_vl_online_api(temp_img_path, config=config, timeout=180, cancel_event=cancel_event)
-                if not crop_md:
-                    continue
+                    print(f"[PaddleOCR-VL Crops] 正在提交第 {page_idx+1} 页 Table Crop #{t_idx+1} (尺寸: {img.size}) 至 VLM...")
+                    crop_md = ocr_client.call_paddleocr_vl_online_api(temp_img_path, config=config, timeout=180, cancel_event=cancel_event)
+                    if not crop_md:
+                        continue
 
-                dfs = parse_structured_vlm_content(crop_md)
-                from table_postprocess import merge_continuation_tables
-                dfs = merge_continuation_tables(dfs)
+                    dfs = parse_structured_vlm_content(crop_md)
+                    from table_postprocess import merge_continuation_tables
+                    dfs = merge_continuation_tables(dfs)
 
-                for sub_t_idx, df in enumerate(dfs):
-                    if df is not None and not df.empty and df.shape[0] >= 1 and df.shape[1] >= 1:
-                        df.attrs['extractor'] = 'paddleocr_vl_crop'
-                        df.attrs['page_idx'] = page_idx
-                        df.attrs['covered_pages'] = [page_idx]
-                        if crop.get("crop_bbox"):
-                            df.attrs['crop_bbox'] = crop['crop_bbox']
-                        if crop.get("pdf_bbox"):
-                            df.attrs['pdf_bbox'] = crop['pdf_bbox']
+                    for sub_t_idx, df in enumerate(dfs):
+                        if df is not None and not df.empty and df.shape[0] >= 1 and df.shape[1] >= 1:
+                            df.attrs['extractor'] = 'paddleocr_vl_crop'
+                            df.attrs['page_idx'] = page_idx
+                            df.attrs['covered_pages'] = [page_idx]
+                            if crop.get("crop_bbox"):
+                                df.attrs['crop_bbox'] = crop['crop_bbox']
+                            if crop.get("pdf_bbox"):
+                                df.attrs['pdf_bbox'] = crop['pdf_bbox']
 
-                        # 触发 Post-OCR 门禁检验与 Agent 协同验证
-                        df = verify_and_rescue_table_with_agent(df, pdf_path, page_idx, df.attrs.get('label', ''))
-                        results.append({
-                            'df': df,
-                            'page_idx': page_idx,
-                            'table_idx': t_idx + sub_t_idx,
-                            'bbox': crop.get("crop_bbox"),
-                            'pdf_bbox': crop.get("pdf_bbox"),
-                            'covered_pages': [page_idx],
-                        })
-                        page_success = True
-            except Exception as e_crop:
-                print(f"[PaddleOCR-VL Crops] 处理第 {page_idx+1} 页 Crop #{t_idx+1} 异常: {e_crop}")
-            finally:
-                if temp_img_path and os.path.exists(temp_img_path):
-                    try:
-                        os.unlink(temp_img_path)
-                    except Exception:
-                        pass
+                            # 触发 Post-OCR 门禁检验与 Agent 协同验证
+                            df = verify_and_rescue_table_with_agent(df, pdf_path, page_idx, df.attrs.get('label', ''))
+                            results.append({
+                                'df': df,
+                                'page_idx': page_idx,
+                                'table_idx': t_idx + sub_t_idx,
+                                'bbox': crop.get("crop_bbox"),
+                                'pdf_bbox': crop.get("pdf_bbox"),
+                                'covered_pages': [page_idx],
+                            })
+                            page_success = True
+                except Exception as e_crop:
+                    print(f"[PaddleOCR-VL Crops] 处理第 {page_idx+1} 页 Crop #{t_idx+1} 异常: {e_crop}")
+                finally:
+                    if temp_img_path and os.path.exists(temp_img_path):
+                        try:
+                            os.unlink(temp_img_path)
+                        except Exception:
+                            pass
 
             # 统计该页期望表数与实际成功提取数，若提取数少于期望表数（如一页双表只切出一张），整页不可标记为完全 resolved
             expected_page_tables = 1
@@ -2780,9 +2798,9 @@ def extract_via_paddleocr_crops(pdf_path: str, pages: Optional[List[int]] = None
                 except ImportError:
                     from table_validator import scan_pdf_table_declarations
                 p_decls = scan_pdf_table_declarations(pdf_path).get(page_idx, [])
-                expected_page_tables = max(1, len(crops), len([d for d in p_decls if not d.get('is_continuation')]))
+                expected_page_tables = max(1, len(page_crops), len([d for d in p_decls if not d.get('is_continuation')]))
             except Exception:
-                expected_page_tables = max(1, len(crops))
+                expected_page_tables = max(1, len(page_crops))
 
             page_extracted_count = sum(1 for r in results if r.get('page_idx') == page_idx)
             if page_success and page_extracted_count >= expected_page_tables:
@@ -2863,6 +2881,12 @@ def reconcile_native_and_ocr_tables(
     unaffected = [r for r in native_results if r.get('page_idx') not in ocr_pages_set]
     merged = list(unaffected)
     handled_ocr_ids = set()
+    appended_ocr_ids = set()
+
+    def _append_ocr_safely(item):
+        if id(item) not in appended_ocr_ids:
+            appended_ocr_ids.add(id(item))
+            merged.append(item)
 
     def _safe_label(item):
         if not item or not isinstance(item, dict):
@@ -2887,7 +2911,7 @@ def reconcile_native_and_ocr_tables(
             for ocr_item in p_ocr:
                 if id(ocr_item) not in handled_ocr_ids:
                     handled_ocr_ids.add(id(ocr_item))
-                    merged.append(ocr_item)
+                    _append_ocr_safely(ocr_item)
             continue
 
         matched_nat_indices = set()
@@ -2908,10 +2932,9 @@ def reconcile_native_and_ocr_tables(
                 if nat_lbl and format_table_label(nat_lbl) == fmt_ocr:
                     matched_nat_indices.add(i_nat)
                     matched_ocr_indices.add(i_ocr)
+                    handled_ocr_ids.add(id(ocr_item))
                     if _should_replace_with_ocr(nat_item, ocr_item):
-                        if id(ocr_item) not in handled_ocr_ids:
-                            handled_ocr_ids.add(id(ocr_item))
-                            merged.append(ocr_item)
+                        _append_ocr_safely(ocr_item)
                         logs.append(f"  Page {p+1}: 表号 [{fmt_ocr}] 原生版本被更优的 OCR 版本精准替换")
                     else:
                         merged.append(nat_item)
@@ -2925,11 +2948,20 @@ def reconcile_native_and_ocr_tables(
             b_ocr = ocr_item.get('pdf_bbox') or ocr_item.get('bbox')
             if not b_ocr:
                 continue
+            ocr_lbl = _safe_label(ocr_item)
+            fmt_ocr = format_table_label(ocr_lbl) if ocr_lbl else None
+
             best_nat_idx = -1
             best_iom = 0.0
             for i_nat, nat_item in enumerate(p_nat):
                 if i_nat in matched_nat_indices:
                     continue
+                # 排除明确的表号冲突 (如 Table 1 与 Table 2 互相独立)
+                nat_lbl = _safe_label(nat_item)
+                fmt_nat = format_table_label(nat_lbl) if nat_lbl else None
+                if fmt_nat and fmt_ocr and fmt_nat != fmt_ocr:
+                    continue
+
                 b_nat = nat_item.get('pdf_bbox') or nat_item.get('bbox')
                 if not b_nat:
                     continue
@@ -2941,11 +2973,10 @@ def reconcile_native_and_ocr_tables(
             if best_nat_idx >= 0:
                 matched_nat_indices.add(best_nat_idx)
                 matched_ocr_indices.add(i_ocr)
+                handled_ocr_ids.add(id(ocr_item))
                 nat_item = p_nat[best_nat_idx]
                 if _should_replace_with_ocr(nat_item, ocr_item):
-                    if id(ocr_item) not in handled_ocr_ids:
-                        handled_ocr_ids.add(id(ocr_item))
-                        merged.append(ocr_item)
+                    _append_ocr_safely(ocr_item)
                     logs.append(f"  Page {p+1}: 空间重叠 (IoM={best_iom:.2f}) 原生表格被更优的 OCR 版本精准替换")
                 else:
                     merged.append(nat_item)
@@ -2958,6 +2989,10 @@ def reconcile_native_and_ocr_tables(
             df_ocr = ocr_item.get('df')
             if df_ocr is None or df_ocr.empty:
                 continue
+            ocr_lbl = _safe_label(ocr_item)
+            fmt_ocr = format_table_label(ocr_lbl) if ocr_lbl else None
+            b_ocr = ocr_item.get('pdf_bbox') or ocr_item.get('bbox')
+
             best_nat_idx = -1
             best_sim = 0.0
             for i_nat, nat_item in enumerate(p_nat):
@@ -2966,6 +3001,20 @@ def reconcile_native_and_ocr_tables(
                 df_nat = nat_item.get('df')
                 if df_nat is None or df_nat.empty:
                     continue
+
+                # 排除明确的表号冲突 (如 Table 1 与 Table 2 互相独立)
+                nat_lbl = _safe_label(nat_item)
+                fmt_nat = format_table_label(nat_lbl) if nat_lbl else None
+                if fmt_nat and fmt_ocr and fmt_nat != fmt_ocr:
+                    continue
+
+                # 排除空间完全分离 (若两者均包含 bbox 且无实质重叠)
+                b_nat = nat_item.get('pdf_bbox') or nat_item.get('bbox')
+                if b_nat and b_ocr:
+                    iou, iom = _compute_bbox_iou(b_nat, b_ocr)
+                    if iou <= 0.05 and iom <= 0.05:
+                        continue
+
                 sim = _table_similarity(df_nat, df_ocr)
                 if sim >= 0.65 and sim > best_sim:
                     best_sim = sim
@@ -2974,11 +3023,10 @@ def reconcile_native_and_ocr_tables(
             if best_nat_idx >= 0:
                 matched_nat_indices.add(best_nat_idx)
                 matched_ocr_indices.add(i_ocr)
+                handled_ocr_ids.add(id(ocr_item))
                 nat_item = p_nat[best_nat_idx]
                 if _should_replace_with_ocr(nat_item, ocr_item):
-                    if id(ocr_item) not in handled_ocr_ids:
-                        handled_ocr_ids.add(id(ocr_item))
-                        merged.append(ocr_item)
+                    _append_ocr_safely(ocr_item)
                     logs.append(f"  Page {p+1}: 内容相似 (sim={best_sim:.2f}) 原生表格被更优的 OCR 版本精准替换")
                 else:
                     merged.append(nat_item)
@@ -2988,7 +3036,7 @@ def reconcile_native_and_ocr_tables(
         for i_ocr, ocr_item in enumerate(p_ocr):
             if i_ocr not in matched_ocr_indices and id(ocr_item) not in handled_ocr_ids:
                 handled_ocr_ids.add(id(ocr_item))
-                merged.append(ocr_item)
+                _append_ocr_safely(ocr_item)
                 logs.append(f"  Page {p+1}: OCR 补充检出新表格，予以采纳")
 
         # 5. 未被匹配的原生结果（同页未被 OCR 覆盖的兄弟表格）
@@ -3008,9 +3056,23 @@ def reconcile_native_and_ocr_tables(
     for ocr_item in ocr_results:
         if id(ocr_item) not in handled_ocr_ids:
             handled_ocr_ids.add(id(ocr_item))
-            merged.append(ocr_item)
+            _append_ocr_safely(ocr_item)
 
     return merged
+
+
+def merge_extracted_tables(
+    native_results: List[Dict[str, Any]],
+    ocr_results: List[Dict[str, Any]],
+    candidate_pages: Optional[List[int]] = None,
+    ocr_candidate_pages: Optional[List[int]] = None,
+    logs: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    表级智能对齐与替换策略（reconcile_native_and_ocr_tables 兼容别名）。
+    """
+    pages = ocr_candidate_pages if ocr_candidate_pages is not None else (candidate_pages or [])
+    return reconcile_native_and_ocr_tables(native_results, ocr_results, pages, logs=logs)
 
 
 def quick_detect_candidate_pages(pdf_path: str) -> List[int]:
@@ -3056,6 +3118,107 @@ def quick_detect_candidate_pages(pdf_path: str) -> List[int]:
         pass
 
     return sorted(list(candidate_pages))
+
+
+def get_table_candidate_pages(
+    pdf_path: str,
+) -> Tuple[List[int], Dict[int, Set[str]], Dict[int, List[Dict[str, Any]]]]:
+    """
+    探测 PDF 中可能包含表格的候选页面索引 (0-indexed)。
+    多信号并集体系：Caption 声明、全图扫描页、矢量线框探测、无框文本表格 (strategy="text") 与轻量列对齐探测。
+
+    返回: (candidate_pages, candidate_sources, page_decls)
+    """
+    if not os.path.exists(pdf_path) or fitz is None:
+        return ([], {}, {})
+
+    candidate_sources: Dict[int, Set[str]] = {}
+
+    def _add_candidate(page_idx: int, src: str):
+        if page_idx not in candidate_sources:
+            candidate_sources[page_idx] = set()
+        candidate_sources[page_idx].add(src)
+
+    page_decls = {}
+    try:
+        try:
+            from .table_validator import scan_pdf_table_declarations
+        except ImportError:
+            from table_validator import scan_pdf_table_declarations
+        page_decls = scan_pdf_table_declarations(pdf_path)
+        for p in page_decls.keys():
+            _add_candidate(p, 'caption')
+    except Exception:
+        pass
+
+    try:
+        doc = fitz.open(pdf_path)
+        for p_idx, page in enumerate(doc):
+            words = page.get_text("words")
+            images = page.get_images()
+            if len(images) > 0 and len(words) < 80:
+                _add_candidate(p_idx, 'image_scan')
+        doc.close()
+    except Exception:
+        pass
+
+    try:
+        with fitz.open(pdf_path) as doc_check:
+            total_pages = len(doc_check)
+            pages_to_check = [p for p in range(total_pages) if p not in candidate_sources]
+            chunk_size = 50 if total_pages <= 300 else 100
+            for chunk_start in range(0, len(pages_to_check), chunk_size):
+                chunk = pages_to_check[chunk_start:chunk_start + chunk_size]
+                for p_idx in chunk:
+                    p_obj = None
+                    try:
+                        p_obj = doc_check[p_idx]
+                        has_drawings = True
+                        try:
+                            drawings = p_obj.get_drawings()
+                            if isinstance(drawings, (list, tuple)) and len(drawings) == 0:
+                                has_drawings = False
+                        except Exception:
+                            has_drawings = True
+
+                        if has_drawings:
+                            tabs = p_obj.find_tables()
+                            if tabs and hasattr(tabs, 'tables') and tabs.tables:
+                                valid_vec_tabs = [
+                                    tb for tb in tabs.tables
+                                    if getattr(tb, 'row_count', 0) >= 1 and getattr(tb, 'col_count', 0) >= 1
+                                ]
+                                if valid_vec_tabs:
+                                    _add_candidate(p_idx, 'vector_find_tables')
+
+                        if p_idx not in candidate_sources:
+                            try:
+                                text_tabs = p_obj.find_tables(strategy="text")
+                                if text_tabs and hasattr(text_tabs, 'tables') and text_tabs.tables:
+                                    valid_text_tabs = [
+                                        tb for tb in text_tabs.tables
+                                        if getattr(tb, 'row_count', 0) >= 1 and getattr(tb, 'col_count', 0) >= 1
+                                    ]
+                                    if valid_text_tabs:
+                                        _add_candidate(p_idx, 'text_find_tables')
+                            except Exception:
+                                pass
+                            if p_idx not in candidate_sources:
+                                try:
+                                    from pdf_tables import probe_disjoint_native_tables
+                                    if probe_disjoint_native_tables(p_obj) > 0:
+                                        _add_candidate(p_idx, 'probe_disjoint_native')
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+                    finally:
+                        p_obj = None
+    except Exception:
+        pass
+
+    cand_pages = sorted(list(candidate_sources.keys()))
+    return (cand_pages, candidate_sources, page_decls)
 
 
 def extract_tables_from_pdf(
@@ -3261,7 +3424,9 @@ def _do_extract_tables_from_pdf(
                                 ]
                                 if valid_vec_tabs:
                                     _add_candidate(p_idx, 'vector_find_tables')
-                        else:
+
+                        # 即使存在绘图或线框未检出，继续尝试文本检测，防止页眉线导致无框表漏检
+                        if p_idx not in candidate_sources:
                             # 无绘图页仍跑一次 find_tables(strategy="text") 或 probe_disjoint_native_tables 轻量文本列对齐探测
                             try:
                                 text_tabs = p_obj.find_tables(strategy="text")
