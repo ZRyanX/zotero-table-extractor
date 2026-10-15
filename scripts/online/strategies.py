@@ -37,18 +37,83 @@ load_config = common.load_config
 load_cookies_from_file = common.load_cookies_from_file
 
 
-def _rows_to_dataframe(rows_data):
+_SUP_UNICODE = {'0':'⁰','1':'¹','2':'²','3':'³','4':'⁴','5':'⁵','6':'⁶','7':'⁷','8':'⁸','9':'⁹','+':'⁺','-':'⁻','−':'⁻','=':'⁼','(':'⁽',')':'⁾','n':'ⁿ','i':'ⁱ'}
+_SUB_UNICODE = {'0':'₀','1':'₁','2':'₂','3':'₃','4':'₄','5':'₅','6':'₆','7':'₇','8':'₈','9':'₉','+':'₊','-':'₋','−':'₋','=':'₌','(':'₍',')':'₎','a':'ₐ','e':'ₑ','o':'ₒ','x':'ₓ','h':'ₕ','k':'ₖ','l':'ₗ','m':'ₘ','n':'ₙ','p':'ₚ','s':'ₛ','t':'ₜ'}
+
+def _xml_cell_to_text(elem) -> str:
+    """递归提取 XML 单元格文本，保留 <sup> 与 <sub> 为 Unicode 上下标或 LaTeX 语义表示，并正确处理换行与块级分隔。"""
+    if elem is None:
+        return ""
+    parts = []
+    if elem.text:
+        parts.append(elem.text)
+    for child in elem:
+        tag = child.tag.split('}')[-1].lower()
+        if tag in ('break', 'br'):
+            parts.append('\n')
+            if child.tail:
+                parts.append(child.tail)
+            continue
+        child_text = _xml_cell_to_text(child)
+        if tag == 'sup':
+            if child_text and all(c in _SUP_UNICODE for c in child_text):
+                parts.append(''.join(_SUP_UNICODE[c] for c in child_text))
+            else:
+                parts.append(f'^{{{child_text}}}')
+        elif tag == 'sub':
+            if child_text and all(c in _SUB_UNICODE for c in child_text):
+                parts.append(''.join(_SUB_UNICODE[c] for c in child_text))
+            else:
+                parts.append(f'_{{{child_text}}}')
+        elif tag in ('p', 'div'):
+            if parts and not parts[-1].endswith((' ', '\n')):
+                parts.append(' ')
+            parts.append(child_text)
+        else:
+            parts.append(child_text)
+        if child.tail:
+            parts.append(child.tail)
+    return ''.join(parts).strip()
+
+
+def _bs4_cell_to_text(cell) -> str:
+    """递归提取 BeautifulSoup HTML 单元格文本，保留 <sup> 与 <sub> 为 Unicode 上下标或 LaTeX 语义表示，并正确处理换行与块级分隔。"""
+    if cell is None:
+        return ""
+    parts = []
+    for child in getattr(cell, 'contents', []):
+        if isinstance(child, str):
+            parts.append(str(child))
+        elif hasattr(child, 'name') and child.name:
+            tag = child.name.lower()
+            if tag == 'br':
+                parts.append('\n')
+                continue
+            inner = _bs4_cell_to_text(child)
+            if tag == 'sup':
+                if inner and all(c in _SUP_UNICODE for c in inner):
+                    parts.append(''.join(_SUP_UNICODE[c] for c in inner))
+                else:
+                    parts.append(f'^{{{inner}}}')
+            elif tag == 'sub':
+                if inner and all(c in _SUB_UNICODE for c in inner):
+                    parts.append(''.join(_SUB_UNICODE[c] for c in inner))
+                else:
+                    parts.append(f'_{{{inner}}}')
+            elif tag in ('p', 'div'):
+                if parts and not parts[-1].endswith((' ', '\n')):
+                    parts.append(' ')
+                parts.append(inner)
+            else:
+                parts.append(inner)
+    return ''.join(parts).strip()
+
+
+def _rows_to_dataframe(rows_data, has_explicit_header=None):
     """
-    将 [[cell,...],...] 二维列表转为 DataFrame，自动将首行提升为表头。
-    修复：旧版直接 pd.DataFrame(rows_data) 不传 columns，导致 [0,1,2,...] 整数列名
-    被 to_excel(header=True) 写入第一行，真实表头被下推到第二行（影响 121 个表）。
-
-    判据：若首行含至少 1 个非数字单元格（字段名），则将其作为 columns，
-    其余行作为 data；否则保持默认整数列名（由 postprocess 后续提升）。
-
-    新增修复：
-    1. 检测首行为纯序号行 [0,1,2,...] 或 [1,2,3,...] 时，跳过首行，从第二行取表头。
-    2. 单列挤压检测：若仅 1 列且单元格含 Tab/多空格分隔符，尝试重新分列。
+    将 [[cell,...],...] 二维列表转为 DataFrame。
+    优先保留源文件的表头标记 (has_explicit_header=True/False)；
+    若未显式指定 (None)，基于真实表头和连续序号判据智能识别。
     """
     if not rows_data:
         return pd.DataFrame()
@@ -58,19 +123,39 @@ def _rows_to_dataframe(rows_data):
         if len(r) < max_cols:
             r.extend([""] * (max_cols - len(r)))
 
-    # 检测首行是否为纯序号行 [0,1,2,...] 或 ['',1,2,3,...]
-    first_row = [str(c).strip() if c is not None else "" for c in rows_data[0]]
-    numeric_first = sum(1 for c in first_row if c and c.replace('.', '').replace('-', '').isdigit())
-    is_index_row = (numeric_first >= max(2, len(first_row) * 0.7) and
-                    all(c == '' or c.replace('.', '').replace('-', '').isdigit() for c in first_row))
+    if has_explicit_header is True:
+        if len(rows_data) >= 2:
+            return pd.DataFrame(rows_data[1:], columns=rows_data[0])
+        elif len(rows_data) == 1:
+            return pd.DataFrame([], columns=rows_data[0])
+    if has_explicit_header is False:
+        return pd.DataFrame(rows_data)
 
-    if is_index_row and len(rows_data) >= 2:
-        # 跳过序号行，从第二行取表头
+    first_row = [str(c).strip() if c is not None else "" for c in rows_data[0]]
+
+    # 严格检验首行是否为连续列序号行 [0,1,2,...] 或 [1,2,3,...]
+    # 绝不能仅凭“全为数字”误删合法的纯数值数据行
+    is_true_index_row = False
+    if len(rows_data) >= 3:
+        clean_first = [c for c in first_row if c]
+        int_candidates = []
+        for c in clean_first:
+            m = re.match(r'^(?:[\(\[]\s*)?(\d+)(?:\s*[\)\]])?$', c)
+            if m:
+                int_candidates.append(int(m.group(1)))
+            else:
+                break
+        if len(int_candidates) >= 2 and len(int_candidates) == len(clean_first):
+            start_val = int_candidates[0]
+            if start_val in (0, 1) and int_candidates == list(range(start_val, start_val + len(int_candidates))):
+                second_row = [str(c).strip() if c is not None else "" for c in rows_data[1]]
+                non_numeric_2 = sum(1 for c in second_row if c and not c.replace('.', '').replace('-', '').replace(',', '').replace('%', '').replace('+', '').isdigit())
+                if len(second_row) > 0 and non_numeric_2 >= max(1, len(second_row) // 3):
+                    is_true_index_row = True
+
+    if is_true_index_row:
         second_row = [str(c).strip() if c is not None else "" for c in rows_data[1]]
-        non_numeric_2 = sum(1 for c in second_row if c and not c.replace('.', '').replace('-', '').replace(',', '').replace('%', '').replace('+', '').isdigit())
-        if len(second_row) > 0 and non_numeric_2 >= max(1, len(second_row) // 3) and len(rows_data) >= 3:
-            return pd.DataFrame(rows_data[2:], columns=second_row)
-        return pd.DataFrame(rows_data[1:])
+        return pd.DataFrame(rows_data[2:], columns=second_row)
 
     # 判断首行是否像表头（含非数字文本）
     non_numeric = sum(1 for c in first_row if c and not c.replace('.', '').replace('-', '').replace(',', '').replace('%', '').replace('+', '').isdigit())
@@ -986,16 +1071,21 @@ def _parse_jats_xml_tables(xml_content, table_idx="all"):
         if foot_elem is not None:
             fn_nodes = foot_elem.findall('.//{*}fn') or foot_elem.findall('.//{*}p')
             for fn in fn_nodes:
-                fn_text = "".join(fn.itertext()).strip()
+                fn_text = _xml_cell_to_text(fn)
                 if fn_text:
                     footnotes.append(fn_text)
             if not footnotes:
-                combined_foot = "".join(foot_elem.itertext()).strip()
+                combined_foot = _xml_cell_to_text(foot_elem)
                 if combined_foot:
                     footnotes.append(combined_foot)
 
         tbl_node = tw.find('.//{*}table')
         if tbl_node is not None:
+            thead = tbl_node.find('.//{*}thead')
+            first_tr = tbl_node.find('.//{*}tr')
+            first_row_has_th = bool(first_tr is not None and any(c.tag.split('}')[-1] == 'th' for c in first_tr))
+            has_explicit_header = True if (thead is not None or first_row_has_th) else None
+
             rows = tbl_node.findall('.//{*}tr')
             if rows:
                 grid = []
@@ -1016,7 +1106,7 @@ def _parse_jats_xml_tables(xml_content, table_idx="all"):
                         except Exception:
                             rowspan = 1
 
-                        text = "".join(cell.itertext()).strip()
+                        text = _xml_cell_to_text(cell)
 
                         while len(grid) < r_idx + rowspan:
                             grid.append([])
@@ -1038,7 +1128,7 @@ def _parse_jats_xml_tables(xml_content, table_idx="all"):
                             row_vals.extend([""] * (max_cols - len(row_vals)))
                         clean_grid.append(row_vals)
 
-                    df = _rows_to_dataframe(clean_grid)
+                    df = _rows_to_dataframe(clean_grid, has_explicit_header=has_explicit_header)
                     if not df.empty and df.shape[0] >= 1 and df.shape[1] >= 1:
                         if label_text:
                             df.attrs['label'] = label_text
@@ -1193,13 +1283,18 @@ def extract_tables_via_arxiv_html(arxiv_id_or_url, table_idx="all"):
                 footnotes = []
                 notes_div = fig.find("div", class_=re.compile(r'ltx_(?:table_)?notes?'))
                 if notes_div:
-                    fn_str = notes_div.get_text(" ", strip=True)
+                    fn_str = _bs4_cell_to_text(notes_div)
                     if fn_str:
                         footnotes.append(fn_str)
 
                 tbl = fig.find("table")
                 if not tbl:
                     continue
+
+                has_thead = tbl.find("thead") is not None
+                first_tr = tbl.find("tr")
+                first_row_has_th = bool(first_tr is not None and first_tr.find_all("th"))
+                has_explicit_header = True if (has_thead or first_row_has_th) else None
 
                 rows = tbl.find_all("tr")
                 if not rows:
@@ -1223,7 +1318,7 @@ def extract_tables_via_arxiv_html(arxiv_id_or_url, table_idx="all"):
                         except Exception:
                             rowspan = 1
 
-                        text = cell.get_text(" ", strip=True)
+                        text = _bs4_cell_to_text(cell)
 
                         while len(grid) < r_idx + rowspan:
                             grid.append([])
@@ -1245,7 +1340,7 @@ def extract_tables_via_arxiv_html(arxiv_id_or_url, table_idx="all"):
                             row_vals.extend([""] * (max_cols - len(row_vals)))
                         clean_grid.append(row_vals)
 
-                    df = _rows_to_dataframe(clean_grid)
+                    df = _rows_to_dataframe(clean_grid, has_explicit_header=has_explicit_header)
                     if not df.empty and df.shape[0] >= 1 and df.shape[1] >= 1:
                         if label_text:
                             df.attrs['label'] = label_text

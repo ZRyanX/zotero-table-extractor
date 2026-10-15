@@ -78,7 +78,7 @@ def format_academic_rich_text(val):
         return val
 
 
-def autofit_excel_columns(file_path, title=None):
+def autofit_excel_columns(file_path, title=None, footnotes=None, sheet_footnotes=None):
     """Auto-fit column widths in the output Excel sheet and ensure full macOS QuickLook / Office metadata compatibility."""
     try:
         from openpyxl import load_workbook
@@ -89,8 +89,33 @@ def autofit_excel_columns(file_path, title=None):
         wb.properties.lastModifiedBy = "Zotero Table Extractor"
         if title:
             wb.properties.title = str(title)[:100]
+
+        if sheet_footnotes is None and footnotes is not None:
+            if isinstance(footnotes, dict):
+                sheet_footnotes = footnotes
+            elif isinstance(footnotes, (list, tuple, str)):
+                sheet_footnotes = {"*default*": footnotes if isinstance(footnotes, (list, tuple)) else [str(footnotes)]}
             
         for sheet in wb.worksheets:
+            # 写入该 Sheet 对应表格的学术尾注 / 附注
+            notes_to_add = []
+            if sheet_footnotes:
+                if sheet.title in sheet_footnotes:
+                    notes_to_add = sheet_footnotes[sheet.title]
+                elif "*default*" in sheet_footnotes and (len(wb.worksheets) == 1 or not any(s in sheet_footnotes for s in wb.sheetnames)):
+                    notes_to_add = sheet_footnotes["*default*"]
+            elif footnotes:
+                notes_to_add = footnotes if isinstance(footnotes, list) else [str(footnotes)]
+
+            if notes_to_add:
+                existing_first_col = {str(row[0].value).strip() for row in sheet.iter_rows() if row and row[0].value is not None}
+                for fn in notes_to_add:
+                    if fn and str(fn).strip():
+                        fn_str = str(fn).strip()
+                        if fn_str not in existing_first_col:
+                            sheet.append([format_academic_rich_text(fn_str)])
+                            existing_first_col.add(fn_str)
+
             # 应用学术上下标富文本渲染
             for row in sheet.iter_rows():
                 for cell in row:
@@ -334,9 +359,15 @@ def save_tables_to_excel(dataframes, output_path, headers=None, single_file=True
                     ws.append([str(c) for c in df.columns])
                     for row in df.itertuples(index=False):
                         ws.append([None if pd.isnull(val) else val for val in row])
+                    fn_list = df.attrs.get('footnotes', [])
+                    if fn_list:
+                        for fn in (fn_list if isinstance(fn_list, list) else [str(fn_list)]):
+                            if fn and str(fn).strip():
+                                ws.append([format_academic_rich_text(str(fn).strip())])
 
                 wb_existing.save(temp_xlsx)
                 wb_existing.close()
+                autofit_excel_columns(temp_xlsx)
             else:
                 sheets_to_write = []
                 main_count = 0
@@ -377,7 +408,8 @@ def save_tables_to_excel(dataframes, output_path, headers=None, single_file=True
                     for s_name, s_df in sheets_to_write:
                         s_df.to_excel(writer, sheet_name=s_name, index=False)
 
-            autofit_excel_columns(temp_xlsx)
+                sheet_fn_map = {s_name: s_df.attrs.get('footnotes') for s_name, s_df in sheets_to_write if s_df.attrs.get('footnotes')}
+                autofit_excel_columns(temp_xlsx, sheet_footnotes=sheet_fn_map)
             try:
                 os.replace(temp_xlsx, output_path)
             except OSError:
@@ -549,14 +581,14 @@ def save_tables_to_excel(dataframes, output_path, headers=None, single_file=True
                     df_to_save.attrs.update(saved_attrs)
                         
                     df_to_save.to_excel(tbl_path, index=False)
-                    autofit_excel_columns(tbl_path, title=df_to_save.attrs.get('table_title') or title or file_label)
+                    autofit_excel_columns(tbl_path, title=df_to_save.attrs.get('table_title') or title or file_label, footnotes=df_to_save.attrs.get('footnotes'))
                     written_files[tbl_path] = df_to_save
                     print(f"Saved: {tbl_path}")
                 except Exception as e:
                     print(f"Error merging dataframes for {tbl_path}: {e}")
             else:
                 df.to_excel(tbl_path, index=False)
-                autofit_excel_columns(tbl_path, title=title or file_label)
+                autofit_excel_columns(tbl_path, title=title or file_label, footnotes=df.attrs.get('footnotes'))
                 written_files[tbl_path] = df
                 print(f"Saved: {tbl_path}")
             

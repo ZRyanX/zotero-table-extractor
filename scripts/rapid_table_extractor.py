@@ -4,10 +4,13 @@ rapid_table_extractor.py — RapidAI / TableStructureRec + RapidTable 本地双�
 
 架构特色：
 1. 有线/无线表格双模型串联与自适应分流：
-   - table_cls 预先判别表格类型（有线表格 vs 无线三线表/开放表）；
-   - 有线表格: UNet 线检测 + SLANet-Plus (快速晶格与合并单元格恢复，~100ms CPU)；
-   - 无线表格: UniTable / Transformer 序列预测 (无框文本拓扑推断，~500ms CPU)。
-2. 全部采用轻量 ONNX 格式，零 GPU 强依赖，纯 CPU 毫秒级推理；
+   - 支持 TableStructureRec (TableCls 判别有线 wired vs 无线 lineless)；
+   - 有线表格: WiredTableRec 或 RapidTable (SLANet-Plus, 轻量 ONNX CPU 毫秒级推理)；
+   - 无线表格: LinelessTableRec 或 UniTable (UniTable 依赖 PyTorch，作为独立可选依赖；未安装 PyTorch 时平滑回退至 SLANet-Plus 或启发式处理)。
+2. 明确区分 ONNX 与 PyTorch 依赖：
+   - SLANet-Plus 采用轻量 ONNX 格式，零 GPU 强依赖，纯 CPU 毫秒级推理；
+   - UniTable 为 PyTorch 深度序列模型，需独立安装 PyTorch 环境；
+   - RapidTable 2/3 依赖 rapidocr>=3.0.0，需正确配套安装。
 3. 输出完整 DOM 与合并单元格信息 (rowspan/colspan)；
 4. 既可作为 8 引擎多方投票 (three_way_vote) 的候选方接入，亦可在云端 OCR 接管前作为本地快速试跑层。
 """
@@ -43,38 +46,42 @@ except ImportError:
 logger = logging.getLogger("rapid_table")
 
 
+_RAPID_TABLE_AVAILABLE: Optional[bool] = None
+
+
 def is_rapid_table_available() -> bool:
-    """检查 rapid_table 或 table_structure_rec 及其 ONNX 运行环境是否可用。"""
+    """检查 rapid_table 或 table_structure_rec 及其运行环境是否真实可用 (检查真实初始化状态并缓存)。"""
+    global _RAPID_TABLE_AVAILABLE
+    if _RAPID_TABLE_AVAILABLE is not None:
+        return _RAPID_TABLE_AVAILABLE
+
     try:
         import rapid_table
-        return True
-    except ImportError:
-        pass
+    except (ImportError, Exception):
+        rapid_table = None
 
     try:
         import table_structure_rec
-        return True
-    except ImportError:
-        pass
+    except (ImportError, Exception):
+        table_structure_rec = None
 
-    # 检查本地 ONNX 运行时与是否有相关模型权重
+    if rapid_table is None and table_structure_rec is None:
+        _RAPID_TABLE_AVAILABLE = False
+        return False
+
     try:
-        import onnxruntime
-        models_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models")
-        if os.path.exists(models_dir):
-            for fname in os.listdir(models_dir):
-                if ("slanet" in fname.lower() or "rapid_table" in fname.lower() or "unitable" in fname.lower()) and fname.endswith(".onnx"):
-                    return True
+        ext = RapidTableExtractor()
+        _RAPID_TABLE_AVAILABLE = ext.is_ready()
     except Exception:
-        pass
+        _RAPID_TABLE_AVAILABLE = False
 
-    return False
+    return _RAPID_TABLE_AVAILABLE
 
 
 class RapidTableExtractor:
     """
     RapidAI TableStructureRec + RapidTable 结构识别包装器。
-    支持 table_cls 区分 wired/wireless 表格，自适应走 SLANet-Plus 或 UniTable。
+    支持 TableCls / 启发式区分 wired/wireless 表格，自适应走 SLANet-Plus 或 UniTable。
     """
 
     def __init__(self, model_dir: Optional[str] = None):
@@ -84,18 +91,54 @@ class RapidTableExtractor:
         self._table_engine = None
         self._wired_engine = None
         self._wireless_engine = None
+        self._wired_tsr_engine = None
+        self._lineless_tsr_engine = None
         self._table_cls = None
         self._initialized = False
+
+    def is_ready(self) -> bool:
+        """检查引擎是否真正完成初始化并具备可用识别模型。"""
+        self._init_engine()
+        return any(x is not None for x in [
+            self._table_engine, self._wired_engine, self._wireless_engine,
+            self._wired_tsr_engine, self._lineless_tsr_engine
+        ])
 
     def _init_engine(self):
         if self._initialized:
             return
         self._initialized = True
+
+        # 1. 尝试加载官方 TableStructureRec 模块 (TableCls, WiredTableRec, LinelessTableRec)
+        try:
+            import table_structure_rec
+            if hasattr(table_structure_rec, "TableCls"):
+                try:
+                    self._table_cls = table_structure_rec.TableCls()
+                except Exception as e_cls:
+                    logger.debug(f"[TableStructureRec] TableCls 初始化跳过: {e_cls}")
+            if hasattr(table_structure_rec, "WiredTableRec"):
+                try:
+                    self._wired_tsr_engine = table_structure_rec.WiredTableRec()
+                except Exception as e_w:
+                    logger.debug(f"[TableStructureRec] WiredTableRec 初始化跳过: {e_w}")
+            if hasattr(table_structure_rec, "LinelessTableRec"):
+                try:
+                    self._lineless_tsr_engine = table_structure_rec.LinelessTableRec()
+                except Exception as e_l:
+                    logger.debug(f"[TableStructureRec] LinelessTableRec 初始化跳过: {e_l}")
+            if self._wired_tsr_engine or self._lineless_tsr_engine:
+                logger.info("[TableStructureRec] 成功加载官方 TableStructureRec 组件")
+        except ImportError:
+            pass
+        except Exception as e_tsr:
+            logger.debug(f"[TableStructureRec] 引擎加载跳过: {e_tsr}")
+
+        # 2. 尝试加载 RapidTable 模块
         try:
             from rapid_table import RapidTable
 
             def _build_rapid_cfg(model_type_name: str, model_dir_val: Optional[str] = None):
-                # 尝试使用官方 RapidTableInput 配置类
                 try:
                     from rapid_table import RapidTableInput, ModelType
                     enum_name = model_type_name.upper().replace("_", "")
@@ -111,7 +154,6 @@ class RapidTableExtractor:
                         return RapidTableInput(**kwargs)
                 except Exception:
                     pass
-                # 兼容性配置对象/字典
                 cfg_obj = {"model_type": model_type_name}
                 if model_dir_val:
                     cfg_obj["model_dir_or_path"] = model_dir_val
@@ -119,7 +161,6 @@ class RapidTableExtractor:
 
             def _instantiate_engine(model_type_name: str, model_dir_val: Optional[str] = None):
                 cfg = _build_rapid_cfg(model_type_name, model_dir_val)
-                # 官方接口契约: RapidTable(cfg) 或 RapidTable(cfg=cfg)
                 for init_attempt in [
                     lambda: RapidTable(cfg),
                     lambda: RapidTable(cfg=cfg),
@@ -146,42 +187,55 @@ class RapidTableExtractor:
                     wired = None
             self._wired_engine = wired
 
-            wireless = _instantiate_engine("unitable", self.model_dir)
-            if wireless is None:
-                wireless = _instantiate_engine("unitable")
-            if wireless is None and wired is None:
+            # UniTable 使用 PyTorch，作为独立可选依赖；
+            # 仅当已在环境引入 torch 或无任何可用引擎时进行尝试，避免在轻量 ONNX 推理或沙箱 mock 中意外引入重度依赖
+            wireless = None
+            if "torch" in sys.modules or (wired is None and self._wired_tsr_engine is None and self._lineless_tsr_engine is None):
                 try:
-                    wireless = RapidTable()
-                except Exception:
-                    wireless = None
-            self._wireless_engine = wireless
+                    import torch
+                    wireless = _instantiate_engine("unitable", self.model_dir)
+                    if wireless is None:
+                        wireless = _instantiate_engine("unitable")
+                except (ImportError, Exception):
+                    logger.debug("[RapidTable] 未安装 PyTorch 或 PyTorch 无法加载，跳过 UniTable 权重加载 (作为独立可选依赖)")
 
-            self._table_engine = self._wired_engine or self._wireless_engine
+            self._wireless_engine = wireless
+            self._table_engine = self._wired_engine or self._wireless_engine or self._wired_tsr_engine or self._lineless_tsr_engine
             if self._table_engine is not None:
                 logger.info("[RapidTable] 成功加载 rapid_table 引擎")
         except ImportError:
-            try:
-                import table_structure_rec
-                if hasattr(table_structure_rec, "TableStructureRec"):
-                    self._table_engine = table_structure_rec.TableStructureRec(model_dir=self.model_dir)
-                elif hasattr(table_structure_rec, "RapidTable"):
-                    self._table_engine = table_structure_rec.RapidTable(model_dir=self.model_dir)
-                logger.info("[RapidTable] 成功加载 table_structure_rec 引擎")
-            except Exception as e_tsr:
-                logger.debug(f"[RapidTable] 引擎加载跳过: {e_tsr}")
+            pass
         except Exception as e:
             logger.debug(f"[RapidTable] rapid_table 引擎加载跳过: {e}")
 
     def classify_table_type(self, img_or_array) -> str:
         """
         判断表格形态：'wired' (有线框网格表) 或 'wireless' (无线框/三线表)。
-        支持模型推理或基于形态学线条密度的快速启发式判别。
+        优先使用官方 TableCls 模型推理；若不可用则平滑回退为形态学线条密度判别。
         """
         if img_or_array is None:
             return "wireless"
 
+        # 1. 优先调用 TableStructureRec 官方 TableCls 模型推理
+        if self._table_cls is not None:
+            try:
+                cls_res = self._table_cls(img_or_array)
+                val_str = ""
+                if isinstance(cls_res, str):
+                    val_str = cls_res.lower()
+                elif isinstance(cls_res, (list, tuple)) and len(cls_res) > 0:
+                    val_str = str(cls_res[0]).lower()
+
+                if val_str:
+                    if "lineless" in val_str or "wireless" in val_str:
+                        return "wireless"
+                    elif "wired" in val_str:
+                        return "wired"
+            except Exception as e_cls:
+                logger.debug(f"[TableStructureRec] TableCls 推理异常，回退启发式判别: {e_cls}")
+
+        # 2. 启发式回退：基于形态学线条密度的快速判别
         try:
-            # 若传入为 PIL Image，转为灰度 numpy 矩阵
             if Image is not None and isinstance(img_or_array, Image.Image):
                 gray = np.array(img_or_array.convert("L"))
             elif np is not None and isinstance(img_or_array, np.ndarray):
@@ -192,14 +246,12 @@ class RapidTableExtractor:
             else:
                 return "wireless"
 
-            # 简易水平/垂直黑线梯度采样判别线框丰富度
             h_diff = np.diff(gray, axis=0)
             v_diff = np.diff(gray, axis=1)
             sharp_lines = (np.abs(h_diff) > 80).sum() + (np.abs(v_diff) > 80).sum()
             total_pixels = gray.size
             line_density = sharp_lines / max(total_pixels, 1)
 
-            # 线密度高于阈值判定为有线表，否则为无线框/开放表
             if line_density > 0.045:
                 return "wired"
             return "wireless"
@@ -208,18 +260,20 @@ class RapidTableExtractor:
 
     @staticmethod
     def _extract_html_content(obj: Any) -> Optional[str]:
-        """递归解包 RapidTable 输出（支持 RapidTableOutput, pred_htmls, pred_html, 字典及元组组合）。"""
+        """递归解包 RapidTable / TableStructureRec 输出（支持 RapidTableOutput, pred_htmls, pred_html, (html, elapse), 字典及元组组合）。"""
         if obj is None:
             return None
         if isinstance(obj, str):
             s = obj.strip()
             return s if s else None
+        if isinstance(obj, (list, tuple)) and len(obj) >= 1 and isinstance(obj[0], str) and ("<table" in obj[0].lower() or "<html" in obj[0].lower()):
+            return obj[0].strip()
         if hasattr(obj, "pred_html") and obj.pred_html is not None:
             return RapidTableExtractor._extract_html_content(obj.pred_html)
         if hasattr(obj, "pred_htmls") and obj.pred_htmls is not None:
             return RapidTableExtractor._extract_html_content(obj.pred_htmls)
         if isinstance(obj, dict):
-            for k in ("pred_html", "pred_htmls", "html"):
+            for k in ("pred_html", "pred_htmls", "html", "table_str", "table_html"):
                 if k in obj and obj[k] is not None:
                     val = RapidTableExtractor._extract_html_content(obj[k])
                     if val:
@@ -295,21 +349,34 @@ class RapidTableExtractor:
     def extract_table_from_image(self, img) -> Optional[pd.DataFrame]:
         """识别单个表格图像切片，返回结构化 DataFrame。"""
         self._init_engine()
-        if self._table_engine is None and self._wired_engine is None and self._wireless_engine is None:
+        if not self.is_ready():
             return None
 
         try:
             table_type = self.classify_table_type(img)
-            # 自适应双模型分流：wired 走 SLANet-Plus, wireless 走 UniTable
-            engine = self._wired_engine if table_type == "wired" and self._wired_engine else (
-                self._wireless_engine if self._wireless_engine else self._table_engine
-            )
-            if engine is None:
-                engine = self._table_engine
-            if engine is None:
+            result = None
+            if table_type == "wired":
+                if self._wired_tsr_engine is not None:
+                    res_tsr = self._wired_tsr_engine(img)
+                    result = res_tsr[0] if isinstance(res_tsr, (list, tuple)) else res_tsr
+                elif self._wired_engine is not None:
+                    result = self._wired_engine(img)
+                elif self._table_engine is not None:
+                    result = self._table_engine(img)
+            else:
+                if self._lineless_tsr_engine is not None:
+                    res_tsr = self._lineless_tsr_engine(img)
+                    result = res_tsr[0] if isinstance(res_tsr, (list, tuple)) else res_tsr
+                elif self._wireless_engine is not None:
+                    result = self._wireless_engine(img)
+                elif self._wired_engine is not None:
+                    result = self._wired_engine(img)
+                elif self._table_engine is not None:
+                    result = self._table_engine(img)
+
+            if result is None:
                 return None
 
-            result = engine(img)
             table_html = self._extract_html_content(result)
             if not table_html:
                 return None
@@ -336,7 +403,7 @@ class RapidTableExtractor:
             return []
 
         self._init_engine()
-        if self._table_engine is None and self._wired_engine is None and self._wireless_engine is None:
+        if not self.is_ready():
             return []
 
         results = []

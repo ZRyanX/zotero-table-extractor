@@ -762,9 +762,11 @@ def call_paddleocr_vl_online_api(file_path: str, config: Optional[dict] = None, 
     if config is None:
         config = load_config()
 
-    engine = config.get("OCR_ENGINE", "auto").lower()
+    engine = (config.get("OCR_ENGINE") or os.environ.get("OCR_ENGINE") or "auto").lower()
     if engine == "mineru":
         return call_mineru_api(file_path, config=config, timeout=timeout, cancel_event=cancel_event)
+    if engine == "docling":
+        return call_docling_table_extractor(file_path, config=config, cancel_event=cancel_event)
 
     model = config.get("PADDLEOCR_MCP_MODEL", "PaddleOCR-VL-1.6")
     res = call_paddleocr_job(file_path, model=model, config=config, timeout=timeout, cancel_event=cancel_event)
@@ -918,6 +920,11 @@ def run_paddleocr_vl(pdf_path: str, pages=None, cancel_event=None, enable_doclay
     - 否则传整个 PDF 给在线 API
     """
     config = load_config()
+    engine = (config.get("OCR_ENGINE") or os.environ.get("OCR_ENGINE") or "auto").lower()
+    if engine == "docling":
+        return call_docling_table_extractor(pdf_path, pages=pages, config=config, cancel_event=cancel_event)
+    if engine == "mineru":
+        return call_mineru_api(pdf_path, config=config, cancel_event=cancel_event)
 
     if cancel_event is not None and cancel_event.is_set():
         return ""
@@ -1133,27 +1140,46 @@ def extract_via_docling(
                 logger.debug(f"[Docling] 创建页面切片失败，将全文档解析: {e_slice}")
                 effective_pdf = pdf_path
 
-        # 根据页面文字层智能决定是否启用 OCR (扫描件/无文本层兜底启用 OCR，有文字层则禁用 OCR 以加速)
-        # 只要存在任一缺少充分文字层的页面 (扫描页/纯图页)，必须启用 OCR 以免漏识别
-        has_scanned_page = False
+        # 根据页面文字层与图像智能决定是否启用 OCR (扫描件/无文本层/包含潜在图片表格时启用 OCR，纯矢量文字页则禁用 OCR 以加速)
+        needs_ocr = False
         try:
             with fitz.open(effective_pdf) as check_doc:
                 for p_check in check_doc:
-                    if len(p_check.get_text("text").strip()) <= 50:
-                        has_scanned_page = True
+                    text_len = len(p_check.get_text("text").strip())
+                    if text_len <= 50:
+                        needs_ocr = True
+                        break
+                    # 正文虽可搜索，但若页面内嵌入栅格图像 (图片表格/扫描插图)，亦须启用 OCR
+                    images = p_check.get_images(full=True)
+                    if images:
+                        for img_info in images:
+                            img_w, img_h = img_info[2], img_info[3]
+                            if (img_w >= 80 and img_h >= 40) or (img_w * img_h >= 4000):
+                                needs_ocr = True
+                                break
+                    if needs_ocr:
                         break
         except Exception:
-            has_scanned_page = True
+            needs_ocr = True
+
+        if config and ("do_ocr" in config or "DO_OCR" in config):
+            needs_ocr = bool(config.get("do_ocr", config.get("DO_OCR", needs_ocr)))
 
         pipeline_options = PdfPipelineOptions()
         pipeline_options.do_table_structure = True
-        pipeline_options.do_ocr = has_scanned_page
+        pipeline_options.do_ocr = needs_ocr
 
-        converter = DocumentConverter(
-            format_options={
-                InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
-            }
-        )
+        format_opts = {
+            InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
+        }
+        if hasattr(InputFormat, "IMAGE"):
+            try:
+                from docling.document_converter import ImageFormatOption
+                format_opts[InputFormat.IMAGE] = ImageFormatOption(pipeline_options=pipeline_options)
+            except Exception:
+                pass
+
+        converter = DocumentConverter(format_options=format_opts)
 
         conv_res = converter.convert(effective_pdf)
         if not conv_res or not conv_res.document:

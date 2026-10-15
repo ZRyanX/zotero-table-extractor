@@ -625,6 +625,9 @@ def main():
     
     args = parser.parse_args()
     
+    if getattr(args, 'ocr_engine', None) and args.ocr_engine != 'auto':
+        os.environ["OCR_ENGINE"] = args.ocr_engine
+
     pdf_input = args.pdf
     pdf_list = []
 

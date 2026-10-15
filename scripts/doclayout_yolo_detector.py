@@ -883,10 +883,12 @@ class PPDocLayoutV3Detector:
             arr = np.transpose(arr, (2, 0, 1))[np.newaxis, ...]
 
             feed_dict = {input_name: arr}
+            has_scale_input = False
             if len(inps) > 1:
                 for inp in inps[1:]:
                     if "scale" in inp.name.lower():
                         feed_dict[inp.name] = np.array([[target_size[1] / h, target_size[0] / w]], dtype=np.float32)
+                        has_scale_input = True
                     elif "shape" in inp.name.lower():
                         feed_dict[inp.name] = np.array([[target_size[1], target_size[0]]], dtype=np.float32)
 
@@ -908,8 +910,17 @@ class PPDocLayoutV3Detector:
                             box = [float(det[0]), float(det[1]), float(det[2]), float(det[3])]
 
                         if score >= conf_threshold:
-                            scale_x = w / target_size[0]
-                            scale_y = h / target_size[1]
+                            # 官方 PaddleDetection 模型结合 scale_factor 后处理已自动恢复原图坐标；
+                            # 若未传入 scale_factor (或纯 ONNX 导出无 scale 输入)，才需按 target_size 比例缩放。
+                            if has_scale_input:
+                                scale_x = 1.0
+                                scale_y = 1.0
+                            elif max(box[2], box[3]) <= 1.05 and target_size[0] > 1.0:
+                                scale_x = float(w)
+                                scale_y = float(h)
+                            else:
+                                scale_x = w / target_size[0]
+                                scale_y = h / target_size[1]
                             scaled_box = [
                                 max(0.0, min(float(w), box[0] * scale_x)),
                                 max(0.0, min(float(h), box[1] * scale_y)),

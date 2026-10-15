@@ -310,17 +310,20 @@ def parse_academic_runs(text: str) -> List[Tuple[str, Optional[str]]]:
     pattern = re.compile(
         r'(\^\{[^}]+\})|'
         r'(_\{[^}]+\})|'
+        r'<sup(?:\s+[^>]*)?>(.*?)</sup>|'
+        r'<sub(?:\s+[^>]*)?>(.*?)</sub>|'
         r'(\^(?:[+-]?\d+[+-]?|[+-]|[a-zA-Z]))|'
         r'(_\d+[+-]?)|'
         r'([⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ⁿⁱ]+)|'
-        r'([₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎ₐₑₒₓₕₖₗₘₙₚₛₜ]+)'
+        r'([₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎ₐₑₒₓₕₖₗₘₙₚₛₜ]+)',
+        re.IGNORECASE
     )
 
     runs = []
     last_idx = 0
     for m in pattern.finditer(t):
         start, end = m.span()
-        sup1, sub1, sup2, sub2, uni_sup, uni_sub = m.groups()
+        sup1, sub1, html_sup, html_sub, sup2, sub2, uni_sup, uni_sub = m.groups()
 
         # Guard for sub2 (_digits): only treat as subscript if preceding text looks like a chemical symbol,
         # single variable, or bracket, NOT an identifier word like table_1, sample_1, group_1
@@ -339,6 +342,10 @@ def parse_academic_runs(text: str) -> List[Tuple[str, Optional[str]]]:
             runs.append((sup1[2:-1], 'superscript'))
         elif sub1:
             runs.append((sub1[2:-1], 'subscript'))
+        elif html_sup:
+            runs.append((html_sup, 'superscript'))
+        elif html_sub:
+            runs.append((html_sub, 'subscript'))
         elif sup2:
             runs.append((sup2[1:], 'superscript'))
         elif sub2:

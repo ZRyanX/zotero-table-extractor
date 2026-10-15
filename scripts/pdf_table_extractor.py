@@ -1300,9 +1300,30 @@ def extract_via_gmft(pdf_path: str, pages: Optional[List[int]] = None) -> List[D
                     df.attrs['page_idx'] = p_idx
 
                     bbox = None
+                    def _is_valid_bbox(b):
+                        return (isinstance(b, (list, tuple)) and len(b) == 4 and
+                                all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in b) and
+                                b[2] > b[0] and b[3] > b[1])
+
+                    def _is_valid_coord(c):
+                        return isinstance(c, (int, float)) and not isinstance(c, bool)
+
                     if hasattr(tbl, 'rect') and tbl.rect is not None:
                         r = tbl.rect
-                        bbox = [getattr(r, 'x0', 0), getattr(r, 'y0', 0), getattr(r, 'x1', 0), getattr(r, 'y1', 0)]
+                        if hasattr(r, 'bbox') and _is_valid_bbox(r.bbox):
+                            bbox = list(r.bbox)
+                        elif (hasattr(r, 'xmin') and hasattr(r, 'ymin') and hasattr(r, 'xmax') and hasattr(r, 'ymax') and
+                              _is_valid_coord(r.xmin) and _is_valid_coord(r.ymin) and _is_valid_coord(r.xmax) and _is_valid_coord(r.ymax) and
+                              r.xmax > r.xmin and r.ymax > r.ymin):
+                            bbox = [r.xmin, r.ymin, r.xmax, r.ymax]
+                        elif _is_valid_bbox(r):
+                            bbox = list(r)
+                        elif (hasattr(r, 'x0') and hasattr(r, 'y0') and hasattr(r, 'x1') and hasattr(r, 'y1') and
+                              _is_valid_coord(r.x0) and _is_valid_coord(r.y0) and _is_valid_coord(r.x1) and _is_valid_coord(r.y1) and
+                              r.x1 > r.x0 and r.y1 > r.y0):
+                            bbox = [r.x0, r.y0, r.x1, r.y1]
+                    elif hasattr(tbl, 'bbox') and _is_valid_bbox(tbl.bbox):
+                        bbox = list(tbl.bbox)
 
                     results.append({
                         'df': df,
@@ -1401,11 +1422,19 @@ def extract_via_pymupdf4llm(pdf_path: str, pages: Optional[List[int]] = None) ->
                     df = df_map(df, lambda x: str(x).strip() if x is not None else "")
                     df.attrs['extractor'] = 'pymupdf4llm'
                     df.attrs['page_idx'] = p_idx
+                    bbox = None
+                    try:
+                        p_tab_finder = doc[p_idx].find_tables()
+                        if p_tab_finder and p_tab_finder.tables:
+                            if tbl_idx < len(p_tab_finder.tables):
+                                bbox = list(p_tab_finder.tables[tbl_idx].bbox)
+                    except Exception:
+                        pass
                     results.append({
                         'df': df,
                         'page_idx': p_idx,
                         'table_idx': tbl_idx,
-                        'bbox': None,
+                        'bbox': bbox,
                         'label': df.attrs.get('label'),
                     })
             except Exception as e_page:
@@ -3659,29 +3688,59 @@ def _do_extract_tables_from_pdf(
             logs.append(f"→ Step 3b: 检验未通过/待精细识别页面 {[p+1 for p in ocr_candidate_pages]} 启动接管修复")
 
             ocr_results = []
-            # 本地先试一把中间层：优先尝试 RapidTable ONNX 结构识别快速挽救
-            if is_rapid_table_available():
+            unresolved_ocr_pages = set(ocr_candidate_pages)
+
+            def _get_page_needed_count(p):
+                decls = [d for d in page_decls.get(p, []) if not d.get('is_continuation')]
+                exp_count = max(1, len(decls))
+                valid_native = len([r for r in valid_fused if r.get('page_idx') == p and not is_table_low_quality(r.get('df'))])
+                return max(1, exp_count - valid_native)
+
+            def _update_unresolved_pages():
+                nonlocal unresolved_ocr_pages
+                for p in list(unresolved_ocr_pages):
+                    needed_count = _get_page_needed_count(p)
+                    valid_on_page = [r for r in ocr_results if r.get('page_idx') == p and not is_table_low_quality(r.get('df'))]
+                    if len(valid_on_page) >= needed_count:
+                        unresolved_ocr_pages.discard(p)
+
+            # 阶段 1: 优先尝试 RapidTable ONNX 结构识别快速挽救
+            if is_rapid_table_available() and unresolved_ocr_pages:
                 try:
-                    rapid_res = extract_via_rapid_table(pdf_path, pages=ocr_candidate_pages)
-                    if rapid_res and any(not is_table_low_quality(r['df']) for r in rapid_res):
-                        logs.append(f"  RapidTable 本地中间层试跑成功提取到 {len(rapid_res)} 个表格 (免调用在线 VLM)")
-                        ocr_results = rapid_res
+                    rapid_pages = sorted(list(unresolved_ocr_pages))
+                    rapid_res = extract_via_rapid_table(pdf_path, pages=rapid_pages)
+                    valid_rapid = [r for r in (rapid_res or []) if not is_table_low_quality(r.get('df'))]
+                    if valid_rapid:
+                        logs.append(f"  RapidTable 本地中间层试跑成功提取到 {len(valid_rapid)} 个表格 (免调用在线 VLM)")
+                        ocr_results.extend(valid_rapid)
+                        _update_unresolved_pages()
                 except Exception as e_rr:
                     logger.debug(f"[RapidTable] 本地中间层接管试跑跳过: {e_rr}")
 
-            if not ocr_results:
-                logs.append(f"  优先通过 DocLayout-YOLO 切图送入 PaddleOCR-VL-1.6 独立接管提取")
-                ocr_results = extract_via_paddleocr_crops(pdf_path, ocr_candidate_pages)
+            # 阶段 2: 对仍未覆盖的页面，通过 DocLayout-YOLO 切图送入 PaddleOCR-VL-1.6 独立接管提取
+            if unresolved_ocr_pages:
+                crop_pages = sorted(list(unresolved_ocr_pages))
+                logs.append(f"  优先通过 DocLayout-YOLO 切图送入 PaddleOCR-VL-1.6 独立接管提取 (待修复页: {[p+1 for p in crop_pages]})")
+                crop_res = extract_via_paddleocr_crops(pdf_path, crop_pages)
+                valid_crops = [r for r in (crop_res or []) if not is_table_low_quality(r.get('df'))]
+                if valid_crops:
+                    ocr_results.extend(valid_crops)
+                    _update_unresolved_pages()
 
-            if not ocr_results:
+            # 阶段 3: 若切图提取后仍有未解决页面，尝试 Docling (TableFormer) 离线接管
+            if unresolved_ocr_pages:
                 try:
                     import ocr_client
-                    docling_results = ocr_client.extract_via_docling(pdf_path, pages=ocr_candidate_pages)
-                    if docling_results:
-                        logs.append(f"  Docling (TableFormer) 离线接管提取到 {len(docling_results)} 个表格")
-                        ocr_results = docling_results
+                    docling_pages = sorted(list(unresolved_ocr_pages))
+                    docling_results = ocr_client.extract_via_docling(pdf_path, pages=docling_pages)
+                    valid_docling = [r for r in (docling_results or []) if not is_table_low_quality(r.get('df'))]
+                    if valid_docling:
+                        logs.append(f"  Docling (TableFormer) 离线接管提取到 {len(valid_docling)} 个表格")
+                        ocr_results.extend(valid_docling)
+                        _update_unresolved_pages()
                 except Exception:
                     pass
+
             if ocr_results:
                 logs.append(f"  独立接管提取到 {len(ocr_results)} 个表格，启动表级精细对齐与安全替换...")
                 all_results = reconcile_native_and_ocr_tables(original_native_results, ocr_results, ocr_candidate_pages, logs)
@@ -3693,10 +3752,10 @@ def _do_extract_tables_from_pdf(
                 logs.append("  use_ocr_fallback=False，降级保留原生未通过检验表格，防止整表永久丢失")
                 all_results = original_native_results
 
-        # Step 3c: 仍未覆盖且从未被 PaddleOCR 处理过的页面 → text_alignment
-        extracted_pages = set(r.get('page_idx', -1) for r in all_results if r.get('page_idx') is not None)
-        ocr_processed_pages = set(ocr_candidate_pages) if 'ocr_candidate_pages' in locals() else set()
-        still_missing = sorted(p for p in target_pages if (p not in extracted_pages or len([r for r in all_results if r.get('page_idx') == p]) < len([d for d in page_decls.get(p, []) if not d.get('is_continuation')])) and p not in ocr_processed_pages)
+        # Step 3c: 仍未覆盖且未在 OCR 中成功产出表格的页面 → text_alignment
+        extracted_pages = set(r.get('page_idx', -1) for r in all_results if r.get('page_idx') is not None and not is_table_low_quality(r.get('df')))
+        ocr_successfully_resolved_pages = set(r.get('page_idx') for r in ocr_results if r.get('page_idx') is not None and not is_table_low_quality(r.get('df'))) if 'ocr_results' in locals() and ocr_results else set()
+        still_missing = sorted(p for p in target_pages if (p not in extracted_pages or len([r for r in all_results if r.get('page_idx') == p and not is_table_low_quality(r.get('df'))]) < len([d for d in page_decls.get(p, []) if not d.get('is_continuation')])) and p not in ocr_successfully_resolved_pages)
         if still_missing:
             logs.append(f"→ Step 3c: 对仍未覆盖/表数不足的 {[p+1 for p in still_missing]} 页尝试文本对齐提取")
             text_align_results = extract_via_text_alignment(pdf_path, pages=still_missing)
@@ -3706,6 +3765,7 @@ def _do_extract_tables_from_pdf(
                     existing_on_page = [r for r in all_results if r.get('page_idx') == ta_page]
                     duplicate = any(_table_similarity(r['df'], ta['df']) >= 0.70 for r in existing_on_page)
                     if not duplicate:
+                        all_results = [r for r in all_results if not (r.get('page_idx') == ta_page and is_table_low_quality(r.get('df')))]
                         all_results.append(ta)
                         extracted_pages.add(ta_page)
 
