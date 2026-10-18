@@ -10,8 +10,10 @@ table_postprocess.py — 表格 DataFrame 纯文本后处理（自 extract_zoter
 import io
 import os
 import re
+import math
 from typing import List, Optional, Tuple, Dict, Any, Union
 
+import numpy as np
 import pandas as pd
 
 try:
@@ -209,8 +211,11 @@ def parse_structured_markdown_tables(md_content):
             
     return tables
 
-def clean_latex_and_ocr(val):
-    """Clean raw LaTeX math markup, OCR typos, and garbled symbols."""
+def clean_latex_and_ocr(val, enable_chemical_typo_fix: bool = False):
+    """Clean raw LaTeX math markup, OCR typos, and garbled symbols.
+    Aggressive chemical substitutions (H20 -> H2O, CQ -> CO2, Tin -> Tm) are decoupled
+    and disabled by default to prevent destroying legitimate sample codes or mineral abbreviations.
+    """
     if not isinstance(val, str) or not val:
         return val
     
@@ -230,6 +235,7 @@ def clean_latex_and_ocr(val):
     # 3. Standardize math symbols & superscripts
     val = val.replace(r'\times', '×').replace(r'\pm', '±').replace(r'\cdot', '·').replace(r'^\circ', '°').replace(r'\circ', '°').replace(r'^{\circ}', '°')
     val = val.replace(r'\Delta', 'Δ').replace(r'\delta', 'δ').replace(r'\mu', 'μ').replace(r'\omega', 'ω').replace(r'\phi', 'φ').replace(r'\beta', 'β').replace(r'\gamma', 'γ')
+    val = val.replace(r'\approx', '≈').replace(r'\leq', '≤').replace(r'\geq', '≥').replace(r'\neq', '≠')
     
     # Superscripts / subscripts cleanup: ^{206} -> 206, _{...} -> ...
     val = re.sub(r'\^\{+([0-9a-zA-Z\+\-\*\s]+)\}+', r'^\1', val)
@@ -242,17 +248,18 @@ def clean_latex_and_ocr(val):
     val = re.sub(r'\s*±\s*', ' ± ', val)
     val = re.sub(r'\s*\^\s*([0-9+-]+)\s*', r'^\1', val)
     
-    # 4. Fix common OCR typos in chemical formulas & mineral terms
-    val = re.sub(r'\bNaC1\b', 'NaCl', val)
-    val = re.sub(r'\bCaC12\b', 'CaCl2', val)
-    val = re.sub(r'\bH20\b', 'H2O', val)
-    val = re.sub(r'\bCQ\b', 'CO2', val)
-    val = re.sub(r'\bCtL\b', 'CH4', val)
-    val = re.sub(r'\bTin-\b', 'Tm -', val)
-    val = re.sub(r'\bTin\b', 'Tm', val)
-    val = re.sub(r'\bcastiterite\b', 'cassiterite', val, flags=re.I)
-    val = re.sub(r'\bberthlerite\b', 'berthierite', val, flags=re.I)
-    val = re.sub(r'\bFable\b', 'Table', val, flags=re.I)
+    # 4. Fix common OCR typos in chemical formulas & mineral terms (Only when explicitly enabled)
+    if enable_chemical_typo_fix:
+        val = re.sub(r'\bNaC1\b', 'NaCl', val)
+        val = re.sub(r'\bCaC12\b', 'CaCl2', val)
+        val = re.sub(r'\bH20\b', 'H2O', val)
+        val = re.sub(r'\bCQ\b', 'CO2', val)
+        val = re.sub(r'\bCtL\b', 'CH4', val)
+        val = re.sub(r'\bTin-\b', 'Tm -', val)
+        val = re.sub(r'\bTin\b', 'Tm', val)
+        val = re.sub(r'\bcastiterite\b', 'cassiterite', val, flags=re.I)
+        val = re.sub(r'\bberthlerite\b', 'berthierite', val, flags=re.I)
+        val = re.sub(r'\bFable\b', 'Table', val, flags=re.I)
     
     # Fix common OCR garbled text in mineral paragenesis
     val = val.replace('(_+qz)', '(± qz)').replace('(_+ qz)', '(± qz)')
@@ -377,7 +384,7 @@ NOTE_PREFIX_PATTERN = re.compile(
 )
 
 STAT_NOTE_PATTERN = re.compile(
-    r'(\*+\s*p\s*[<>=]|\bp\s*<\s*0\.\d+|\bp\s*>\s*0\.\d+|\bmean\s*±|\bvalues\s+(?:in\s+parentheses|represent)|\bdiffer\s+significantly|\bnot\s+detected|\bbdl\b|\bna\b|\bp-value\b)',
+    r'(\*+\s*p\s*[<>=]|\bp\s*<\s*0\.\d+|\bp\s*>\s*0\.\d+|\bmean\s*±|\bvalues\s+(?:in\s+parentheses|represent)|\bdiffer\s+significantly|\bnot\s+detected|\b(?:na|bdl)\b\s*[:=]|below\s+detection\s+limit|\bp-value\b)',
     re.IGNORECASE
 )
 
@@ -405,12 +412,19 @@ def is_academic_footnote_row(row_values: list, col_count: Optional[int] = None) 
 
     # 1. 明确的尾注前缀 (Note:, 注:, * 等)
     if NOTE_PREFIX_PATTERN.search(full_text_clean):
-        if len(non_empty) <= 2 or all_same or len(full_text_clean) > 20:
+        has_multi_data = sum(1 for v in non_empty if is_pure_data_value(v)) >= 2
+        if col_count > 1 and len(non_empty) > 2 and has_multi_data:
+            pass
+        elif len(non_empty) <= 2 or all_same or len(full_text_clean) > 20:
             return True, full_text_clean
 
     # 2. 显著性检验与统计学说明 (* p < 0.05, mean ± SD 等)
     if STAT_NOTE_PATTERN.search(full_text_clean):
-        if len(non_empty) <= 2 or all_same or len(full_text_clean) > 15:
+        # 保护多列正常数据行：若为多列表且 > 1 个非空单元格，且包含合法数据值，严禁误判为尾注
+        has_valid_data = any(is_pure_data_value(v) for v in non_empty)
+        if col_count > 1 and len(non_empty) > 1 and has_valid_data:
+            pass
+        elif len(non_empty) <= 2 or all_same or len(full_text_clean) > 15:
             return True, full_text_clean
 
     # 3. 散文解释句：多列表 (col_count > 1) 底部的单单元格/全跨列说明
@@ -647,6 +661,9 @@ def try_numeric(val):
         # 保护带前导零的代码字符串（如 001, 08, -001）避免失真转为 1, 8
         if re.match(r'^[+-]?0\d+$', val_clean):
             return val
+        # 保护 > 15 位的超长整数/样号/条形码/ID，防止 IEEE 754 精度截断
+        if re.match(r'^[+-]?\d+$', val_clean) and len(val_clean.lstrip('+-')) > 15:
+            return val
         try:
             if '.' in val_clean or 'e' in val_clean.lower():
                 return float(val_clean)
@@ -661,6 +678,9 @@ def escape_formula(val):
         clean_val = val.replace(',', '').strip()
         # 保护带前导零的代码字符串（如 -001, +02），避免被转换为数值丢失前导零，加单引号防 Excel 解释
         if re.match(r'^[+-]?0\d+$', clean_val):
+            return "'" + val
+        # 保护 > 15 位的超长整数串，防止 Excel 破坏精度，加单引号转为文本
+        if re.match(r'^[+-]?\d+$', clean_val) and len(clean_val.lstrip('+-')) > 15:
             return "'" + val
         try:
             if '.' in clean_val or 'e' in clean_val.lower():
@@ -710,7 +730,7 @@ def strip_embedded_duplicate_headers(df: pd.DataFrame) -> pd.DataFrame:
     Scans the body of a DataFrame (rows 1 to end) for any embedded duplicate header rows
     reprinted across multi-page tables (e.g., repeating column names or unit rows midway through the table).
     """
-    if df is None or df.empty or len(df) <= 3:
+    if df is None or df.empty or len(df) < 3:
         return df
 
     real_cols = [
@@ -732,13 +752,17 @@ def strip_embedded_duplicate_headers(df: pd.DataFrame) -> pd.DataFrame:
         if len(row_vals) <= 2 and any(re.search(r'^(?:续表|接上表|\(contd|\(continued|continued table)', v) for v in row_vals):
             rows_to_drop.append(r_idx)
             continue
-        # 2. 检查是否为跨页重复打印的表头行 (列名匹配率 >= 40%)
+        # 2. 检查是否为跨页重复打印的表头行
         # 真实表头应由非纯数据文本构成，严禁把包含合法数据值的行误删为重复表头
         if len(row_vals) >= 2:
+            num_numeric = sum(1 for v in row_vals if is_pure_data_value(v))
+            if num_numeric > 0 or (num_numeric / max(1, len(row_vals))) >= 0.25:
+                continue
+
             non_data_vals = [v for v in row_vals if not is_pure_data_value(v)]
             if non_data_vals:
-                matches = sum(1 for v in non_data_vals if any(v == c or (len(v) >= 2 and v in c) for c in real_cols))
-                if (matches / max(1, len(row_vals))) >= 0.40 and matches >= 2:
+                matches = sum(1 for v in non_data_vals if any(v == c or v in c.split() for c in real_cols))
+                if (matches / max(1, len(non_data_vals))) >= 0.75 and matches >= 2:
                     rows_to_drop.append(r_idx)
                     continue
 
@@ -759,20 +783,36 @@ def _clean_vlm_dataframe(df: pd.DataFrame, original_attrs: dict) -> pd.DataFrame
     
     # 确保列名唯一性
     if not df.columns.is_unique:
-        seen = {}
+        seen = set()
         unique_cols = []
-        for col in df.columns:
-            c_s = str(col)
-            if c_s in seen:
-                seen[c_s] += 1
-                unique_cols.append(f"{c_s}_{seen[c_s]}")
+        for idx, col in enumerate(df.columns):
+            candidate = str(col) if (col is not None and str(col).strip()) else f"Col_{idx+1}"
+            if candidate not in seen:
+                seen.add(candidate)
+                unique_cols.append(candidate)
             else:
-                seen[c_s] = 0
-                unique_cols.append(c_s)
+                k = 1
+                new_name = f"{candidate}_{k}"
+                while new_name in seen:
+                    k += 1
+                    new_name = f"{candidate}_{k}"
+                seen.add(new_name)
+                unique_cols.append(new_name)
         df.columns = unique_cols
 
     # 2. 安全单元格清洗与地学符号无损规整（不拆分文本）
-    df = df_map(df, lambda x: clean_latex_and_ocr(clean_text(str(x))) if pd.notna(x) and str(x).strip() not in ('nan', 'None') else "")
+    # 区分 Python None/np.nan 与合法的单元格文本 "None"，杜绝误删 "None"
+    def _clean_cell(x):
+        if x is None:
+            return ""
+        if isinstance(x, float) and np.isnan(x):
+            return ""
+        s = str(x)
+        if s.strip().lower() == 'nan':
+            return ""
+        return clean_latex_and_ocr(clean_text(s))
+
+    df = df_map(df, _clean_cell)
 
     # 3. 剥离跨页拼接中可能残留的印刷重复表头行
     df = strip_embedded_duplicate_headers(df)
@@ -798,6 +838,9 @@ def _clean_vlm_dataframe(df: pd.DataFrame, original_attrs: dict) -> pd.DataFrame
             s = str(v).replace(',', '').strip()
             # 保护带前导零的代码/样号（如 001, 08, -001）避免失真
             if re.match(r'^[+-]?0\d+$', s):
+                return False
+            # 保护 > 15 位的超长整数/样号/条形码/ID，防止 IEEE 754 精度截断
+            if re.match(r'^[+-]?\d+$', s) and len(s.lstrip('+-')) > 15:
                 return False
             try:
                 float(s)
@@ -1046,8 +1089,12 @@ def _filter_noise_and_placeholders(df: pd.DataFrame) -> pd.DataFrame:
                 continue
 
         # 2. 识别跨页合并后残留的重复表头行 (仅针对真实文本表头，严禁对数字或占位列名匹配)
-        matching_header_cells = sum(1 for c in cells if c.lower() in real_col_names) if real_col_names else 0
-        is_repeat_header = len(cells) >= 3 and bool(real_col_names) and (matching_header_cells / len(cells) >= 0.4)
+        num_numeric_in_cells = sum(1 for c in cells if is_pure_data_value(c))
+        if num_numeric_in_cells > 0 or (num_numeric_in_cells / max(1, len(cells))) >= 0.25:
+            is_repeat_header = False
+        else:
+            matching_header_cells = sum(1 for c in cells if any(c.lower() == r or c.lower() in r.split() for r in real_col_names)) if real_col_names else 0
+            is_repeat_header = len(cells) >= 3 and bool(real_col_names) and (matching_header_cells / len(cells) >= 0.75)
         if is_repeat_header and r_idx > 0:
             rows_to_drop.add(r_idx)
             prev_was_repeated_header = True
@@ -1132,7 +1179,14 @@ def postprocess_dataframe(df, headers=None):
         return df
         
     original_attrs = df.attrs.copy() if hasattr(df, 'attrs') else {}
-    is_vlm = (original_attrs.get('extractor') == 'paddleocr_vl' or original_attrs.get('source') == 'paddleocr_vl')
+    extractor_name = str(original_attrs.get('extractor', '')).lower()
+    source_name = str(original_attrs.get('source', '')).lower()
+    is_vlm = (
+        original_attrs.get('extractor') == 'mineru_api' or
+        extractor_name in ('paddleocr_vl', 'mineru_api', 'mineru', 'docling', 'teleocr') or
+        source_name in ('paddleocr_vl', 'mineru_api', 'mineru', 'docling', 'teleocr') or
+        extractor_name.startswith('vlm')
+    )
 
     # 1. 付费墙拦截判定（严格词边界匹配与多关键词共现，彻底避免 parent/different/register of samples 误杀）
     if is_paywall_table(df) or original_attrs.get('rejected_reason') == 'paywall':
@@ -1145,7 +1199,7 @@ def postprocess_dataframe(df, headers=None):
 
     df = df.copy().reset_index(drop=True)
 
-    # 2. 针对 PaddleOCR-VL-1.6 的零破坏直通管道
+    # 2. 针对 PaddleOCR-VL-1.6 / MinerU 官方高保真结构化表格的零破坏直通管道
     if is_vlm:
         return _clean_vlm_dataframe(df, original_attrs)
 
@@ -1175,16 +1229,21 @@ def postprocess_dataframe(df, headers=None):
 
     # 保证列名唯一
     if not df.columns.is_unique:
-        seen = {}
+        seen = set()
         unique_cols = []
-        for col in df.columns:
-            col_str = str(col) if col is not None else "Unnamed"
-            if col_str in seen:
-                seen[col_str] += 1
-                unique_cols.append(f"{col_str}_{seen[col_str]}")
+        for idx, col in enumerate(df.columns):
+            candidate = str(col) if (col is not None and str(col).strip()) else f"Col_{idx+1}"
+            if candidate not in seen:
+                seen.add(candidate)
+                unique_cols.append(candidate)
             else:
-                seen[col_str] = 0
-                unique_cols.append(col_str)
+                k = 1
+                new_name = f"{candidate}_{k}"
+                while new_name in seen:
+                    k += 1
+                    new_name = f"{candidate}_{k}"
+                seen.add(new_name)
+                unique_cols.append(new_name)
         df.columns = unique_cols
 
     # 步骤 C: 行列展开（紧缩列、多行子行、章节分类）
@@ -1225,6 +1284,19 @@ def postprocess_dataframe(df, headers=None):
         df.attrs.update(original_attrs)
         
     return df
+
+
+# 别名兼容
+postprocess_table = postprocess_dataframe
+
+
+def clean_extracted_table(df: pd.DataFrame) -> pd.DataFrame:
+    """清洗提取后的 DataFrame 单元格文本，保留合法的 'None' 字符串，转换 None/NaN 为 ''。"""
+    if df is None or df.empty:
+        return df
+    original_attrs = df.attrs.copy() if hasattr(df, 'attrs') else {}
+    return _clean_vlm_dataframe(df.copy(), original_attrs)
+
 
 
 def is_merged_row_table(table):
@@ -1516,6 +1588,16 @@ def merge_cross_page_split_cells(prev_df: pd.DataFrame, next_df: pd.DataFrame) -
         complementary = True
 
     if text_split or (col0_empty_in_next and complementary):
+        # 严禁将两行各自包含独立有效数值的行进行盲目拼合（如 12.5 与 13.5 拼成 "12.5 13.5" 并丢弃行 2）
+        numeric_conflicts = 0
+        for i in range(min(len(last_row), len(first_row))):
+            p_val = last_row[i]
+            n_val = first_row[i]
+            if p_val and n_val and is_pure_data_value(p_val) and is_pure_data_value(n_val):
+                numeric_conflicts += 1
+        if numeric_conflicts > 0:
+            return prev_df, next_df
+
         merged_last = list(last_row)
         for i in range(min(len(merged_last), len(first_row))):
             p_val = merged_last[i]
@@ -1524,6 +1606,8 @@ def merge_cross_page_split_cells(prev_df: pd.DataFrame, next_df: pd.DataFrame) -
                 if p_val and p_val.endswith(('-', '—')):
                     merged_last[i] = p_val[:-1] + n_val
                 elif p_val:
+                    if is_pure_data_value(p_val) or is_pure_data_value(n_val):
+                        return prev_df, next_df
                     merged_last[i] = p_val + " " + n_val
                 else:
                     merged_last[i] = n_val
@@ -1677,7 +1761,8 @@ def combine_df_group(group):
                     raw_first_ints == list(range(len(first_row))) or
                     raw_first_ints == list(range(1, len(first_row) + 1))
                 )
-                first_row_is_data = sum(1 for c in first_row if is_pure_data_value(c)) / max(1, len(first_row)) >= 0.3
+                num_numeric = sum(1 for c in first_row if is_pure_data_value(c))
+                first_row_is_data = num_numeric > 0 or (num_numeric / max(1, len(first_row))) >= 0.25
                 is_subsequent_text = False
                 if len(next_df) > 1:
                     for val in next_df.iloc[1].values:
@@ -1685,7 +1770,9 @@ def combine_df_group(group):
                             is_subsequent_text = True
                             break
                 is_index_row = len(first_row) >= 3 and is_seq and (has_exp_idx or (is_subsequent_text and not first_row_is_data))
-                is_repeat_header = (not first_row_is_data) and sum(1 for c in first_row if c and any(_normalize_col_name(c) == _normalize_col_name(b) for b in base_cols)) / max(1, len(base_cols)) >= 0.25
+                non_data_first = [c for c in first_row if c and not is_pure_data_value(c)]
+                matches = sum(1 for c in non_data_first if any(_normalize_col_name(c) == _normalize_col_name(b) or _normalize_col_name(c) in _normalize_col_name(b).split() for b in base_cols))
+                is_repeat_header = (not first_row_is_data) and bool(base_cols) and len(non_data_first) >= 2 and (matches / max(1, len(non_data_first)) >= 0.75) and matches >= 2
                 is_unit_row = len(first_row) > 0 and all(any(u in c.lower() for u in ['wt%', 'ppm', 'ppb', '%', '‰', 'ma', 'ga', 'ka', '℃', '°c']) or c.startswith('(') for c in first_row if c)
                 # 续表标题横幅行 (如 "Table 1 (continued)", "Table 1 Continued", "接上表", "Table 1 (cont'd)")
                 is_cont_banner = bool(re.search(r'(?:table\s*\d+|表\s*\d+|续表|接上表|续上表|continued|cont\'?d|\(cont\b|cont\.)', row_str)) and len([c for c in first_row if c]) <= 3
@@ -1728,6 +1815,243 @@ def combine_df_group(group):
     res.attrs = base_df.attrs.copy()
     return res
 
+
+def _compute_bbox_iou(box1, box2) -> float:
+    """计算两个边界框之间的 IoU (Intersection over Union)。"""
+    if not box1 or not box2 or len(box1) < 4 or len(box2) < 4:
+        return 0.0
+    x_left = max(box1[0], box2[0])
+    y_top = max(box1[1], box2[1])
+    x_right = min(box1[2], box2[2])
+    y_bottom = min(box1[3], box2[3])
+    if x_right < x_left or y_bottom < y_top:
+        return 0.0
+    intersection_area = max(0.0, x_right - x_left) * max(0.0, y_bottom - y_top)
+    box1_area = max(0.0, (box1[2] - box1[0]) * (box1[3] - box1[1]))
+    box2_area = max(0.0, (box2[2] - box2[0]) * (box2[3] - box2[1]))
+    union_area = box1_area + box2_area - intersection_area
+    if union_area <= 0:
+        return 0.0
+    return intersection_area / union_area
+
+
+def is_conflicting_or_distinct_version(df1, df2) -> bool:
+    """
+    判断两个具有相同表号/标签的表格是否为独立或冲突的版本，而非重复提取。
+    若两个表格数据行互不重叠、样本互斥或来源不同且无法对齐，返回 True 以保留双方独立版本。
+    """
+    if df1 is None or df2 is None:
+        return False
+    if not isinstance(df1, pd.DataFrame) or not isinstance(df2, pd.DataFrame):
+        return False
+    if df1.empty or df2.empty:
+        return False
+
+    # 提取非空非占位符的有效数据单元格集合 (转为小写字符串)
+    def _extract_data_cells(df):
+        cells = set()
+        for v in df.values.flatten():
+            if pd.notna(v):
+                s = str(v).strip().lower()
+                if s and s not in ('', 'nan', 'none', '-', '—', 'n/a', 'na', 'null'):
+                    cells.add(s)
+        return cells
+
+    cells1 = _extract_data_cells(df1)
+    cells2 = _extract_data_cells(df2)
+
+    # 若任一表无任何有效数据元胞，不构成冲突独立版本
+    if not cells1 or not cells2:
+        return False
+
+    shared = cells1 & cells2
+    min_len = min(len(cells1), len(cells2))
+    overlap_ratio = len(shared) / max(1, min_len)
+
+    # 1. 如果有效数据单元格重合度低于 40%，说明两表包含互不相同的样本或数据记录，属于冲突/独立表
+    if overlap_ratio < 0.40:
+        return True
+
+    # 2. 检查字段列名：若两表核心有效列名明显不一致且公共字段少于一半
+    cols1 = set(str(c).lower().strip() for c in df1.columns if not str(c).startswith(('Unnamed', 'Col')) and str(c).strip() not in ('', 'nan', 'none'))
+    cols2 = set(str(c).lower().strip() for c in df2.columns if not str(c).startswith(('Unnamed', 'Col')) and str(c).strip() not in ('', 'nan', 'none'))
+    if cols1 and cols2:
+        common_cols = cols1 & cols2
+        jaccard_cols = len(common_cols) / max(1, len(cols1 | cols2))
+        if jaccard_cols < 0.40 and overlap_ratio < 0.60:
+            return True
+
+    # 3. 来源检查：若一个来自在线（HTML/JATS），另一个来自本地 PDF/OCR，且数据无法完全对齐
+    src1 = str(df1.attrs.get('source') or df1.attrs.get('extractor') or '').lower()
+    src2 = str(df2.attrs.get('source') or df2.attrs.get('extractor') or '').lower()
+    is_diff_provenance = (
+        bool('online' in src1 or 'jats' in src1 or 'arxiv' in src1 or 'html' in src1) !=
+        bool('online' in src2 or 'jats' in src2 or 'arxiv' in src2 or 'html' in src2)
+    )
+    if is_diff_provenance and overlap_ratio < 0.80:
+        return True
+
+    # 4. 样本—字段—值关联冲突检测（杜绝全表单元格集合相同但样本间数值互换/冲突导致丢表）
+    def _norm_val(v):
+        if pd.isna(v):
+            return ""
+        s = str(v).strip().lower().replace(',', '')
+        if s in ('', 'nan', 'none', '-', '—', 'n/a', 'na', 'null'):
+            return ""
+        try:
+            f = float(s)
+            return f"{f:.6g}"
+        except Exception:
+            return s
+
+    def _find_sample_key_col(df):
+        if df is None or df.empty:
+            return None
+        cols = list(df.columns)
+        id_patterns = [
+            r'(?:^|[\s_\-])(?:sample|id|identifier|name|specimen|station|site|case|patient|gene|no\.?|item|code|label|compound|material)(?:$|[\s_\-])',
+            r'^(?:样本|编号|名称|样品|站位|点位|实验号|序号)$',
+        ]
+        for c_idx, c in enumerate(cols):
+            c_str = str(c).strip().lower()
+            if any(re.search(pat, c_str, re.IGNORECASE) for pat in id_patterns):
+                vals = [str(v).strip().lower() for v in df.iloc[:, c_idx] if pd.notna(v) and str(v).strip().lower() not in ('', 'nan', 'none', '-', '—')]
+                if len(vals) >= 1:
+                    return c_idx
+
+        # 若首列包含文本/离散标识符，作为样本键候选
+        if df.shape[1] >= 2:
+            vals = [str(v).strip().lower() for v in df.iloc[:, 0] if pd.notna(v) and str(v).strip().lower() not in ('', 'nan', 'none', '-', '—')]
+            if len(vals) >= 2 and len(set(vals)) >= 2:
+                return 0
+        return None
+
+    k1 = _find_sample_key_col(df1)
+    k2 = _find_sample_key_col(df2)
+    if k1 is not None and k2 is not None:
+        s1_map = {}
+        for r in range(df1.shape[0]):
+            raw_s = df1.iat[r, k1]
+            if pd.isna(raw_s):
+                continue
+            s_key = str(raw_s).strip().lower()
+            if s_key not in ('', 'nan', 'none', '-', '—') and s_key not in s1_map:
+                s1_map[s_key] = r
+
+        s2_map = {}
+        for r in range(df2.shape[0]):
+            raw_s = df2.iat[r, k2]
+            if pd.isna(raw_s):
+                continue
+            s_key = str(raw_s).strip().lower()
+            if s_key not in ('', 'nan', 'none', '-', '—') and s_key not in s2_map:
+                s2_map[s_key] = r
+
+        samples1 = set(s1_map.keys())
+        samples2 = set(s2_map.keys())
+
+        if samples1 and samples2:
+            common_samples = samples1 & samples2
+            min_samples = min(len(samples1), len(samples2))
+            sample_overlap = len(common_samples) / max(1, min_samples)
+
+            # 4a. 样本集合重合度低 (<40%)：属于互补分段表或不同独立表
+            if sample_overlap < 0.40:
+                return True
+
+            # 4b. 共有样本的各字段数值一致性比对
+            cols1_clean = {str(c).strip().lower(): idx for idx, c in enumerate(df1.columns)
+                           if idx != k1 and not str(c).startswith(('Unnamed', 'Col')) and str(c).strip().lower() not in ('', 'nan', 'none')}
+            cols2_clean = {str(c).strip().lower(): idx for idx, c in enumerate(df2.columns)
+                           if idx != k2 and not str(c).startswith(('Unnamed', 'Col')) and str(c).strip().lower() not in ('', 'nan', 'none')}
+            common_fields = set(cols1_clean.keys()) & set(cols2_clean.keys())
+
+            col_pairs = []
+            if common_fields:
+                for f in common_fields:
+                    col_pairs.append((cols1_clean[f], cols2_clean[f]))
+            else:
+                non_k1 = [i for i in range(df1.shape[1]) if i != k1]
+                non_k2 = [i for i in range(df2.shape[1]) if i != k2]
+                col_pairs = list(zip(non_k1, non_k2))
+
+            if col_pairs and common_samples:
+                agreed = 0
+                conflicted = 0
+                for c1_i, c2_i in col_pairs:
+                    s_val1 = {}
+                    s_val2 = {}
+                    for s in common_samples:
+                        r1 = s1_map[s]
+                        r2 = s2_map[s]
+                        v1 = _norm_val(df1.iat[r1, c1_i])
+                        v2 = _norm_val(df2.iat[r2, c2_i])
+                        if v1 and v2:
+                            s_val1[s] = v1
+                            s_val2[s] = v2
+                            if v1 == v2:
+                                agreed += 1
+                            else:
+                                conflicted += 1
+
+                    # 检查数值是否在样本间发生了互换 (如 A=13, B=25 vs A=25, B=13)
+                    samples_with_vals = list(s_val1.keys())
+                    for i in range(len(samples_with_vals)):
+                        sa = samples_with_vals[i]
+                        for j in range(i + 1, len(samples_with_vals)):
+                            sb = samples_with_vals[j]
+                            if (s_val1[sa] == s_val2[sb] and
+                                s_val1[sb] == s_val2[sa] and
+                                s_val1[sa] != s_val1[sb]):
+                                return True
+
+                total_checked = agreed + conflicted
+                if total_checked > 0 and conflicted > 0:
+                    conflict_ratio = conflicted / total_checked
+                    # 若数值在样本间互换或存在明显数据冲突（冲突数 >= 2 或不同来源且存在数值分歧）
+                    if is_diff_provenance:
+                        if conflict_ratio >= 0.10 or conflicted >= 1:
+                            return True
+                    else:
+                        if conflicted >= 2 or conflict_ratio >= 0.15:
+                            return True
+    elif df1.shape == df2.shape and df1.shape[0] >= 2 and df1.shape[1] >= 2:
+        # 矩阵/无显式样本列：按行列位置比对数值一致性
+        pos_agreed = 0
+        pos_conflicted = 0
+        cell_vals1 = {}
+        cell_vals2 = {}
+        for r_i in range(df1.shape[0]):
+            for c_i in range(df1.shape[1]):
+                v1 = _norm_val(df1.iat[r_i, c_i])
+                v2 = _norm_val(df2.iat[r_i, c_i])
+                if v1 and v2:
+                    cell_vals1[(r_i, c_i)] = v1
+                    cell_vals2[(r_i, c_i)] = v2
+                    if v1 == v2:
+                        pos_agreed += 1
+                    else:
+                        pos_conflicted += 1
+
+        # 检查矩阵单元格之间是否存在数值互换
+        cells_list = list(cell_vals1.keys())
+        for i in range(len(cells_list)):
+            ca = cells_list[i]
+            for j in range(i + 1, len(cells_list)):
+                cb = cells_list[j]
+                if (cell_vals1[ca] == cell_vals2[cb] and
+                    cell_vals1[cb] == cell_vals2[ca] and
+                    cell_vals1[ca] != cell_vals1[cb]):
+                    return True
+
+        pos_total = pos_agreed + pos_conflicted
+        if pos_total > 0 and pos_conflicted > 0:
+            if pos_conflicted >= 2 or (pos_conflicted / pos_total) >= 0.15:
+                return True
+
+    return False
+
+
 def merge_continuation_tables(dfs):
     """
     Merges contiguous or matching continuation DataFrames into single DataFrames per table.
@@ -1762,20 +2086,42 @@ def merge_continuation_tables(dfs):
     if not normalized_dfs:
         return []
 
-    # 环境变量与配置开关检查 (MinerU cross-page table merge switch)
-    if os.getenv("MINERU_TABLE_MERGE_ENABLE", "true").lower() in ("0", "false", "no", "off"):
+    # 环境变量与配置开关检查 (MinerU cross-page table merge switch: 支持环境变量优先，fallback 到 load_config)
+    try:
+        from . import common as _common_mod
+        cfg = _common_mod.load_config()
+    except Exception:
+        try:
+            import common as _common_mod
+            cfg = _common_mod.load_config()
+        except Exception:
+            cfg = {}
+    env_merge = os.getenv("MINERU_TABLE_MERGE_ENABLE")
+    if env_merge is not None:
+        merge_enabled = (env_merge.lower() not in ("0", "false", "no", "off"))
+    else:
+        cfg_merge = cfg.get("MINERU_TABLE_MERGE_ENABLE", True)
+        if isinstance(cfg_merge, str):
+            merge_enabled = (cfg_merge.lower() not in ("0", "false", "no", "off"))
+        else:
+            merge_enabled = bool(cfg_merge)
+    if not merge_enabled:
         return normalized_dfs
 
     def norm_label(lbl):
         if not lbl:
             return None
-        # 移除常见的续表后缀如 (continued), Continued, (cont.), cont., cont'd, (续), （续）, 续, 续表, 接上表
-        clean = re.sub(r'[\s,\-–—]*[\(（]?(?:cont\'?d|continued|cont|续表|续上表|接上表|续)\.?[）\)]?', '', str(lbl), flags=re.IGNORECASE)
-        # 规整中英文表号前缀空格（如 "表1" -> "表 1", "Table1" -> "Table 1"）
+        s = str(lbl).strip()
+        m = TABLE_LABEL_RE.search(s)
+        target = m.group(0) if m else s
+        fmt = format_table_label(target)
+        candidate = fmt or target
+        clean = re.sub(r'[\s,\-–—]*[\(（]?(?:cont\'?d|continued|cont|续表|续上表|接上表|续)\.?[）\)]?', '', candidate, flags=re.IGNORECASE)
         clean = re.sub(r'^(table|表)\s*([0-9a-zA-Z]+)', r'\1 \2', clean, flags=re.IGNORECASE)
         clean = re.sub(r'[:.\-–—\s]+$', '', clean)
         clean = re.sub(r'\s+', ' ', clean).strip()
-        return clean
+        return clean if clean else None
+
 
     merged_dfs = []
     current_group = []
@@ -1800,14 +2146,22 @@ def merge_continuation_tables(dfs):
         if df is None or df.empty:
             continue
 
-        lbl = norm_label(df.attrs.get('label'))
+        curr_raw_lbl = df.attrs.get('label')
+        if not curr_raw_lbl and df.attrs.get('table_title'):
+            m_t = TABLE_LABEL_RE.search(str(df.attrs.get('table_title')))
+            curr_raw_lbl = m_t.group(0) if m_t else df.attrs.get('table_title')
+        lbl = norm_label(curr_raw_lbl)
         
         if not current_group:
             current_group.append(df)
             continue
 
         prev_df = current_group[-1]
-        prev_lbl = norm_label(prev_df.attrs.get('label'))
+        prev_raw_lbl = prev_df.attrs.get('label')
+        if not prev_raw_lbl and prev_df.attrs.get('table_title'):
+            m_p = TABLE_LABEL_RE.search(str(prev_df.attrs.get('table_title')))
+            prev_raw_lbl = m_p.group(0) if m_p else prev_df.attrs.get('table_title')
+        prev_lbl = norm_label(prev_raw_lbl)
         prev_page = prev_df.attrs.get('page_idx')
         curr_page = df.attrs.get('page_idx')
         
@@ -1879,21 +2233,108 @@ def merge_continuation_tables(dfs):
 
         is_unlabeled_cont = (
             (not lbl or is_explicit_cont or cols_are_data) and
-            (is_next_page or is_block_sequence or (page_dist is not None and page_dist <= 2)) and
+            (is_next_page or is_block_sequence or (page_dist is not None and 1 <= page_dist <= 2)) and
             prev_lbl and
             cols_match and
             not is_small_unlabeled_independent
         )
 
+        def _extract_table_id(label_or_title):
+            if not label_or_title:
+                return None
+            nl = norm_label(label_or_title)
+            if nl:
+                m = TABLE_LABEL_RE.search(nl)
+                if m:
+                    return m.group(0).lower().replace(' ', '')
+                m_simple = re.search(r'(?:table|表|tab\.)\s*([0-9a-zA-Z\.\-_]+)', nl, re.IGNORECASE)
+                if m_simple:
+                    return f"table{m_simple.group(1).lower()}"
+                return None
+            return None
+
+        curr_tid = _extract_table_id(lbl) or _extract_table_id(df.attrs.get('table_title'))
+        prev_tid = _extract_table_id(prev_lbl) or _extract_table_id(prev_df.attrs.get('table_title'))
+        # 仅当两张表均明确具有互相冲突的不同表号（如 Table 1 vs Table 2）时，才判定为表号冲突。
+        # 描述性续表标题（如 Chemical composition (continued)）未指定冲突表号，绝不视为表号冲突。
+        has_label_conflict = bool(
+            (curr_tid and prev_tid and curr_tid != prev_tid) or
+            (lbl and prev_lbl and curr_tid is None and prev_tid is None and not is_explicit_cont and not df.attrs.get('is_continuation') and lbl.lower() != prev_lbl.lower())
+        )
+
+        if has_label_conflict:
+            combined = _finalize_merged_group(current_group)
+            if combined is not None:
+                merged_dfs.append(combined)
+            current_group = [df]
+            continue
+
+        effective_prev_lbl = prev_df.attrs.get('label')
+        if not effective_prev_lbl and prev_raw_lbl:
+            m_ep = TABLE_LABEL_RE.search(str(prev_raw_lbl))
+            effective_prev_lbl = format_table_label(m_ep.group(0)) if m_ep else prev_raw_lbl
+
+        is_same_page_cont = is_same_page and not has_label_conflict and bool(is_explicit_cont or df.attrs.get('is_continuation'))
+
+        src_prev = str(prev_df.attrs.get('source') or prev_df.attrs.get('extractor') or '').lower()
+        src_curr = str(df.attrs.get('source') or df.attrs.get('extractor') or '').lower()
+        is_diff_prov = (
+            bool('online' in src_prev or 'jats' in src_prev or 'arxiv' in src_prev or 'html' in src_prev) !=
+            bool('online' in src_curr or 'jats' in src_curr or 'arxiv' in src_curr or 'html' in src_curr)
+        )
+
+        # 1. 来源不同（在线 vs 本地 PDF）且未对齐：绝不可合并为同一张表的续表，直接保留双方独立版本
+        if is_diff_prov and is_conflicting_or_distinct_version(prev_df, df):
+            combined = _finalize_merged_group(current_group)
+            if combined is not None:
+                merged_dfs.append(combined)
+            current_group = [df]
+            continue
+
         if is_same_page and is_same_label:
-            # 同页同标签为重复提取，保留质量更好/单元格更完整的版本，不作追加
+            # 检查是否为同页续表片段：若显式包含续表标识或 is_continuation 属性，且空间分离 (IoU < 0.1)，按同页续表纵向追加拼接
+            iou = _compute_bbox_iou(prev_bbox, curr_bbox)
+            if is_same_page_cont and (not prev_bbox or not curr_bbox or iou < 0.1):
+                if (not df.attrs.get('label') or df.attrs.get('is_continuation')) and effective_prev_lbl:
+                    df.attrs['label'] = effective_prev_lbl
+                if not prev_df.attrs.get('label') and effective_prev_lbl:
+                    prev_df.attrs['label'] = effective_prev_lbl
+                if (not df.attrs.get('table_title') or df.attrs.get('is_continuation')) and prev_df.attrs.get('table_title'):
+                    df.attrs['table_title'] = prev_df.attrs.get('table_title')
+                current_group.append(df)
+                continue
+
+            # 检查是否为无法对齐的冲突独立版本（如同一页内数据互不重合的独立表格）
+            # 必须保留双方独立版本，杜绝在导出前再次粗暴去重致使样本丢失
+            if is_conflicting_or_distinct_version(prev_df, df):
+                combined = _finalize_merged_group(current_group)
+                if combined is not None:
+                    merged_dfs.append(combined)
+                current_group = [df]
+                continue
+
+            # 否则确系同页同标签重复提取，保留质量更好/单元格更完整的版本，不作追加
             if df.size > prev_df.size:
                 current_group[-1] = df
             continue
 
+        if is_same_page_cont and cols_match and not has_label_conflict:
+            iou = _compute_bbox_iou(prev_bbox, curr_bbox)
+            if not prev_bbox or not curr_bbox or iou < 0.1:
+                if (not df.attrs.get('label') or df.attrs.get('is_continuation')) and effective_prev_lbl:
+                    df.attrs['label'] = effective_prev_lbl
+                if not prev_df.attrs.get('label') and effective_prev_lbl:
+                    prev_df.attrs['label'] = effective_prev_lbl
+                if (not df.attrs.get('table_title') or df.attrs.get('is_continuation')) and prev_df.attrs.get('table_title'):
+                    df.attrs['table_title'] = prev_df.attrs.get('table_title')
+                current_group.append(df)
+                continue
+
         if is_same_label or is_unlabeled_cont:
-            if (not df.attrs.get('label') or df.attrs.get('is_continuation')) and prev_df.attrs.get('label'):
-                df.attrs['label'] = prev_df.attrs.get('label')
+            if (not df.attrs.get('label') or df.attrs.get('is_continuation')) and effective_prev_lbl:
+                df.attrs['label'] = effective_prev_lbl
+            if not prev_df.attrs.get('label') and effective_prev_lbl:
+                prev_df.attrs['label'] = effective_prev_lbl
             if (not df.attrs.get('table_title') or df.attrs.get('is_continuation')) and prev_df.attrs.get('table_title'):
                 df.attrs['table_title'] = prev_df.attrs.get('table_title')
             current_group.append(df)

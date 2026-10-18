@@ -16,9 +16,14 @@ import sys
 import time
 import tempfile
 import zipfile
-from typing import List, Dict, Any, Optional
+import collections
+from typing import List, Dict, Any, Optional, Union, Tuple, Set
 
+import logging
 import requests
+import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 try:
     import pymupdf as fitz
@@ -32,9 +37,9 @@ except ImportError:
     Image = None
 
 try:
-    from .common import load_config
+    from .common import load_config, clean_text, clean_latex_and_ocr, TABLE_LABEL_RE, format_table_label
 except ImportError:
-    from common import load_config
+    from common import load_config, clean_text, clean_latex_and_ocr, TABLE_LABEL_RE, format_table_label
 
 try:
     from .table_postprocess import parse_structured_vlm_content
@@ -114,23 +119,702 @@ def _sleep_cancel_aware(seconds: float, cancel_event=None) -> bool:
 # MinerU 官方 API 客户端与多云视觉容灾集成
 # ===========================================================================
 
+def format_page_ranges(page_ranges: Optional[Union[str, List[int]]]) -> Optional[str]:
+    """格式化页码范围参数，兼容整数列表 (0-based) 与字符串范围 (如 '1-3,5')。"""
+    if not page_ranges:
+        return None
+    if isinstance(page_ranges, str):
+        return page_ranges.strip()
+    if isinstance(page_ranges, (list, tuple, set)):
+        if not page_ranges:
+            return None
+        # 内部页码集合统一为 0-based 索引，无条件转换为 MinerU 官方要求的 1-based 页码
+        sorted_p = [p + 1 for p in sorted(set(int(p) for p in page_ranges))]
+        ranges = []
+        start = sorted_p[0]
+        end = sorted_p[0]
+        for p in sorted_p[1:]:
+            if p == end + 1:
+                end = p
+            else:
+                ranges.append(f"{start}-{end}" if start != end else f"{start}")
+                start = end = p
+        ranges.append(f"{start}-{end}" if start != end else f"{start}")
+        return ",".join(ranges)
+    return str(page_ranges)
+
+
+def _extract_polymorphic_text(val: Any) -> str:
+    """多态文本提取辅助函数：统一兼容字符串、字典、字典列表或多层嵌套。"""
+    if not val:
+        return ""
+    if isinstance(val, str):
+        return val.strip()
+    if isinstance(val, (int, float)):
+        return str(val)
+    if isinstance(val, dict):
+        txt = (
+            val.get("text") or
+            val.get("content") or
+            val.get("title") or
+            val.get("caption") or
+            val.get("raw") or
+            val.get("value") or
+            ""
+        )
+        if txt:
+            return str(txt).strip()
+        nested = val.get("children") or val.get("blocks") or val.get("items") or val.get("paragraphs") or val.get("lines") or val.get("spans")
+        if nested:
+            return _extract_polymorphic_text(nested)
+        parts = [str(v).strip() for v in val.values() if isinstance(v, (str, int, float)) and str(v).strip()]
+        return " ".join(parts).strip()
+    if isinstance(val, (list, tuple, set)):
+        parts = []
+        for sub in val:
+            txt = _extract_polymorphic_text(sub)
+            if txt:
+                parts.append(txt)
+        return " ".join(parts).strip()
+    return str(val).strip()
+
+
+def _make_columns_unique(cols: List[str]) -> List[str]:
+    """生成绝对唯一的列名列表，杜绝重名冲突。"""
+    seen = set()
+    unique_cols = []
+    for idx, c in enumerate(cols):
+        candidate = c if (c and str(c).strip()) else f"Col_{idx+1}"
+        if candidate not in seen:
+            seen.add(candidate)
+            unique_cols.append(candidate)
+        else:
+            k = 1
+            new_name = f"{candidate}_{k}"
+            while new_name in seen:
+                k += 1
+                new_name = f"{candidate}_{k}"
+            seen.add(new_name)
+            unique_cols.append(new_name)
+    return unique_cols
+
+
+SUB_MAP = str.maketrans('0123456789+-=()aehijklmnoprstuvx', '₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎ₐₑₕᵢⱼₖₗₘₙₒₚᵣₛₜᵤᵥₓ')
+SUP_MAP = str.maketrans('0123456789+-−=()ni', '⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁻⁼⁽⁾ⁿⁱ')
+
+def _convert_sub_sup(text: str) -> str:
+    """将 HTML 中的 <sub>/<sup> 标签转换为高保真 Unicode 上下标，确保 pd.read_html 及导出时学术符号完整。"""
+    text = re.sub(r'<sub>(.*?)</sub>', lambda m: m.group(1).translate(SUB_MAP), text, flags=re.IGNORECASE)
+    text = re.sub(r'<sup>(.*?)</sup>', lambda m: m.group(1).translate(SUP_MAP), text, flags=re.IGNORECASE)
+    return text
+
+
+def _parse_mineru_table_html(table_html_or_md: str) -> List[pd.DataFrame]:
+    """将 MinerU 返回的 table_body (HTML 或 Markdown) 安全解析为 DataFrame 列表。"""
+    if not isinstance(table_html_or_md, str):
+        if isinstance(table_html_or_md, dict):
+            table_html_or_md = (
+                table_html_or_md.get("html") or
+                table_html_or_md.get("body") or
+                table_html_or_md.get("markdown") or
+                table_html_or_md.get("text") or
+                ""
+            )
+        table_html_or_md = str(table_html_or_md) if table_html_or_md is not None else ""
+    if not table_html_or_md or not table_html_or_md.strip():
+        return []
+    content = table_html_or_md.strip()
+
+    if "<table" in content.lower():
+        try:
+            converted_content = _convert_sub_sup(content)
+            # 锁定单元格为 str，避免自动将样号 001、范围 10-20、编码等误转为数值/日期
+            conv = collections.defaultdict(lambda: str)
+            dfs = pd.read_html(io.StringIO(converted_content), keep_default_na=False, converters=conv)
+            cleaned_dfs = []
+            for df in dfs:
+                if df is None or df.empty:
+                    continue
+                # 规范化并展开 MultiIndex 复合表头
+                if isinstance(df.columns, pd.MultiIndex):
+                    flat_cols = []
+                    for col_tuple in df.columns:
+                        parts = []
+                        for p in col_tuple:
+                            if p is None:
+                                continue
+                            p_str = clean_latex_and_ocr(clean_text(str(p))).strip()
+                            # 仅过滤系统生成的 unnamed 或纯数字列标签如 col_1，保护真实词汇如 Color, Cold, Column
+                            if p_str and not re.match(r'^(?:unnamed\b|col[_\s]*\d+$)', p_str, re.IGNORECASE) and p_str.lower() not in ('nan', 'none'):
+                                if not parts or p_str != parts[-1]:
+                                    parts.append(p_str)
+                        flat_cols.append('_'.join(parts) if parts else '')
+                    df.columns = _make_columns_unique(flat_cols)
+                else:
+                    cols = [
+                        clean_latex_and_ocr(clean_text(str(c))).strip()
+                        if pd.notna(c) and not re.match(r'^(?:unnamed\b|col[_\s]*\d+$|none$|nan$)', str(c).strip(), re.IGNORECASE)
+                        else f"Col_{i+1}"
+                        for i, c in enumerate(df.columns)
+                    ]
+                    df.columns = _make_columns_unique(cols)
+                cleaned_dfs.append(df)
+            if cleaned_dfs:
+                return cleaned_dfs
+        except Exception:
+            pass
+
+    # Markdown 表格降级解析
+    if parse_structured_vlm_content is not None:
+        return parse_structured_vlm_content(content)
+    return []
+
+
+def extract_mineru_structured_archive(archive_input: Any) -> List[pd.DataFrame]:
+    """
+    从 MinerU 解析结果的 ZIP 包中深度提取结构化表格：
+    1. 动态匹配 JSON 索引文件：优先匹配 *content_list*.json, *middle*.json, *structured_content*.json 等；
+    2. 提取结构化字段：table_body (HTML/Markdown), bbox, polymorphic table_caption, table_footnote；
+    3. 安全解析 HTML / 表格至 DataFrame，干净展平 MultiIndex 多级复合表头，并锁定原始数据类型；
+    4. 完整绑定元数据至 df.attrs ('extractor': 'mineru_api', 'page_idx', 'bbox', 'table_title', 'table_footnote')。
+    """
+    zf = None
+    should_close = False
+    try:
+        if isinstance(archive_input, zipfile.ZipFile):
+            zf = archive_input
+        elif isinstance(archive_input, (bytes, bytearray)):
+            zf = zipfile.ZipFile(io.BytesIO(archive_input))
+            should_close = True
+        elif isinstance(archive_input, io.BytesIO):
+            zf = zipfile.ZipFile(archive_input)
+            should_close = True
+        elif isinstance(archive_input, str):
+            if archive_input.startswith(("http://", "https://")):
+                resp = requests.get(archive_input, timeout=120)
+                if resp.status_code != 200:
+                    print(f"[MinerU] 下载 ZIP 产物包失败 status={resp.status_code}")
+                    return []
+                zf = zipfile.ZipFile(io.BytesIO(resp.content))
+                should_close = True
+            elif os.path.exists(archive_input):
+                zf = zipfile.ZipFile(archive_input)
+                should_close = True
+            else:
+                return []
+        else:
+            return []
+
+        names = zf.namelist()
+
+        def _find_table_body_and_box(obj: Any) -> Tuple[Optional[str], Optional[list]]:
+            if not obj:
+                return None, None
+            if isinstance(obj, str):
+                if "<table" in obj.lower() or "\n|" in obj or obj.strip().startswith("|"):
+                    return obj.strip(), None
+                return None, None
+            if isinstance(obj, dict):
+                bbox = obj.get("bbox") or obj.get("box") or obj.get("rect")
+                # Direct body keys
+                for k in ("table_body", "html", "table_html", "body"):
+                    val = obj.get(k)
+                    if isinstance(val, str) and val.strip():
+                        return val.strip(), bbox
+                    elif isinstance(val, dict):
+                        sub_b, sub_box = _find_table_body_and_box(val)
+                        if sub_b:
+                            return sub_b, bbox or sub_box
+
+                # Content key
+                c = obj.get("content")
+                if isinstance(c, str) and c.strip():
+                    if "<table" in c.lower() or "\n|" in c or c.strip().startswith("|"):
+                        return c.strip(), bbox
+                elif isinstance(c, dict):
+                    sub_b, sub_box = _find_table_body_and_box(c)
+                    if sub_b:
+                        return sub_b, bbox or sub_box
+
+                # Table block check
+                obj_type = str(obj.get("type", "")).lower()
+                if obj_type in ("table", "table_body"):
+                    for k in ("markdown", "text", "raw"):
+                        val = obj.get(k)
+                        if isinstance(val, str) and val.strip() and ("<table" in val.lower() or "\n|" in val or val.strip().startswith("|")):
+                            return val.strip(), bbox
+
+                # Deep search in blocks / lines / spans / elements
+                for child_k in ("blocks", "lines", "spans", "elements"):
+                    children = obj.get(child_k)
+                    if isinstance(children, list):
+                        for child in children:
+                            sub_b, sub_box = _find_table_body_and_box(child)
+                            if sub_b:
+                                return sub_b, bbox or sub_box
+
+                return None, bbox
+            return None, None
+
+        def _collect_table_candidates(data: Any, inherited_page: Optional[int] = None) -> List[Tuple[dict, Optional[int]]]:
+            results = []
+            if not data:
+                return results
+
+            if isinstance(data, list):
+                is_nested_pages = any(isinstance(elem, list) for elem in data) if data else False
+                is_page_dict_list = all(isinstance(elem, dict) and any(k in elem for k in ("blocks", "preproc_blocks", "elements", "tables")) for elem in data) if data else False
+                for idx, elem in enumerate(data):
+                    page = idx if ((is_nested_pages or is_page_dict_list) and inherited_page is None) else inherited_page
+                    results.extend(_collect_table_candidates(elem, page))
+                return results
+
+            if isinstance(data, dict):
+                curr_page = inherited_page
+                raw_p = data.get("page_idx")
+                if raw_p is None:
+                    p_no = data.get("page_no")
+                    if isinstance(p_no, int) and p_no > 0:
+                        curr_page = p_no - 1
+                    elif isinstance(p_no, str):
+                        try:
+                            curr_page = max(0, int(p_no) - 1)
+                        except Exception:
+                            pass
+                else:
+                    try:
+                        curr_page = int(raw_p)
+                    except Exception:
+                        pass
+
+                # 1. pages tree (docvortex / middle v2)
+                if "pages" in data and isinstance(data["pages"], list):
+                    for pg in data["pages"]:
+                        p_idx = pg.get("page_idx")
+                        if p_idx is None:
+                            p_no = pg.get("page_no")
+                            p_idx = (p_no - 1) if (isinstance(p_no, int) and p_no > 0) else curr_page
+                        blocks = pg.get("blocks", []) or pg.get("content", [])
+                        results.extend(_collect_table_candidates(blocks, p_idx))
+                    return results
+
+                # 2. pdf_info tree
+                if "pdf_info" in data and isinstance(data["pdf_info"], list):
+                    for p_info in data["pdf_info"]:
+                        p_idx = p_info.get("page_idx")
+                        if p_idx is None:
+                            p_no = p_info.get("page_no")
+                            p_idx = (p_no - 1) if (isinstance(p_no, int) and p_no > 0) else curr_page
+                        blocks = p_info.get("preproc_blocks", []) + p_info.get("blocks", []) + p_info.get("tables", [])
+                        results.extend(_collect_table_candidates(blocks, p_idx))
+                    return results
+
+                # 3. dict itself as table item (evaluated before generic container keys to protect block-level bbox & metadata)
+                item_type = str(data.get("type", "")).lower()
+                has_table_attr = any(k in data for k in ("table_body", "table_html"))
+                if item_type in ("table", "table_body") or has_table_attr:
+                    results.append((data, curr_page))
+                    return results
+
+                # 4. generic container keys
+                for container_k in ("content_list", "elements", "blocks", "tables", "data"):
+                    val = data.get(container_k)
+                    if isinstance(val, (list, dict)):
+                        sub = _collect_table_candidates(val, curr_page)
+                        if sub:
+                            results.extend(sub)
+                            return results
+
+            return results
+
+        def _extract_page_size_from_dict(d):
+            if not isinstance(d, dict):
+                return None
+            for k in ("page_size", "size", "pagesize"):
+                val = d.get(k)
+                if isinstance(val, (list, tuple)) and len(val) >= 2:
+                    try:
+                        w, h = float(val[0]), float(val[1])
+                        if w > 0 and h > 0:
+                            return (w, h)
+                    except Exception:
+                        pass
+            w = d.get("page_w") or d.get("width") or d.get("w")
+            h = d.get("page_h") or d.get("height") or d.get("h")
+            if w is not None and h is not None:
+                try:
+                    w, h = float(w), float(h)
+                    if w > 0 and h > 0:
+                        return (w, h)
+                except Exception:
+                    pass
+            return None
+
+        # 收集所有 JSON 文件并按优先级排序
+        json_candidates = []
+        for name in names:
+            base = os.path.basename(name)
+            if base.startswith('.') or '__MACOSX' in name:
+                continue
+            if not base.lower().endswith('.json'):
+                continue
+            if re.search(r'content_list', base, re.IGNORECASE):
+                priority = 1
+            elif re.search(r'middle', base, re.IGNORECASE):
+                priority = 2
+            elif re.search(r'structured_content', base, re.IGNORECASE):
+                priority = 3
+            else:
+                priority = 4
+            json_candidates.append((priority, name))
+
+        json_candidates.sort(key=lambda x: (x[0], len(x[1])))
+
+        # 预先扫描各 JSON (特别是 middle.json / pdf_info / pages) 提取页面物理尺寸
+        known_page_sizes = {}
+        for _, jname in json_candidates:
+            try:
+                raw_scan = zf.read(jname)
+                scan_data = json.loads(raw_scan.decode('utf-8', errors='replace'))
+                if isinstance(scan_data, dict):
+                    for p_info in scan_data.get("pdf_info", []):
+                        if isinstance(p_info, dict):
+                            pidx = p_info.get("page_idx")
+                            if pidx is None:
+                                p_no = p_info.get("page_no")
+                                if isinstance(p_no, int) and p_no > 0:
+                                    pidx = p_no - 1
+                            ps = _extract_page_size_from_dict(p_info)
+                            if pidx is not None and ps:
+                                known_page_sizes[int(pidx)] = ps
+                    for pg in scan_data.get("pages", []):
+                        if isinstance(pg, dict):
+                            pidx = pg.get("page_idx")
+                            if pidx is None:
+                                p_no = pg.get("page_no")
+                                if isinstance(p_no, int) and p_no > 0:
+                                    pidx = p_no - 1
+                            ps = _extract_page_size_from_dict(pg)
+                            if pidx is not None and ps:
+                                known_page_sizes[int(pidx)] = ps
+            except Exception:
+                pass
+
+        # 逐个尝试候选 JSON，具有优雅降级回退
+        all_candidate_tables = []
+        for _, json_name in json_candidates:
+            try:
+                raw_bytes = zf.read(json_name)
+                data = json.loads(raw_bytes.decode('utf-8', errors='replace'))
+                raw_items = _collect_table_candidates(data)
+                if not raw_items:
+                    continue
+
+                is_content_list = bool(re.search(r'content_list', os.path.basename(json_name), re.IGNORECASE))
+                extracted_dfs = []
+                for item, default_page in raw_items:
+                    try:
+                        table_body, box = _find_table_body_and_box(item)
+                        if not table_body:
+                            continue
+
+                        raw_p = item.get("page_idx")
+                        if raw_p is None:
+                            p_no = item.get("page_no")
+                            if isinstance(p_no, int) and p_no > 0:
+                                page_idx = p_no - 1
+                            elif isinstance(p_no, str):
+                                try:
+                                    page_idx = max(0, int(p_no) - 1)
+                                except Exception:
+                                    page_idx = default_page if default_page is not None else 0
+                            else:
+                                page_idx = default_page if default_page is not None else 0
+                        else:
+                            try:
+                                page_idx = int(raw_p)
+                            except Exception:
+                                page_idx = default_page if default_page is not None else 0
+
+                        content_obj = {}
+                        container_children = item.get("content") or item.get("blocks") or []
+                        if isinstance(container_children, dict):
+                            content_obj = container_children
+                        elif isinstance(container_children, list):
+                            for c_elem in container_children:
+                                if isinstance(c_elem, dict):
+                                    elem_type = str(c_elem.get("type", "")).lower()
+                                    if "caption" in elem_type or "title" in elem_type:
+                                        content_obj.setdefault("table_caption", c_elem)
+                                    elif "footnote" in elem_type or "note" in elem_type:
+                                        content_obj.setdefault("table_footnote", c_elem)
+                                    for k in ("table_caption", "caption", "title", "table_footnote", "footnote", "footnotes", "label", "is_continuation"):
+                                        if k in c_elem:
+                                            content_obj.setdefault(k, c_elem[k])
+
+                        raw_caption = (
+                            item.get("table_caption") or item.get("caption") or item.get("title") or
+                            content_obj.get("table_caption") or content_obj.get("caption") or content_obj.get("title")
+                        )
+                        caption = _extract_polymorphic_text(raw_caption)
+
+                        raw_footnote = (
+                            item.get("table_footnote") or item.get("footnote") or item.get("footnotes") or
+                            content_obj.get("table_footnote") or content_obj.get("footnote") or content_obj.get("footnotes")
+                        )
+                        footnote = _extract_polymorphic_text(raw_footnote)
+
+                        raw_lbl = item.get("label") or item.get("table_label") or content_obj.get("label") or content_obj.get("table_label")
+                        label = format_table_label(str(raw_lbl)) if raw_lbl else ""
+                        if not label and caption:
+                            m_lbl = TABLE_LABEL_RE.search(caption)
+                            if m_lbl:
+                                label = format_table_label(m_lbl.group(0))
+
+                        is_continuation = bool(
+                            item.get("is_continuation") or
+                            content_obj.get("is_continuation") or
+                            re.search(r'(?:续表|接上表|续上表|（续）|\(续\)|continued|cont\'?d|\(cont\b|cont\.)', caption, re.IGNORECASE)
+                        )
+
+                        dfs = _parse_mineru_table_html(table_body)
+                        for df in dfs:
+                            if df is not None and not df.empty:
+                                df.attrs['extractor'] = 'mineru_api'
+                                df.attrs['page_idx'] = page_idx
+                                df.attrs['bbox'] = box
+                                if page_idx in known_page_sizes:
+                                    df.attrs['page_size'] = known_page_sizes[page_idx]
+                                if is_content_list:
+                                    df.attrs['bbox_format'] = 'norm_1000'
+                                    df.attrs['coord_format'] = 'norm_1000'
+                                else:
+                                    df.attrs['bbox_format'] = 'points'
+                                    df.attrs['coord_format'] = 'points'
+                                df.attrs['table_title'] = caption
+                                df.attrs['table_footnote'] = footnote
+                                df.attrs['footnotes'] = [footnote] if footnote else []
+                                if label:
+                                    df.attrs['label'] = label
+                                if is_continuation:
+                                    df.attrs['is_continuation'] = True
+                                extracted_dfs.append(df)
+                    except Exception as e_item:
+                        logger.debug(f"[MinerU] 解析单个 item 异常已跳过: {e_item}")
+                        continue
+
+                if extracted_dfs:
+                    all_candidate_tables.append((json_name, extracted_dfs))
+            except Exception as e_json:
+                logger.debug(f"[MinerU] 解析候选 JSON {json_name} 失败，尝试下一候选: {e_json}")
+                continue
+
+        if all_candidate_tables:
+            if len(all_candidate_tables) == 1:
+                return all_candidate_tables[0][1]
+
+            # 跨表示融合多文件结果：取最大表示或融合非重复表格，补齐单一 JSON 遗漏的表格
+            def _calc_valid_cells(df):
+                if df is None or df.empty:
+                    return 0
+                return sum(1 for v in df.values.flatten() if pd.notna(v) and str(v).strip() not in ('', 'nan', 'none'))
+
+            def _normalize_mineru_bbox_to_1000(bbox, bbox_format=None, page_size=None):
+                if not bbox or len(bbox) < 4:
+                    return None
+                try:
+                    x0, y0, x1, y1 = float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])
+                except Exception:
+                    return None
+
+                # 确保坐标顺序正常: min, min, max, max
+                x0, x1 = min(x0, x1), max(x0, x1)
+                y0, y1 = min(y0, y1), max(y0, y1)
+
+                if bbox_format == 'norm_1000':
+                    return [x0, y0, x1, y1]
+
+                # Check if coordinates are in 0..1 range
+                if max(x0, y0, x1, y1) <= 1.0 and max(x0, y0, x1, y1) > 0:
+                    return [x0 * 1000.0, y0 * 1000.0, x1 * 1000.0, y1 * 1000.0]
+
+                # Points format: normalize using page_size
+                pw, ph = 595.28, 841.89
+                if page_size and len(page_size) >= 2:
+                    try:
+                        w, h = float(page_size[0]), float(page_size[1])
+                        if w > 0 and h > 0:
+                            pw, ph = w, h
+                    except Exception:
+                        pass
+
+                # Detect rotated/transposed page orientation
+                if x1 > pw and x1 <= ph and y1 <= pw:
+                    pw, ph = ph, pw
+
+                return [x0 / pw * 1000.0, y0 / ph * 1000.0, x1 / pw * 1000.0, y1 / ph * 1000.0]
+
+            def _is_same_mineru_table(t1, t2):
+                l1 = t1.attrs.get('label')
+                l2 = t2.attrs.get('label')
+                p1 = t1.attrs.get('page_idx')
+                p2 = t2.attrs.get('page_idx')
+
+                fmt_l1 = format_table_label(l1) if l1 else None
+                fmt_l2 = format_table_label(l2) if l2 else None
+
+                # 0. 明确表号冲突：若两者均具有明确且不同的表号（如 Table 1 vs Table 2），绝非同一张表
+                if fmt_l1 and fmt_l2 and fmt_l1 != fmt_l2:
+                    return False
+
+                # 若两表处于明确不同的页面，绝非同一张表
+                if p1 is not None and p2 is not None and p1 != p2:
+                    return False
+
+                # 1. 明确表号相同
+                if fmt_l1 and fmt_l2 and fmt_l1 == fmt_l2:
+                    return True
+
+                # 2. 同页且空间 IoU 高 (统一归一化为 0-1000 坐标系后再计算 IoU，杜绝 points 与 norm_1000 混淆误删)
+                if (p1 is None or p2 is None or p1 == p2):
+                    b1 = t1.attrs.get('bbox')
+                    b2 = t2.attrs.get('bbox')
+                    ps1 = t1.attrs.get('page_size') or known_page_sizes.get(p1)
+                    ps2 = t2.attrs.get('page_size') or known_page_sizes.get(p2)
+                    nb1 = _normalize_mineru_bbox_to_1000(b1, t1.attrs.get('bbox_format'), ps1)
+                    nb2 = _normalize_mineru_bbox_to_1000(b2, t2.attrs.get('bbox_format'), ps2)
+                    if nb1 and nb2 and len(nb1) >= 4 and len(nb2) >= 4:
+                        inter = max(0.0, min(nb1[2], nb2[2]) - max(nb1[0], nb2[0])) * max(0.0, min(nb1[3], nb2[3]) - max(nb1[1], nb2[1]))
+                        a1 = max(0.0, (nb1[2] - nb1[0]) * (nb1[3] - nb1[1]))
+                        a2 = max(0.0, (nb2[2] - nb2[0]) * (nb2[3] - nb2[1]))
+                        union = a1 + a2 - inter
+                        if union > 0 and (inter / union) >= 0.3:
+                            return True
+
+                # 3. 同页 (或页码未知) 且数据单元格高重合度 (仅限表号无冲突时)
+                if (p1 is None or p2 is None or p1 == p2) and (not fmt_l1 or not fmt_l2):
+                    c1 = set(str(v).strip().lower() for v in t1.values.flatten() if pd.notna(v) and str(v).strip() not in ('', 'nan', 'none'))
+                    c2 = set(str(v).strip().lower() for v in t2.values.flatten() if pd.notna(v) and str(v).strip() not in ('', 'nan', 'none'))
+                    if c1 and c2:
+                        overlap = len(c1 & c2) / max(1, min(len(c1), len(c2)))
+                        if overlap >= 0.5:
+                            return True
+
+                return False
+
+            master_dfs = list(all_candidate_tables[0][1])
+            for _, dfs in all_candidate_tables[1:]:
+                for new_t in dfs:
+                    dup_idx = None
+                    for idx, existing_t in enumerate(master_dfs):
+                        if _is_same_mineru_table(existing_t, new_t):
+                            dup_idx = idx
+                            break
+                    if dup_idx is not None:
+                        existing_t = master_dfs[dup_idx]
+                        if _calc_valid_cells(new_t) > _calc_valid_cells(existing_t):
+                            for k, v in existing_t.attrs.items():
+                                if k not in new_t.attrs or not new_t.attrs[k]:
+                                    new_t.attrs[k] = v
+                            master_dfs[dup_idx] = new_t
+                        else:
+                            for k, v in new_t.attrs.items():
+                                if k not in existing_t.attrs or not existing_t.attrs[k]:
+                                    existing_t.attrs[k] = v
+                    else:
+                        master_dfs.append(new_t)
+
+            if master_dfs:
+                def _table_sort_key(d):
+                    p = d.attrs.get('page_idx', 0)
+                    if p is None:
+                        p = 0
+                    box = d.attrs.get('bbox')
+                    top = box[1] if (box and len(box) >= 2) else 0
+                    return (p, top)
+                master_dfs.sort(key=_table_sort_key)
+                return master_dfs
+
+        # 若未从 JSON 解析出表格，优雅回退至从 .md 文件解析
+        md_files = [n for n in names if n.lower().endswith('.md') and not os.path.basename(n).startswith('.') and '__MACOSX' not in n]
+        if md_files:
+            chosen_md = md_files[0]
+            for n in md_files:
+                if os.path.basename(n).lower() in ("output.md", "auto.md", "full.md"):
+                    chosen_md = n
+                    break
+            md_text = zf.read(chosen_md).decode('utf-8', errors='replace')
+            if parse_structured_vlm_content is not None:
+                dfs = parse_structured_vlm_content(md_text)
+                for df in dfs:
+                    if df is not None and not df.empty:
+                        df.attrs['extractor'] = 'mineru_api'
+                return dfs
+
+        return []
+    except Exception as e:
+        print(f"[MinerU] 解析结构化 ZIP 产物包失败: {e}")
+        return []
+    finally:
+        if should_close and zf is not None:
+            try:
+                zf.close()
+            except Exception:
+                pass
+
+
 class MinerUClient:
     """
     MinerU 官方云端 API 客户端 (mineru.net)。
     官方提供每日 1,000 页免费提取额度，用于多云双活与百度 AIStudio 队列熔断兜底。
+    集成零 Token Agent 备用 API 与结构化高精表格抽取。
     """
     def __init__(self, api_key: str = "", api_base: str = "https://mineru.net"):
         self.api_key = api_key or os.getenv("MINERU_API_KEY", "")
         self.api_base = (api_base or os.getenv("MINERU_API_BASE", "https://mineru.net") or "https://mineru.net").rstrip("/")
+        self._agent_tasks: Set[str] = set()
+        self._single_tasks: Set[str] = set()
 
-    def submit_task(self, file_path: str, is_ocr: bool = True, enable_table: bool = True, enable_formula: bool = True) -> Optional[str]:
+    def submit_task(
+        self,
+        file_path: str,
+        is_ocr: bool = True,
+        enable_table: bool = True,
+        enable_formula: bool = True,
+        page_ranges: Optional[Union[str, List[int]]] = None,
+        pages: Optional[Union[str, List[int]]] = None,
+    ) -> Optional[str]:
         """
         提交解析任务至 MinerU API，返回 batch_id 或 task_id。
-        支持本地 PDF / 图片文件及远程 URL。
+        支持本地 PDF / 图片文件及远程 URL，支持 page_ranges/pages 指定页码范围。
+        未配置 MINERU_API_KEY 时，自动对 <=10MB 且 <=20 页的文档走 Agent API 零 Token 备用提取。
         """
+        if page_ranges is None and pages is not None:
+            page_ranges = pages
+        page_ranges_str = format_page_ranges(page_ranges)
+
         if not self.api_key:
-            print("[MinerU] 提示: 未配置 MINERU_API_KEY，无法提交任务")
-            return None
+            # 零 Token Agent 备用 API 触发检查 (文件大小 <= 10MB 且页数 <= 20)
+            is_eligible = False
+            file_size_bytes = 0
+            page_count = 1
+            if isinstance(file_path, str) and os.path.exists(file_path):
+                file_size_bytes = os.path.getsize(file_path)
+                if file_path.lower().endswith(".pdf"):
+                    try:
+                        with fitz.open(file_path) as doc:
+                            page_count = len(doc)
+                    except Exception:
+                        page_count = 1
+                if file_size_bytes <= 10 * 1024 * 1024 and page_count <= 20:
+                    is_eligible = True
+
+            if is_eligible:
+                print(f"[MinerU Agent API] 未配置 MINERU_API_KEY，且文件满足免费额度限制 (大小: {file_size_bytes / (1024*1024):.2f}MB <= 10MB, 页数: {page_count} <= 20)，触发零 Token Agent 备用 API 提交...")
+                return self._submit_agent_task(file_path, page_ranges=page_ranges_str)
+            else:
+                print("[MinerU] 提示: 未配置 MINERU_API_KEY，无法提交任务")
+                return None
 
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -148,11 +832,15 @@ class MinerUClient:
                 "model": "vlm",
                 "model_version": "vlm"
             }
+            if page_ranges_str:
+                payload["page_ranges"] = page_ranges_str
             try:
                 resp = requests.post(url, json=payload, headers=headers, timeout=60)
                 if resp.status_code == 200:
                     data = resp.json().get("data", {})
                     task_id = data.get("task_id") or data.get("batch_id")
+                    if task_id:
+                        self._single_tasks.add(str(task_id))
                     return task_id
                 else:
                     print(f"[MinerU] URL 任务提交失败 status={resp.status_code}: {resp.text[:200]}")
@@ -168,13 +856,18 @@ class MinerUClient:
 
         batch_url = f"{self.api_base}/api/v4/file-urls/batch"
         filename = os.path.basename(file_path)
+        file_item = {"name": filename}
+        if page_ranges_str:
+            file_item["page_ranges"] = page_ranges_str
         payload = {
-            "files": [{"name": filename}],
+            "files": [file_item],
             "model_version": "vlm",
             "enable_formula": enable_formula,
             "enable_table": enable_table,
             "is_ocr": is_ocr
         }
+        if page_ranges_str:
+            payload["page_ranges"] = page_ranges_str
 
         try:
             resp = requests.post(batch_url, json=payload, headers=headers, timeout=60)
@@ -211,19 +904,90 @@ class MinerUClient:
             print(f"[MinerU] 提交任务异常: {e}")
             return None
 
+    def _submit_agent_task(self, file_path: str, page_ranges: Optional[str] = None) -> Optional[str]:
+        """向 MinerU 零 Token Agent 备用 API (/api/v1/agent/parse/file) 提交轻量任务。
+        按照官方协议：POST JSON 获取预签名上传 URL -> PUT 二进制上传 -> 返回 task_id。
+        """
+        agent_url = f"{self.api_base}/api/v1/agent/parse/file"
+        try:
+            filename = os.path.basename(file_path)
+            payload = {
+                "filename": filename,
+                "file_name": filename,
+                "backend": "pipeline",
+                "return_md": True,
+            }
+            if page_ranges:
+                payload["page_range"] = page_ranges
+            headers = {"Content-Type": "application/json"}
+            resp = requests.post(agent_url, json=payload, headers=headers, timeout=120)
+            if resp.status_code == 200:
+                res_json = resp.json()
+                data = res_json.get("data")
+                task_id = None
+                upload_url = None
+                if isinstance(data, dict):
+                    task_id = data.get("task_id") or data.get("batch_id") or res_json.get("task_id") or res_json.get("batch_id")
+                    upload_url = data.get("file_url") or data.get("upload_url") or data.get("url") or res_json.get("file_url") or res_json.get("upload_url") or res_json.get("url")
+                elif isinstance(data, str):
+                    task_id = data
+                elif data is None:
+                    task_id = res_json.get("task_id") or res_json.get("batch_id")
+                    upload_url = res_json.get("file_url") or res_json.get("upload_url") or res_json.get("url")
+
+                if upload_url:
+                    with open(file_path, "rb") as f:
+                        put_headers = {"Content-Type": ""}
+                        put_resp = requests.put(upload_url, data=f, headers=put_headers, timeout=120)
+                        if isinstance(getattr(put_resp, 'status_code', None), int) and put_resp.status_code not in (200, 201):
+                            print(f"[MinerU Agent API] 文件上传失败 status={put_resp.status_code}")
+                            return None
+
+                if task_id:
+                    self._agent_tasks.add(str(task_id))
+                    return str(task_id)
+            print(f"[MinerU Agent API] 提交失败 status={resp.status_code}: {resp.text[:200]}")
+        except Exception as e:
+            print(f"[MinerU Agent API] 提交异常: {e}")
+        return None
+
     def poll_task(self, task_id: str, timeout: int = 600, cancel_event=None) -> Dict[str, Any]:
         """
         轮询 MinerU 任务状态，直至完成或超时。
         """
-        if not self.api_key or not task_id:
+        if not task_id:
             return {"success": False, "error": "invalid_args"}
 
+        timeout_env = os.getenv("MINERU_POLL_TIMEOUT")
+        if timeout_env:
+            try:
+                timeout = int(timeout_env)
+            except Exception:
+                pass
+        else:
+            try:
+                from common import load_config
+                _cfg = load_config()
+                if _cfg.get("MINERU_POLL_TIMEOUT"):
+                    timeout = int(_cfg.get("MINERU_POLL_TIMEOUT"))
+            except Exception:
+                pass
+
+        is_agent_task = (str(task_id) in self._agent_tasks) or (not self.api_key)
+        is_single_task = (str(task_id) in getattr(self, '_single_tasks', set()))
         headers = {
-            "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json"
         }
-        query_url = f"{self.api_base}/api/v4/extract-results/batch/{task_id}"
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
         task_query_url = f"{self.api_base}/api/v4/extract/task/{task_id}"
+        if is_agent_task:
+            query_url = f"{self.api_base}/api/v1/agent/parse/{task_id}"
+        elif is_single_task:
+            query_url = task_query_url
+        else:
+            query_url = f"{self.api_base}/api/v4/extract-results/batch/{task_id}"
 
         start_time = time.time()
         print(f"[MinerU] 任务已提交 (ID: {task_id})，开始轮询结果...")
@@ -239,8 +1003,24 @@ class MinerUClient:
 
             try:
                 resp = requests.get(query_url, headers=headers, timeout=30)
-                if resp.status_code == 404:
-                    resp = requests.get(task_query_url, headers=headers, timeout=30)
+                if not is_agent_task and query_url != task_query_url:
+                    switch_to_single = False
+                    if resp.status_code == 404:
+                        switch_to_single = True
+                    elif resp.status_code == 200:
+                        try:
+                            rj = resp.json()
+                            code = rj.get("code")
+                            data_field = rj.get("data")
+                            if code not in (0, 200, None) or (not data_field and rj.get("state") is None):
+                                switch_to_single = True
+                        except Exception:
+                            pass
+                    if switch_to_single:
+                        resp_single = requests.get(task_query_url, headers=headers, timeout=30)
+                        resp = resp_single
+                        query_url = task_query_url
+                        self._single_tasks.add(str(task_id))
             except Exception as e:
                 print(f"[MinerU] 轮询网络异常: {e}")
                 if _sleep_cancel_aware(5, cancel_event):
@@ -254,8 +1034,18 @@ class MinerUClient:
                 continue
 
             res_json = resp.json()
-            data = res_json.get("data", {})
-            state = data.get("state") or data.get("status")
+            code = res_json.get("code")
+            msg = res_json.get("msg") or res_json.get("message")
+            if code not in (0, 200, None):
+                print(f"[MinerU] 任务执行失败: code={code}, msg={msg}")
+                return {"success": False, "state": "failed", "error": msg or f"API error code {code}"}
+
+            data = res_json.get("data")
+            if data is None:
+                data = {}
+            elif isinstance(data, str):
+                data = {"markdown": data, "state": "done"}
+            state = data.get("state") or data.get("status") or res_json.get("state")
             error_msg = data.get("message") or data.get("errorMsg") or data.get("err_msg")
 
             extract_results = data.get("extract_result") or data.get("extract_results") or []
@@ -266,7 +1056,12 @@ class MinerUClient:
                     if not error_msg:
                         error_msg = first_res.get("err_msg") or first_res.get("message") or first_res.get("errorMsg")
 
-            if state in ("done", "success"):
+            if state in ("done", "success") or (is_agent_task and (
+                data.get("markdown") or data.get("full_zip_url") or data.get("markdown_url") or
+                (isinstance(extract_results, list) and extract_results and isinstance(extract_results[0], dict) and (
+                    extract_results[0].get("markdown") or extract_results[0].get("markdown_url") or extract_results[0].get("full_zip_url")
+                ))
+            )):
                 print("[MinerU] 任务解析成功！")
                 return {"success": True, "state": "done", "data": data}
             elif state in ("failed", "error"):
@@ -294,12 +1089,29 @@ class MinerUClient:
             if "markdown" in result_data and result_data["markdown"]:
                 return result_data["markdown"]
 
+            md_url = result_data.get("markdown_url")
+            if md_url:
+                try:
+                    r = requests.get(md_url, timeout=60)
+                    if r.status_code == 200:
+                        return r.text
+                except Exception:
+                    pass
+
             extract_results = result_data.get("extract_result") or result_data.get("extract_results") or []
             if isinstance(extract_results, list) and extract_results:
                 first_res = extract_results[0]
                 if isinstance(first_res, dict):
                     if "markdown" in first_res and first_res["markdown"]:
                         return first_res["markdown"]
+                    first_md_url = first_res.get("markdown_url")
+                    if first_md_url:
+                        try:
+                            r = requests.get(first_md_url, timeout=60)
+                            if r.status_code == 200:
+                                return r.text
+                        except Exception:
+                            pass
                     if "full_zip_url" in first_res and first_res["full_zip_url"]:
                         return self._download_and_extract_md(first_res["full_zip_url"])
 
@@ -308,6 +1120,104 @@ class MinerUClient:
                 return self._download_and_extract_md(zip_url)
 
         return ""
+
+    def parse_mineru_structured_result(self, result_data: Any) -> List[pd.DataFrame]:
+        """
+        从 MinerU 任务返回数据中解析结构化表格 DataFrames：
+        支持 ZIP URL 下载解压，或直接解析 JSON 数据中的 content_list。
+        """
+        if not result_data:
+            return []
+
+        if isinstance(result_data, (bytes, bytearray, io.BytesIO)):
+            return extract_mineru_structured_archive(result_data)
+
+        if isinstance(result_data, str):
+            if result_data.startswith(("http://", "https://")):
+                dfs = extract_mineru_structured_archive(result_data)
+                if dfs:
+                    return dfs
+            if os.path.exists(result_data) and result_data.lower().endswith(".zip"):
+                return extract_mineru_structured_archive(result_data)
+            if ("\n|" in result_data or "<table" in result_data.lower()) and parse_structured_vlm_content is not None:
+                dfs = parse_structured_vlm_content(result_data)
+                for df in dfs:
+                    if df is not None and not df.empty:
+                        df.attrs['extractor'] = 'mineru_api'
+                return dfs
+
+        if isinstance(result_data, dict):
+            md_url = result_data.get("markdown_url")
+            if md_url:
+                try:
+                    r = requests.get(md_url, timeout=60)
+                    if r.status_code == 200 and r.text:
+                        dfs = parse_structured_vlm_content(r.text) if parse_structured_vlm_content is not None else []
+                        for df in dfs:
+                            if df is not None and not df.empty:
+                                df.attrs['extractor'] = 'mineru_api'
+                        if dfs:
+                            return dfs
+                except Exception:
+                    pass
+
+            extract_results = result_data.get("extract_result") or result_data.get("extract_results") or []
+            if isinstance(extract_results, list) and extract_results:
+                first_res = extract_results[0]
+                if isinstance(first_res, dict):
+                    first_md_url = first_res.get("markdown_url")
+                    if first_md_url:
+                        try:
+                            r = requests.get(first_md_url, timeout=60)
+                            if r.status_code == 200 and r.text:
+                                dfs = parse_structured_vlm_content(r.text) if parse_structured_vlm_content is not None else []
+                                for df in dfs:
+                                    if df is not None and not df.empty:
+                                        df.attrs['extractor'] = 'mineru_api'
+                                if dfs:
+                                    return dfs
+                        except Exception:
+                            pass
+                    if "markdown" in first_res and first_res["markdown"] and parse_structured_vlm_content is not None:
+                        dfs = parse_structured_vlm_content(first_res["markdown"])
+                        for df in dfs:
+                            if df is not None and not df.empty:
+                                df.attrs['extractor'] = 'mineru_api'
+                        if dfs:
+                            return dfs
+                    zip_url = first_res.get("full_zip_url") or first_res.get("result_url") or first_res.get("zip_url")
+                    if zip_url:
+                        dfs = extract_mineru_structured_archive(zip_url)
+                        if dfs:
+                            return dfs
+                    if "content_list" in first_res or "pdf_info" in first_res or "elements" in first_res:
+                        bio = io.BytesIO()
+                        with zipfile.ZipFile(bio, 'w') as zf:
+                            zf.writestr("content_list.json", json.dumps(first_res))
+                        bio.seek(0)
+                        return extract_mineru_structured_archive(bio)
+
+            zip_url = result_data.get("result_url") or result_data.get("full_zip_url")
+            if zip_url:
+                dfs = extract_mineru_structured_archive(zip_url)
+                if dfs:
+                    return dfs
+
+            if "content_list" in result_data or "pdf_info" in result_data or "elements" in result_data:
+                bio = io.BytesIO()
+                with zipfile.ZipFile(bio, 'w') as zf:
+                    zf.writestr("content_list.json", json.dumps(result_data))
+                bio.seek(0)
+                return extract_mineru_structured_archive(bio)
+
+            if "markdown" in result_data and result_data["markdown"] and parse_structured_vlm_content is not None:
+                dfs = parse_structured_vlm_content(result_data["markdown"])
+                for df in dfs:
+                    if df is not None and not df.empty:
+                        df.attrs['extractor'] = 'mineru_api'
+                return dfs
+
+        return []
 
     def _download_and_extract_md(self, zip_url: str) -> str:
         try:
@@ -331,7 +1241,11 @@ class MinerUClient:
         return ""
 
 
-def mineru_submit_task(file_path: str, config: Optional[dict] = None) -> Optional[str]:
+def mineru_submit_task(
+    file_path: str,
+    config: Optional[dict] = None,
+    page_ranges: Optional[Union[str, List[int]]] = None,
+) -> Optional[str]:
     """快捷提交 MinerU 任务。"""
     if config is None:
         config = load_config()
@@ -339,7 +1253,7 @@ def mineru_submit_task(file_path: str, config: Optional[dict] = None) -> Optiona
         api_key=config.get("MINERU_API_KEY", ""),
         api_base=config.get("MINERU_API_BASE", "https://mineru.net")
     )
-    return client.submit_task(file_path)
+    return client.submit_task(file_path, page_ranges=page_ranges)
 
 
 def mineru_poll_task(task_id: str, config: Optional[dict] = None, timeout: int = 600, cancel_event=None) -> Dict[str, Any]:
@@ -359,17 +1273,32 @@ def parse_mineru_table_result(result_data: Any) -> str:
     return client.parse_mineru_table_result(result_data)
 
 
-def call_mineru_api(file_path: str, config: Optional[dict] = None, timeout: int = 600, cancel_event=None) -> str:
+def parse_mineru_structured_result(result_data: Any) -> List[pd.DataFrame]:
+    """解析 MinerU 产物并返回结构化 DataFrame 列表。"""
+    client = MinerUClient()
+    return client.parse_mineru_structured_result(result_data)
+
+
+def call_mineru_api(
+    file_path: str,
+    config: Optional[dict] = None,
+    timeout: int = 600,
+    cancel_event=None,
+    page_ranges: Optional[Union[str, List[int]]] = None,
+    pages: Optional[Union[str, List[int]]] = None,
+) -> str:
     """
     通过 MinerU 官方云端 API 进行高保真多模态解析并返回 Markdown 表格字符串。
     """
+    if page_ranges is None and pages is not None:
+        page_ranges = pages
     if config is None:
         config = load_config()
     client = MinerUClient(
         api_key=config.get("MINERU_API_KEY", ""),
         api_base=config.get("MINERU_API_BASE", "https://mineru.net")
     )
-    task_id = client.submit_task(file_path)
+    task_id = client.submit_task(file_path, page_ranges=page_ranges)
     if not task_id:
         return ""
     poll_res = client.poll_task(task_id, timeout=timeout, cancel_event=cancel_event)
@@ -378,8 +1307,64 @@ def call_mineru_api(file_path: str, config: Optional[dict] = None, timeout: int 
     return client.parse_mineru_table_result(poll_res.get("data", {}))
 
 
+def call_mineru_structured_api(
+    file_path: str,
+    config: Optional[dict] = None,
+    timeout: int = 600,
+    cancel_event=None,
+    page_ranges: Optional[Union[str, List[int]]] = None,
+    pages: Optional[Union[str, List[int]]] = None,
+) -> List[pd.DataFrame]:
+    """
+    通过 MinerU 官方云端 API 进行高保真多模态解析，直接返回高质量结构化 DataFrame 列表。
+    """
+    if page_ranges is None and pages is not None:
+        page_ranges = pages
+    if config is None:
+        config = load_config()
+    client = MinerUClient(
+        api_key=config.get("MINERU_API_KEY", ""),
+        api_base=config.get("MINERU_API_BASE", "https://mineru.net")
+    )
+    task_id = client.submit_task(file_path, page_ranges=page_ranges)
+    if not task_id:
+        return []
+    poll_res = client.poll_task(task_id, timeout=timeout, cancel_event=cancel_event)
+    if not poll_res.get("success"):
+        return []
+    return client.parse_mineru_structured_result(poll_res.get("data", {}))
+
+
 # 全局默认 MinerU 客户端实例
 mineru_client = MinerUClient()
+
+
+def is_mineru_available(config: Optional[dict] = None, file_path: Optional[str] = None) -> bool:
+    """
+    检查 MinerU 是否可用：
+    1. 配置了 MINERU_API_KEY；
+    2. 或文件符合零 Token 备用 Agent API 条件 (文件存在、<=10MB 且 <=20 页)。
+    """
+    if config is None:
+        try:
+            config = load_config()
+        except Exception:
+            config = {}
+    key = config.get("MINERU_API_KEY", "") or os.getenv("MINERU_API_KEY", "")
+    if key:
+        return True
+    if file_path and isinstance(file_path, str) and os.path.exists(file_path):
+        try:
+            if os.path.getsize(file_path) <= 10 * 1024 * 1024:
+                if file_path.lower().endswith(".pdf"):
+                    with fitz.open(file_path) as doc:
+                        if len(doc) <= 20:
+                            return True
+                else:
+                    return True
+        except Exception:
+            pass
+    return False
 
 
 # ===========================================================================
@@ -416,7 +1401,9 @@ def call_paddleocr_job(
 
     token = (
         os.getenv("PADDLEOCR_ACCESS_TOKEN")
+        or config.get("PADDLEOCR_ACCESS_TOKEN")
         or config.get("PADDLEOCR_MCP_AISTUDIO_ACCESS_TOKEN")
+        or config.get("PADDLEOCR_VL_TOKEN")
         or ""
     )
     def _make_failover_result(mineru_md: str) -> Dict[str, Any]:
@@ -431,8 +1418,8 @@ def call_paddleocr_job(
         }
 
     if not token:
-        # 若未配置百度 Token 但配置了 MinerU，直接平滑切换
-        if config.get("MINERU_API_KEY"):
+        # 若未配置百度 Token 但 MinerU 可用（配置了 key 或符合 Agent 免费额度），直接平滑切换
+        if is_mineru_available(config, file_path):
             print(f"[{model}] 提示: 未配置百度 AIStudio Token，自动切换至 MinerU API 解析...")
             mineru_md = call_mineru_api(file_path, config=config, timeout=timeout, cancel_event=cancel_event)
             if mineru_md:
@@ -451,6 +1438,9 @@ def call_paddleocr_job(
     if not is_url and not os.path.exists(file_path):
         print(f"[{model}] 文件不存在: {file_path}")
         return {"success": False, "model": model, "error": "file_not_found", "combined_markdown": "", "pages": []}
+
+    engine_pref = (config.get("OCR_ENGINE") or os.environ.get("OCR_ENGINE") or "auto").lower()
+    can_mineru_failover = is_mineru_available(config, file_path) and engine_pref in ("auto", "mineru")
 
     # 提交作业（支持指数退避与满队列重试，并在队列爆满或超时时无缝熔断至 MinerU）
     retry_waits = [5, 15, 30, 60, 90]
@@ -480,7 +1470,7 @@ def call_paddleocr_job(
         except Exception as e:
             print(f"[{model}] 提交作业失败: {e}")
             is_net_err = isinstance(e, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)) or "timeout" in str(e).lower() or "connection" in str(e).lower()
-            if is_net_err and config.get("MINERU_API_KEY") and config.get("OCR_ENGINE", "auto") in ("auto", "mineru"):
+            if is_net_err and can_mineru_failover:
                 print(f"[{model}] 百度 AIStudio 提交网络异常/超时，触发多云熔断，自动切换至 MinerU API...")
                 mineru_md = call_mineru_api(file_path, config=config, timeout=timeout, cancel_event=cancel_event)
                 if mineru_md:
@@ -492,7 +1482,7 @@ def call_paddleocr_job(
             job_id = resp_data.get("jobId")
             break
         elif job_response.status_code == 400 and "队列已满" in job_response.text:
-            if config.get("MINERU_API_KEY") and config.get("OCR_ENGINE", "auto") in ("auto", "mineru"):
+            if can_mineru_failover:
                 print(f"[{model}] 遇到百度 AIStudio 队列已满 (status=400 队列已满)，立即触发多云双活熔断，无缝切换至 MinerU API...")
                 mineru_md = call_mineru_api(file_path, config=config, timeout=timeout, cancel_event=cancel_event)
                 if mineru_md:
@@ -503,7 +1493,7 @@ def call_paddleocr_job(
             continue
         else:
             print(f"[{model}] 提交作业失败, status={job_response.status_code}: {job_response.text[:200]}")
-            if job_response.status_code in (500, 502, 503, 504) and config.get("MINERU_API_KEY") and config.get("OCR_ENGINE", "auto") in ("auto", "mineru"):
+            if job_response.status_code in (500, 502, 503, 504) and can_mineru_failover:
                 print(f"[{model}] 百度 AIStudio 服务端异常 (status={job_response.status_code})，触发多云熔断，自动切换至 MinerU API...")
                 mineru_md = call_mineru_api(file_path, config=config, timeout=timeout, cancel_event=cancel_event)
                 if mineru_md:
@@ -511,7 +1501,7 @@ def call_paddleocr_job(
             return {"success": False, "model": model, "error": f"status_{job_response.status_code}", "combined_markdown": "", "pages": []}
     else:
         print(f"[{model}] 提交作业重试 {len(retry_waits)} 次后仍失败")
-        if config.get("MINERU_API_KEY") and config.get("OCR_ENGINE", "auto") in ("auto", "mineru"):
+        if can_mineru_failover:
             print(f"[{model}] 百度 AIStudio 多次重试未成功，无缝切换至 MinerU API...")
             mineru_md = call_mineru_api(file_path, config=config, timeout=timeout, cancel_event=cancel_event)
             if mineru_md:
@@ -531,7 +1521,7 @@ def call_paddleocr_job(
 
         if time.time() - start_time > timeout:
             print(f"[{model}] 轮询超时 ({timeout}s)，跳过")
-            if config.get("MINERU_API_KEY") and config.get("OCR_ENGINE", "auto") in ("auto", "mineru"):
+            if can_mineru_failover:
                 print(f"[{model}] 百度 AIStudio 轮询超时，无缝切换至 MinerU API...")
                 mineru_md = call_mineru_api(file_path, config=config, timeout=timeout, cancel_event=cancel_event)
                 if mineru_md:
@@ -575,7 +1565,7 @@ def call_paddleocr_job(
         elif state == "failed":
             error_msg = data.get("errorMsg", "unknown")
             print(f"[{model}] 作业失败: {error_msg}")
-            if config.get("MINERU_API_KEY") and config.get("OCR_ENGINE", "auto") in ("auto", "mineru"):
+            if can_mineru_failover:
                 print(f"[{model}] 百度 AIStudio 任务失败 ({error_msg})，无缝切换至 MinerU API...")
                 mineru_md = call_mineru_api(file_path, config=config, timeout=timeout, cancel_event=cancel_event)
                 if mineru_md:
@@ -750,7 +1740,14 @@ def extract_pp_structure_table_crops(pdf_path: str, config: Optional[dict] = Non
 # PaddleOCR-VL-1.6 专用接口与双阶段融合管线
 # ===========================================================================
 
-def call_paddleocr_vl_online_api(file_path: str, config: Optional[dict] = None, timeout: int = 600, cancel_event=None) -> str:
+def call_paddleocr_vl_online_api(
+    file_path: str,
+    config: Optional[dict] = None,
+    timeout: int = 600,
+    cancel_event=None,
+    pages: Optional[Union[str, List[int]]] = None,
+    page_ranges: Optional[Union[str, List[int]]] = None,
+) -> str:
     """
     通过 AIStudio 在线 API 调用 PaddleOCR-VL-1.6。
     支持多云双活与容灾回退：
@@ -759,35 +1756,50 @@ def call_paddleocr_vl_online_api(file_path: str, config: Optional[dict] = None, 
     支持传整个 PDF 文件或单页图片文件 / 图像 URL。
     返回合并后的 Markdown 字符串。
     """
+    if pages is None and page_ranges is not None:
+        pages = page_ranges
+    if page_ranges is None and pages is not None:
+        page_ranges = pages
     if config is None:
         config = load_config()
 
     engine = (config.get("OCR_ENGINE") or os.environ.get("OCR_ENGINE") or "auto").lower()
     if engine == "mineru":
-        return call_mineru_api(file_path, config=config, timeout=timeout, cancel_event=cancel_event)
+        return call_mineru_api(file_path, config=config, timeout=timeout, cancel_event=cancel_event, page_ranges=page_ranges, pages=pages)
     if engine == "docling":
-        return call_docling_table_extractor(file_path, config=config, cancel_event=cancel_event)
+        return call_docling_table_extractor(file_path, config=config, cancel_event=cancel_event, pages=pages)
 
     model = config.get("PADDLEOCR_MCP_MODEL", "PaddleOCR-VL-1.6")
     res = call_paddleocr_job(file_path, model=model, config=config, timeout=timeout, cancel_event=cancel_event)
     md = res.get("combined_markdown", "")
-    if not md and config.get("MINERU_API_KEY") and not res.get("failover") and engine in ("auto", "mineru"):
+    if not md and is_mineru_available(config, file_path) and not res.get("failover") and engine in ("auto", "mineru"):
         print("[Dual-Cloud Failover] AIStudio 未返回有效解析结果，尝试 MinerU API 进行视觉兜底...")
-        md = call_mineru_api(file_path, config=config, timeout=timeout, cancel_event=cancel_event)
+        md = call_mineru_api(file_path, config=config, timeout=timeout, cancel_event=cancel_event, page_ranges=page_ranges, pages=pages)
     return md
 
 
-def run_ppstructure_vlm_pipeline(pdf_path: str, pages: Optional[List[int]] = None, cancel_event=None) -> str:
+def run_ppstructure_vlm_pipeline(
+    pdf_path: str,
+    pages: Optional[List[int]] = None,
+    cancel_event=None,
+    config: Optional[dict] = None,
+) -> str:
     """
     PP-StructureV3 + PaddleOCR-VL-1.6 两阶段融合提取管线：
     1. 第一阶段（定位）：由 PP-StructureV3 快速分析版面，识别表格所在页面、提取表格区域切图（Crop）；
     2. 第二阶段（精细解析）：将表格切图（或目标页）送入 PaddleOCR-VL-1.6 进行多模态精细解析，输出精准结构化表格；
     3. 产出合并后的结构化 Markdown。
     """
-    config = load_config()
+    if config is None:
+        config = load_config()
 
     if cancel_event is not None and cancel_event.is_set():
         return ""
+
+    engine = (config.get("OCR_ENGINE") or os.environ.get("OCR_ENGINE") or "auto").lower()
+    if engine == "mineru":
+        print("[PP-StructureV3 -> VLM] 检测到 OCR_ENGINE='mineru'，直接调用 MinerU API 解析...")
+        return call_mineru_api(pdf_path, config=config, timeout=600, cancel_event=cancel_event, page_ranges=pages)
 
     # 1. 前置定位：PP-StructureV3 版面分析与表格切图定位
     print(f"[PP-StructureV3 -> VLM] 阶段 1: 正在使用 PP-StructureV3 进行版面分析与表格定位...")
@@ -924,7 +1936,7 @@ def run_paddleocr_vl(pdf_path: str, pages=None, cancel_event=None, enable_doclay
     if engine == "docling":
         return call_docling_table_extractor(pdf_path, pages=pages, config=config, cancel_event=cancel_event)
     if engine == "mineru":
-        return call_mineru_api(pdf_path, config=config, cancel_event=cancel_event)
+        return call_mineru_api(pdf_path, page_ranges=pages, pages=pages, config=config, cancel_event=cancel_event)
 
     if cancel_event is not None and cancel_event.is_set():
         return ""
@@ -1385,11 +2397,18 @@ class MinerUBackend(OCRBackend):
             key = os.getenv("MINERU_API_KEY", "")
         healthy = bool(key)
         return {
-            "status": "healthy" if healthy else "unauthenticated",
-            "message": "API key configured" if healthy else "Missing MINERU_API_KEY"
+            "status": "healthy" if healthy else "agent_fallback",
+            "message": "API key configured" if healthy else "Using Agent API fallback (<=10MB, <=20 pages)"
         }
 
-    def extract(self, file_path: str, **kwargs) -> str:
+    def extract(self, file_path: str, **kwargs) -> Any:
+        if "page_ranges" not in kwargs and "pages" in kwargs:
+            kwargs["page_ranges"] = kwargs.pop("pages")
+        structured = kwargs.pop("structured", False)
+        if "config" not in kwargs:
+            kwargs["config"] = getattr(self, "config", None) or load_config()
+        if structured:
+            return call_mineru_structured_api(file_path, **kwargs)
         return call_mineru_api(file_path, **kwargs)
 
 

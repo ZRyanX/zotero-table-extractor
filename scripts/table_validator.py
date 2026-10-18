@@ -13,7 +13,7 @@ try:
 except ImportError:
     import fitz
 import pandas as pd
-from typing import List, Dict, Any, Tuple, Set, Optional
+from typing import List, Dict, Any, Tuple, Set, Optional, Union
 
 try:
     from .common import (
@@ -382,3 +382,451 @@ def validate_native_extraction_pipeline(
 
     validation_logs.append(f"→ [验证模块完成] 判定合格原生表格: {len(valid_native_results)} 个, 必须由 PaddleOCR-VL 接管页面: {[p+1 for p in sorted(pages_requiring_ocr)]}")
     return valid_native_results, pages_requiring_ocr, validation_logs
+
+
+def _extract_numeric_tokens(text_or_cell: Any) -> List[str]:
+    """从文本或单元格值中提取规范化的数字字符串列表（支持小数、科学计数法、去除千分位逗号、数字区间平展）。"""
+    if text_or_cell is None:
+        return []
+    s = str(text_or_cell).strip()
+    if not s or s.lower() in ('nan', 'none', '-', '—', '–', '/'):
+        return []
+    # 去除千分位逗号，如 1,234.56 -> 1234.56 (使用零宽断言避免重叠匹配跳过)
+    s_clean = re.sub(r'(?<=\d),(?=\d)', '', s)
+    # 将数字之间的区间连字符 (10-20, 10–20, 10~20, 10至20) 平展为空格分隔的独立数值
+    s_clean = re.sub(r'(?<=\d)\s*[-–~至到]\s*(?=\d)', ' ', s_clean)
+    tokens = re.findall(r'[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?', s_clean)
+    normalized = []
+    for t in tokens:
+        try:
+            val = float(t)
+            normalized.append(f"{val:g}")
+        except Exception:
+            normalized.append(t)
+    return normalized
+
+
+def verify_table_numeric_integrity(
+    df: pd.DataFrame,
+    pdf_path: str,
+    page_idx: int,
+    bbox: Optional[Union[List[float], Tuple[float, ...]]] = None,
+    min_match_ratio: float = 0.7,
+    min_recall: float = 0.5,
+    coord_format: Optional[str] = None,
+) -> Tuple[bool, Dict[str, Any]]:
+    """
+    针对表格提取结果的本地质量与数值一致性门禁 (Local Quality & Numeric Integrity Gate)。
+    
+    核心机制：
+    1. 旋转感知的坐标反投影：使用 fitz.Rect(bbox) * page.derotation_matrix + cropbox offset 准确定位 PDF 文本流；
+    2. 损坏矢量字库与私有编码安全旁路：检测 [\uf000-\uf8ff] 或 \ufffd，遇乱码字库时无条件信任视觉/OCR 结果，跳过拒绝；
+    3. 数值双向多重集 (Bidirectional Bag-of-Numbers) 比对：不仅检验提取结果中的数字是否源自 PDF 原文 (precision)，
+       更核验 PDF 对应区域内的数字是否被大面积遗漏或截断 (recall)；
+    4. 明确区分 'passed' (通过), 'failed' (失败), 'unverified' (无法验证，如无文本层或空区域) 状态，
+       杜绝空白文本层在提取到数据时被盲目当成通过。
+    """
+    if df is None or df.empty:
+        return False, {
+            "is_valid": False,
+            "status": "failed",
+            "match_ratio": 0.0,
+            "precision": 0.0,
+            "recall": 0.0,
+            "reason": "empty_dataframe",
+            "matched_count": 0,
+            "total_df_count": 0,
+            "pdf_num_count": 0,
+            "font_corrupted": False,
+        }
+
+    # 从 df.attrs 补充 bbox 与 page_idx
+    if bbox is None and hasattr(df, 'attrs'):
+        bbox = df.attrs.get('bbox')
+    if page_idx is None and hasattr(df, 'attrs'):
+        page_idx = df.attrs.get('page_idx', 0)
+
+    if not os.path.exists(pdf_path):
+        return False, {
+            "is_valid": False,
+            "status": "unverified",
+            "match_ratio": 0.0,
+            "precision": 0.0,
+            "recall": 0.0,
+            "reason": "pdf_not_found_skipped",
+            "matched_count": 0,
+            "total_df_count": 0,
+            "pdf_num_count": 0,
+            "font_corrupted": False,
+        }
+
+    pdf_text = ""
+    doc = None
+    converted_bbox = None
+    try:
+        doc = fitz.open(pdf_path)
+        if page_idx < 0 or page_idx >= len(doc):
+            return False, {
+                "is_valid": False,
+                "status": "unverified",
+                "match_ratio": 0.0,
+                "precision": 0.0,
+                "recall": 0.0,
+                "reason": "page_idx_out_of_bounds",
+                "matched_count": 0,
+                "total_df_count": 0,
+                "pdf_num_count": 0,
+                "font_corrupted": False,
+            }
+        page = doc[page_idx]
+
+        # 1. 旋转感知的坐标反投影 (Rotation-aware coordinate de-projection)
+        if bbox and len(bbox) >= 4:
+            bx0, by0, bx1, by1 = bbox[:4]
+            orig_bx0, orig_by0, orig_bx1, orig_by1 = bx0, by0, bx1, by1
+            w, h = page.rect.width, page.rect.height
+
+            # 坐标系归一化单位判断与统一转换：
+            # 1) 0..1 归一化坐标
+            # 2) MinerU content_list 0..1000 归一化坐标 (明确按结果格式转换，不能凭数值范围猜测)
+            is_norm_1000 = False
+            if coord_format in ("norm_1000", "mineru_1000", "1000"):
+                is_norm_1000 = True
+            elif coord_format in ("points", "pt"):
+                is_norm_1000 = False
+            elif df is not None and hasattr(df, "attrs"):
+                b_fmt = df.attrs.get("bbox_format") or df.attrs.get("coord_format")
+                if b_fmt in ("norm_1000", "mineru_1000", "1000"):
+                    is_norm_1000 = True
+                elif b_fmt in ("points", "pt"):
+                    is_norm_1000 = False
+                elif df.attrs.get("extractor") == "mineru_api":
+                    is_norm_1000 = True
+
+            if 0 <= bx0 <= 1 and 0 <= bx1 <= 1 and 0 <= by0 <= 1 and 0 <= by1 <= 1 and (bx1 - bx0 < 1.0 or by1 - by0 < 1.0):
+                bx0, bx1 = bx0 * w, bx1 * w
+                by0, by1 = by0 * h, by1 * h
+            elif is_norm_1000:
+                norm_bx0, norm_bx1 = (bx0 / 1000.0) * w, (bx1 / 1000.0) * w
+                norm_by0, norm_by1 = (by0 / 1000.0) * h, (by1 / 1000.0) * h
+
+                bx0, bx1 = norm_bx0, norm_bx1
+                by0, by1 = norm_by0, norm_by1
+
+                # 若原始坐标已完全落在当前页面尺寸范围内 (如部分测试用例或缓存已存为 pt 坐标)，
+                # 需核对 norm_1000 与原始 pt 坐标在页面实际数字文本上的吻合度，优先采纳数据吻合度更高的区域
+                if orig_bx1 <= w and orig_by1 <= h and df is not None and hasattr(df, "values"):
+                    df_tokens = []
+                    for v in df.values.flatten():
+                        df_tokens.extend(_extract_numeric_tokens(v))
+                    if df_tokens:
+                        from collections import Counter
+                        df_c = Counter(df_tokens)
+
+                        r_norm = fitz.Rect(norm_bx0, norm_by0, norm_bx1, norm_by1).normalize()
+                        norm_text = page.get_text("text", clip=r_norm)
+                        n_tokens = []
+                        for line in norm_text.splitlines():
+                            n_tokens.extend(_extract_numeric_tokens(line))
+                        norm_match = sum((df_c & Counter(n_tokens)).values())
+
+                        r_pt = fitz.Rect(orig_bx0, orig_by0, orig_bx1, orig_by1).normalize()
+                        pt_text = page.get_text("text", clip=r_pt)
+                        pt_tokens = []
+                        for line in pt_text.splitlines():
+                            pt_tokens.extend(_extract_numeric_tokens(line))
+                        pt_match = sum((df_c & Counter(pt_tokens)).values())
+
+                        if pt_match > norm_match:
+                            bx0, by0, bx1, by1 = orig_bx0, orig_by0, orig_bx1, orig_by1
+
+            converted_bbox = [round(float(bx0), 2), round(float(by0), 2), round(float(bx1), 2), round(float(by1), 2)]
+            rect = fitz.Rect(bx0, by0, bx1, by1)
+            if hasattr(page, "derotation_matrix"):
+                rect = rect * page.derotation_matrix
+            rect = rect.normalize()
+
+            # 优先尝试旋转反投影区域
+            pdf_text = page.get_text("text", clip=rect)
+
+            # 若反投影区域未取到文本，且存在非零 CropBox 偏移，尝试加入 CropBox 偏移 (防止视觉坐标系原点为 CropBox 相对原点)
+            cb = getattr(page, "cropbox", None)
+            if not pdf_text.strip() and cb is not None and (cb.x0 != 0 or cb.y0 != 0):
+                rect_cb = fitz.Rect(rect.x0 + cb.x0, rect.y0 + cb.y0, rect.x1 + cb.x0, rect.y1 + cb.y0).normalize()
+                text_cb = page.get_text("text", clip=rect_cb)
+                if text_cb.strip():
+                    pdf_text = text_cb
+                    rect = rect_cb
+
+            # 若仍未取到文本且页面存在旋转，兜底尝试原始未旋转 Rect (防止输入坐标原本就是未旋转的绝对坐标)
+            if not pdf_text.strip() and getattr(page, "rotation", 0) != 0:
+                raw_rect = fitz.Rect(bx0, by0, bx1, by1).normalize()
+                fallback_text = page.get_text("text", clip=raw_rect)
+                if fallback_text.strip():
+                    pdf_text = fallback_text
+                    rect = raw_rect
+        else:
+            pdf_text = page.get_text("text")
+
+    except Exception as e_pdf:
+        return False, {
+            "is_valid": False,
+            "status": "unverified",
+            "match_ratio": 0.0,
+            "precision": 0.0,
+            "recall": 0.0,
+            "reason": f"pdf_read_error_skipped: {e_pdf}",
+            "matched_count": 0,
+            "total_df_count": 0,
+            "pdf_num_count": 0,
+            "font_corrupted": False,
+        }
+    finally:
+        if doc is not None:
+            try:
+                doc.close()
+            except Exception:
+                pass
+
+    # 2. 局部损坏矢量字库与私有编码安全旁路 (Private-use / Replacement characters)
+    corrupted_chars = re.findall(r'[\uf000-\uf8ff\ufffd]', pdf_text)
+    if corrupted_chars:
+        print(f"[Validator] 检测到 PDF 矢量文本层包含私有区/坏损字符 (共 {len(corrupted_chars)} 个，如 U+{ord(corrupted_chars[0]):04X})，矢量字体映射损坏。启动视觉保真信任旁路，跳过数值拒绝。")
+        return True, {
+            "is_valid": True,
+            "status": "passed",
+            "font_corrupted": True,
+            "reason": "trusted_visual_due_to_broken_font",
+            "corrupted_char_count": len(corrupted_chars),
+            "match_ratio": 1.0,
+            "precision": 1.0,
+            "recall": 1.0,
+            "matched_count": 0,
+            "total_df_count": 0,
+            "pdf_num_count": 0,
+        }
+
+    # 3. 提取数字多重集 (Bag-of-Numbers)
+    df_nums = []
+    for col in df.columns:
+        for val in df[col]:
+            df_nums.extend(_extract_numeric_tokens(val))
+
+    pdf_nums = _extract_numeric_tokens(pdf_text)
+    total_df_count = len(df_nums)
+    total_pdf_count = len(pdf_nums)
+
+    # 4. 扫描件/纯图片无文本层或 BBox 落在空白处校验
+    if not pdf_text.strip():
+        if total_df_count == 0:
+            return True, {
+                "is_valid": True,
+                "status": "passed",
+                "font_corrupted": False,
+                "reason": "text_only_table",
+                "match_ratio": 1.0,
+                "precision": 1.0,
+                "recall": 1.0,
+                "matched_count": 0,
+                "total_df_count": 0,
+                "pdf_num_count": 0,
+            }
+        info_dict = {
+            "is_valid": False,
+            "status": "unverified",
+            "font_corrupted": False,
+            "reason": "scanned_or_empty_text_layer",
+            "match_ratio": 0.0,
+            "precision": 0.0,
+            "recall": 0.0,
+            "matched_count": 0,
+            "total_df_count": total_df_count,
+            "pdf_num_count": 0,
+        }
+        if converted_bbox is not None:
+            info_dict["converted_bbox"] = converted_bbox
+        return False, info_dict
+
+    # 纯文字表格无需数值比对
+    if total_df_count == 0 and total_pdf_count == 0:
+        return True, {
+            "is_valid": True,
+            "status": "passed",
+            "font_corrupted": False,
+            "reason": "text_only_table",
+            "match_ratio": 1.0,
+            "precision": 1.0,
+            "recall": 1.0,
+            "matched_count": 0,
+            "total_df_count": 0,
+            "pdf_num_count": 0,
+        }
+
+    # PDF 在对应区域未提取到数字（如错误 bbox 截到空白处或全图无数字）
+    if total_pdf_count == 0:
+        return False, {
+            "is_valid": False,
+            "status": "unverified",
+            "font_corrupted": False,
+            "reason": "no_pdf_numbers_in_bbox",
+            "match_ratio": 0.0,
+            "precision": 0.0,
+            "recall": 0.0,
+            "matched_count": 0,
+            "total_df_count": total_df_count,
+            "pdf_num_count": 0,
+        }
+
+    if total_df_count == 0 and total_pdf_count > 0:
+        return False, {
+            "is_valid": False,
+            "status": "failed",
+            "font_corrupted": False,
+            "reason": f"numeric_completeness_failed: table has 0 numbers while PDF contains {total_pdf_count} numbers",
+            "match_ratio": 0.0,
+            "precision": 0.0,
+            "recall": 0.0,
+            "matched_count": 0,
+            "total_df_count": 0,
+            "pdf_num_count": total_pdf_count,
+        }
+
+    from collections import Counter
+    df_counter = Counter(df_nums)
+    pdf_counter = Counter(pdf_nums)
+    intersection = df_counter & pdf_counter
+    matched_count = sum(intersection.values())
+
+    precision = matched_count / total_df_count if total_df_count > 0 else 1.0
+    recall = matched_count / total_pdf_count if total_pdf_count > 0 else 1.0
+
+    # 双向一致性校验：precision 检查提取准确率，recall 检查原文数据完整率
+    is_valid = (precision >= min_match_ratio and recall >= min_recall)
+    status = "passed" if is_valid else "failed"
+
+    if is_valid:
+        reason = f"passed_numeric_integrity (ratio: {precision:.1%})"
+    elif recall < min_recall and precision >= min_match_ratio:
+        reason = f"numeric_completeness_failed: only {matched_count}/{total_pdf_count} PDF numbers recovered ({recall:.1%} < {min_recall:.1%})"
+    else:
+        reason = f"numeric_integrity_failed: {matched_count}/{total_df_count} numbers matched ({precision:.1%} < {min_match_ratio:.1%})"
+
+    info_dict = {
+        "is_valid": is_valid,
+        "status": status,
+        "match_ratio": precision,
+        "precision": precision,
+        "recall": recall,
+        "matched_count": matched_count,
+        "total_df_count": total_df_count,
+        "pdf_num_count": total_pdf_count,
+        "font_corrupted": False,
+        "reason": reason,
+    }
+    if converted_bbox is not None:
+        info_dict["converted_bbox"] = converted_bbox
+    return is_valid, info_dict
+
+
+def cross_check_missed_tables(
+    extracted_tables: List[Any],
+    pdf_path: str,
+) -> Dict[str, Any]:
+    """
+    交叉比对 PDF 全文表格声明 (scan_pdf_table_declarations) 与已提取表格，
+    检测漏检表格 (Missed Tables) 并生成诊断报告。
+    """
+    page_declarations = scan_pdf_table_declarations(pdf_path)
+
+    declared_tables = []
+    declared_labels = set()
+    for p_idx, decls in page_declarations.items():
+        for d in decls:
+            if not d.get('is_continuation'):
+                lbl = format_table_label(d.get('label', ''))
+                declared_tables.append({
+                    'label': lbl or d.get('label'),
+                    'title': d.get('title', ''),
+                    'page_idx': p_idx,
+                    'raw_line': d.get('raw_line', ''),
+                })
+                if lbl:
+                    declared_labels.add(lbl)
+
+    extracted_labels = set()
+    extracted_info = []
+    for idx, t in enumerate(extracted_tables):
+        if isinstance(t, pd.DataFrame):
+            df = t
+            p_idx = df.attrs.get('page_idx', 0)
+            raw_lbl = df.attrs.get('label', '')
+            title = df.attrs.get('table_title', '')
+        elif isinstance(t, dict):
+            df = t.get('df')
+            p_idx = t.get('page_idx', df.attrs.get('page_idx', 0) if df is not None and hasattr(df, 'attrs') else 0)
+            raw_lbl = t.get('label') or (df.attrs.get('label') if df is not None and hasattr(df, 'attrs') else '')
+            title = t.get('title') or (df.attrs.get('table_title') if df is not None and hasattr(df, 'attrs') else '')
+        else:
+            continue
+
+        if not raw_lbl and title:
+            m_lbl = TABLE_LABEL_RE.search(title)
+            if m_lbl:
+                raw_lbl = m_lbl.group(0)
+
+        fmt_lbl = format_table_label(raw_lbl) if raw_lbl else ""
+        if fmt_lbl:
+            extracted_labels.add(fmt_lbl)
+        extracted_info.append({
+            'index': idx,
+            'label': fmt_lbl or raw_lbl,
+            'title': title,
+            'page_idx': p_idx,
+        })
+
+    missed_tables = []
+    for d in declared_tables:
+        lbl = d['label']
+        if lbl and lbl not in extracted_labels:
+            missed_tables.append(d)
+
+    # 扫描页检测（低字符量且含图像的页面，其表格无法由文本声明检出，属于“覆盖度未知”）
+    scanned_pages = []
+    if os.path.exists(pdf_path):
+        try:
+            with fitz.open(pdf_path) as doc:
+                for p_idx, page in enumerate(doc):
+                    words = page.get_text("words")
+                    images = page.get_images()
+                    if len(images) > 0 and len(words) < 80:
+                        scanned_pages.append(p_idx)
+        except Exception:
+            pass
+
+    extracted_pages = set(info['page_idx'] for info in extracted_info if info.get('page_idx') is not None)
+    uncovered_scanned_pages = [p for p in scanned_pages if p not in extracted_pages]
+
+    is_complete = (len(missed_tables) == 0 and len(uncovered_scanned_pages) == 0)
+    coverage_unknown = len(uncovered_scanned_pages) > 0
+
+    report = {
+        'declared_count': len(declared_tables),
+        'extracted_count': len(extracted_tables),
+        'declared_tables': declared_tables,
+        'extracted_labels': list(extracted_labels),
+        'missed_tables': missed_tables,
+        'missed_count': len(missed_tables),
+        'is_complete': is_complete,
+        'coverage_unknown': coverage_unknown,
+        'scanned_pages': scanned_pages,
+        'uncovered_scanned_pages': uncovered_scanned_pages,
+    }
+    if missed_tables:
+        missed_summary = [f"{m['label']} (Page {m['page_idx']+1})" for m in missed_tables]
+        print(f"[Validator] 发现 {len(missed_tables)} 个未被提取的声明表格: {', '.join(missed_summary)}")
+    elif coverage_unknown:
+        print(f"[Validator] 检测到扫描页面 {[p+1 for p in uncovered_scanned_pages]} 缺少文本层且未提取到表格，表格覆盖未知 (coverage_unknown=True)")
+    else:
+        print(f"[Validator] 全文表格声明比对完成: 声明 {len(declared_tables)} 个表格，已全覆盖")
+
+    return report

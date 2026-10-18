@@ -1,0 +1,327 @@
+{
+  "group": "Group C: Untitled tables and appendix tables",
+  "file_name": "group_c_untitled_appendix_tables.pdf",
+  "num_pages": 3,
+  "tables": [
+    {
+      "table_id": "Table 1",
+      "label": "Table 1",
+      "page_idx": 0,
+      "caption": "Table 1. Electron microprobe analyses of pyrite and arsenopyrite.",
+      "columns": [
+        "Sample",
+        "Mineral",
+        "Fe (wt%)",
+        "S",
+        "As",
+        "Au (ppm)",
+        "Ag",
+        "Total"
+      ],
+      "num_rows": 10,
+      "num_cols": 8,
+      "rows": [
+        [
+          "JD-01",
+          "Py-I",
+          "46.00",
+          "50.90",
+          "1.25",
+          "15.9",
+          "3.20",
+          "99.55"
+        ],
+        [
+          "JD-02",
+          "Py-I",
+          "46.20",
+          "50.60",
+          "1.65",
+          "19.4",
+          "3.60",
+          "99.60"
+        ],
+        [
+          "JD-03",
+          "Py-I",
+          "46.40",
+          "50.30",
+          "2.05",
+          "22.9",
+          "4.00",
+          "99.65"
+        ],
+        [
+          "JD-04",
+          "Py-I",
+          "46.60",
+          "50.00",
+          "2.45",
+          "26.4",
+          "4.40",
+          "99.70"
+        ],
+        [
+          "JD-05",
+          "Py-I",
+          "46.80",
+          "49.70",
+          "2.85",
+          "29.9",
+          "4.80",
+          "99.75"
+        ],
+        [
+          "JD-06",
+          "Apy-I",
+          "47.00",
+          "49.40",
+          "3.25",
+          "33.4",
+          "5.20",
+          "99.80"
+        ],
+        [
+          "JD-07",
+          "Apy-I",
+          "47.20",
+          "49.10",
+          "3.65",
+          "36.9",
+          "5.60",
+          "99.85"
+        ],
+        [
+          "JD-08",
+          "Apy-I",
+          "47.40",
+          "48.80",
+          "4.05",
+          "40.4",
+          "6.00",
+          "99.90"
+        ],
+        [
+          "JD-09",
+          "Apy-I",
+          "47.60",
+          "48.50",
+          "4.45",
+          "43.9",
+          "6.40",
+          "99.95"
+        ],
+        [
+          "JD-10",
+          "Apy-I",
+          "47.80",
+          "48.20",
+          "4.85",
+          "47.4",
+          "6.80",
+          "100.00"
+        ]
+      ],
+      "is_untitled": false,
+      "sampled_numeric_cells": [
+        {
+          "row_idx": 0,
+          "col_idx": 2,
+          "col_name": "Fe (wt%)",
+          "raw_val": "46.00",
+          "numeric_val": 46.0
+        },
+        {
+          "row_idx": 4,
+          "col_idx": 5,
+          "col_name": "Au (ppm)",
+          "raw_val": "29.9",
+          "numeric_val": 29.9
+        },
+        {
+          "row_idx": 9,
+          "col_idx": 4,
+          "col_name": "As",
+          "raw_val": "4.85",
+          "numeric_val": 4.85
+        }
+      ]
+    },
+    {
+      "table_id": "Appendix 1",
+      "label": "Appendix 1",
+      "page_idx": 2,
+      "caption": "APPENDIX 1: Spectrometer calibration conditions and detection limits for EMPA standard calibrations.",
+      "columns": [
+        "Element",
+        "Line",
+        "Crystal",
+        "Standard Mineral",
+        "Peak (s)",
+        "Bkg (s)",
+        "LOD (ppm)"
+      ],
+      "num_rows": 14,
+      "num_cols": 7,
+      "rows": [
+        [
+          "Fe",
+          "Ka",
+          "LIF",
+          "Natural Pyrite",
+          "20",
+          "10",
+          "120"
+        ],
+        [
+          "S",
+          "Ka",
+          "PET",
+          "Natural Pyrite",
+          "20",
+          "10",
+          "150"
+        ],
+        [
+          "As",
+          "La",
+          "TAP",
+          "Synthetic GaAs",
+          "30",
+          "15",
+          "250"
+        ],
+        [
+          "Au",
+          "La",
+          "LIF",
+          "Pure Metal (99.99%)",
+          "40",
+          "20",
+          "180"
+        ],
+        [
+          "Ag",
+          "La",
+          "PET",
+          "Pure Ag Metal",
+          "30",
+          "15",
+          "140"
+        ],
+        [
+          "Cu",
+          "Ka",
+          "LIF",
+          "Natural Chalcopyrite",
+          "20",
+          "10",
+          "110"
+        ],
+        [
+          "Zn",
+          "Ka",
+          "LIF",
+          "Natural Sphalerite",
+          "20",
+          "10",
+          "130"
+        ],
+        [
+          "Pb",
+          "Ma",
+          "PET",
+          "Natural Galena",
+          "30",
+          "15",
+          "300"
+        ],
+        [
+          "Co",
+          "Ka",
+          "LIF",
+          "Pure Co Metal",
+          "30",
+          "15",
+          "95"
+        ],
+        [
+          "Ni",
+          "Ka",
+          "LIF",
+          "Natural Pentlandite",
+          "30",
+          "15",
+          "90"
+        ],
+        [
+          "Sb",
+          "La",
+          "PET",
+          "Natural Stibnite",
+          "30",
+          "15",
+          "160"
+        ],
+        [
+          "Bi",
+          "Ma",
+          "PET",
+          "Synthetic Bi2S3",
+          "40",
+          "20",
+          "280"
+        ],
+        [
+          "Te",
+          "La",
+          "PET",
+          "Pure Te Metal",
+          "30",
+          "15",
+          "190"
+        ],
+        [
+          "Se",
+          "Ka",
+          "LIF",
+          "Synthetic Bi2Se3",
+          "30",
+          "15",
+          "175"
+        ]
+      ],
+      "is_untitled": true,
+      "sampled_numeric_cells": [
+        {
+          "row_idx": 0,
+          "col_idx": 6,
+          "col_name": "LOD (ppm)",
+          "raw_val": "120",
+          "numeric_val": 120.0
+        },
+        {
+          "row_idx": 3,
+          "col_idx": 6,
+          "col_name": "LOD (ppm)",
+          "raw_val": "180",
+          "numeric_val": 180.0
+        },
+        {
+          "row_idx": 7,
+          "col_idx": 6,
+          "col_name": "LOD (ppm)",
+          "raw_val": "300",
+          "numeric_val": 300.0
+        },
+        {
+          "row_idx": 13,
+          "col_idx": 6,
+          "col_name": "LOD (ppm)",
+          "raw_val": "175",
+          "numeric_val": 175.0
+        }
+      ]
+    }
+  ]
+}

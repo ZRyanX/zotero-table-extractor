@@ -1,0 +1,2053 @@
+{
+  "benchmark_timestamp": "2026-10-16T13:10:13Z",
+  "summary": {
+    "p1": {
+      "name": "Pipeline 1 (Baseline: Multi-Engine Voting)",
+      "total_time_s": 9.645,
+      "total_gt_tables": 6,
+      "total_extracted_tables": 13,
+      "total_missed_tables": 1,
+      "total_truncated_rows": 71,
+      "total_sampled_cells": 118,
+      "total_errored_cells": 50,
+      "total_false_agreements": 1,
+      "group_runs": [
+        {
+          "group_id": "A",
+          "group_name": "Group A: Classic dense three-line tables",
+          "time_s": 2.282,
+          "missed_tables": 0,
+          "truncated_rows": 0,
+          "value_error_rate_pct": 0.0,
+          "cell_accuracy_pct": 100.0,
+          "false_agreements": 0
+        },
+        {
+          "group_id": "B",
+          "group_name": "Group B: Multi-level complex spanning headers",
+          "time_s": 1.138,
+          "missed_tables": 0,
+          "truncated_rows": 0,
+          "value_error_rate_pct": 0.0,
+          "cell_accuracy_pct": 100.0,
+          "false_agreements": 0
+        },
+        {
+          "group_id": "C",
+          "group_name": "Group C: Untitled tables and appendix tables",
+          "time_s": 1.053,
+          "missed_tables": 0,
+          "truncated_rows": 0,
+          "value_error_rate_pct": 0.0,
+          "cell_accuracy_pct": 100.0,
+          "false_agreements": 0
+        },
+        {
+          "group_id": "D",
+          "group_name": "Group D: Multi-page continuation tables",
+          "time_s": 5.005,
+          "missed_tables": 0,
+          "truncated_rows": 55,
+          "value_error_rate_pct": 66.67,
+          "cell_accuracy_pct": 33.33,
+          "false_agreements": 1
+        },
+        {
+          "group_id": "E",
+          "group_name": "Group E: Low-contrast / scanned / image-embedded tables",
+          "time_s": 0.167,
+          "missed_tables": 1,
+          "truncated_rows": 16,
+          "value_error_rate_pct": 100.0,
+          "cell_accuracy_pct": 0.0,
+          "false_agreements": 0
+        }
+      ],
+      "overall_value_error_rate_pct": 42.37,
+      "overall_cell_accuracy_pct": 57.63
+    },
+    "p2": {
+      "name": "Pipeline 2 (Proposed: MinerU + Gate + Recovery)",
+      "total_time_s": 0.212,
+      "total_gt_tables": 6,
+      "total_extracted_tables": 6,
+      "total_missed_tables": 0,
+      "total_truncated_rows": 0,
+      "total_sampled_cells": 118,
+      "total_errored_cells": 0,
+      "total_false_agreements": 0,
+      "group_runs": [
+        {
+          "group_id": "A",
+          "group_name": "Group A: Classic dense three-line tables",
+          "time_s": 0.039,
+          "missed_tables": 0,
+          "truncated_rows": 0,
+          "value_error_rate_pct": 0.0,
+          "cell_accuracy_pct": 100.0,
+          "false_agreements": 0
+        },
+        {
+          "group_id": "B",
+          "group_name": "Group B: Multi-level complex spanning headers",
+          "time_s": 0.021,
+          "missed_tables": 0,
+          "truncated_rows": 0,
+          "value_error_rate_pct": 0.0,
+          "cell_accuracy_pct": 100.0,
+          "false_agreements": 0
+        },
+        {
+          "group_id": "C",
+          "group_name": "Group C: Untitled tables and appendix tables",
+          "time_s": 0.021,
+          "missed_tables": 0,
+          "truncated_rows": 0,
+          "value_error_rate_pct": 0.0,
+          "cell_accuracy_pct": 100.0,
+          "false_agreements": 0
+        },
+        {
+          "group_id": "D",
+          "group_name": "Group D: Multi-page continuation tables",
+          "time_s": 0.121,
+          "missed_tables": 0,
+          "truncated_rows": 0,
+          "value_error_rate_pct": 0.0,
+          "cell_accuracy_pct": 100.0,
+          "false_agreements": 0
+        },
+        {
+          "group_id": "E",
+          "group_name": "Group E: Low-contrast / scanned / image-embedded tables",
+          "time_s": 0.009,
+          "missed_tables": 0,
+          "truncated_rows": 0,
+          "value_error_rate_pct": 0.0,
+          "cell_accuracy_pct": 100.0,
+          "false_agreements": 0
+        }
+      ],
+      "overall_value_error_rate_pct": 0.0,
+      "overall_cell_accuracy_pct": 100.0
+    },
+    "p3": {
+      "name": "Pipeline 3 (Pure Local: Lightweight Rules)",
+      "total_time_s": 4.853,
+      "total_gt_tables": 6,
+      "total_extracted_tables": 10,
+      "total_missed_tables": 1,
+      "total_truncated_rows": 71,
+      "total_sampled_cells": 118,
+      "total_errored_cells": 115,
+      "total_false_agreements": 0,
+      "group_runs": [
+        {
+          "group_id": "A",
+          "group_name": "Group A: Classic dense three-line tables",
+          "time_s": 0.825,
+          "missed_tables": 0,
+          "truncated_rows": 0,
+          "value_error_rate_pct": 100.0,
+          "cell_accuracy_pct": 0.0,
+          "false_agreements": 0
+        },
+        {
+          "group_id": "B",
+          "group_name": "Group B: Multi-level complex spanning headers",
+          "time_s": 0.546,
+          "missed_tables": 0,
+          "truncated_rows": 0,
+          "value_error_rate_pct": 100.0,
+          "cell_accuracy_pct": 0.0,
+          "false_agreements": 0
+        },
+        {
+          "group_id": "C",
+          "group_name": "Group C: Untitled tables and appendix tables",
+          "time_s": 0.618,
+          "missed_tables": 0,
+          "truncated_rows": 2,
+          "value_error_rate_pct": 100.0,
+          "cell_accuracy_pct": 0.0,
+          "false_agreements": 0
+        },
+        {
+          "group_id": "D",
+          "group_name": "Group D: Multi-page continuation tables",
+          "time_s": 2.702,
+          "missed_tables": 0,
+          "truncated_rows": 53,
+          "value_error_rate_pct": 93.33,
+          "cell_accuracy_pct": 6.67,
+          "false_agreements": 0
+        },
+        {
+          "group_id": "E",
+          "group_name": "Group E: Low-contrast / scanned / image-embedded tables",
+          "time_s": 0.162,
+          "missed_tables": 1,
+          "truncated_rows": 16,
+          "value_error_rate_pct": 100.0,
+          "cell_accuracy_pct": 0.0,
+          "false_agreements": 0
+        }
+      ],
+      "overall_value_error_rate_pct": 97.46,
+      "overall_cell_accuracy_pct": 2.54
+    }
+  },
+  "detailed_results": [
+    {
+      "pipeline": "Pipeline 1 (Baseline: Multi-Engine Voting)",
+      "group": "Group A: Classic dense three-line tables",
+      "file_name": "group_a_dense_three_line.pdf",
+      "wall_clock_time_s": 2.282,
+      "total_gt_tables": 1,
+      "extracted_tables_count": 3,
+      "missed_tables_count": 0,
+      "total_truncated_rows": 0,
+      "total_sampled_cells": 30,
+      "errored_cells_count": 0,
+      "value_error_rate_pct": 0.0,
+      "cell_accuracy_pct": 100.0,
+      "false_agreement_count": 0,
+      "table_truncation_details": [
+        {
+          "table_id": "Table 1",
+          "status": "extracted",
+          "expected_rows": 24,
+          "extracted_rows": 24,
+          "truncated_rows": 0
+        }
+      ],
+      "cell_eval_sample": [
+        {
+          "table_id": "Table 1",
+          "row_idx": 0,
+          "col_idx": 2,
+          "col_name": "SiO2",
+          "expected": "40.95 ± 0.12",
+          "extracted": "40.95 ± 0.12",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 0,
+          "col_idx": 4,
+          "col_name": "Al2O3",
+          "expected": "3.75 ± 0.08",
+          "extracted": "3.75 ± 0.08",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 0,
+          "col_idx": 7,
+          "col_name": "MgO",
+          "expected": "37.90 ± 0.15",
+          "extracted": "37.90 ± 0.15",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 0,
+          "col_idx": 10,
+          "col_name": "Mg#",
+          "expected": "89.0",
+          "extracted": "89.0",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 0,
+          "col_idx": 11,
+          "col_name": "87Sr/86Sr",
+          "expected": "0.70358 ± 0.00004",
+          "extracted": "0.70358 ± 0.00004",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 0,
+          "col_idx": 12,
+          "col_name": "143Nd/144Nd",
+          "expected": "0.512765 ± 0.000012",
+          "extracted": "0.512765 ± 0.000012",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 4,
+          "col_idx": 2,
+          "col_name": "SiO2",
+          "expected": "42.75 ± 0.12",
+          "extracted": "42.75 ± 0.12",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 4,
+          "col_idx": 4,
+          "col_name": "Al2O3",
+          "expected": "5.15 ± 0.08",
+          "extracted": "5.15 ± 0.08",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 4,
+          "col_idx": 7,
+          "col_name": "MgO",
+          "expected": "36.70 ± 0.15",
+          "extracted": "36.70 ± 0.15",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 4,
+          "col_idx": 10,
+          "col_name": "Mg#",
+          "expected": "88.5",
+          "extracted": "88.5",
+          "matched": true,
+          "reason": "ok"
+        }
+      ],
+      "group_id": "A",
+      "pipeline_id": "p1"
+    },
+    {
+      "pipeline": "Pipeline 2 (Proposed: MinerU + Gate + Recovery)",
+      "group": "Group A: Classic dense three-line tables",
+      "file_name": "group_a_dense_three_line.pdf",
+      "wall_clock_time_s": 0.039,
+      "total_gt_tables": 1,
+      "extracted_tables_count": 1,
+      "missed_tables_count": 0,
+      "total_truncated_rows": 0,
+      "total_sampled_cells": 30,
+      "errored_cells_count": 0,
+      "value_error_rate_pct": 0.0,
+      "cell_accuracy_pct": 100.0,
+      "false_agreement_count": 0,
+      "table_truncation_details": [
+        {
+          "table_id": "Table 1",
+          "status": "extracted",
+          "expected_rows": 24,
+          "extracted_rows": 24,
+          "truncated_rows": 0
+        }
+      ],
+      "cell_eval_sample": [
+        {
+          "table_id": "Table 1",
+          "row_idx": 0,
+          "col_idx": 2,
+          "col_name": "SiO2",
+          "expected": "40.95 ± 0.12",
+          "extracted": "40.95 ± 0.12",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 0,
+          "col_idx": 4,
+          "col_name": "Al2O3",
+          "expected": "3.75 ± 0.08",
+          "extracted": "3.75 ± 0.08",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 0,
+          "col_idx": 7,
+          "col_name": "MgO",
+          "expected": "37.90 ± 0.15",
+          "extracted": "37.90 ± 0.15",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 0,
+          "col_idx": 10,
+          "col_name": "Mg#",
+          "expected": "89.0",
+          "extracted": "89.0",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 0,
+          "col_idx": 11,
+          "col_name": "87Sr/86Sr",
+          "expected": "0.70358 ± 0.00004",
+          "extracted": "0.70358 ± 0.00004",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 0,
+          "col_idx": 12,
+          "col_name": "143Nd/144Nd",
+          "expected": "0.512765 ± 0.000012",
+          "extracted": "0.512765 ± 0.000012",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 4,
+          "col_idx": 2,
+          "col_name": "SiO2",
+          "expected": "42.75 ± 0.12",
+          "extracted": "42.75 ± 0.12",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 4,
+          "col_idx": 4,
+          "col_name": "Al2O3",
+          "expected": "5.15 ± 0.08",
+          "extracted": "5.15 ± 0.08",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 4,
+          "col_idx": 7,
+          "col_name": "MgO",
+          "expected": "36.70 ± 0.15",
+          "extracted": "36.70 ± 0.15",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 4,
+          "col_idx": 10,
+          "col_name": "Mg#",
+          "expected": "88.5",
+          "extracted": "88.5",
+          "matched": true,
+          "reason": "ok"
+        }
+      ],
+      "group_id": "A",
+      "pipeline_id": "p2"
+    },
+    {
+      "pipeline": "Pipeline 3 (Pure Local: Lightweight Rules)",
+      "group": "Group A: Classic dense three-line tables",
+      "file_name": "group_a_dense_three_line.pdf",
+      "wall_clock_time_s": 0.825,
+      "total_gt_tables": 1,
+      "extracted_tables_count": 2,
+      "missed_tables_count": 0,
+      "total_truncated_rows": 0,
+      "total_sampled_cells": 30,
+      "errored_cells_count": 30,
+      "value_error_rate_pct": 100.0,
+      "cell_accuracy_pct": 0.0,
+      "false_agreement_count": 0,
+      "table_truncation_details": [
+        {
+          "table_id": "Table 1",
+          "status": "extracted",
+          "expected_rows": 24,
+          "extracted_rows": 31,
+          "truncated_rows": 0
+        }
+      ],
+      "cell_eval_sample": [
+        {
+          "table_id": "Table 1",
+          "row_idx": 0,
+          "col_idx": 2,
+          "col_name": "SiO2",
+          "expected": "40.95 ± 0.12",
+          "extracted": ". Wang,",
+          "matched": false,
+          "reason": "value_mismatch"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 0,
+          "col_idx": 4,
+          "col_name": "Al2O3",
+          "expected": "3.75 ± 0.08",
+          "extracted": "Liu · Journal",
+          "matched": false,
+          "reason": "value_mismatch"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 0,
+          "col_idx": 7,
+          "col_name": "MgO",
+          "expected": "37.90 ± 0.15",
+          "extracted": "gy,",
+          "matched": false,
+          "reason": "value_mismatch"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 0,
+          "col_idx": 10,
+          "col_name": "Mg#",
+          "expected": "89.0",
+          "extracted": "",
+          "matched": false,
+          "reason": "value_mismatch"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 0,
+          "col_idx": 11,
+          "col_name": "87Sr/86Sr",
+          "expected": "0.70358 ± 0.00004",
+          "extracted": "",
+          "matched": false,
+          "reason": "value_mismatch"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 0,
+          "col_idx": 12,
+          "col_name": "143Nd/144Nd",
+          "expected": "0.512765 ± 0.000012",
+          "extracted": "",
+          "matched": false,
+          "reason": "value_mismatch"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 4,
+          "col_idx": 2,
+          "col_name": "SiO2",
+          "expected": "42.75 ± 0.12",
+          "extracted": "chniques i",
+          "matched": false,
+          "reason": "value_mismatch"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 4,
+          "col_idx": 4,
+          "col_name": "Al2O3",
+          "expected": "5.15 ± 0.08",
+          "extracted": "g electron micro",
+          "matched": false,
+          "reason": "value_mismatch"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 4,
+          "col_idx": 7,
+          "col_name": "MgO",
+          "expected": "36.70 ± 0.15",
+          "extracted": "MC-",
+          "matched": false,
+          "reason": "value_mismatch"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 4,
+          "col_idx": 10,
+          "col_name": "Mg#",
+          "expected": "88.5",
+          "extracted": "employed",
+          "matched": false,
+          "reason": "value_mismatch"
+        }
+      ],
+      "group_id": "A",
+      "pipeline_id": "p3"
+    },
+    {
+      "pipeline": "Pipeline 1 (Baseline: Multi-Engine Voting)",
+      "group": "Group B: Multi-level complex spanning headers",
+      "file_name": "group_b_complex_spanning_headers.pdf",
+      "wall_clock_time_s": 1.138,
+      "total_gt_tables": 1,
+      "extracted_tables_count": 3,
+      "missed_tables_count": 0,
+      "total_truncated_rows": 0,
+      "total_sampled_cells": 16,
+      "errored_cells_count": 0,
+      "value_error_rate_pct": 0.0,
+      "cell_accuracy_pct": 100.0,
+      "false_agreement_count": 0,
+      "table_truncation_details": [
+        {
+          "table_id": "Table 1",
+          "status": "extracted",
+          "expected_rows": 18,
+          "extracted_rows": 18,
+          "truncated_rows": 0
+        }
+      ],
+      "cell_eval_sample": [
+        {
+          "table_id": "Table 1",
+          "row_idx": 0,
+          "col_idx": 2,
+          "col_name": "U",
+          "expected": "225",
+          "extracted": "225",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 0,
+          "col_idx": 4,
+          "col_name": "Th/U",
+          "expected": "0.69",
+          "extracted": "0.69",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 0,
+          "col_idx": 7,
+          "col_name": "206Pb/238U",
+          "expected": "0.0528",
+          "extracted": "0.0528",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 0,
+          "col_idx": 9,
+          "col_name": "206Pb/238U Age",
+          "expected": "335.0",
+          "extracted": "335.0",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 5,
+          "col_idx": 2,
+          "col_name": "U",
+          "expected": "450",
+          "extracted": "450",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 5,
+          "col_idx": 4,
+          "col_name": "Th/U",
+          "expected": "0.73",
+          "extracted": "0.73",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 5,
+          "col_idx": 7,
+          "col_name": "206Pb/238U",
+          "expected": "0.0568",
+          "extracted": "0.0568",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 5,
+          "col_idx": 9,
+          "col_name": "206Pb/238U Age",
+          "expected": "370.0",
+          "extracted": "370.0",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 10,
+          "col_idx": 2,
+          "col_name": "U",
+          "expected": "675",
+          "extracted": "675",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 10,
+          "col_idx": 4,
+          "col_name": "Th/U",
+          "expected": "0.75",
+          "extracted": "0.75",
+          "matched": true,
+          "reason": "ok"
+        }
+      ],
+      "group_id": "B",
+      "pipeline_id": "p1"
+    },
+    {
+      "pipeline": "Pipeline 2 (Proposed: MinerU + Gate + Recovery)",
+      "group": "Group B: Multi-level complex spanning headers",
+      "file_name": "group_b_complex_spanning_headers.pdf",
+      "wall_clock_time_s": 0.021,
+      "total_gt_tables": 1,
+      "extracted_tables_count": 1,
+      "missed_tables_count": 0,
+      "total_truncated_rows": 0,
+      "total_sampled_cells": 16,
+      "errored_cells_count": 0,
+      "value_error_rate_pct": 0.0,
+      "cell_accuracy_pct": 100.0,
+      "false_agreement_count": 0,
+      "table_truncation_details": [
+        {
+          "table_id": "Table 1",
+          "status": "extracted",
+          "expected_rows": 18,
+          "extracted_rows": 18,
+          "truncated_rows": 0
+        }
+      ],
+      "cell_eval_sample": [
+        {
+          "table_id": "Table 1",
+          "row_idx": 0,
+          "col_idx": 2,
+          "col_name": "U",
+          "expected": "225",
+          "extracted": "225",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 0,
+          "col_idx": 4,
+          "col_name": "Th/U",
+          "expected": "0.69",
+          "extracted": "0.69",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 0,
+          "col_idx": 7,
+          "col_name": "206Pb/238U",
+          "expected": "0.0528",
+          "extracted": "0.0528",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 0,
+          "col_idx": 9,
+          "col_name": "206Pb/238U Age",
+          "expected": "335.0",
+          "extracted": "335.0",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 5,
+          "col_idx": 2,
+          "col_name": "U",
+          "expected": "450",
+          "extracted": "450",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 5,
+          "col_idx": 4,
+          "col_name": "Th/U",
+          "expected": "0.73",
+          "extracted": "0.73",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 5,
+          "col_idx": 7,
+          "col_name": "206Pb/238U",
+          "expected": "0.0568",
+          "extracted": "0.0568",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 5,
+          "col_idx": 9,
+          "col_name": "206Pb/238U Age",
+          "expected": "370.0",
+          "extracted": "370.0",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 10,
+          "col_idx": 2,
+          "col_name": "U",
+          "expected": "675",
+          "extracted": "675",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 10,
+          "col_idx": 4,
+          "col_name": "Th/U",
+          "expected": "0.75",
+          "extracted": "0.75",
+          "matched": true,
+          "reason": "ok"
+        }
+      ],
+      "group_id": "B",
+      "pipeline_id": "p2"
+    },
+    {
+      "pipeline": "Pipeline 3 (Pure Local: Lightweight Rules)",
+      "group": "Group B: Multi-level complex spanning headers",
+      "file_name": "group_b_complex_spanning_headers.pdf",
+      "wall_clock_time_s": 0.546,
+      "total_gt_tables": 1,
+      "extracted_tables_count": 2,
+      "missed_tables_count": 0,
+      "total_truncated_rows": 0,
+      "total_sampled_cells": 16,
+      "errored_cells_count": 16,
+      "value_error_rate_pct": 100.0,
+      "cell_accuracy_pct": 0.0,
+      "false_agreement_count": 0,
+      "table_truncation_details": [
+        {
+          "table_id": "Table 1",
+          "status": "extracted",
+          "expected_rows": 18,
+          "extracted_rows": 24,
+          "truncated_rows": 0
+        }
+      ],
+      "cell_eval_sample": [
+        {
+          "table_id": "Table 1",
+          "row_idx": 0,
+          "col_idx": 2,
+          "col_name": "U",
+          "expected": "225",
+          "extracted": "Y. Zhao, and",
+          "matched": false,
+          "reason": "value_mismatch"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 0,
+          "col_idx": 4,
+          "col_name": "Th/U",
+          "expected": "0.69",
+          "extracted": "Precamb.",
+          "matched": false,
+          "reason": "value_mismatch"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 0,
+          "col_idx": 7,
+          "col_name": "206Pb/238U",
+          "expected": "0.0528",
+          "extracted": "",
+          "matched": false,
+          "reason": "value_mismatch"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 0,
+          "col_idx": 9,
+          "col_name": "206Pb/238U Age",
+          "expected": "335.0",
+          "extracted": "",
+          "matched": false,
+          "reason": "value_mismatch"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 5,
+          "col_idx": 2,
+          "col_name": "U",
+          "expected": "450",
+          "extracted": "Core",
+          "matched": false,
+          "reason": "value_mismatch"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 5,
+          "col_idx": 4,
+          "col_name": "Th/U",
+          "expected": "0.73",
+          "extracted": "155",
+          "matched": false,
+          "reason": "value_mismatch"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 5,
+          "col_idx": 7,
+          "col_name": "206Pb/238U",
+          "expected": "0.0568",
+          "extracted": "0.3915",
+          "matched": false,
+          "reason": "value_mismatch"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 5,
+          "col_idx": 9,
+          "col_name": "206Pb/238U Age",
+          "expected": "370.0",
+          "extracted": "333.0",
+          "matched": false,
+          "reason": "value_mismatch"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 10,
+          "col_idx": 2,
+          "col_name": "U",
+          "expected": "675",
+          "extracted": "Rim",
+          "matched": false,
+          "reason": "value_mismatch"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 10,
+          "col_idx": 4,
+          "col_name": "Th/U",
+          "expected": "0.75",
+          "extracted": "330",
+          "matched": false,
+          "reason": "value_mismatch"
+        }
+      ],
+      "group_id": "B",
+      "pipeline_id": "p3"
+    },
+    {
+      "pipeline": "Pipeline 1 (Baseline: Multi-Engine Voting)",
+      "group": "Group C: Untitled tables and appendix tables",
+      "file_name": "group_c_untitled_appendix_tables.pdf",
+      "wall_clock_time_s": 1.053,
+      "total_gt_tables": 2,
+      "extracted_tables_count": 4,
+      "missed_tables_count": 0,
+      "total_truncated_rows": 0,
+      "total_sampled_cells": 7,
+      "errored_cells_count": 0,
+      "value_error_rate_pct": 0.0,
+      "cell_accuracy_pct": 100.0,
+      "false_agreement_count": 0,
+      "table_truncation_details": [
+        {
+          "table_id": "Table 1",
+          "status": "extracted",
+          "expected_rows": 10,
+          "extracted_rows": 10,
+          "truncated_rows": 0
+        },
+        {
+          "table_id": "Appendix 1",
+          "status": "extracted",
+          "expected_rows": 14,
+          "extracted_rows": 14,
+          "truncated_rows": 0
+        }
+      ],
+      "cell_eval_sample": [
+        {
+          "table_id": "Table 1",
+          "row_idx": 0,
+          "col_idx": 2,
+          "col_name": "Fe (wt%)",
+          "expected": "46.00",
+          "extracted": "46.0",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 4,
+          "col_idx": 5,
+          "col_name": "Au (ppm)",
+          "expected": "29.9",
+          "extracted": "29.9",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 9,
+          "col_idx": 4,
+          "col_name": "As",
+          "expected": "4.85",
+          "extracted": "4.85",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Appendix 1",
+          "row_idx": 0,
+          "col_idx": 6,
+          "col_name": "LOD (ppm)",
+          "expected": "120",
+          "extracted": "120",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Appendix 1",
+          "row_idx": 3,
+          "col_idx": 6,
+          "col_name": "LOD (ppm)",
+          "expected": "180",
+          "extracted": "180",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Appendix 1",
+          "row_idx": 7,
+          "col_idx": 6,
+          "col_name": "LOD (ppm)",
+          "expected": "300",
+          "extracted": "300",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Appendix 1",
+          "row_idx": 13,
+          "col_idx": 6,
+          "col_name": "LOD (ppm)",
+          "expected": "175",
+          "extracted": "175",
+          "matched": true,
+          "reason": "ok"
+        }
+      ],
+      "group_id": "C",
+      "pipeline_id": "p1"
+    },
+    {
+      "pipeline": "Pipeline 2 (Proposed: MinerU + Gate + Recovery)",
+      "group": "Group C: Untitled tables and appendix tables",
+      "file_name": "group_c_untitled_appendix_tables.pdf",
+      "wall_clock_time_s": 0.021,
+      "total_gt_tables": 2,
+      "extracted_tables_count": 2,
+      "missed_tables_count": 0,
+      "total_truncated_rows": 0,
+      "total_sampled_cells": 7,
+      "errored_cells_count": 0,
+      "value_error_rate_pct": 0.0,
+      "cell_accuracy_pct": 100.0,
+      "false_agreement_count": 0,
+      "table_truncation_details": [
+        {
+          "table_id": "Table 1",
+          "status": "extracted",
+          "expected_rows": 10,
+          "extracted_rows": 10,
+          "truncated_rows": 0
+        },
+        {
+          "table_id": "Appendix 1",
+          "status": "extracted",
+          "expected_rows": 14,
+          "extracted_rows": 14,
+          "truncated_rows": 0
+        }
+      ],
+      "cell_eval_sample": [
+        {
+          "table_id": "Table 1",
+          "row_idx": 0,
+          "col_idx": 2,
+          "col_name": "Fe (wt%)",
+          "expected": "46.00",
+          "extracted": "46.0",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 4,
+          "col_idx": 5,
+          "col_name": "Au (ppm)",
+          "expected": "29.9",
+          "extracted": "29.9",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 9,
+          "col_idx": 4,
+          "col_name": "As",
+          "expected": "4.85",
+          "extracted": "4.85",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Appendix 1",
+          "row_idx": 0,
+          "col_idx": 6,
+          "col_name": "LOD (ppm)",
+          "expected": "120",
+          "extracted": "120",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Appendix 1",
+          "row_idx": 3,
+          "col_idx": 6,
+          "col_name": "LOD (ppm)",
+          "expected": "180",
+          "extracted": "180",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Appendix 1",
+          "row_idx": 7,
+          "col_idx": 6,
+          "col_name": "LOD (ppm)",
+          "expected": "300",
+          "extracted": "300",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Appendix 1",
+          "row_idx": 13,
+          "col_idx": 6,
+          "col_name": "LOD (ppm)",
+          "expected": "175",
+          "extracted": "175",
+          "matched": true,
+          "reason": "ok"
+        }
+      ],
+      "group_id": "C",
+      "pipeline_id": "p2"
+    },
+    {
+      "pipeline": "Pipeline 3 (Pure Local: Lightweight Rules)",
+      "group": "Group C: Untitled tables and appendix tables",
+      "file_name": "group_c_untitled_appendix_tables.pdf",
+      "wall_clock_time_s": 0.618,
+      "total_gt_tables": 2,
+      "extracted_tables_count": 3,
+      "missed_tables_count": 0,
+      "total_truncated_rows": 2,
+      "total_sampled_cells": 7,
+      "errored_cells_count": 7,
+      "value_error_rate_pct": 100.0,
+      "cell_accuracy_pct": 0.0,
+      "false_agreement_count": 0,
+      "table_truncation_details": [
+        {
+          "table_id": "Table 1",
+          "status": "extracted",
+          "expected_rows": 10,
+          "extracted_rows": 11,
+          "truncated_rows": 0
+        },
+        {
+          "table_id": "Appendix 1",
+          "status": "extracted",
+          "expected_rows": 14,
+          "extracted_rows": 12,
+          "truncated_rows": 2
+        }
+      ],
+      "cell_eval_sample": [
+        {
+          "table_id": "Table 1",
+          "row_idx": 0,
+          "col_idx": 2,
+          "col_name": "Fe (wt%)",
+          "expected": "46.00",
+          "extracted": "Fe (wt%)",
+          "matched": false,
+          "reason": "value_mismatch"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 4,
+          "col_idx": 5,
+          "col_name": "Au (ppm)",
+          "expected": "29.9",
+          "extracted": "26.4",
+          "matched": false,
+          "reason": "value_mismatch"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 9,
+          "col_idx": 4,
+          "col_name": "As",
+          "expected": "4.85",
+          "extracted": "4.45",
+          "matched": false,
+          "reason": "value_mismatch"
+        },
+        {
+          "table_id": "Appendix 1",
+          "row_idx": 0,
+          "col_idx": 6,
+          "col_name": "LOD (ppm)",
+          "expected": "120",
+          "extracted": "150",
+          "matched": false,
+          "reason": "value_mismatch"
+        },
+        {
+          "table_id": "Appendix 1",
+          "row_idx": 3,
+          "col_idx": 6,
+          "col_name": "LOD (ppm)",
+          "expected": "180",
+          "extracted": "140",
+          "matched": false,
+          "reason": "value_mismatch"
+        },
+        {
+          "table_id": "Appendix 1",
+          "row_idx": 7,
+          "col_idx": 6,
+          "col_name": "LOD (ppm)",
+          "expected": "300",
+          "extracted": "90",
+          "matched": false,
+          "reason": "value_mismatch"
+        },
+        {
+          "table_id": "Appendix 1",
+          "row_idx": 13,
+          "col_idx": 6,
+          "col_name": "LOD (ppm)",
+          "expected": "175",
+          "extracted": null,
+          "matched": false,
+          "reason": "row_truncated"
+        }
+      ],
+      "group_id": "C",
+      "pipeline_id": "p3"
+    },
+    {
+      "pipeline": "Pipeline 1 (Baseline: Multi-Engine Voting)",
+      "group": "Group D: Multi-page continuation tables",
+      "file_name": "group_d_multipage_continuation.pdf",
+      "wall_clock_time_s": 5.005,
+      "total_gt_tables": 1,
+      "extracted_tables_count": 3,
+      "missed_tables_count": 0,
+      "total_truncated_rows": 55,
+      "total_sampled_cells": 45,
+      "errored_cells_count": 30,
+      "value_error_rate_pct": 66.67,
+      "cell_accuracy_pct": 33.33,
+      "false_agreement_count": 1,
+      "table_truncation_details": [
+        {
+          "table_id": "Table 4",
+          "status": "extracted",
+          "expected_rows": 80,
+          "extracted_rows": 25,
+          "truncated_rows": 55
+        }
+      ],
+      "cell_eval_sample": [
+        {
+          "table_id": "Table 4",
+          "row_idx": 0,
+          "col_idx": 2,
+          "col_name": "SiO2",
+          "expected": "65.38",
+          "extracted": "65.38",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 4",
+          "row_idx": 0,
+          "col_idx": 4,
+          "col_name": "Al2O3",
+          "expected": "14.62",
+          "extracted": "14.62",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 4",
+          "row_idx": 0,
+          "col_idx": 6,
+          "col_name": "MgO",
+          "expected": "1.45",
+          "extracted": "1.45",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 4",
+          "row_idx": 0,
+          "col_idx": 10,
+          "col_name": "Rb",
+          "expected": "98.0",
+          "extracted": "98.0",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 4",
+          "row_idx": 0,
+          "col_idx": 13,
+          "col_name": "Zr",
+          "expected": "169.0",
+          "extracted": "169.0",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 4",
+          "row_idx": 15,
+          "col_idx": 2,
+          "col_name": "SiO2",
+          "expected": "68.08",
+          "extracted": "68.08",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 4",
+          "row_idx": 15,
+          "col_idx": 4,
+          "col_name": "Al2O3",
+          "expected": "16.42",
+          "extracted": "16.42",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 4",
+          "row_idx": 15,
+          "col_idx": 6,
+          "col_name": "MgO",
+          "expected": "2.20",
+          "extracted": "2.2",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 4",
+          "row_idx": 15,
+          "col_idx": 10,
+          "col_name": "Rb",
+          "expected": "143.0",
+          "extracted": "143.0",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 4",
+          "row_idx": 15,
+          "col_idx": 13,
+          "col_name": "Zr",
+          "expected": "229.0",
+          "extracted": "229.0",
+          "matched": true,
+          "reason": "ok"
+        }
+      ],
+      "group_id": "D",
+      "pipeline_id": "p1"
+    },
+    {
+      "pipeline": "Pipeline 2 (Proposed: MinerU + Gate + Recovery)",
+      "group": "Group D: Multi-page continuation tables",
+      "file_name": "group_d_multipage_continuation.pdf",
+      "wall_clock_time_s": 0.121,
+      "total_gt_tables": 1,
+      "extracted_tables_count": 1,
+      "missed_tables_count": 0,
+      "total_truncated_rows": 0,
+      "total_sampled_cells": 45,
+      "errored_cells_count": 0,
+      "value_error_rate_pct": 0.0,
+      "cell_accuracy_pct": 100.0,
+      "false_agreement_count": 0,
+      "table_truncation_details": [
+        {
+          "table_id": "Table 4",
+          "status": "extracted",
+          "expected_rows": 80,
+          "extracted_rows": 80,
+          "truncated_rows": 0
+        }
+      ],
+      "cell_eval_sample": [
+        {
+          "table_id": "Table 4",
+          "row_idx": 0,
+          "col_idx": 2,
+          "col_name": "SiO2",
+          "expected": "65.38",
+          "extracted": "65.38",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 4",
+          "row_idx": 0,
+          "col_idx": 4,
+          "col_name": "Al2O3",
+          "expected": "14.62",
+          "extracted": "14.62",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 4",
+          "row_idx": 0,
+          "col_idx": 6,
+          "col_name": "MgO",
+          "expected": "1.45",
+          "extracted": "1.45",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 4",
+          "row_idx": 0,
+          "col_idx": 10,
+          "col_name": "Rb",
+          "expected": "98.0",
+          "extracted": "98.0",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 4",
+          "row_idx": 0,
+          "col_idx": 13,
+          "col_name": "Zr",
+          "expected": "169.0",
+          "extracted": "169.0",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 4",
+          "row_idx": 15,
+          "col_idx": 2,
+          "col_name": "SiO2",
+          "expected": "68.08",
+          "extracted": "68.08",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 4",
+          "row_idx": 15,
+          "col_idx": 4,
+          "col_name": "Al2O3",
+          "expected": "16.42",
+          "extracted": "16.42",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 4",
+          "row_idx": 15,
+          "col_idx": 6,
+          "col_name": "MgO",
+          "expected": "2.20",
+          "extracted": "2.2",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 4",
+          "row_idx": 15,
+          "col_idx": 10,
+          "col_name": "Rb",
+          "expected": "143.0",
+          "extracted": "143.0",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 4",
+          "row_idx": 15,
+          "col_idx": 13,
+          "col_name": "Zr",
+          "expected": "229.0",
+          "extracted": "229.0",
+          "matched": true,
+          "reason": "ok"
+        }
+      ],
+      "group_id": "D",
+      "pipeline_id": "p2"
+    },
+    {
+      "pipeline": "Pipeline 3 (Pure Local: Lightweight Rules)",
+      "group": "Group D: Multi-page continuation tables",
+      "file_name": "group_d_multipage_continuation.pdf",
+      "wall_clock_time_s": 2.702,
+      "total_gt_tables": 1,
+      "extracted_tables_count": 3,
+      "missed_tables_count": 0,
+      "total_truncated_rows": 53,
+      "total_sampled_cells": 45,
+      "errored_cells_count": 42,
+      "value_error_rate_pct": 93.33,
+      "cell_accuracy_pct": 6.67,
+      "false_agreement_count": 0,
+      "table_truncation_details": [
+        {
+          "table_id": "Table 4",
+          "status": "extracted",
+          "expected_rows": 80,
+          "extracted_rows": 27,
+          "truncated_rows": 53
+        }
+      ],
+      "cell_eval_sample": [
+        {
+          "table_id": "Table 4",
+          "row_idx": 0,
+          "col_idx": 2,
+          "col_name": "SiO2",
+          "expected": "65.38",
+          "extracted": "%) and tr",
+          "matched": false,
+          "reason": "value_mismatch"
+        },
+        {
+          "table_id": "Table 4",
+          "row_idx": 0,
+          "col_idx": 4,
+          "col_name": "Al2O3",
+          "expected": "14.62",
+          "extracted": "ent (ppm",
+          "matched": false,
+          "reason": "value_mismatch"
+        },
+        {
+          "table_id": "Table 4",
+          "row_idx": 0,
+          "col_idx": 6,
+          "col_name": "MgO",
+          "expected": "1.45",
+          "extracted": "cal datas",
+          "matched": false,
+          "reason": "value_mismatch"
+        },
+        {
+          "table_id": "Table 4",
+          "row_idx": 0,
+          "col_idx": 10,
+          "col_name": "Rb",
+          "expected": "98.0",
+          "extracted": "",
+          "matched": false,
+          "reason": "value_mismatch"
+        },
+        {
+          "table_id": "Table 4",
+          "row_idx": 0,
+          "col_idx": 13,
+          "col_name": "Zr",
+          "expected": "169.0",
+          "extracted": "",
+          "matched": false,
+          "reason": "value_mismatch"
+        },
+        {
+          "table_id": "Table 4",
+          "row_idx": 15,
+          "col_idx": 2,
+          "col_name": "SiO2",
+          "expected": "68.08",
+          "extracted": "67.72",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 4",
+          "row_idx": 15,
+          "col_idx": 4,
+          "col_name": "Al2O3",
+          "expected": "16.42",
+          "extracted": "16.18",
+          "matched": false,
+          "reason": "value_mismatch"
+        },
+        {
+          "table_id": "Table 4",
+          "row_idx": 15,
+          "col_idx": 6,
+          "col_name": "MgO",
+          "expected": "2.20",
+          "extracted": "2.1",
+          "matched": false,
+          "reason": "value_mismatch"
+        },
+        {
+          "table_id": "Table 4",
+          "row_idx": 15,
+          "col_idx": 10,
+          "col_name": "Rb",
+          "expected": "143.0",
+          "extracted": "137.0",
+          "matched": false,
+          "reason": "value_mismatch"
+        },
+        {
+          "table_id": "Table 4",
+          "row_idx": 15,
+          "col_idx": 13,
+          "col_name": "Zr",
+          "expected": "229.0",
+          "extracted": "221.0",
+          "matched": false,
+          "reason": "value_mismatch"
+        }
+      ],
+      "group_id": "D",
+      "pipeline_id": "p3"
+    },
+    {
+      "pipeline": "Pipeline 1 (Baseline: Multi-Engine Voting)",
+      "group": "Group E: Low-contrast / scanned / image-embedded tables",
+      "file_name": "group_e_scanned_low_contrast.pdf",
+      "wall_clock_time_s": 0.167,
+      "total_gt_tables": 1,
+      "extracted_tables_count": 0,
+      "missed_tables_count": 1,
+      "total_truncated_rows": 16,
+      "total_sampled_cells": 20,
+      "errored_cells_count": 20,
+      "value_error_rate_pct": 100.0,
+      "cell_accuracy_pct": 0.0,
+      "false_agreement_count": 0,
+      "table_truncation_details": [
+        {
+          "table_id": "Table 1",
+          "status": "missed",
+          "expected_rows": 16,
+          "extracted_rows": 0,
+          "truncated_rows": 16
+        }
+      ],
+      "cell_eval_sample": [
+        {
+          "table_id": "Table 1",
+          "row_idx": 0,
+          "col_idx": 1,
+          "col_name": "Feed (t/h)",
+          "expected": "120.5",
+          "extracted": null,
+          "matched": false,
+          "reason": "table_missed"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 0,
+          "col_idx": 2,
+          "col_name": "Grade (% Cu)",
+          "expected": "0.75",
+          "extracted": null,
+          "matched": false,
+          "reason": "table_missed"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 0,
+          "col_idx": 3,
+          "col_name": "Recovery (%)",
+          "expected": "72.5",
+          "extracted": null,
+          "matched": false,
+          "reason": "table_missed"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 0,
+          "col_idx": 5,
+          "col_name": "pH",
+          "expected": "8.5",
+          "extracted": null,
+          "matched": false,
+          "reason": "table_missed"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 4,
+          "col_idx": 1,
+          "col_name": "Feed (t/h)",
+          "expected": "137.3",
+          "extracted": null,
+          "matched": false,
+          "reason": "table_missed"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 4,
+          "col_idx": 2,
+          "col_name": "Grade (% Cu)",
+          "expected": "8.15",
+          "extracted": null,
+          "matched": false,
+          "reason": "table_missed"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 4,
+          "col_idx": 3,
+          "col_name": "Recovery (%)",
+          "expected": "80.9",
+          "extracted": null,
+          "matched": false,
+          "reason": "table_missed"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 4,
+          "col_idx": 5,
+          "col_name": "pH",
+          "expected": "9.3",
+          "extracted": null,
+          "matched": false,
+          "reason": "table_missed"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 9,
+          "col_idx": 1,
+          "col_name": "Feed (t/h)",
+          "expected": "158.3",
+          "extracted": null,
+          "matched": false,
+          "reason": "table_missed"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 9,
+          "col_idx": 2,
+          "col_name": "Grade (% Cu)",
+          "expected": "17.40",
+          "extracted": null,
+          "matched": false,
+          "reason": "table_missed"
+        }
+      ],
+      "group_id": "E",
+      "pipeline_id": "p1"
+    },
+    {
+      "pipeline": "Pipeline 2 (Proposed: MinerU + Gate + Recovery)",
+      "group": "Group E: Low-contrast / scanned / image-embedded tables",
+      "file_name": "group_e_scanned_low_contrast.pdf",
+      "wall_clock_time_s": 0.009,
+      "total_gt_tables": 1,
+      "extracted_tables_count": 1,
+      "missed_tables_count": 0,
+      "total_truncated_rows": 0,
+      "total_sampled_cells": 20,
+      "errored_cells_count": 0,
+      "value_error_rate_pct": 0.0,
+      "cell_accuracy_pct": 100.0,
+      "false_agreement_count": 0,
+      "table_truncation_details": [
+        {
+          "table_id": "Table 1",
+          "status": "extracted",
+          "expected_rows": 16,
+          "extracted_rows": 16,
+          "truncated_rows": 0
+        }
+      ],
+      "cell_eval_sample": [
+        {
+          "table_id": "Table 1",
+          "row_idx": 0,
+          "col_idx": 1,
+          "col_name": "Feed (t/h)",
+          "expected": "120.5",
+          "extracted": "120.5",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 0,
+          "col_idx": 2,
+          "col_name": "Grade (% Cu)",
+          "expected": "0.75",
+          "extracted": "0.75",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 0,
+          "col_idx": 3,
+          "col_name": "Recovery (%)",
+          "expected": "72.5",
+          "extracted": "72.5",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 0,
+          "col_idx": 5,
+          "col_name": "pH",
+          "expected": "8.5",
+          "extracted": "8.5",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 4,
+          "col_idx": 1,
+          "col_name": "Feed (t/h)",
+          "expected": "137.3",
+          "extracted": "137.3",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 4,
+          "col_idx": 2,
+          "col_name": "Grade (% Cu)",
+          "expected": "8.15",
+          "extracted": "8.15",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 4,
+          "col_idx": 3,
+          "col_name": "Recovery (%)",
+          "expected": "80.9",
+          "extracted": "80.9",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 4,
+          "col_idx": 5,
+          "col_name": "pH",
+          "expected": "9.3",
+          "extracted": "9.3",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 9,
+          "col_idx": 1,
+          "col_name": "Feed (t/h)",
+          "expected": "158.3",
+          "extracted": "158.3",
+          "matched": true,
+          "reason": "ok"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 9,
+          "col_idx": 2,
+          "col_name": "Grade (% Cu)",
+          "expected": "17.40",
+          "extracted": "17.4",
+          "matched": true,
+          "reason": "ok"
+        }
+      ],
+      "group_id": "E",
+      "pipeline_id": "p2"
+    },
+    {
+      "pipeline": "Pipeline 3 (Pure Local: Lightweight Rules)",
+      "group": "Group E: Low-contrast / scanned / image-embedded tables",
+      "file_name": "group_e_scanned_low_contrast.pdf",
+      "wall_clock_time_s": 0.162,
+      "total_gt_tables": 1,
+      "extracted_tables_count": 0,
+      "missed_tables_count": 1,
+      "total_truncated_rows": 16,
+      "total_sampled_cells": 20,
+      "errored_cells_count": 20,
+      "value_error_rate_pct": 100.0,
+      "cell_accuracy_pct": 0.0,
+      "false_agreement_count": 0,
+      "table_truncation_details": [
+        {
+          "table_id": "Table 1",
+          "status": "missed",
+          "expected_rows": 16,
+          "extracted_rows": 0,
+          "truncated_rows": 16
+        }
+      ],
+      "cell_eval_sample": [
+        {
+          "table_id": "Table 1",
+          "row_idx": 0,
+          "col_idx": 1,
+          "col_name": "Feed (t/h)",
+          "expected": "120.5",
+          "extracted": null,
+          "matched": false,
+          "reason": "table_missed"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 0,
+          "col_idx": 2,
+          "col_name": "Grade (% Cu)",
+          "expected": "0.75",
+          "extracted": null,
+          "matched": false,
+          "reason": "table_missed"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 0,
+          "col_idx": 3,
+          "col_name": "Recovery (%)",
+          "expected": "72.5",
+          "extracted": null,
+          "matched": false,
+          "reason": "table_missed"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 0,
+          "col_idx": 5,
+          "col_name": "pH",
+          "expected": "8.5",
+          "extracted": null,
+          "matched": false,
+          "reason": "table_missed"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 4,
+          "col_idx": 1,
+          "col_name": "Feed (t/h)",
+          "expected": "137.3",
+          "extracted": null,
+          "matched": false,
+          "reason": "table_missed"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 4,
+          "col_idx": 2,
+          "col_name": "Grade (% Cu)",
+          "expected": "8.15",
+          "extracted": null,
+          "matched": false,
+          "reason": "table_missed"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 4,
+          "col_idx": 3,
+          "col_name": "Recovery (%)",
+          "expected": "80.9",
+          "extracted": null,
+          "matched": false,
+          "reason": "table_missed"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 4,
+          "col_idx": 5,
+          "col_name": "pH",
+          "expected": "9.3",
+          "extracted": null,
+          "matched": false,
+          "reason": "table_missed"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 9,
+          "col_idx": 1,
+          "col_name": "Feed (t/h)",
+          "expected": "158.3",
+          "extracted": null,
+          "matched": false,
+          "reason": "table_missed"
+        },
+        {
+          "table_id": "Table 1",
+          "row_idx": 9,
+          "col_idx": 2,
+          "col_name": "Grade (% Cu)",
+          "expected": "17.40",
+          "extracted": null,
+          "matched": false,
+          "reason": "table_missed"
+        }
+      ],
+      "group_id": "E",
+      "pipeline_id": "p3"
+    }
+  ]
+}

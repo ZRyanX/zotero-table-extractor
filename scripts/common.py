@@ -344,8 +344,11 @@ def clean_text(val):
     val = " ".join(val.split())
     return val
 
-def clean_latex_and_ocr(val):
-    """Clean raw LaTeX math markup, OCR typos, and garbled symbols."""
+def clean_latex_and_ocr(val, enable_chemical_typo_fix: bool = False):
+    """Clean raw LaTeX math markup, OCR typos, and garbled symbols.
+    Aggressive chemical substitutions (H20 -> H2O, CQ -> CO2, Tin -> Tm) are decoupled
+    and disabled by default to prevent destroying legitimate sample codes or mineral abbreviations.
+    """
     if not isinstance(val, str) or not val:
         return val
 
@@ -378,17 +381,18 @@ def clean_latex_and_ocr(val):
     val = re.sub(r'\s*±\s*', ' ± ', val)
     val = re.sub(r'\s*\^\s*([0-9+-]+)\s*', r'^\1', val)
 
-    # 4. Fix common OCR typos in chemical formulas & mineral terms
-    val = re.sub(r'\bNaC1\b', 'NaCl', val)
-    val = re.sub(r'\bCaC12\b', 'CaCl2', val)
-    val = re.sub(r'\bH20\b', 'H2O', val)
-    val = re.sub(r'\bCQ\b', 'CO2', val)
-    val = re.sub(r'\bCtL\b', 'CH4', val)
-    val = re.sub(r'\bTin-\b', 'Tm -', val)
-    val = re.sub(r'\bTin\b', 'Tm', val)
-    val = re.sub(r'\bcastiterite\b', 'cassiterite', val, flags=re.I)
-    val = re.sub(r'\bberthlerite\b', 'berthierite', val, flags=re.I)
-    val = re.sub(r'\bFable\b', 'Table', val, flags=re.I)
+    # 4. Fix common OCR typos in chemical formulas & mineral terms (Only when explicitly enabled)
+    if enable_chemical_typo_fix:
+        val = re.sub(r'\bNaC1\b', 'NaCl', val)
+        val = re.sub(r'\bCaC12\b', 'CaCl2', val)
+        val = re.sub(r'\bH20\b', 'H2O', val)
+        val = re.sub(r'\bCQ\b', 'CO2', val)
+        val = re.sub(r'\bCtL\b', 'CH4', val)
+        val = re.sub(r'\bTin-\b', 'Tm -', val)
+        val = re.sub(r'\bTin\b', 'Tm', val)
+        val = re.sub(r'\bcastiterite\b', 'cassiterite', val, flags=re.I)
+        val = re.sub(r'\bberthlerite\b', 'berthierite', val, flags=re.I)
+        val = re.sub(r'\bFable\b', 'Table', val, flags=re.I)
 
     # Fix common OCR garbled text in mineral paragenesis
     val = val.replace('(_+qz)', '(± qz)').replace('(_+ qz)', '(± qz)')

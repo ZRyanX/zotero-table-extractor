@@ -24,11 +24,14 @@ except ImportError:
 import sys
 import os
 import re
+from decimal import Decimal, InvalidOperation
 import json
 import argparse
 import threading
 import concurrent.futures
 from typing import Tuple, Set, Optional, List, Dict, Any, Union
+
+import pandas as pd
 
 try:
     import pymupdf as fitz
@@ -338,6 +341,391 @@ def _trigger_zotero_sync(pdf_path, target_output, dfs, args):
         print(f"[ZoteroSync Hook Notice] {e_sync}")
 
 
+def _normalize_merge_key(val: Any) -> str:
+    """
+    标准化合并连接键：消除大小写、首尾空白以及浮点数/整数格式差异 (如 '25.0' -> '25')。
+    采用 Decimal 无损解析，杜绝大整数编号精度塌陷与高精度浮点碰撞。
+    保护带前导零的样本编号 (如 '01', '007', '+007') 不被截断为整数。
+    """
+    if pd.isna(val) or val is None:
+        return ""
+    s = str(val).strip()
+    if s.lower() in ("", "nan", "none", "null", "-", "—", "infinity", "inf"):
+        return ""
+    # 保护前导零整数编码 (如 01, 007, +007)
+    if re.match(r'^[+-]?0\d+$', s):
+        clean = s.lstrip('+')
+        return clean.casefold()
+    try:
+        # 纯整数无损保留
+        if re.match(r'^[+-]?\d+$', s):
+            return str(int(s))
+        d = Decimal(s)
+        if not d.is_finite():
+            return s.casefold()
+        if d == d.to_integral():
+            return str(int(d))
+        sign, digits, exp = d.as_tuple()
+        if exp < 0:
+            return f"{d:f}".rstrip('0').rstrip('.')
+        elif exp >= 0:
+            return str(int(d))
+    except (InvalidOperation, ValueError, TypeError, OverflowError):
+        pass
+    return s.casefold()
+
+
+def _merge_complementary_tables(primary_df: pd.DataFrame, secondary_df: pd.DataFrame) -> Optional[pd.DataFrame]:
+    """
+    智能合并两张属于同一表格但行列/字段互补的 DataFrame：
+    保留 primary_df 作为主干结构（包含其全量行与数据），
+    安全补充 secondary_df 中独有的列数据，杜绝字段丢失。
+    严禁盲目按行位置补列，必须在确认行身份后对齐合并；
+    保留双方未匹配行（避免丢行），若存在重复键冲突或无法置信确认行身份时返回 None 以便独立保留版本。
+    """
+    prim = primary_df.reset_index(drop=True)
+    sec = secondary_df.reset_index(drop=True)
+
+    p_cols = list(prim.columns)
+    s_cols = list(sec.columns)
+    p_map = {str(c).lower().strip(): c for c in p_cols}
+    s_map = {str(c).lower().strip(): c for c in s_cols}
+
+    common_lower = [c for c in p_map if c in s_map and not c.startswith(('unnamed', 'col')) and c not in ('', 'nan', 'none')]
+    extra_s_lower = [c for c in s_map if c not in p_map and not c.startswith(('unnamed', 'col')) and c not in ('', 'nan', 'none')]
+
+    extra_s_cols = [s_map[c] for c in extra_s_lower]
+
+    merged = None
+    if common_lower:
+        p_on = [p_map[c] for c in common_lower]
+        try:
+            rename_dict = {s_map[c]: p_map[c] for c in common_lower}
+            sec_renamed = sec.rename(columns=rename_dict)
+            on_cols = p_on
+
+            prim_join = prim.copy()
+            sec_join = sec_renamed.copy()
+            for c in on_cols:
+                prim_join[f'_key_{c}'] = prim_join[c].apply(_normalize_merge_key)
+                sec_join[f'_key_{c}'] = sec_join[c].apply(_normalize_merge_key)
+
+            key_cols = [f'_key_{c}' for c in on_cols]
+
+            prim_valid = prim_join[prim_join[key_cols].apply(lambda row: any(v != "" for v in row), axis=1)]
+            sec_valid = sec_join[sec_join[key_cols].apply(lambda row: any(v != "" for v in row), axis=1)]
+
+            # 1. 检查复合键唯一性与数据冲突：
+            # 若任意一方存在重复复合键且非键列数据存在冲突，或键重复导致对应歧义，严禁盲目去重覆盖数值，直接放弃合并
+            has_composite_conflict = False
+            sec_has_dups = sec_valid.duplicated(subset=key_cols, keep=False).any()
+            prim_has_dups = prim_valid.duplicated(subset=key_cols, keep=False).any()
+
+            if sec_has_dups:
+                for _, group in sec_valid.groupby(key_cols):
+                    if len(group) > 1:
+                        non_key_cols = [c for c in sec_renamed.columns if c not in on_cols and not c.startswith('_key_')]
+                        for col in non_key_cols:
+                            distinct_vals = set(
+                                str(v).strip() for v in group[col]
+                                if pd.notna(v) and str(v).strip().lower() not in ('nan', 'none')
+                            )
+                            if len(distinct_vals) > 1:
+                                has_composite_conflict = True
+                                break
+                    if has_composite_conflict:
+                        break
+
+            if not has_composite_conflict and prim_has_dups:
+                prim_non_key = [c for c in prim.columns if c not in on_cols and not c.startswith('_key_')]
+                for _, group in prim_valid.groupby(key_cols):
+                    if len(group) > 1:
+                        for col in prim_non_key:
+                            distinct_vals = set(
+                                str(v).strip() for v in group[col]
+                                if pd.notna(v) and str(v).strip().lower() not in ('nan', 'none')
+                            )
+                            if len(distinct_vals) > 1:
+                                has_composite_conflict = True
+                                break
+                    if has_composite_conflict:
+                        break
+
+            # 复合键唯一性保护：若键重复导致对应歧义或存在冲突，放弃盲目去重合并
+            if sec_has_dups or prim_has_dups or has_composite_conflict:
+                has_composite_conflict = True
+
+            if not has_composite_conflict and len(sec_valid) > 0 and len(prim_valid) > 0:
+                sec_to_merge = sec_valid[key_cols + extra_s_cols].copy()
+                sec_to_merge['_sec_matched_idx'] = sec_valid.index
+
+                merged_candidate = pd.merge(
+                    prim_join,
+                    sec_to_merge,
+                    on=key_cols,
+                    how='left'
+                )
+
+                matched_sec_indices = set(int(x) for x in merged_candidate['_sec_matched_idx'].dropna())
+                merged_candidate = merged_candidate.drop(columns=key_cols + ['_sec_matched_idx'])
+
+                non_empty_added = sum(
+                    1 for c in extra_s_cols if c in merged_candidate.columns
+                    for v in merged_candidate[c] if pd.notna(v) and str(v).strip() not in ('', 'nan', 'none')
+                )
+
+                # 只有在双方存在置信匹配（至少匹配到有效数据）时才接受
+                if len(matched_sec_indices) > 0 and (non_empty_added > 0 or not extra_s_cols):
+                    unmatched_sec = sec_renamed[~sec_renamed.index.isin(matched_sec_indices)]
+                    all_cols = list(prim.columns) + [c for c in extra_s_cols if c not in prim.columns]
+                    if not unmatched_sec.empty:
+                        aligned_unmatched = pd.DataFrame(index=unmatched_sec.index)
+                        for c in all_cols:
+                            aligned_unmatched[c] = unmatched_sec[c] if c in unmatched_sec.columns else ''
+                        merged_candidate = pd.concat([merged_candidate, aligned_unmatched], ignore_index=True)
+                    merged = merged_candidate
+
+            if merged is None and not has_composite_conflict:
+                # 复合键未能匹配，仅在存在明确样本/实体标识列且无数据冲突时，尝试单标识列对齐
+                id_keywords = ('sample', 'id', 'name', 'specimen', 'no', 'num', 'number', 'code', 'site', 'station', 'point', '样', '编号', '样品', '名称')
+                id_key_cols = [k for k in key_cols if any(w in k.lower() for w in id_keywords)]
+                candidate_fallback_keys = id_key_cols if id_key_cols else []
+
+                best_single = None
+                max_matches = 0
+                for k in candidate_fallback_keys:
+                    prim_keys = prim_join[prim_join[k] != ''][k]
+                    sec_keys = sec_join[sec_join[k] != ''][k]
+                    # 标识键必须在双方非空记录中唯一，严禁一对多或多对多匹配
+                    if len(prim_keys) == 0 or len(sec_keys) == 0:
+                        continue
+                    if len(prim_keys) != prim_keys.nunique() or len(sec_keys) != sec_keys.nunique():
+                        continue
+
+                    sec_k_valid = sec_join[sec_join[k] != ''].copy()
+                    has_data_conflict = False
+                    other_common = [c for c in on_cols if f'_key_{c}' != k]
+                    if other_common:
+                        sec_check = sec_k_valid.set_index(k)
+                        for idx, row in prim_join.iterrows():
+                            key_val = row[k]
+                            if key_val and key_val in sec_check.index:
+                                sec_row = sec_check.loc[key_val]
+                                for c in other_common:
+                                    kc = f'_key_{c}'
+                                    pv = row[kc]
+                                    sv = sec_row[kc]
+                                    if pv and sv and pv != sv:
+                                        has_data_conflict = True
+                                        break
+                            if has_data_conflict:
+                                break
+                    if has_data_conflict:
+                        continue
+
+                    sec_to_merge = sec_k_valid[[k] + extra_s_cols].copy()
+                    sec_to_merge['_sec_matched_idx'] = sec_k_valid.index
+                    cand = pd.merge(
+                        prim_join,
+                        sec_to_merge,
+                        on=[k],
+                        how='left'
+                    )
+
+                    matched_sec_indices = set(int(x) for x in cand['_sec_matched_idx'].dropna())
+                    cand = cand.drop(columns=key_cols + ['_sec_matched_idx'])
+
+                    n_added = sum(
+                        1 for c in extra_s_cols if c in cand.columns
+                        for v in cand[c] if pd.notna(v) and str(v).strip() not in ('', 'nan', 'none')
+                    )
+                    if len(matched_sec_indices) > 0 and (n_added > max_matches or (max_matches == 0 and not extra_s_cols)):
+                        unmatched_sec = sec_renamed[~sec_renamed.index.isin(matched_sec_indices)]
+                        all_cols = list(prim.columns) + [c for c in extra_s_cols if c not in prim.columns]
+                        if not unmatched_sec.empty:
+                            aligned_unmatched = pd.DataFrame(index=unmatched_sec.index)
+                            for c in all_cols:
+                                aligned_unmatched[c] = unmatched_sec[c] if c in unmatched_sec.columns else ''
+                            cand = pd.concat([cand, aligned_unmatched], ignore_index=True)
+                        max_matches = max(n_added, 1)
+                        best_single = cand
+                if best_single is not None:
+                    merged = best_single
+        except Exception:
+            merged = None
+
+    if merged is None:
+        # 共同字段无法置信匹配行身份或存在冲突时，绝不按物理位置盲目补列，直接返回 None 告知调用方独立保留冲突双方数据
+        return None
+
+    merged = merged.fillna('')
+    merged.attrs = dict(prim.attrs)
+    if not merged.attrs.get('label') and sec.attrs.get('label'):
+        merged.attrs['label'] = sec.attrs['label']
+    if not merged.attrs.get('table_title') and sec.attrs.get('table_title'):
+        merged.attrs['table_title'] = sec.attrs['table_title']
+    return merged
+
+
+def _merge_online_and_pdf_tables(online_list, pdf_list):
+    """
+    智能合并在线高保真表格与本地 PDF / MinerU 提取表格：
+    比对数据覆盖度 (shape[0] * shape[1] 以及有效非空数据元胞数)。
+    若本地 PDF / MinerU 版本相比在线版本显著具有更多数据行/单元格 (例如在线版本仅为付费墙折叠/预览截断)，
+    优先使用本地 PDF 完整表覆盖在线残表，杜绝因盲目保存在线表而丢弃完整本地大表；
+    若两端字段互补（例如在线拥有独有列），执行字段合并保留全量列，防止丢列。
+    严格核对表格身份，杜绝无表号表误替换不同页已标定表。
+    """
+    if not online_list:
+        return list(pdf_list) if pdf_list else []
+    if not pdf_list:
+        return list(online_list)
+
+    for o_item in online_list:
+        if hasattr(o_item, 'attrs') and not o_item.attrs.get('source'):
+            o_item.attrs['source'] = 'online'
+    for p_item in pdf_list:
+        if hasattr(p_item, 'attrs') and not p_item.attrs.get('source'):
+            p_item.attrs['source'] = 'pdf'
+
+    combined = list(online_list)
+
+    def _calc_cells(df):
+        if df is None or df.empty:
+            return 0
+        return sum(1 for v in df.values.flatten() if pd.notna(v) and str(v).strip() not in ('', 'nan', 'none'))
+
+    for p_df in pdf_list:
+        p_lbl = p_df.attrs.get('label') or p_df.attrs.get('table_title')
+        fmt_p_lbl = format_table_label(p_lbl) if p_lbl else None
+        p_page = p_df.attrs.get('page_idx')
+
+        matched_idx = None
+        if fmt_p_lbl:
+            # 1. 显式表号精准匹配
+            for idx, o_df in enumerate(combined):
+                o_lbl = o_df.attrs.get('label') or o_df.attrs.get('table_title')
+                fmt_o_lbl = format_table_label(o_lbl) if o_lbl else None
+                if fmt_o_lbl and fmt_o_lbl == fmt_p_lbl:
+                    matched_idx = idx
+                    break
+        else:
+            # 2. PDF 表格无明确表号：必须核对列重合度与页面归属，严禁无条件认定或跨页顶替
+            for idx, o_df in enumerate(combined):
+                o_lbl = o_df.attrs.get('label') or o_df.attrs.get('table_title')
+                fmt_o_lbl = format_table_label(o_lbl) if o_lbl else None
+                o_page = o_df.attrs.get('page_idx')
+
+                # 若两端均明确指定了页码且不在同一页，绝不可匹配
+                if p_page is not None and o_page is not None and p_page != o_page:
+                    continue
+
+                o_cells = set(
+                    str(v).strip().lower() for v in o_df.values.flatten()
+                    if pd.notna(v) and str(v).strip().lower() not in ('', 'nan', 'none', '-', '—')
+                )
+                p_cells = set(
+                    str(v).strip().lower() for v in p_df.values.flatten()
+                    if pd.notna(v) and str(v).strip().lower() not in ('', 'nan', 'none', '-', '—')
+                )
+                shared_cells = o_cells & p_cells
+
+                o_cols = set(str(c).lower().strip() for c in o_df.columns if not str(c).startswith(('Unnamed', 'Col')) and str(c).strip() not in ('', 'nan', 'none'))
+                p_cols = set(str(c).lower().strip() for c in p_df.columns if not str(c).startswith(('Unnamed', 'Col')) and str(c).strip() not in ('', 'nan', 'none'))
+                
+                cols_match = False
+                if o_cols and p_cols:
+                    jaccard = len(o_cols & p_cols) / max(1, len(o_cols | p_cols))
+                    is_subset = o_cols.issubset(p_cols) or p_cols.issubset(o_cols)
+                    if jaccard >= 0.5 or (is_subset and len(o_cols & p_cols) >= 2):
+                        cols_match = True
+
+                # 若在线表有明确标签（如 Table 1），而 PDF 表格无明确表号：
+                # 严禁仅凭列名重合就顶替已标定表！必须满足数据真值重合
+                if fmt_o_lbl and not fmt_p_lbl:
+                    cell_overlap_ratio = len(shared_cells) / max(1, min(len(o_cells), len(p_cells))) if (o_cells and p_cells) else 0.0
+                    if cols_match and len(shared_cells) >= 2 and cell_overlap_ratio >= 0.25:
+                        matched_idx = idx
+                        break
+                elif not fmt_o_lbl and not fmt_p_lbl:
+                    cell_overlap_ratio = len(shared_cells) / max(1, min(len(o_cells), len(p_cells))) if (o_cells and p_cells) else 0.0
+                    if cols_match and (cell_overlap_ratio >= 0.25 or (p_page is not None and o_page is not None and p_page == o_page)):
+                        matched_idx = idx
+                        break
+
+        if matched_idx is not None:
+            o_df = combined[matched_idx]
+            p_rows, o_rows = len(p_df), len(o_df)
+            p_cells = _calc_cells(p_df)
+            o_cells = _calc_cells(o_df)
+            p_coverage = p_df.shape[0] * p_df.shape[1]
+            o_coverage = o_df.shape[0] * o_df.shape[1]
+
+            tbl_desc = fmt_p_lbl or o_df.attrs.get('label') or "Table"
+
+            # 字段互补分析：检查是否有任一方拥有对方缺失的有效列
+            o_cols_clean = set(str(c).lower().strip() for c in o_df.columns if not str(c).startswith(('Unnamed', 'Col')) and str(c).strip() not in ('', 'nan', 'none'))
+            p_cols_clean = set(str(c).lower().strip() for c in p_df.columns if not str(c).startswith(('Unnamed', 'Col')) and str(c).strip() not in ('', 'nan', 'none'))
+            common_cols = o_cols_clean & p_cols_clean
+            extra_o_cols = [c for c in o_df.columns if str(c).lower().strip() in (o_cols_clean - p_cols_clean)] if common_cols else []
+            extra_p_cols = [c for c in p_df.columns if str(c).lower().strip() in (p_cols_clean - o_cols_clean)] if common_cols else []
+
+            # 如果本地 PDF 表格列数显著更多 (例如大于等于在线列数的 2 倍) 或容积显著更大且缺乏共同字段重合，视为本地完整表覆盖截断的在线残表
+            is_p_overwhelming = (
+                (p_df.shape[1] >= 2 * o_df.shape[1]) or
+                (p_coverage >= 2 * o_coverage and p_df.shape[1] > o_df.shape[1])
+            )
+
+            if extra_o_cols:
+                # 在线表具有 PDF 缺失的补充列：绝不能因 PDF 列数更多而跳过补列丢弃在线独有字段，优先互补合并
+                merged = _merge_complementary_tables(p_df, o_df)
+                if merged is not None:
+                    print(f"[Merge] 本地 PDF 表格 [{tbl_desc}] 与在线表格字段互补，合并保留在线补充列 {extra_o_cols} 并保留全量行 ({len(merged)}行/{len(merged.columns)}列)")
+                    combined[matched_idx] = merged
+                else:
+                    # 无法置信对齐行身份，保留冲突双方独立数据，杜绝数据错配与遗失
+                    print(f"[Merge] 本地 PDF 表格 [{tbl_desc}] 与在线表格无法置信匹配行身份，保留双方独立版本")
+                    combined.append(p_df)
+            elif extra_p_cols:
+                # 在线行数或行内容与 PDF 字段互补：以在线为主干，补充 PDF 独有列并保留全量行
+                merged = _merge_complementary_tables(o_df, p_df)
+                if merged is not None:
+                    print(f"[Merge] 在线表格 [{tbl_desc}] 与本地 PDF 表格字段互补，合并保留 PDF 补充列 {extra_p_cols} 并保留全量行 ({len(merged)}行/{len(merged.columns)}列)")
+                    combined[matched_idx] = merged
+                else:
+                    print(f"[Merge] 在线表格 [{tbl_desc}] 与本地 PDF 表格无法置信匹配行身份，保留双方独立版本")
+                    combined.append(p_df)
+            else:
+                # 结构完全包含或一方在所有维度显著更全
+                is_p_better = (
+                    is_p_overwhelming or
+                    (not extra_o_cols and p_rows > o_rows) or
+                    (not extra_o_cols and p_cells > o_cells) or
+                    (not extra_o_cols and p_coverage > o_coverage and p_cells >= o_cells)
+                )
+                if is_p_better:
+                    # 若双方存在共同字段，优先尝试互补合并保留双方全量行（杜绝丢弃在线独有样本）
+                    merged = None
+                    if common_cols:
+                        merged = _merge_complementary_tables(p_df, o_df)
+                    if merged is not None:
+                        print(f"[Merge] 本地 PDF 表格 [{tbl_desc}] 覆盖在线残表并合并保留双方全量行 ({len(merged)}行/{len(merged.columns)}列)")
+                        combined[matched_idx] = merged
+                    else:
+                        print(f"[Merge] 本地 PDF 表格 [{tbl_desc}] 数据覆盖显著更全 ({p_rows}行/{p_cells}单元格/容积{p_coverage} vs 在线{o_rows}行/{o_cells}单元格/容积{o_coverage})，覆盖截断的在线表")
+                        p_df_copy = p_df.copy()
+                        p_df_copy.attrs = dict(p_df.attrs)
+                        if not p_df_copy.attrs.get('label') and o_df.attrs.get('label'):
+                            p_df_copy.attrs['label'] = o_df.attrs['label']
+                        if not p_df_copy.attrs.get('table_title') and o_df.attrs.get('table_title'):
+                            p_df_copy.attrs['table_title'] = o_df.attrs['table_title']
+                        combined[matched_idx] = p_df_copy
+        else:
+            combined.append(p_df)
+
+    return combined
+
+
 def _do_process_single_pdf(pdf_path, orig_pdf_path, args, is_batch=False, plan=None, candidate_pages=None, remediated=None):
     output_path = args.output
     filename_base = os.path.splitext(os.path.basename(orig_pdf_path))[0]
@@ -445,8 +833,22 @@ def _do_process_single_pdf(pdf_path, orig_pdf_path, args, is_batch=False, plan=N
                     has_scanned_page = True
 
                 is_complete = False
-                if has_scanned_page:
-                    # 扫描页缺少有效文本层，完整性未知，严禁提前判定为完整，必须由本地管线补充核查
+                has_sparse_or_truncated = False
+                for o_df in online_dfs:
+                    if o_df is None or len(o_df) <= 3:
+                        has_sparse_or_truncated = True
+                        break
+                    non_empty_count = sum(
+                        1 for v in o_df.values.flatten()
+                        if pd.notna(v) and str(v).strip() not in ('', 'nan', 'none', '-', '—')
+                    )
+                    density = non_empty_count / max(1, o_df.size)
+                    if non_empty_count < 6 or density < 0.25:
+                        has_sparse_or_truncated = True
+                        break
+
+                if has_scanned_page or has_sparse_or_truncated:
+                    # 扫描页或在线预览截断表，完整性未知，严禁提前判定为完整，必须由本地管线补充核查
                     is_complete = False
                 elif expected_labels:
                     is_complete = (len(missing_labels) == 0 and len(online_dfs) >= expected_count)
@@ -473,7 +875,7 @@ def _do_process_single_pdf(pdf_path, orig_pdf_path, args, is_batch=False, plan=N
                 if save_ok:
                     extracted_online = True
                     print(f"[Online] Successfully extracted tables via online HTML source -> {target_output}")
-                    if online_only or is_complete:
+                    if online_only:
                         _trigger_zotero_sync(orig_pdf_path, target_output, online_dfs, args)
                         return True
                     print(f"[Online -> PDF Supplement] 已保留 {len(online_dfs)} 个在线表格，将由本地 PDF 管线补充剩余缺失表格...")
@@ -500,12 +902,7 @@ def _do_process_single_pdf(pdf_path, orig_pdf_path, args, is_batch=False, plan=N
             vlm_dfs = parse_structured_vlm_content(content)
             if vlm_dfs:
                 print(f"[PDF -> Structured] Extracted {len(vlm_dfs)} structured tables from local file.")
-                combined_struct_dfs = list(online_dfs) if online_dfs else []
-                for s_df in vlm_dfs:
-                    s_lbl = s_df.attrs.get('label') or s_df.attrs.get('table_title')
-                    fmt_s_lbl = format_table_label(s_lbl) if s_lbl else None
-                    if not fmt_s_lbl or (fmt_s_lbl not in (online_labels or set()) and make_safe_filename(fmt_s_lbl) not in (online_skip_labels or set())):
-                        combined_struct_dfs.append(s_df)
+                combined_struct_dfs = _merge_online_and_pdf_tables(online_dfs, vlm_dfs)
 
                 if save_tables_to_excel(combined_struct_dfs, target_output, getattr(args, 'headers', None), single_file,
                                         skip_supplementary=getattr(args, 'skip_supplementary', False)):
@@ -532,13 +929,8 @@ def _do_process_single_pdf(pdf_path, orig_pdf_path, args, is_batch=False, plan=N
                 extractors = [r['df'].attrs.get('extractor', 'unknown') for r in results]
                 print(f"[PDF] 提取到 {len(dfs)} 个表格 (extractors: {set(extractors)})")
                 
-                # 在线高保真表格与 PDF 补漏表格先合并去重
-                combined_dfs = list(online_dfs) if online_dfs else []
-                for p_df in dfs:
-                    p_lbl = p_df.attrs.get('label') or p_df.attrs.get('table_title')
-                    fmt_p_lbl = format_table_label(p_lbl) if p_lbl else None
-                    if not fmt_p_lbl or (fmt_p_lbl not in (online_labels or set()) and make_safe_filename(fmt_p_lbl) not in (online_skip_labels or set())):
-                        combined_dfs.append(p_df)
+                # 在线高保真表格与 PDF 补漏表格智能合并（比对覆盖度，杜绝盲目丢弃完整本地表）
+                combined_dfs = _merge_online_and_pdf_tables(online_dfs, dfs)
 
                 if save_tables_to_excel(combined_dfs, target_output, getattr(args, 'headers', None), single_file,
                                         skip_supplementary=getattr(args, 'skip_supplementary', False)):
@@ -559,12 +951,7 @@ def _do_process_single_pdf(pdf_path, orig_pdf_path, args, is_batch=False, plan=N
                 full_md = ocr_client.run_paddleocr_vl(pdf_path, pages=None, cancel_event=None)
                 if full_md:
                     vlm_dfs = parse_structured_vlm_content(full_md)
-                    combined_vlm_dfs = list(online_dfs) if online_dfs else []
-                    for v_df in (vlm_dfs or []):
-                        v_lbl = v_df.attrs.get('label') or v_df.attrs.get('table_title')
-                        fmt_v_lbl = format_table_label(v_lbl) if v_lbl else None
-                        if not fmt_v_lbl or (fmt_v_lbl not in (online_labels or set()) and make_safe_filename(fmt_v_lbl) not in (online_skip_labels or set())):
-                            combined_vlm_dfs.append(v_df)
+                    combined_vlm_dfs = _merge_online_and_pdf_tables(online_dfs, vlm_dfs)
 
                     if combined_vlm_dfs and save_tables_to_excel(combined_vlm_dfs, target_output, getattr(args, 'headers', None), single_file,
                                                                         skip_supplementary=getattr(args, 'skip_supplementary', False)):

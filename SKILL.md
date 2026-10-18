@@ -32,28 +32,30 @@ description: 从 Zotero 选中条目（依赖 ai4paper-zotero MCP 获取物理�
               ├─ 矢量线框与文本表格全篇自适应探测 (有绘图页线框未检出时继续跑文本与离散列探测)
               └─ 跨页续表多模态追溯 (关键词/纯数据密度/网格线/图片/无框稀疏多列对齐)
               │
-              ├──────────┬──────────────────┐
-              │          │                  │
-           Native     Scanned            Mixed
-              │          │                  │
-              ▼          ▼                  ▼
-         8 引擎投票:  DocLayout-YOLO     多方投票(文本页)
-         pdf-inspector + PP-StructureV3  + OCR/VLM(扫描页)
-         + PyMuPDF4LLM 局部切图与补扫     (在线 PaddleOCR-VL
-         + find_tables 首选在线 PaddleOCR-VL 离线 Docling TableFormer)
-         + text_align  离线 Docling TableFormer
-         + pdfplumber  多模态精细解析
-         + Camelot
-         + GMFT (TATR)
-         + img2table (OpenCV, 200->72 DPI 点坐标归一)
+              ├──────────────────────┬──────────────────┐
+              │                      │                  │
+           Native                 Scanned             Mixed
+              │                      │                  │
+              ▼                      ▼                  ▼
+      生产主抽取管线:           DocLayout-YOLO      主抽取(文本页)
+      1. Tagged PDF 结构树     + PP-StructureV3   + OCR/VLM(扫描页)
+         (Fast-path 快速通道)    局部切图与补扫     (首选 PaddleOCR-VL
+      2. MinerU 结构化主抽取    (首选 PaddleOCR-VL  离线 Docling TableFormer)
+         (含 page_ranges 选页)   离线 Docling)
+      3. 本地数值完整性门禁
+         (table_validator 校验)
+              │
+              ├─ 门禁未通过/页面未覆盖/启用 legacy ──► 定向局部修复与 8 引擎投票备用管线:
+              │    (pdf-inspector + PyMuPDF4LLM + find_tables + text_align
+              │     + pdfplumber + Camelot + GMFT (TATR) + img2table + RapidTable)
               │
               ├─ 2D bbox 空间重叠 (IoU/IoM) + 表号标签防冲突聚类，杜绝同页多表误合并
               ├─ IBM TEDS (树编辑距离拓扑度量) + 矩阵相似度加权判定一致性 (结构树优先)
-              ├─ 低置信度 (<0.90) 或检验瑕疵页 → DocLayout-YOLO 切图 + PP-Structure 补扫 → PaddleOCR-VL (在线) / Docling TableFormer (离线备用) 接管
+              ├─ 严格质量门禁 (_should_replace_with_ocr)：严禁少行少列 OCR 替换非退化原生表
               ├─ 表级精细对齐与替换策略：精准替换瑕疵表，保留同页未受干扰的有效原生表并正确标记已处理
               ├─ 7 阶轻量直通安全后处理（公式注入防御、数值类型推断、多级表头展平、DeepDoc/MinerU 启发式对齐）
               ├─ 参考 olmOCR 2 设计的边界与尾注分离启发式：隔离表题/数据矩阵/尾注 (* p < 0.05, Note: ..., 注: ...)
-              └─ 跨页续表与多分页自适应合并（严格位置与单调序列证据校验）
+              └─ 跨页续表自适应合并（智能解析描述性续表标题，严格排除虚假表号冲突）
               │
               ▼
          Excel 导出 (openpyxl CellRichText 学术上下标与化学式保真，补漏合并写入原子替换) ──► 可选自动回写挂载至 Zotero & Better-Notes 笔记

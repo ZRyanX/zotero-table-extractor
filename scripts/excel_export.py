@@ -20,9 +20,15 @@ except ImportError:
 
 # Table post-processing helpers
 try:
-    from .table_postprocess import postprocess_dataframe, merge_continuation_tables, is_paywall_table, parse_academic_runs, convert_latex_math_to_unicode
+    from .table_postprocess import (
+        postprocess_dataframe, merge_continuation_tables, is_paywall_table,
+        parse_academic_runs, convert_latex_math_to_unicode, is_conflicting_or_distinct_version
+    )
 except ImportError:
-    from table_postprocess import postprocess_dataframe, merge_continuation_tables, is_paywall_table, parse_academic_runs, convert_latex_math_to_unicode
+    from table_postprocess import (
+        postprocess_dataframe, merge_continuation_tables, is_paywall_table,
+        parse_academic_runs, convert_latex_math_to_unicode, is_conflicting_or_distinct_version
+    )
 
 
 def make_safe_filename(name):
@@ -116,15 +122,24 @@ def autofit_excel_columns(file_path, title=None, footnotes=None, sheet_footnotes
                             sheet.append([format_academic_rich_text(fn_str)])
                             existing_first_col.add(fn_str)
 
-            # 应用学术上下标富文本渲染
+            # 应用学术上下标富文本渲染并保护超长数字串
             for row in sheet.iter_rows():
                 for cell in row:
-                    if cell.value is not None and isinstance(cell.value, str):
-                        if getattr(cell, 'data_type', None) == 'f' or cell.value.startswith('='):
+                    if cell.value is not None:
+                        val_str = str(cell.value).strip()
+                        val_clean = val_str.lstrip('+-')
+                        # 保护 > 15 位的超长整数/样号/条形码/ID 显式作为文本单元格存储 ('s')，杜绝 Excel IEEE 754 截断
+                        if val_clean.isdigit() and len(val_clean) > 15:
+                            cell.value = str(val_str)
+                            cell.data_type = 's'
                             continue
-                        new_val = format_academic_rich_text(cell.value)
-                        if new_val is not cell.value:
-                            cell.value = new_val
+
+                        if isinstance(cell.value, str):
+                            if getattr(cell, 'data_type', None) == 'f' or cell.value.startswith('='):
+                                continue
+                            new_val = format_academic_rich_text(cell.value)
+                            if new_val is not cell.value:
+                                cell.value = new_val
 
             for col in sheet.columns:
                 max_len = 0
@@ -181,12 +196,19 @@ def _load_excel_with_attrs(tbl_path, output_path=None):
             try:
                 with open(cap_file, 'r', encoding='utf-8') as f:
                     for line in f:
-                        if ':' in line:
-                            k, v = line.split(':', 1)
-                            if k.strip() == base or make_safe_filename(k.strip()) == base:
-                                existing_df.attrs['table_title'] = v.strip()
-                                existing_df.attrs['label'] = k.strip()
-                                break
+                        line_s = line.strip()
+                        if not line_s or line_s.startswith("#"):
+                            continue
+                        if '\t' in line_s:
+                            k, v = line_s.split('\t', 1)
+                        elif ':' in line_s:
+                            k, v = line_s.split(':', 1)
+                        else:
+                            continue
+                        if k.strip() == base or make_safe_filename(k.strip()) == base:
+                            existing_df.attrs['table_title'] = v.strip()
+                            existing_df.attrs['label'] = k.strip()
+                            break
             except Exception:
                 pass
     return existing_df
@@ -350,10 +372,28 @@ def save_tables_to_excel(dataframes, output_path, headers=None, single_file=True
 
                     used_sheet_names = set(wb_existing.sheetnames)
                     orig_sheet_name = sheet_name
-                    suffix = 1
-                    while sheet_name in used_sheet_names:
-                        sheet_name = f"{orig_sheet_name[:27]}_{suffix}"
-                        suffix += 1
+                    if sheet_name in used_sheet_names:
+                        curr_p = df.attrs.get('page_idx')
+                        src_str = str(df.attrs.get('source') or df.attrs.get('extractor') or '').lower()
+                        is_distant = (curr_p is not None and curr_p >= 2)
+                        is_online = bool('online' in src_str or 'jats' in src_str or 'arxiv' in src_str or 'html' in src_str)
+
+                        if is_distant:
+                            candidate = f"{orig_sheet_name[:25]}_p{curr_p + 1}"
+                        elif is_online:
+                            candidate = f"{orig_sheet_name[:22]} (Online)"
+                        elif 'pdf' in src_str:
+                            candidate = f"{orig_sheet_name[:25]} (PDF)"
+                        else:
+                            candidate = f"{orig_sheet_name[:26]} (v2)"
+
+                        if candidate not in used_sheet_names:
+                            sheet_name = candidate
+                        else:
+                            suffix = 2
+                            while sheet_name in used_sheet_names:
+                                sheet_name = f"{orig_sheet_name[:25]} (v{suffix})"
+                                suffix += 1
 
                     ws = wb_existing.create_sheet(title=sheet_name)
                     ws.append([str(c) for c in df.columns])
@@ -397,10 +437,45 @@ def save_tables_to_excel(dataframes, output_path, headers=None, single_file=True
 
                     used_sheet_names = [s[0] for s in sheets_to_write]
                     orig_sheet_name = sheet_name
-                    suffix = 1
-                    while sheet_name in used_sheet_names:
-                        sheet_name = f"{orig_sheet_name[:27]}_{suffix}"
-                        suffix += 1
+                    if sheet_name in used_sheet_names:
+                        curr_p = df.attrs.get('page_idx')
+                        existing_p = None
+                        existing_src = ""
+                        for s_name, s_df in sheets_to_write:
+                            if s_name == orig_sheet_name:
+                                existing_p = s_df.attrs.get('page_idx')
+                                existing_src = str(s_df.attrs.get('source') or s_df.attrs.get('extractor') or '').lower()
+                                break
+
+                        src_str = str(df.attrs.get('source') or df.attrs.get('extractor') or '').lower()
+                        is_distant = (
+                            (curr_p is not None and existing_p is not None and abs(curr_p - existing_p) >= 2) or
+                            (curr_p is not None and curr_p >= 2 and existing_p is None)
+                        )
+                        is_diff_provenance = (
+                            bool('online' in src_str or 'jats' in src_str or 'arxiv' in src_str or 'html' in src_str) !=
+                            bool('online' in existing_src or 'jats' in existing_src or 'arxiv' in existing_src or 'html' in existing_src)
+                        )
+
+                        if is_distant:
+                            candidate = f"{orig_sheet_name[:25]}_p{curr_p + 1}"
+                        elif is_diff_provenance:
+                            if 'online' in src_str or 'jats' in src_str or 'arxiv' in src_str or 'html' in src_str:
+                                candidate = f"{orig_sheet_name[:22]} (Online)"
+                            else:
+                                candidate = f"{orig_sheet_name[:25]} (PDF)"
+                        elif 'pdf' in src_str and 'online' not in src_str and not existing_src:
+                            candidate = f"{orig_sheet_name[:25]} (PDF)"
+                        else:
+                            candidate = f"{orig_sheet_name[:26]} (v2)"
+
+                        if candidate not in used_sheet_names:
+                            sheet_name = candidate
+                        else:
+                            suffix = 2
+                            while sheet_name in used_sheet_names:
+                                sheet_name = f"{orig_sheet_name[:25]} (v{suffix})"
+                                suffix += 1
 
                     sheets_to_write.append((sheet_name, df))
 
@@ -408,7 +483,11 @@ def save_tables_to_excel(dataframes, output_path, headers=None, single_file=True
                     for s_name, s_df in sheets_to_write:
                         s_df.to_excel(writer, sheet_name=s_name, index=False)
 
-                sheet_fn_map = {s_name: s_df.attrs.get('footnotes') for s_name, s_df in sheets_to_write if s_df.attrs.get('footnotes')}
+                sheet_fn_map = {
+                    s_name: (s_df.attrs.get('footnotes') or s_df.attrs.get('table_footnote'))
+                    for s_name, s_df in sheets_to_write
+                    if (s_df.attrs.get('footnotes') or s_df.attrs.get('table_footnote'))
+                }
                 autofit_excel_columns(temp_xlsx, sheet_footnotes=sheet_fn_map)
             try:
                 os.replace(temp_xlsx, output_path)
@@ -533,10 +612,38 @@ def save_tables_to_excel(dataframes, output_path, headers=None, single_file=True
                         bool(df.attrs.get('is_continuation'))
                     )
                     
+                    curr_p = df.attrs.get('page_idx')
+                    existing_p = existing_df.attrs.get('page_idx')
+                    is_distant_table = False
+                    if curr_p is not None and existing_p is not None and abs(curr_p - existing_p) >= 2:
+                        is_distant_table = True
+                    elif curr_p is not None and curr_p >= 2 and (existing_p is None or existing_p < 2):
+                        # 现有表缺少页码属性(或位于首页/次页)但当前表在后方页面(>=第3页)，保留为独立表
+                        is_distant_table = True
+
                     if is_cont_part:
                         from table_postprocess import combine_df_group
                         print("-> Detected continuation fragment. Merging with existing table...")
                         df_to_save = combine_df_group([existing_df, df])
+                    elif is_distant_table:
+                        # 检查是否为同名但位于不同章节/页面的独立数据表（如论文作者笔误重复表号，或远隔页面）
+                        p_num = curr_p + 1 if curr_p is not None else idx + 1
+                        tbl_path = os.path.join(output_path, f"{safe_label}_p{p_num}.xlsx")
+                        suffix_i = 2
+                        while os.path.exists(tbl_path) or tbl_path in written_files:
+                            tbl_path = os.path.join(output_path, f"{safe_label}_p{p_num}_{suffix_i}.xlsx")
+                            suffix_i += 1
+                        df_to_save = df
+                        print(f"-> Detected distinct table on page {p_num} sharing label {safe_label}. Saving as {tbl_path}...")
+                    elif is_conflicting_or_distinct_version(existing_df, df):
+                        # 冲突独立版本另存为独立版本文件，杜绝覆盖导致数据丢失
+                        tbl_path = os.path.join(output_path, f"{safe_label}_v2.xlsx")
+                        suffix_i = 3
+                        while os.path.exists(tbl_path) or tbl_path in written_files:
+                            tbl_path = os.path.join(output_path, f"{safe_label}_v{suffix_i}.xlsx")
+                            suffix_i += 1
+                        df_to_save = df
+                        print(f"-> Detected conflicting unaligned version for {safe_label}. Saving as {tbl_path}...")
                     elif overlap_ratio >= 0.5:
                         existing_valid_cells = existing_df.dropna(how='all').notna().sum().sum()
                         new_valid_cells = df.dropna(how='all').notna().sum().sum()
@@ -551,22 +658,7 @@ def save_tables_to_excel(dataframes, output_path, headers=None, single_file=True
                         else:
                             df_to_save = df if new_valid_cells >= existing_valid_cells else existing_df
                     else:
-                        # 检查是否为同名但位于不同章节/页面的独立数据表（如论文作者笔误重复表号）
-                        curr_p = df.attrs.get('page_idx')
-                        existing_p = existing_df.attrs.get('page_idx')
-                        is_distant_table = False
-                        if curr_p is not None and existing_p is not None and abs(curr_p - existing_p) >= 2:
-                            is_distant_table = True
-                        elif curr_p is not None and curr_p > 5 and existing_p is None:
-                            # 现有表缺少页码属性但当前表在后方页面，保留为独立表
-                            is_distant_table = True
-
-                        if is_distant_table and curr_p is not None:
-                            # 独立表格另存为带页码的规范文件名，避免覆盖前表
-                            tbl_path = os.path.join(output_path, f"{safe_label}_P{curr_p + 1}.xlsx")
-                            df_to_save = df
-                            print(f"-> Detected distinct table on page {curr_p + 1} sharing label {safe_label}. Saving as {tbl_path}...")
-                        elif df.attrs.get('extractor') in ('paddleocr_vl', 'ppstructure_vlm') or df.size >= existing_df.size:
+                        if df.attrs.get('extractor') in ('paddleocr_vl', 'ppstructure_vlm') or df.size >= existing_df.size:
                             print("-> High-priority OCR table replaces lower-priority version...")
                             df_to_save = df
                         else:
@@ -581,20 +673,21 @@ def save_tables_to_excel(dataframes, output_path, headers=None, single_file=True
                     df_to_save.attrs.update(saved_attrs)
                         
                     df_to_save.to_excel(tbl_path, index=False)
-                    autofit_excel_columns(tbl_path, title=df_to_save.attrs.get('table_title') or title or file_label, footnotes=df_to_save.attrs.get('footnotes'))
+                    autofit_excel_columns(tbl_path, title=df_to_save.attrs.get('table_title') or title or file_label, footnotes=df_to_save.attrs.get('footnotes') or df_to_save.attrs.get('table_footnote'))
                     written_files[tbl_path] = df_to_save
                     print(f"Saved: {tbl_path}")
                 except Exception as e:
                     print(f"Error merging dataframes for {tbl_path}: {e}")
             else:
                 df.to_excel(tbl_path, index=False)
-                autofit_excel_columns(tbl_path, title=title or file_label, footnotes=df.attrs.get('footnotes'))
+                autofit_excel_columns(tbl_path, title=title or file_label, footnotes=df.attrs.get('footnotes') or df.attrs.get('table_footnote'))
                 written_files[tbl_path] = df
                 print(f"Saved: {tbl_path}")
             
             # Collect caption info
+            actual_base = os.path.splitext(os.path.basename(tbl_path))[0]
             full_title = title.strip() if title and title.strip() else file_label
-            captions.append((file_label, full_title))
+            captions.append((actual_base, full_title))
             
         # Write table_captions.txt in the same directory
         captions_path = os.path.join(output_path, "table_captions.txt")

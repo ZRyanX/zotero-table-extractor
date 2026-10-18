@@ -44,6 +44,7 @@ import io
 import time
 import tempfile
 import logging
+from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple, Set
 
 try:
@@ -1840,22 +1841,69 @@ def three_way_vote(
 
 def extract_via_ocr(pdf_path: str, pages: Optional[List[int]] = None) -> List[Dict[str, Any]]:
     """
-    兜底方案: PP-StructureV3 定位 + PaddleOCR-VL-1.6 多模态解析。
+    兜底方案: MinerU 高保真多模态解析 / PP-StructureV3 定位 + PaddleOCR-VL-1.6 多模态解析。
     仅当 PDF 无文本层或三方投票全部失败时使用。
     """
     results = []
 
+    try:
+        from .common import load_config
+    except ImportError:
+        try:
+            from common import load_config
+        except ImportError:
+            load_config = lambda: {}
+    config = load_config()
+    engine = (config.get("OCR_ENGINE") or os.environ.get("OCR_ENGINE") or "auto").lower()
+
+    try:
+        from . import ocr_client
+    except ImportError:
+        import ocr_client
+    try:
+        from .table_postprocess import parse_structured_vlm_content
+    except ImportError:
+        from table_postprocess import parse_structured_vlm_content
+
+    # 0. 若配置首选引擎为 MinerU，优先直接调用 MinerU 高精度多模态提取
+    if engine == "mineru":
+        try:
+            print("[OCR] 检测到 OCR_ENGINE='mineru'，优先调用 MinerU 高保真多模态结构化提取...")
+            if hasattr(ocr_client, "call_mineru_structured_api"):
+                dfs = ocr_client.call_mineru_structured_api(pdf_path, config=config, page_ranges=pages, pages=pages)
+            else:
+                md_out = ocr_client.call_mineru_api(pdf_path, config=config, page_ranges=pages, pages=pages)
+                dfs = parse_structured_vlm_content(md_out) if md_out else []
+
+            if dfs:
+                for i, df in enumerate(dfs):
+                    if df is not None and not df.empty:
+                        df.attrs['extractor'] = 'mineru_api'
+                        p_idx = df.attrs.get('page_idx')
+                        if pages:
+                            if p_idx is None or p_idx not in pages:
+                                if p_idx is not None and isinstance(p_idx, int) and 0 <= p_idx < len(pages):
+                                    p_idx = pages[p_idx]
+                                else:
+                                    p_idx = pages[min(i, len(pages) - 1)]
+                        elif p_idx is None:
+                            p_idx = 0
+                        df.attrs['page_idx'] = p_idx
+                        results.append({
+                            'df': df,
+                            'page_idx': p_idx,
+                            'table_idx': i,
+                            'bbox': df.attrs.get('bbox'),
+                            'extractor': 'mineru_api',
+                        })
+                if results:
+                    print(f"[OCR] MinerU 结构化提取成功，获得 {len(results)} 个表格")
+                    return results
+        except Exception as e_mineru:
+            logger.warning(f"MinerU extraction error: {e_mineru}")
+
     # 1. PP-StructureV3 -> PaddleOCR-VL-1.6 两阶段融合管线
     try:
-        try:
-            from . import ocr_client
-        except ImportError:
-            import ocr_client
-        try:
-            from .table_postprocess import parse_structured_vlm_content
-        except ImportError:
-            from table_postprocess import parse_structured_vlm_content
-
         full_md = ocr_client.run_ppstructure_vlm_pipeline(pdf_path, pages=pages, cancel_event=None)
         if full_md:
             dfs = parse_structured_vlm_content(full_md)
@@ -1899,34 +1947,38 @@ def extract_via_ocr(pdf_path: str, pages: Optional[List[int]] = None) -> List[Di
                 import ocr_client
             registry = ocr_client.get_ocr_registry()
             for backend_name in ["teleocr", "mineru", "rapid_table"]:
-                b = registry.get_backend(backend_name)
-                if b and b.probe_health().get("status") == "healthy":
-                    res_out = b.extract(pdf_path, pages=pages)
-                    if isinstance(res_out, str) and res_out.strip():
-                        try:
-                            from .table_postprocess import parse_structured_vlm_content
-                        except ImportError:
-                            from table_postprocess import parse_structured_vlm_content
-                        dfs = parse_structured_vlm_content(res_out)
-                        for i, df in enumerate(dfs):
-                            if df is not None and not df.empty:
-                                df.attrs['extractor'] = backend_name
-                                p_idx = pages[i] if (pages and i < len(pages)) else (pages[0] if pages else 0)
-                                df.attrs['page_idx'] = p_idx
-                                results.append({
-                                    'df': df,
-                                    'page_idx': p_idx,
-                                    'table_idx': i,
-                                    'bbox': None,
-                                    'extractor': backend_name,
-                                })
-                        if results:
-                            print(f"[OCR] OCR-Hub 动态调度成功: {backend_name} 提取到 {len(results)} 个表格")
+                try:
+                    b = registry.get_backend(backend_name)
+                    if b and b.probe_health().get("status") in ("healthy", "agent_fallback"):
+                        res_out = b.extract(pdf_path, pages=pages)
+                        if isinstance(res_out, str) and res_out.strip():
+                            try:
+                                from .table_postprocess import parse_structured_vlm_content
+                            except ImportError:
+                                from table_postprocess import parse_structured_vlm_content
+                            dfs = parse_structured_vlm_content(res_out)
+                            for i, df in enumerate(dfs):
+                                if df is not None and not df.empty:
+                                    df.attrs['extractor'] = backend_name
+                                    p_idx = pages[i] if (pages and i < len(pages)) else (pages[0] if pages else 0)
+                                    df.attrs['page_idx'] = p_idx
+                                    results.append({
+                                        'df': df,
+                                        'page_idx': p_idx,
+                                        'table_idx': i,
+                                        'bbox': None,
+                                        'extractor': backend_name,
+                                    })
+                            if results:
+                                print(f"[OCR] OCR-Hub 动态调度成功: {backend_name} 提取到 {len(results)} 个表格")
+                                break
+                        elif isinstance(res_out, list) and res_out:
+                            results.extend(res_out)
+                            print(f"[OCR] OCR-Hub 动态调度成功: {backend_name} 提取到 {len(res_out)} 个表格")
                             break
-                    elif isinstance(res_out, list) and res_out:
-                        results.extend(res_out)
-                        print(f"[OCR] OCR-Hub 动态调度成功: {backend_name} 提取到 {len(res_out)} 个表格")
-                        break
+                except Exception as e_backend:
+                    logger.debug(f"[OCR-Hub] Backend {backend_name} 调度异常: {e_backend}")
+                    continue
         except Exception as e_hub:
             logger.debug(f"[OCR-Hub] 动态调度异常: {e_hub}")
 
@@ -2853,32 +2905,291 @@ def extract_via_paddleocr_crops(pdf_path: str, pages: Optional[List[int]] = None
     return results
 
 
+def _get_table_garbage_row_indices(df: Any) -> set:
+    """
+    识别表格中被明确污染的行索引（如论文元数据、投稿日期、跨页重复打印表头、续表注记或全空行）。
+    """
+    if df is None or not hasattr(df, 'empty') or df.empty or not hasattr(df, 'shape'):
+        return set()
+    garbage_indices = set()
+    article_metadata_kws = [
+        "基金项目", "作者简介", "中图分类号", "文献标识码", "收稿日期", "通信作者",
+        "引用格式", "received:", "accepted:", "revised:", "published:", "doi:",
+        "copyright", "all rights reserved", "http:", "https:"
+    ]
+    col_strs = [str(c).strip().lower() for c in df.columns if str(c).strip() and not str(c).startswith("Unnamed:")]
+
+    def _is_num(val):
+        try:
+            float(str(val).replace(",", "").strip())
+            return True
+        except ValueError:
+            return False
+
+    for r in range(df.shape[0]):
+        row_vals = [str(df.iat[r, c]).strip() for c in range(df.shape[1]) if str(df.iat[r, c]).strip() not in ("", "nan", "none")]
+        if not row_vals:
+            garbage_indices.add(r)
+            continue
+        row_str = " ".join(row_vals).lower()
+        # 1. 论文元数据/投稿信息/版权污染
+        if any(kw in row_str for kw in article_metadata_kws) or re.search(r'\b(?:received|accepted|revised|published)\b.*?\b\d{4}\b', row_str):
+            garbage_indices.add(r)
+            continue
+        # 2. 跨页/表格内部重复打印的表头行
+        if len(row_vals) >= 2 and col_strs:
+            num_numeric = sum(1 for v in row_vals if _is_num(v))
+            if num_numeric == 0:
+                matches = sum(1 for v in row_vals if v.lower() in col_strs or any(v.lower() == c or v.lower() in c.split() for c in col_strs))
+                if matches >= 2 and (matches / len(row_vals)) >= 0.5:
+                    garbage_indices.add(r)
+                    continue
+        # 3. 续表标记行
+        if len(row_vals) <= 2 and any(re.search(r'^(?:续表|接上表|\(contd|\(continued|continued table)', v.lower()) for v in row_vals):
+            garbage_indices.add(r)
+            continue
+    return garbage_indices
+
+
 def _should_replace_with_ocr(nat_item, ocr_item) -> bool:
     """
-    质量比对门禁：严格比较原生表格与 OCR 表格质量，防止空表、行数截断或劣质 OCR 破坏优质原生表。
+    质量比对门禁：严格比较原生表格与 OCR 表格质量，防止空表、行数截断、丢列或劣质 OCR 破坏优质原生表。
+    原生表格非退化（非空/非单单元格）且无污染时，绝不允许少行少列的 OCR 版本替换原生表；
+    若原生表存在污染、表头重复、论文元数据混入或被判定为低质，应比较有效数据的保留情况，允许高质量 OCR 修复。
     """
     df_n = nat_item.get('df') if isinstance(nat_item, dict) else nat_item
     df_o = ocr_item.get('df') if isinstance(ocr_item, dict) else ocr_item
     if df_o is None or df_o.empty:
         return False
+
+    # 若原生表格退化为无意义残表（空表、单单元格），允许合格 OCR 替换
+    is_n_degenerate = (
+        df_n is None or
+        df_n.empty or
+        df_n.size <= 1 or
+        (df_n.shape[0] <= 1 and df_n.shape[1] <= 1)
+    )
+    if is_n_degenerate:
+        return not is_table_low_quality(df_o)
+
     if is_table_low_quality(df_o) and not is_table_low_quality(df_n):
         return False
-    if is_table_low_quality(df_n) and not is_table_low_quality(df_o):
+
+    # 识别原生表格中是否存在明确的污染、表头重复、元数据混入或低质量判定
+    is_n_low_quality = is_table_low_quality(df_n)
+    if isinstance(nat_item, dict):
+        if nat_item.get('low_quality') or nat_item.get('is_contaminated') or (nat_item.get('confidence', 1.0) < 0.6):
+            is_n_low_quality = True
+
+    garbage_row_indices = _get_table_garbage_row_indices(df_n)
+    is_n_contaminated = len(garbage_row_indices) > 0
+
+    clean_n = df_n.iloc[[i for i in range(df_n.shape[0]) if i not in garbage_row_indices]] if garbage_row_indices else df_n
+    if len(clean_n) == 0:
+        return not is_table_low_quality(df_o)
+
+    # 若原生表为单列破碎表 (clean_n.shape[1] == 1)，而 OCR 提取出结构完整的有效多列表格 (>= 2 列)，允许 OCR 修复替换
+    if clean_n.shape[1] == 1 and df_o.shape[1] >= 2 and not is_table_low_quality(df_o):
         return True
-    # 行数截断保护：如果 OCR 行数严重少于原生且原生并非低质，保留原生
-    if df_n is not None and df_o.shape[0] < df_n.shape[0] * 0.7 and df_n.shape[0] >= 3:
+
+    n_clean_valid_cells = sum(1 for v in clean_n.values.flatten() if v is not None and str(v).strip() not in ('', 'nan', 'none'))
+    o_valid_cells = sum(1 for v in df_o.values.flatten() if v is not None and str(v).strip() not in ('', 'nan', 'none'))
+
+    clean_n_cols = len([c for c in clean_n.columns if str(c).strip() and not str(c).startswith("Unnamed:")])
+    ocr_cols = len([c for c in df_o.columns if str(c).strip() and not str(c).startswith("Unnamed:")])
+
+    clean_n_is_low_quality = is_table_low_quality(clean_n)
+
+    # 核对有效记录（行样本）的实际保留情况：
+    # 提取 clean_n 各行样本标识及字段对应关系，核对 df_o 是否实际保留了该样本记录，杜绝全表单元格集合比对掩盖样本丢失
+    def _find_sample_id_col(df):
+        if df is None or df.empty:
+            return None
+        cols = list(df.columns)
+        id_patterns = [
+            r'(?:^|[\s_\-])(?:sample|id|identifier|name|specimen|station|site|case|patient|gene|no\.?|item|code|label|compound|material)(?:$|[\s_\-])',
+            r'^(?:样本|编号|名称|样品|站位|点位|实验号|序号)$',
+        ]
+        for c_idx, c in enumerate(cols):
+            c_str = str(c).strip().lower()
+            if any(re.search(pat, c_str, re.IGNORECASE) for pat in id_patterns):
+                col_vals = [str(v).strip().lower() for v in df.iloc[:, c_idx] if pd.notna(v) and str(v).strip().lower() not in ('', 'nan', 'none', '-', '—')]
+                if len(col_vals) > 0 and len(set(col_vals)) >= min(2, len(col_vals)):
+                    return c_idx
+
+        # If column 0 has mostly unique text tokens across rows:
+        col_vals = [str(v).strip().lower() for v in df.iloc[:, 0] if pd.notna(v) and str(v).strip().lower() not in ('', 'nan', 'none', '-', '—')]
+        if len(col_vals) >= 2 and len(set(col_vals)) / max(1, len(col_vals)) >= 0.4:
+            return 0
+        return None
+
+    id_col_n = _find_sample_id_col(clean_n)
+    id_col_o = _find_sample_id_col(df_o)
+
+    has_missing_distinct_samples = False
+    clean_rows_matched = 0
+
+    if id_col_n is not None:
+        n_id_vals = [
+            str(clean_n.iat[r, id_col_n]).strip().lower()
+            for r in range(clean_n.shape[0])
+            if pd.notna(clean_n.iat[r, id_col_n]) and str(clean_n.iat[r, id_col_n]).strip().lower() not in ('', 'nan', 'none', '-', '—')
+        ]
+        distinct_n_ids = set(n_id_vals)
+
+        best_o_col = id_col_o
+        if distinct_n_ids:
+            if best_o_col is None:
+                best_overlap = 0
+                for c_idx in range(df_o.shape[1]):
+                    c_vals = set(
+                        str(df_o.iat[r, c_idx]).strip().lower()
+                        for r in range(df_o.shape[0])
+                        if pd.notna(df_o.iat[r, c_idx]) and str(df_o.iat[r, c_idx]).strip().lower() not in ('', 'nan', 'none', '-', '—')
+                    )
+                    ol = len(distinct_n_ids & c_vals)
+                    if ol > best_overlap:
+                        best_overlap = ol
+                        best_o_col = c_idx
+
+            if best_o_col is not None:
+                o_id_vals_set = set(
+                    str(df_o.iat[r, best_o_col]).strip().lower()
+                    for r in range(df_o.shape[0])
+                    if pd.notna(df_o.iat[r, best_o_col]) and str(df_o.iat[r, best_o_col]).strip().lower() not in ('', 'nan', 'none', '-', '—')
+                )
+            else:
+                o_id_vals_set = set(
+                    str(v).strip().lower() for v in df_o.values.flatten()
+                    if pd.notna(v) and str(v).strip().lower() not in ('', 'nan', 'none', '-', '—')
+                )
+
+            missing_ids = distinct_n_ids - o_id_vals_set
+            if missing_ids:
+                has_missing_distinct_samples = True
+
+            matched_o_rows = set()
+            for r_i in range(clean_n.shape[0]):
+                raw_id = clean_n.iat[r_i, id_col_n]
+                s_id = str(raw_id).strip().lower() if pd.notna(raw_id) else ''
+                n_row_vals = set(
+                    str(clean_n.iat[r_i, c]).strip().lower()
+                    for c in range(clean_n.shape[1])
+                    if c != id_col_n and pd.notna(clean_n.iat[r_i, c]) and str(clean_n.iat[r_i, c]).strip().lower() not in ('', 'nan', 'none', '-', '—')
+                )
+
+                matched = False
+                if s_id and s_id not in ('', 'nan', 'none', '-', '—'):
+                    for r_j in range(df_o.shape[0]):
+                        if r_j in matched_o_rows:
+                            continue
+                        o_row_id = (
+                            str(df_o.iat[r_j, best_o_col]).strip().lower()
+                            if (best_o_col is not None and pd.notna(df_o.iat[r_j, best_o_col]))
+                            else ''
+                        )
+                        if o_row_id == s_id or (best_o_col is None and s_id in set(str(v).strip().lower() for v in df_o.iloc[r_j] if pd.notna(v))):
+                            o_row_vals = set(
+                                str(df_o.iat[r_j, c]).strip().lower()
+                                for c in range(df_o.shape[1])
+                                if (best_o_col is None or c != best_o_col) and pd.notna(df_o.iat[r_j, c]) and str(df_o.iat[r_j, c]).strip().lower() not in ('', 'nan', 'none', '-', '—')
+                            )
+                            if not n_row_vals or not o_row_vals or len(n_row_vals & o_row_vals) > 0:
+                                matched_o_rows.add(r_j)
+                                matched = True
+                                break
+                else:
+                    for r_j in range(df_o.shape[0]):
+                        if r_j in matched_o_rows:
+                            continue
+                        o_row_vals = set(
+                            str(df_o.iat[r_j, c]).strip().lower()
+                            for c in range(df_o.shape[1])
+                            if pd.notna(df_o.iat[r_j, c]) and str(df_o.iat[r_j, c]).strip().lower() not in ('', 'nan', 'none', '-', '—')
+                        )
+                        if n_row_vals and o_row_vals:
+                            overlap = len(n_row_vals & o_row_vals) / max(1, len(n_row_vals))
+                            if overlap >= 0.7:
+                                matched_o_rows.add(r_j)
+                                matched = True
+                                break
+                        elif not n_row_vals:
+                            matched_o_rows.add(r_j)
+                            matched = True
+                            break
+                if matched:
+                    clean_rows_matched += 1
+    else:
+        matched_o_rows = set()
+        for r_i in range(clean_n.shape[0]):
+            n_row_vals = set(
+                str(clean_n.iat[r_i, c]).strip().lower()
+                for c in range(clean_n.shape[1])
+                if pd.notna(clean_n.iat[r_i, c]) and str(clean_n.iat[r_i, c]).strip().lower() not in ('', 'nan', 'none', '-', '—')
+            )
+            if not n_row_vals:
+                clean_rows_matched += 1
+                continue
+            matched = False
+            for r_j in range(df_o.shape[0]):
+                if r_j in matched_o_rows:
+                    continue
+                o_row_vals = set(
+                    str(df_o.iat[r_j, c]).strip().lower()
+                    for c in range(df_o.shape[1])
+                    if pd.notna(df_o.iat[r_j, c]) and str(df_o.iat[r_j, c]).strip().lower() not in ('', 'nan', 'none', '-', '—')
+                )
+                if o_row_vals:
+                    overlap = len(n_row_vals & o_row_vals) / max(1, len(n_row_vals))
+                    if overlap >= 0.7:
+                        matched_o_rows.add(r_j)
+                        matched = True
+                        break
+            if matched:
+                clean_rows_matched += 1
+
+    record_retention_ratio = clean_rows_matched / max(1, clean_n.shape[0])
+
+    # 严格门禁：无论原生表是否受污染，都绝不允许 OCR 丢失独立样本或通过重复假造行记录！
+    if has_missing_distinct_samples:
         return False
-    # 列结构保护：如果 OCR 列数严重萎缩（列切分丢失合并），保留原生
-    if df_n is not None and df_n.shape[1] >= 3 and df_o.shape[1] < df_n.shape[1] * 0.6:
+    min_retention = 0.90 if clean_n_is_low_quality else 0.95
+    if record_retention_ratio < min_retention:
         return False
+
+    # 若原生表格存在缺陷/污染/低质：只要 OCR 本身合格且通过样本核查，允许剔除垃圾行替换
+    if is_n_low_quality or is_n_contaminated:
+        if not clean_n_is_low_quality:
+            if (df_o.shape[0] >= len(clean_n) and ocr_cols >= clean_n_cols and
+                o_valid_cells >= (0.85 * n_clean_valid_cells)):
+                return True
+            return False
+        else:
+            if o_valid_cells >= (0.75 * n_clean_valid_cells):
+                if df_o.shape[0] >= int(0.9 * len(clean_n)) or ocr_cols >= clean_n_cols:
+                    return True
+            return False
+
+    # 原生表格为清洁高质表格：严格保护其已有行列结构与数据量
+    if df_o.shape[0] < df_n.shape[0]:
+        return False
+    if df_o.shape[1] < df_n.shape[1]:
+        return False
+    if o_valid_cells < n_clean_valid_cells and not clean_n_is_low_quality:
+        return False
+
     # 填充率对比：如果 OCR 极度稀疏而原生填充良好，保留原生
-    n_cells = df_n.size if df_n is not None else 0
+    n_cells = df_n.size
     o_cells = df_o.size
-    n_fill = sum(1 for v in df_n.values.flatten() if v is not None and str(v).strip()) / max(1, n_cells) if df_n is not None else 0
-    o_fill = sum(1 for v in df_o.values.flatten() if v is not None and str(v).strip()) / max(1, o_cells)
-    if df_n is not None and o_fill < 0.20 and n_fill >= 0.50:
+    n_fill = n_clean_valid_cells / max(1, n_cells)
+    o_fill = o_valid_cells / max(1, o_cells)
+    if o_fill < 0.20 and n_fill >= 0.50:
         return False
+
     return True
+
+
+_merge_or_replace_with_ocr = _should_replace_with_ocr
 
 
 def reconcile_native_and_ocr_tables(
@@ -3356,7 +3667,7 @@ def _do_extract_tables_from_pdf(
     logs.append(f"  pdf_type={inspector_result['pdf_type']}, "
                 f"confidence={inspector_result['confidence']:.2f}, "
                 f"pages_with_tables={inspector_result['pages_with_tables']}")
-    if inspector_result['error']:
+    if inspector_result.get('error'):
         logs.append(f"  pdf-inspector 错误: {inspector_result['error']}")
 
     pdf_type = inspector_result['pdf_type']
@@ -3626,61 +3937,295 @@ def _do_extract_tables_from_pdf(
         all_results.extend(ocr_results)
         logs.append(f"  OCR 提取到 {len(ocr_results)} 个表格")
     else:
-        # ── native PDF → 多方投票 + 低相似度页面回退 PaddleOCR-VL ──
-        logs.append("→ Step 2: native PDF，启动多方投票 (pdf-inspector + PyMuPDF4LLM + GMFT + Camelot/img2table + pdfplumber + find_tables)")
-
+        # ── native PDF → 主抽取架构 (Tagged PDF 结构树 -> MinerU 结构化 -> 本地数值门禁 -> 定向修复) + 备用多方投票 ──
         native_target_pages = [p for p in target_pages if p not in pure_image_pages] if target_pages is not None else None
 
-        # 优先提取 Tagged PDF / PDF/UA 语义结构树表格 (最高保真度)
-        structure_results = extract_via_structure_tree(pdf_path, pages=native_target_pages)
-        if structure_results:
-            logs.append(f"  Tagged PDF 结构树提取到 {len(structure_results)} 个语义表格 (pdf_inspector_structure)")
-
-        ft_results = extract_via_find_tables(pdf_path, pages=native_target_pages)
-        plumber_results = extract_via_pdfplumber(pdf_path, pages=native_target_pages)
-        camelot_results = extract_via_camelot(pdf_path, pages=native_target_pages)
-        img2table_results = extract_via_img2table(pdf_path, pages=native_target_pages)
-        gmft_results = extract_via_gmft(pdf_path, pages=native_target_pages)
-        pymupdf4llm_results = extract_via_pymupdf4llm(pdf_path, pages=native_target_pages)
-        if pymupdf4llm_results:
-            logs.append(f"  PyMuPDF4LLM 提取到 {len(pymupdf4llm_results)} 个表格 (LLM-ready Markdown)")
-        rapid_table_results = extract_via_rapid_table(pdf_path, pages=native_target_pages) if is_rapid_table_available() else []
-        if rapid_table_results:
-            logs.append(f"  RapidTable 提取到 {len(rapid_table_results)} 个表格 (ONNX 结构识别)")
-        align_results = extract_via_text_alignment(pdf_path, pages=native_target_pages)
-
-        # 多方投票融合
-        logs.append("→ Step 3: 多方投票融合")
-        fused, vote_logs, vote_summary = three_way_vote(
-            inspector_tables, ft_results, plumber_results, camelot_results,
-            align_tables=align_results,
-            structure_tables=structure_results,
-            gmft_tables=gmft_results,
-            img2table_tables=img2table_results,
-            pymupdf4llm_tables=pymupdf4llm_results,
-            rapid_table_tables=rapid_table_results,
-        )
-
-        logs.extend(vote_logs)
-
-        if fused:
-            all_results.extend(fused)
-            extractors = set(r['df'].attrs.get('vote_extractor', r['df'].attrs.get('extractor', '?')) for r in fused)
-            logs.append(f"  投票完成: {len(fused)} 个表格 (extractors: {extractors})")
-        else:
-            logs.append("  多方投票未获得表格")
-
-        # Step 3b: 多方投票综合检验模块（坏损表、表头错位、表序缺失、续表中断、单页多表漏抓检验）
+        # 检查是否配置强制启用 legacy 多方投票
         try:
-            from .table_validator import validate_native_extraction_pipeline
+            from common import load_config
+            _cfg = load_config()
+        except Exception:
+            _cfg = {}
+        use_legacy_voting = os.getenv("USE_LEGACY_VOTING", "").lower() in ("1", "true") or _cfg.get("USE_LEGACY_VOTING", False)
+
+        try:
+            from . import table_validator
         except ImportError:
-            from table_validator import validate_native_extraction_pipeline
-        original_native_results = list(all_results)
-        valid_fused, pages_requiring_ocr, val_logs = validate_native_extraction_pipeline(
-            all_results, pdf_path, target_pages, vote_summary
-        )
-        logs.extend(val_logs)
-        all_results = valid_fused
+            import table_validator
+        try:
+            from . import ocr_client
+        except ImportError:
+            import ocr_client
+
+        primary_succeeded = False
+        pages_requiring_ocr = set()
+        original_native_results = []
+        valid_fused = []
+
+        if not use_legacy_voting:
+            logs.append("→ Step 2: native PDF，启动主抽取管线 (Tagged PDF 结构树 -> MinerU 结构化主抽取 -> 本地数值门禁)")
+
+            # 1. Tagged PDF / PDF/UA 语义结构树快速通道 (Fast-path: 最高保真度)
+            structure_results = extract_via_structure_tree(pdf_path, pages=native_target_pages)
+            if structure_results:
+                logs.append(f"  Tagged PDF 结构树快速通道提取到 {len(structure_results)} 个语义表格")
+                valid_struct_tables = []
+                for s_item in structure_results:
+                    s_df = s_item.get('df')
+                    p_i = s_item.get('page_idx', s_df.attrs.get('page_idx', 0) if hasattr(s_df, 'attrs') else 0)
+                    b_box = s_item.get('bbox', s_df.attrs.get('bbox') if hasattr(s_df, 'attrs') else None)
+                    v_ok, v_info = table_validator.verify_table_numeric_integrity(
+                        df=s_df, pdf_path=pdf_path, page_idx=p_i, bbox=b_box, min_match_ratio=0.7
+                    )
+                    if v_ok:
+                        valid_struct_tables.append(s_item)
+                struct_covered_pages = set(t.get('page_idx') for t in valid_struct_tables)
+                is_struct_complete = False
+                struct_report = None
+                if valid_struct_tables:
+                    try:
+                        struct_report = table_validator.cross_check_missed_tables([t['df'] for t in valid_struct_tables], pdf_path)
+                    except Exception:
+                        struct_report = None
+
+                    has_no_missed = bool(
+                        struct_report and
+                        len(struct_report.get('missed_tables', [])) == 0 and
+                        not struct_report.get("coverage_unknown", False) and
+                        struct_report.get("is_complete", False)
+                    )
+                    # 结构树快速通道必须确认无明确缺表声明，且覆盖该页所有前置探测到的候选表格
+                    cand_counts_covered = True
+                    for p in (native_target_pages or []):
+                        p_struct_cnt = len([t for t in valid_struct_tables if t.get('page_idx') == p])
+                        p_cand_cnt = len([t for t in inspector_tables if t.get('page_idx') == p])
+                        if p_struct_cnt < p_cand_cnt:
+                            cand_counts_covered = False
+                            break
+
+                    pages_covered = bool(native_target_pages and set(native_target_pages).issubset(struct_covered_pages))
+
+                    if has_no_missed and cand_counts_covered and pages_covered:
+                        is_struct_complete = True
+                if is_struct_complete:
+                    logs.append("  Tagged PDF 结构树快速通道全覆盖并全部通过数值门禁，直接采纳！")
+                    all_results = valid_struct_tables
+                    original_native_results = list(all_results)
+                    valid_fused = list(all_results)
+                    primary_succeeded = True
+
+            # 2. 若快速通道未完全覆盖，启动 MinerU 结构化主抽取 (with page_ranges)
+            if not primary_succeeded and ocr_client:
+                pdf_p = Path(pdf_path)
+                cache_zip = pdf_p.parent / "mineru_cache" / f"{pdf_p.stem}.zip"
+                mineru_dfs = []
+                if cache_zip.exists():
+                    logs.append(f"  发现本地 MinerU 结构化缓存包: {cache_zip.name}")
+                    try:
+                        mineru_dfs = ocr_client.extract_mineru_structured_archive(str(cache_zip))
+                    except Exception as e_c:
+                        logs.append(f"  读取 MinerU 缓存异常: {e_c}")
+                        mineru_dfs = []
+                    if not mineru_dfs:
+                        logs.append(f"  [Warning] 本地 MinerU 缓存包损坏或为空 ({cache_zip.name})，自动清理失效缓存并回退至主抽取接口...")
+                        try:
+                            cache_zip.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                if not mineru_dfs and ocr_client.is_mineru_available(file_path=pdf_path):
+                    page_desc = [p + 1 for p in native_target_pages] if native_target_pages else "all"
+                    logs.append(f"  调用 MinerU 官方高保真结构化主抽取 (页码: {page_desc})")
+                    try:
+                        mineru_dfs = ocr_client.call_mineru_structured_api(pdf_path, page_ranges=native_target_pages)
+                    except Exception as e_mineru:
+                        logs.append(f"  MinerU 结构化主抽取异常: {e_mineru}")
+                        mineru_dfs = []
+
+                if mineru_dfs:
+                    logs.append(f"  MinerU 结构化主抽取解析出 {len(mineru_dfs)} 个表格，启动本地数值一致性门禁核验...")
+                    accepted_mineru = []
+                    unverified_mineru = []
+                    for i_m, m_df in enumerate(mineru_dfs):
+                        p_idx = m_df.attrs.get('page_idx', native_target_pages[i_m] if (native_target_pages and i_m < len(native_target_pages)) else (native_target_pages[0] if native_target_pages else 0))
+                        bbox = m_df.attrs.get('bbox')
+                        is_valid, info = table_validator.verify_table_numeric_integrity(
+                            df=m_df, pdf_path=pdf_path, page_idx=p_idx, bbox=bbox, min_match_ratio=0.7
+                        )
+                        converted_bbox = info.get("converted_bbox") or bbox
+                        if hasattr(m_df, 'attrs'):
+                            m_df.attrs['bbox'] = converted_bbox
+                            m_df.attrs['bbox_format'] = 'points'
+                        logs.append(
+                            f"  Table #{i_m+1} (Page {p_idx+1}): gate_valid={is_valid}, match_ratio={info.get('match_ratio', 0):.2f}, font_corrupted={info.get('font_corrupted')}"
+                        )
+                        if is_valid:
+                            accepted_mineru.append({
+                                'df': m_df,
+                                'page_idx': p_idx,
+                                'table_idx': i_m,
+                                'bbox': converted_bbox,
+                                'extractor': 'mineru_api',
+                            })
+                        else:
+                            pages_requiring_ocr.add(p_idx)
+                            if info.get('status') == 'unverified':
+                                logs.append(f"  Table #{i_m+1} (Page {p_idx+1}) 位于扫描区域或无文本层 (unverified)，保留候选待视觉复核")
+                                unverified_mineru.append({
+                                    'df': m_df,
+                                    'page_idx': p_idx,
+                                    'table_idx': i_m,
+                                    'bbox': converted_bbox,
+                                    'extractor': 'mineru_api',
+                                    'unverified': True,
+                                })
+
+                    # 交叉核对全文声明漏表与扫描页覆盖未知
+                    try:
+                        report = table_validator.cross_check_missed_tables([t['df'] for t in accepted_mineru], pdf_path)
+                        if not report.get("is_complete", True) or report.get("coverage_unknown", False):
+                            for missed in report.get("missed_tables", []):
+                                p_m = missed.get("page_idx")
+                                if p_m is not None:
+                                    pages_requiring_ocr.add(p_m)
+                                    logs.append(f"  交叉核验发现未覆盖声明表 {missed.get('label')} (Page {p_m+1})")
+                            for p_scan in report.get("uncovered_scanned_pages", []):
+                                pages_requiring_ocr.add(p_scan)
+                                logs.append(f"  扫描页 {p_scan+1} 覆盖未知，加入定向修复")
+                    except Exception as e_cc:
+                        logger.debug(f"Cross check error: {e_cc}")
+
+                    covered_m_pages = set(t['page_idx'] for t in accepted_mineru)
+                    for p_req in (native_target_pages or []):
+                        if p_req not in covered_m_pages:
+                            pages_requiring_ocr.add(p_req)
+
+                    # 保留并核对前置探测发现的独立表格候选区域 (bounding boxes)
+                    for cand in inspector_tables:
+                        c_p = cand.get('page_idx')
+                        if c_p is None and cand.get('df') is not None and hasattr(cand['df'], 'attrs'):
+                            c_p = cand['df'].attrs.get('page_idx')
+                        if c_p is None:
+                            continue
+                        c_box = cand.get('bbox') or (cand['df'].attrs.get('bbox') if cand.get('df') is not None and hasattr(cand.get('df'), 'attrs') else None)
+                        c_lbl = cand.get('label') or (cand['df'].attrs.get('label') if cand.get('df') is not None and hasattr(cand.get('df'), 'attrs') else None)
+                        c_fmt = format_table_label(c_lbl) if c_lbl else None
+
+                        is_covered = False
+                        for m_item in accepted_mineru:
+                            if m_item.get('page_idx') != c_p:
+                                continue
+                            m_df = m_item.get('df')
+                            m_box = m_item.get('bbox') or (m_df.attrs.get('bbox') if m_df is not None and hasattr(m_df, 'attrs') else None)
+                            m_lbl = m_df.attrs.get('label') if m_df is not None and hasattr(m_df, 'attrs') else None
+                            m_fmt = format_table_label(m_lbl) if m_lbl else None
+
+                            if c_fmt and m_fmt and c_fmt == m_fmt:
+                                is_covered = True
+                                break
+                            if c_box and m_box:
+                                iou, iom = _compute_bbox_iou(c_box, m_box)
+                                if iou >= 0.20 or iom >= 0.35:
+                                    is_covered = True
+                                    break
+                        if not is_covered:
+                            pages_requiring_ocr.add(c_p)
+                            logs.append(f"  前置候选表格区域在 Page {c_p+1} 未被 MinerU 覆盖 (bbox={c_box})，触发补漏救助")
+                            # 若前置候选表格具备有效数据并通过数值校验，予以保留备份
+                            cand_df = cand.get('df')
+                            if cand_df is not None and not cand_df.empty:
+                                c_ok, _ = table_validator.verify_table_numeric_integrity(
+                                    cand_df, pdf_path, c_p, c_box, min_match_ratio=0.7
+                                )
+                                if c_ok:
+                                    cand_copy = dict(cand)
+                                    cand_copy['page_idx'] = c_p
+                                    cand_copy['bbox'] = c_box
+                                    cand_copy['extractor'] = cand_df.attrs.get('extractor', 'pdf_inspector')
+                                    if hasattr(cand_df, 'attrs'):
+                                        cand_df.attrs['page_idx'] = c_p
+                                        cand_df.attrs['bbox'] = c_box
+                                        if not cand_df.attrs.get('extractor'):
+                                            cand_df.attrs['extractor'] = 'pdf_inspector'
+                                    accepted_mineru.append(cand_copy)
+
+                    if accepted_mineru:
+                        all_results = list(accepted_mineru)
+                        for u_item in unverified_mineru:
+                            if not any(id(a.get('df')) == id(u_item.get('df')) for a in all_results):
+                                all_results.append(u_item)
+                        original_native_results = list(all_results)
+                        valid_fused = list(all_results)
+                        primary_succeeded = True
+                    else:
+                        if unverified_mineru:
+                            all_results = list(unverified_mineru)
+                            original_native_results = list(unverified_mineru)
+                            valid_fused = list(unverified_mineru)
+                            logs.append("  MinerU 提取的表格均位于无文本层/扫描区域 (unverified)，保留候选并触发视觉验证，平滑降级进入原生多方投票备用管线")
+                        else:
+                            logs.append("  MinerU 提取的所有表格均未通过数值门禁，平滑降级进入原生多方投票备用管线")
+
+        # 3. 若未启用主抽取或主抽取未产出有效表格，平滑降级进入原生多方投票备用管线 (Legacy Fallback)
+        if not primary_succeeded:
+            logs.append("→ Step 2: 进入原生多方投票备用管线 (pdf-inspector + PyMuPDF4LLM + GMFT + Camelot/img2table + pdfplumber + find_tables)")
+            structure_results = extract_via_structure_tree(pdf_path, pages=native_target_pages)
+            if structure_results:
+                logs.append(f"  Tagged PDF 结构树提取到 {len(structure_results)} 个语义表格 (pdf_inspector_structure)")
+
+            ft_results = extract_via_find_tables(pdf_path, pages=native_target_pages)
+            plumber_results = extract_via_pdfplumber(pdf_path, pages=native_target_pages)
+            camelot_results = extract_via_camelot(pdf_path, pages=native_target_pages)
+            img2table_results = extract_via_img2table(pdf_path, pages=native_target_pages)
+            gmft_results = extract_via_gmft(pdf_path, pages=native_target_pages)
+            pymupdf4llm_results = extract_via_pymupdf4llm(pdf_path, pages=native_target_pages)
+            if pymupdf4llm_results:
+                logs.append(f"  PyMuPDF4LLM 提取到 {len(pymupdf4llm_results)} 个表格 (LLM-ready Markdown)")
+            rapid_table_results = extract_via_rapid_table(pdf_path, pages=native_target_pages) if is_rapid_table_available() else []
+            if rapid_table_results:
+                logs.append(f"  RapidTable 提取到 {len(rapid_table_results)} 个表格 (ONNX 结构识别)")
+            align_results = extract_via_text_alignment(pdf_path, pages=native_target_pages)
+
+            # 多方投票融合
+            logs.append("→ Step 3: 多方投票融合")
+            fused, vote_logs, vote_summary = three_way_vote(
+                inspector_tables, ft_results, plumber_results, camelot_results,
+                align_tables=align_results,
+                structure_tables=structure_results,
+                gmft_tables=gmft_results,
+                img2table_tables=img2table_results,
+                pymupdf4llm_tables=pymupdf4llm_results,
+                rapid_table_tables=rapid_table_results,
+            )
+            logs.extend(vote_logs)
+
+            if fused:
+                for f_item in fused:
+                    if not any(id(a.get('df')) == id(f_item.get('df')) for a in all_results):
+                        all_results.append(f_item)
+                extractors = set(r['df'].attrs.get('vote_extractor', r['df'].attrs.get('extractor', '?')) for r in all_results)
+                logs.append(f"  投票完成: {len(all_results)} 个表格 (extractors: {extractors})")
+            else:
+                logs.append("  多方投票未获得表格")
+
+            # Step 3b: 多方投票综合检验模块（坏损表、表头错位、表序缺失、续表中断、单页多表漏抓检验）
+            try:
+                from .table_validator import validate_native_extraction_pipeline
+            except ImportError:
+                from table_validator import validate_native_extraction_pipeline
+            original_native_results = list(all_results)
+            if 'unverified_mineru' in locals() and unverified_mineru:
+                for u_item in unverified_mineru:
+                    if not any(id(r.get('df')) == id(u_item.get('df')) for r in original_native_results):
+                        original_native_results.append(u_item)
+                    if not any(id(r.get('df')) == id(u_item.get('df')) for r in all_results):
+                        all_results.append(u_item)
+                    pages_requiring_ocr.add(u_item.get('page_idx'))
+            valid_fused, pages_req, val_logs = validate_native_extraction_pipeline(
+                all_results, pdf_path, target_pages, vote_summary
+            )
+            logs.extend(val_logs)
+            all_results = valid_fused
+            pages_requiring_ocr.update(pages_req)
 
         # 若检验发现任何问题、缺陷或低置信度页面，优先通过 DocLayout-YOLO 目标切图送入 PaddleOCR-VL 独立接管提取
         if pages_requiring_ocr and use_ocr_fallback:
@@ -3692,7 +4237,8 @@ def _do_extract_tables_from_pdf(
 
             def _get_page_needed_count(p):
                 decls = [d for d in page_decls.get(p, []) if not d.get('is_continuation')]
-                exp_count = max(1, len(decls))
+                cand_count = len([t for t in inspector_tables if t.get('page_idx') == p])
+                exp_count = max(len(decls), cand_count, 1)
                 valid_native = len([r for r in valid_fused if r.get('page_idx') == p and not is_table_low_quality(r.get('df'))])
                 return max(1, exp_count - valid_native)
 
@@ -3755,7 +4301,12 @@ def _do_extract_tables_from_pdf(
         # Step 3c: 仍未覆盖且未在 OCR 中成功产出表格的页面 → text_alignment
         extracted_pages = set(r.get('page_idx', -1) for r in all_results if r.get('page_idx') is not None and not is_table_low_quality(r.get('df')))
         ocr_successfully_resolved_pages = set(r.get('page_idx') for r in ocr_results if r.get('page_idx') is not None and not is_table_low_quality(r.get('df'))) if 'ocr_results' in locals() and ocr_results else set()
-        still_missing = sorted(p for p in target_pages if (p not in extracted_pages or len([r for r in all_results if r.get('page_idx') == p and not is_table_low_quality(r.get('df'))]) < len([d for d in page_decls.get(p, []) if not d.get('is_continuation')])) and p not in ocr_successfully_resolved_pages)
+        def _get_page_expected_count(p):
+            decls_cnt = len([d for d in page_decls.get(p, []) if not d.get('is_continuation')])
+            cands_cnt = len([t for t in inspector_tables if t.get('page_idx') == p])
+            return max(decls_cnt, cands_cnt, 1)
+
+        still_missing = sorted(p for p in target_pages if (p not in extracted_pages or len([r for r in all_results if r.get('page_idx') == p and not is_table_low_quality(r.get('df'))]) < _get_page_expected_count(p)) and p not in ocr_successfully_resolved_pages)
         if still_missing:
             logs.append(f"→ Step 3c: 对仍未覆盖/表数不足的 {[p+1 for p in still_missing]} 页尝试文本对齐提取")
             text_align_results = extract_via_text_alignment(pdf_path, pages=still_missing)
@@ -3805,13 +4356,15 @@ def _do_extract_tables_from_pdf(
             logs.append(f"  跨页合并跳过: {e}")
 
     total_declared_count = sum(1 for decls in page_decls.values() for d in decls if not d.get('is_continuation'))
-    if all_results and (total_declared_count == 0 or len(all_results) >= total_declared_count or not use_ocr_fallback):
+    total_cand_count = len(inspector_tables)
+    total_expected_tables = max(total_declared_count, total_cand_count)
+    if all_results and (total_expected_tables == 0 or len(all_results) >= total_expected_tables or not use_ocr_fallback):
         extractors = set(r['df'].attrs.get('extractor', '?') for r in all_results)
         logs.append(f"  最终: {len(all_results)} 个表格 (extractors: {extractors})")
         return all_results, logs
 
     # Step 5: 全局 OCR 兜底 (结构化提取未获得有效表格，或已提取表数少于声明表数)
-    logs.append(f"→ Step 5: 结构化提取表数 ({len(all_results)}) 少于声明表数 ({total_declared_count}) 或为空，回退到全局 OCR")
+    logs.append(f"→ Step 5: 结构化提取表数 ({len(all_results)}) 少于声明表数 ({total_expected_tables}) 或为空，回退到全局 OCR")
     if use_ocr_fallback:
         ocr_results = extract_via_ocr(pdf_path)
         if ocr_results:

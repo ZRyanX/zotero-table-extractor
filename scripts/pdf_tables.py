@@ -627,9 +627,26 @@ def inspect_crop_region(pdf_path: str, page_index: int, crop_bbox: List[float], 
         import pdf_inspector
         if hasattr(pdf_inspector, 'extract_text_in_regions'):
             region_texts = pdf_inspector.extract_text_in_regions(pdf_path, [(page_index, [[x1, y1, x2, y2]])])
-            if region_texts and region_texts[0].regions:
-                reg = region_texts[0].regions[0]
-                text = (reg.text or "").strip()
+            reg = region_texts[0].regions[0] if (region_texts and region_texts[0].regions) else None
+            text = (reg.text or "").strip() if reg else ""
+            if not text:
+                try:
+                    with fitz.open(pdf_path) as doc:
+                        if 0 <= page_index < len(doc):
+                            p = doc[page_index]
+                            cb_x0, cb_y0 = p.cropbox.x0, p.cropbox.y0
+                            if cb_x0 != 0 or cb_y0 != 0:
+                                rx1, ry1, rx2, ry2 = x1 - cb_x0, y1 - cb_y0, x2 - cb_x0, y2 - cb_y0
+                                region_texts_cb = pdf_inspector.extract_text_in_regions(pdf_path, [(page_index, [[rx1, ry1, rx2, ry2]])])
+                                if region_texts_cb and region_texts_cb[0].regions:
+                                    reg_cb = region_texts_cb[0].regions[0]
+                                    text_cb = (reg_cb.text or "").strip()
+                                    if text_cb:
+                                        reg = reg_cb
+                                        text = text_cb
+                except Exception:
+                    pass
+            if reg is not None and text:
                 res['text'] = text
                 # 判定条件：显式 needs_ocr 标记，或仅包含图片标记 [Image: ...]，或文本极度匮乏
                 is_image_only = text.startswith('[Image:') or (len(text) < 5 and not any(c.isalnum() for c in text))
@@ -694,15 +711,27 @@ def rebuild_df_with_style_hierarchy(
     if not items:
         return None, "", ""
 
+    cb_x0, cb_y0 = 0.0, 0.0
+    cb_height = page_height
+
     # 精确计算 MediaBox 坐标区间 (top-left 原点)
     if crop_bbox is not None:
         x_min, y_min, x_max, y_max, mb_height = convert_crop_to_mediabox(pdf_path, page_index, crop_bbox, dpi)
+        try:
+            with fitz.open(pdf_path) as doc:
+                if 0 <= page_index < len(doc):
+                    page = doc[page_index]
+                    cb_x0, cb_y0 = page.cropbox.x0, page.cropbox.y0
+                    cb_height = page.cropbox.height
+        except Exception:
+            pass
     else:
         try:
             with fitz.open(pdf_path) as doc:
                 page = doc[page_index]
                 unrot_rect = crop_rect * page.derotation_matrix
                 cb_x0, cb_y0 = page.cropbox.x0, page.cropbox.y0
+                cb_height = page.cropbox.height
                 x0 = unrot_rect.x0 + cb_x0
                 y0 = unrot_rect.y0 + cb_y0
                 x1 = unrot_rect.x1 + cb_x0
@@ -717,8 +746,14 @@ def rebuild_df_with_style_hierarchy(
     filtered = []
     for it in items:
         top_y = mb_height - it.y
-        if (x_min - 4.0 <= it.x <= x_max + 4.0 and
-                y_min - 4.0 <= top_y <= y_max + 4.0):
+        in_direct = (x_min - 4.0 <= it.x <= x_max + 4.0 and
+                     y_min - 4.0 <= top_y <= y_max + 4.0)
+        in_cb = False
+        if not in_direct and (cb_x0 != 0.0 or cb_y0 != 0.0):
+            top_y_cb = cb_height - it.y + cb_y0
+            in_cb = (x_min - 4.0 <= it.x + cb_x0 <= x_max + 4.0 and
+                     y_min - 4.0 <= top_y_cb <= y_max + 4.0)
+        if in_direct or in_cb:
             filtered.append(it)
 
     if len(filtered) < 4:

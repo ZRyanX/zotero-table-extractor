@@ -1,0 +1,296 @@
+{
+  "group": "Group E: Low-contrast / scanned / image-embedded tables",
+  "file_name": "group_e_scanned_low_contrast.pdf",
+  "num_pages": 2,
+  "is_scanned": true,
+  "tables": [
+    {
+      "table_id": "Table 1",
+      "label": "Table 1",
+      "page_idx": 0,
+      "caption": "Table 1. Flotation stage recovery and mineral balance sheet.",
+      "columns": [
+        "Stage",
+        "Feed (t/h)",
+        "Grade (% Cu)",
+        "Recovery (%)",
+        "Tailings (%)",
+        "pH"
+      ],
+      "num_rows": 16,
+      "num_cols": 6,
+      "rows": [
+        [
+          "Primary Rougher",
+          "120.5",
+          "0.75",
+          "72.5",
+          "0.12",
+          "8.5"
+        ],
+        [
+          "Secondary Rougher",
+          "124.7",
+          "2.60",
+          "74.6",
+          "0.16",
+          "8.7"
+        ],
+        [
+          "Rougher Scavenger",
+          "128.9",
+          "4.45",
+          "76.7",
+          "0.20",
+          "8.9"
+        ],
+        [
+          "Cleaner 1",
+          "133.1",
+          "6.30",
+          "78.8",
+          "0.24",
+          "9.1"
+        ],
+        [
+          "Cleaner 2",
+          "137.3",
+          "8.15",
+          "80.9",
+          "0.28",
+          "9.3"
+        ],
+        [
+          "Cleaner 3",
+          "141.5",
+          "10.00",
+          "83.0",
+          "0.32",
+          "9.5"
+        ],
+        [
+          "Cleaner Scavenger",
+          "145.7",
+          "11.85",
+          "85.1",
+          "0.36",
+          "9.7"
+        ],
+        [
+          "Regrind Feed",
+          "149.9",
+          "13.70",
+          "87.2",
+          "0.40",
+          "9.9"
+        ],
+        [
+          "Regrind Circuit",
+          "154.1",
+          "15.55",
+          "89.3",
+          "0.44",
+          "10.1"
+        ],
+        [
+          "Final Concentrate",
+          "158.3",
+          "17.40",
+          "91.4",
+          "0.48",
+          "10.3"
+        ],
+        [
+          "Rougher Tailings",
+          "162.5",
+          "19.25",
+          "93.5",
+          "0.52",
+          "10.5"
+        ],
+        [
+          "Final Tailings",
+          "166.7",
+          "21.10",
+          "95.6",
+          "0.56",
+          "10.7"
+        ],
+        [
+          "Thickener Underflow",
+          "170.9",
+          "22.95",
+          "73.7",
+          "0.60",
+          "10.9"
+        ],
+        [
+          "Filter Cake",
+          "175.1",
+          "24.80",
+          "75.8",
+          "0.64",
+          "11.1"
+        ],
+        [
+          "Effluent Water",
+          "179.3",
+          "26.65",
+          "77.9",
+          "0.68",
+          "11.3"
+        ],
+        [
+          "Recycle Stream",
+          "183.5",
+          "28.50",
+          "80.0",
+          "0.72",
+          "8.5"
+        ]
+      ],
+      "sampled_numeric_cells": [
+        {
+          "row_idx": 0,
+          "col_idx": 1,
+          "col_name": "Feed (t/h)",
+          "raw_val": "120.5",
+          "numeric_val": 120.5
+        },
+        {
+          "row_idx": 0,
+          "col_idx": 2,
+          "col_name": "Grade (% Cu)",
+          "raw_val": "0.75",
+          "numeric_val": 0.75
+        },
+        {
+          "row_idx": 0,
+          "col_idx": 3,
+          "col_name": "Recovery (%)",
+          "raw_val": "72.5",
+          "numeric_val": 72.5
+        },
+        {
+          "row_idx": 0,
+          "col_idx": 5,
+          "col_name": "pH",
+          "raw_val": "8.5",
+          "numeric_val": 8.5
+        },
+        {
+          "row_idx": 4,
+          "col_idx": 1,
+          "col_name": "Feed (t/h)",
+          "raw_val": "137.3",
+          "numeric_val": 137.3
+        },
+        {
+          "row_idx": 4,
+          "col_idx": 2,
+          "col_name": "Grade (% Cu)",
+          "raw_val": "8.15",
+          "numeric_val": 8.15
+        },
+        {
+          "row_idx": 4,
+          "col_idx": 3,
+          "col_name": "Recovery (%)",
+          "raw_val": "80.9",
+          "numeric_val": 80.9
+        },
+        {
+          "row_idx": 4,
+          "col_idx": 5,
+          "col_name": "pH",
+          "raw_val": "9.3",
+          "numeric_val": 9.3
+        },
+        {
+          "row_idx": 9,
+          "col_idx": 1,
+          "col_name": "Feed (t/h)",
+          "raw_val": "158.3",
+          "numeric_val": 158.3
+        },
+        {
+          "row_idx": 9,
+          "col_idx": 2,
+          "col_name": "Grade (% Cu)",
+          "raw_val": "17.40",
+          "numeric_val": 17.4
+        },
+        {
+          "row_idx": 9,
+          "col_idx": 3,
+          "col_name": "Recovery (%)",
+          "raw_val": "91.4",
+          "numeric_val": 91.4
+        },
+        {
+          "row_idx": 9,
+          "col_idx": 5,
+          "col_name": "pH",
+          "raw_val": "10.3",
+          "numeric_val": 10.3
+        },
+        {
+          "row_idx": 11,
+          "col_idx": 1,
+          "col_name": "Feed (t/h)",
+          "raw_val": "166.7",
+          "numeric_val": 166.7
+        },
+        {
+          "row_idx": 11,
+          "col_idx": 2,
+          "col_name": "Grade (% Cu)",
+          "raw_val": "21.10",
+          "numeric_val": 21.1
+        },
+        {
+          "row_idx": 11,
+          "col_idx": 3,
+          "col_name": "Recovery (%)",
+          "raw_val": "95.6",
+          "numeric_val": 95.6
+        },
+        {
+          "row_idx": 11,
+          "col_idx": 5,
+          "col_name": "pH",
+          "raw_val": "10.7",
+          "numeric_val": 10.7
+        },
+        {
+          "row_idx": 15,
+          "col_idx": 1,
+          "col_name": "Feed (t/h)",
+          "raw_val": "183.5",
+          "numeric_val": 183.5
+        },
+        {
+          "row_idx": 15,
+          "col_idx": 2,
+          "col_name": "Grade (% Cu)",
+          "raw_val": "28.50",
+          "numeric_val": 28.5
+        },
+        {
+          "row_idx": 15,
+          "col_idx": 3,
+          "col_name": "Recovery (%)",
+          "raw_val": "80.0",
+          "numeric_val": 80.0
+        },
+        {
+          "row_idx": 15,
+          "col_idx": 5,
+          "col_name": "pH",
+          "raw_val": "8.5",
+          "numeric_val": 8.5
+        }
+      ]
+    }
+  ]
+}
