@@ -13,15 +13,22 @@ import json
 import os
 import re
 import sys
+import glob
 import time
+import shutil
 import tempfile
 import zipfile
+import subprocess
 import collections
 from typing import List, Dict, Any, Optional, Union, Tuple, Set
 
 import logging
 import requests
 import pandas as pd
+try:
+    import numpy as np
+except ImportError:
+    np = None
 
 logger = logging.getLogger(__name__)
 
@@ -251,13 +258,29 @@ def _parse_mineru_table_html(table_html_or_md: str) -> List[pd.DataFrame]:
                         flat_cols.append('_'.join(parts) if parts else '')
                     df.columns = _make_columns_unique(flat_cols)
                 else:
-                    cols = [
-                        clean_latex_and_ocr(clean_text(str(c))).strip()
-                        if pd.notna(c) and not re.match(r'^(?:unnamed\b|col[_\s]*\d+$|none$|nan$)', str(c).strip(), re.IGNORECASE)
-                        else f"Col_{i+1}"
-                        for i, c in enumerate(df.columns)
-                    ]
-                    df.columns = _make_columns_unique(cols)
+                    # 检查是否为未识别出 <th> 的默认数字列名 (0, 1, 2...)
+                    is_default_int_cols = all(
+                        isinstance(c, int) or (np is not None and isinstance(c, np.integer)) or (isinstance(c, str) and c.strip().isdigit())
+                        for c in df.columns
+                    )
+                    if is_default_int_cols and len(df) > 0:
+                        first_row = [clean_latex_and_ocr(clean_text(str(x))).strip() for x in df.iloc[0]]
+                        # 若首行包含至少一个文本标签，则将首行作为表头提升
+                        has_text = any(len(c) > 0 and not c.replace('.', '').replace('-', '').replace(',', '').isdigit() for c in first_row)
+                        if has_text:
+                            df = df.iloc[1:].reset_index(drop=True)
+                            df.columns = _make_columns_unique(first_row)
+                        else:
+                            cols = [f"Col_{i+1}" for i in range(len(df.columns))]
+                            df.columns = cols
+                    else:
+                        cols = [
+                            clean_latex_and_ocr(clean_text(str(c))).strip()
+                            if pd.notna(c) and not re.match(r'^(?:unnamed\b|col[_\s]*\d+$|none$|nan$)', str(c).strip(), re.IGNORECASE)
+                            else f"Col_{i+1}"
+                            for i, c in enumerate(df.columns)
+                        ]
+                        df.columns = _make_columns_unique(cols)
                 cleaned_dfs.append(df)
             if cleaned_dfs:
                 return cleaned_dfs
@@ -270,13 +293,149 @@ def _parse_mineru_table_html(table_html_or_md: str) -> List[pd.DataFrame]:
     return []
 
 
+def download_resilient_asset(url: str, timeout: int = 60) -> Optional[bytes]:
+    """
+    高可用弹性下载器，专为 OpenXLab CDN 与代理/TUN 环境网络加固。
+    1. 首选标准 requests.get 下载；
+    2. 若触发 SSL_ERROR_SYSCALL、UNEXPECTED_EOF_WHILE_READING、ConnectionError 或握手中断：
+       自动通过 AliDNS / Tencent DoH 获取真实公网 CDN 节点 IP，并以原始 Host 直连重试；
+    3. 成功下载后返回 bytes 数据，失败返回 None。
+    """
+    if not url or not isinstance(url, str) or not url.startswith(("http://", "https://")):
+        return None
+
+    try:
+        resp = requests.get(url, timeout=timeout)
+        if resp.status_code == 200 and resp.content:
+            return resp.content
+    except Exception as e_direct:
+        logger.debug(f"[ResilientDownloader] 直连下载异常: {e_direct}，启动 DNS-over-HTTPS 与 IP 旁路降级...")
+
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    host = parsed.netloc
+    path = parsed.path
+    if parsed.query:
+        path += "?" + parsed.query
+
+    ips = []
+    # 1. 尝试 AliDNS DoH
+    try:
+        doh = requests.get(f"https://223.5.5.5/resolve?name={host}&type=A", timeout=3).json()
+        for ans in doh.get("Answer", []):
+            if ans.get("type") == 1 and ans.get("data"):
+                ips.append(ans["data"])
+    except Exception:
+        pass
+
+    # 2. 尝试 Tencent DoH
+    if not ips:
+        try:
+            doh = requests.get(f"https://doh.pub/resolve?name={host}&type=A", timeout=3).json()
+            for ans in doh.get("Answer", []):
+                if ans.get("type") == 1 and ans.get("data"):
+                    ips.append(ans["data"])
+        except Exception:
+            pass
+
+    # 3. 预设知名 CDN 节点池兜底 (如 cdn-mineru.openxlab.org.cn)
+    fallback_pool = ["171.107.77.45", "124.227.186.47", "116.253.28.241", "120.240.159.96"]
+    for ip in fallback_pool:
+        if ip not in ips:
+            ips.append(ip)
+
+    # 逐个直连 IP
+    for ip in ips[:4]:
+        try:
+            direct_url = f"{parsed.scheme}://{ip}{path}"
+            headers = {"Host": host}
+            r = requests.get(direct_url, headers=headers, verify=False, timeout=timeout)
+            if r.status_code == 200 and r.content:
+                logger.debug(f"[ResilientDownloader] 通过直连 IP {ip} 成功下载资产 ({len(r.content)} bytes)")
+                return r.content
+        except Exception as e_ip:
+            logger.debug(f"[ResilientDownloader] 直连 IP {ip} 失败: {e_ip}")
+            continue
+
+    return None
+
+
+class DirArchive:
+    """
+    目录归档适配器，模拟 zipfile.ZipFile 核心接口 (namelist, read, close, getinfo, infolist, context manager)。
+    允许直接将已解压目录（如 mineru-open-api CLI 生成的输出目录）送入
+    extract_mineru_structured_archive 进行无缝结构化解析，省去任何中转打包步骤。
+    """
+    def __init__(self, dir_path: str):
+        self.dir_path = os.path.abspath(dir_path)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    def namelist(self) -> List[str]:
+        if not os.path.isdir(self.dir_path):
+            return []
+        names = []
+        for root, dirs, files in os.walk(self.dir_path):
+            for f in sorted(files):
+                rel = os.path.relpath(os.path.join(root, f), self.dir_path)
+                names.append(rel.replace("\\", "/"))
+        return names
+
+    def read(self, name: str) -> bytes:
+        norm = name.replace("\\", "/").lstrip("/")
+        # 防止目录穿越
+        target = os.path.abspath(os.path.join(self.dir_path, os.path.normpath(norm)))
+        if not target.startswith(self.dir_path):
+            raise ValueError(f"Directory traversal detected in DirArchive: {name}")
+
+        full_path = target
+        if not os.path.isfile(full_path):
+            base = os.path.basename(norm)
+            found = False
+            for root, dirs, files in os.walk(self.dir_path):
+                if base in files:
+                    full_path = os.path.join(root, base)
+                    found = True
+                    break
+            if not found:
+                raise FileNotFoundError(f"File not found in archive directory: {name}")
+        with open(full_path, "rb") as f:
+            return f.read()
+
+    def getinfo(self, name: str):
+        norm = name.replace("\\", "/").lstrip("/")
+        target = os.path.abspath(os.path.join(self.dir_path, os.path.normpath(norm)))
+        if not os.path.isfile(target):
+            base = os.path.basename(norm)
+            for root, dirs, files in os.walk(self.dir_path):
+                if base in files:
+                    target = os.path.join(root, base)
+                    break
+        if not os.path.isfile(target):
+            raise KeyError(f"There is no item named {name!r} in the archive")
+        ZipInfoMock = collections.namedtuple("ZipInfoMock", ["filename", "file_size"])
+        rel = os.path.relpath(target, self.dir_path).replace("\\", "/")
+        return ZipInfoMock(filename=rel, file_size=os.path.getsize(target))
+
+    def infolist(self):
+        return [self.getinfo(n) for n in self.namelist()]
+
+    def close(self):
+        pass
+
+
 def extract_mineru_structured_archive(archive_input: Any) -> List[pd.DataFrame]:
     """
-    从 MinerU 解析结果的 ZIP 包中深度提取结构化表格：
-    1. 动态匹配 JSON 索引文件：优先匹配 *content_list*.json, *middle*.json, *structured_content*.json 等；
-    2. 提取结构化字段：table_body (HTML/Markdown), bbox, polymorphic table_caption, table_footnote；
-    3. 安全解析 HTML / 表格至 DataFrame，干净展平 MultiIndex 多级复合表头，并锁定原始数据类型；
-    4. 完整绑定元数据至 df.attrs ('extractor': 'mineru_api', 'page_idx', 'bbox', 'table_title', 'table_footnote')。
+    从 MinerU 解析结果的 ZIP 包或解压目录中深度提取结构化表格：
+    1. 支持 ZipFile、bytes、BytesIO、本地 ZIP 路径、远程 ZIP URL 以及解压目录 (mineru-open-api CLI 产物)；
+    2. 动态匹配 JSON 索引文件：优先匹配 *content_list*.json, *middle*.json, *structured_content*.json 等；
+    3. 提取结构化字段：table_body (HTML/Markdown), bbox, polymorphic table_caption, table_footnote；
+    4. 安全解析 HTML / 表格至 DataFrame，干净展平 MultiIndex 多级复合表头，并锁定原始数据类型；
+    5. 完整绑定元数据至 df.attrs ('extractor': 'mineru_api', 'page_idx', 'bbox', 'table_title', 'table_footnote')。
     """
     zf = None
     should_close = False
@@ -291,12 +450,15 @@ def extract_mineru_structured_archive(archive_input: Any) -> List[pd.DataFrame]:
             should_close = True
         elif isinstance(archive_input, str):
             if archive_input.startswith(("http://", "https://")):
-                resp = requests.get(archive_input, timeout=120)
-                if resp.status_code != 200:
-                    print(f"[MinerU] 下载 ZIP 产物包失败 status={resp.status_code}")
+                content = download_resilient_asset(archive_input, timeout=120)
+                if not content:
+                    print(f"[MinerU] 下载 ZIP 产物包失败 (URL: {archive_input})")
                     return []
-                zf = zipfile.ZipFile(io.BytesIO(resp.content))
+                zf = zipfile.ZipFile(io.BytesIO(content))
                 should_close = True
+            elif os.path.isdir(archive_input):
+                zf = DirArchive(archive_input)
+                should_close = False
             elif os.path.exists(archive_input):
                 zf = zipfile.ZipFile(archive_input)
                 should_close = True
@@ -598,6 +760,8 @@ def extract_mineru_structured_archive(archive_input: Any) -> List[pd.DataFrame]:
                                     df.attrs['label'] = label
                                 if is_continuation:
                                     df.attrs['is_continuation'] = True
+                                if isinstance(zf, DirArchive):
+                                    df.attrs['mineru_source'] = 'cli'
                                 extracted_dfs.append(df)
                     except Exception as e_item:
                         logger.debug(f"[MinerU] 解析单个 item 异常已跳过: {e_item}")
@@ -749,6 +913,8 @@ def extract_mineru_structured_archive(archive_input: Any) -> List[pd.DataFrame]:
                 for df in dfs:
                     if df is not None and not df.empty:
                         df.attrs['extractor'] = 'mineru_api'
+                        if isinstance(zf, DirArchive):
+                            df.attrs['mineru_source'] = 'cli'
                 return dfs
 
         return []
@@ -1092,9 +1258,9 @@ class MinerUClient:
             md_url = result_data.get("markdown_url")
             if md_url:
                 try:
-                    r = requests.get(md_url, timeout=60)
-                    if r.status_code == 200:
-                        return r.text
+                    md_b = download_resilient_asset(md_url, timeout=60)
+                    if md_b:
+                        return md_b.decode("utf-8", errors="replace")
                 except Exception:
                     pass
 
@@ -1107,9 +1273,9 @@ class MinerUClient:
                     first_md_url = first_res.get("markdown_url")
                     if first_md_url:
                         try:
-                            r = requests.get(first_md_url, timeout=60)
-                            if r.status_code == 200:
-                                return r.text
+                            md_b = download_resilient_asset(first_md_url, timeout=60)
+                            if md_b:
+                                return md_b.decode("utf-8", errors="replace")
                         except Exception:
                             pass
                     if "full_zip_url" in first_res and first_res["full_zip_url"]:
@@ -1150,9 +1316,10 @@ class MinerUClient:
             md_url = result_data.get("markdown_url")
             if md_url:
                 try:
-                    r = requests.get(md_url, timeout=60)
-                    if r.status_code == 200 and r.text:
-                        dfs = parse_structured_vlm_content(r.text) if parse_structured_vlm_content is not None else []
+                    md_b = download_resilient_asset(md_url, timeout=60)
+                    if md_b:
+                        text = md_b.decode("utf-8", errors="replace")
+                        dfs = parse_structured_vlm_content(text) if parse_structured_vlm_content is not None else []
                         for df in dfs:
                             if df is not None and not df.empty:
                                 df.attrs['extractor'] = 'mineru_api'
@@ -1168,9 +1335,10 @@ class MinerUClient:
                     first_md_url = first_res.get("markdown_url")
                     if first_md_url:
                         try:
-                            r = requests.get(first_md_url, timeout=60)
-                            if r.status_code == 200 and r.text:
-                                dfs = parse_structured_vlm_content(r.text) if parse_structured_vlm_content is not None else []
+                            md_b = download_resilient_asset(first_md_url, timeout=60)
+                            if md_b:
+                                text = md_b.decode("utf-8", errors="replace")
+                                dfs = parse_structured_vlm_content(text) if parse_structured_vlm_content is not None else []
                                 for df in dfs:
                                     if df is not None and not df.empty:
                                         df.attrs['extractor'] = 'mineru_api'
@@ -1221,11 +1389,11 @@ class MinerUClient:
 
     def _download_and_extract_md(self, zip_url: str) -> str:
         try:
-            resp = requests.get(zip_url, timeout=120)
-            if resp.status_code != 200:
-                print(f"[MinerU] 下载 ZIP 结果包失败 status={resp.status_code}")
+            content = download_resilient_asset(zip_url, timeout=120)
+            if not content:
+                print(f"[MinerU] 下载 ZIP 结果包失败")
                 return ""
-            with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+            with zipfile.ZipFile(io.BytesIO(content)) as zf:
                 md_files = [n for n in zf.namelist() if n.lower().endswith(".md")]
                 if md_files:
                     chosen = md_files[0]
@@ -1279,6 +1447,424 @@ def parse_mineru_structured_result(result_data: Any) -> List[pd.DataFrame]:
     return client.parse_mineru_structured_result(result_data)
 
 
+def find_mineru_cli_binary(custom_path: Optional[str] = None) -> Optional[str]:
+    """探测系统中的 mineru-open-api CLI 可执行文件路径。"""
+    if custom_path and str(custom_path).strip():
+        cp = str(custom_path).strip()
+        if os.path.isfile(cp) and (os.name == "nt" or os.access(cp, os.X_OK)):
+            return os.path.abspath(cp)
+        # 若传入自定义路径但文件不存在或不可执行，不应返回无效路径，继续降级检查环境变量与系统候选路径
+
+    env_cli = os.getenv("MINERU_CLI_PATH", "").strip()
+    if env_cli and os.path.isfile(env_cli) and (os.name == "nt" or os.access(env_cli, os.X_OK)):
+        return os.path.abspath(env_cli)
+
+    which_bin = shutil.which("mineru-open-api")
+    if which_bin:
+        return which_bin
+
+    home = os.path.expanduser("~")
+    candidates = [
+        *glob.glob(os.path.join(home, ".nvm", "versions", "node", "*", "bin", "mineru-open-api")),
+        os.path.join(home, ".npm-global", "bin", "mineru-open-api"),
+        os.path.join(home, ".bun", "bin", "mineru-open-api"),
+        "/usr/local/bin/mineru-open-api",
+        "/opt/homebrew/bin/mineru-open-api",
+        os.path.join(home, "go", "bin", "mineru-open-api"),
+        os.path.join(os.getenv("GOPATH", os.path.join(home, "go")), "bin", "mineru-open-api"),
+        os.path.join(os.getenv("APPDATA", ""), "npm", "mineru-open-api.cmd"),
+        os.path.join(home, "go", "bin", "mineru-open-api.exe"),
+    ]
+    for cand in candidates:
+        if cand and os.path.isfile(cand) and (os.name == "nt" or os.access(cand, os.X_OK)):
+            return os.path.abspath(cand)
+
+    return None
+
+
+def is_mineru_cli_available(config: Optional[dict] = None) -> bool:
+    """检查 mineru-open-api CLI 是否可用且未被显式禁用。"""
+    cli_mode = str((config or {}).get("MINERU_USE_CLI", os.getenv("MINERU_USE_CLI", "auto"))).lower().strip()
+    if cli_mode in ("false", "0", "api", "no", "disabled"):
+        return False
+    cfg_path = (config or {}).get("MINERU_CLI_PATH") if config else None
+    return find_mineru_cli_binary(cfg_path) is not None
+
+
+def resolve_mineru_token(config: Optional[dict] = None) -> str:
+    """
+    按优先级解析 MinerU Token / API Key：
+    1. 传入或加载的 config 中的 MINERU_TOKEN / MINERU_API_KEY；
+    2. 环境变量 MINERU_TOKEN / MINERU_API_KEY；
+    3. 官方 Open API CLI 配置文件 (~/.mineru/config.yaml)。
+    """
+    if config:
+        for k in ("MINERU_TOKEN", "MINERU_API_KEY"):
+            val = config.get(k)
+            if val and str(val).strip():
+                return str(val).strip()
+
+    for env_k in ("MINERU_TOKEN", "MINERU_API_KEY"):
+        env_val = os.getenv(env_k)
+        if env_val and env_val.strip():
+            return env_val.strip()
+
+    cfg_yaml = os.path.expanduser("~/.mineru/config.yaml")
+    if os.path.isfile(cfg_yaml):
+        try:
+            with open(cfg_yaml, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("token:"):
+                        tok = line.split(":", 1)[1].strip().strip('"').strip("'")
+                        if tok:
+                            return tok
+        except Exception:
+            pass
+    return ""
+
+
+class MinerUCLIClient:
+    """
+    MinerU 官方 Open API CLI 客户端 (mineru-open-api)。
+    依托官方发布的 Open API CLI，直接由系统命令行承担：
+    1. 自动化文档上传（包括批次任务注册与 OSS 传输）；
+    2. 异步状态跟踪与轮询；
+    3. 结果产物包自动下载与解压；
+    将原本多步易碎的 HTTP 请求大幅精简为单次命令行调用，并完美保留结构化表格解析与多维元数据注入。
+    """
+    def __init__(
+        self,
+        cli_path: Optional[str] = None,
+        api_key: str = "",
+        api_base: str = "https://mineru.net"
+    ):
+        self.cli_path = find_mineru_cli_binary(cli_path)
+        self.api_key = api_key or resolve_mineru_token()
+        self.api_base = (api_base or os.getenv("MINERU_API_BASE", "https://mineru.net") or "https://mineru.net").rstrip("/")
+
+    def is_available(self) -> bool:
+        """检查 mineru-open-api 可执行文件是否存在且可用。"""
+        return self.cli_path is not None and os.path.exists(self.cli_path)
+
+    def extract(
+        self,
+        file_path: str,
+        output_dir: Optional[str] = None,
+        formats: str = "json,md",
+        page_ranges: Optional[Union[str, List[int]]] = None,
+        pages: Optional[Union[str, List[int]]] = None,
+        model: Optional[str] = None,
+        timeout: int = 600,
+        cancel_event=None,
+        is_ocr: bool = False,
+        enable_table: bool = True,
+        enable_formula: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        通过 mineru-open-api extract 执行高精度结构化抽取。
+        自动上传、轮询、下载并解压到目标目录，解析出 List[pd.DataFrame] 及完整 Markdown。
+        具备管道防死锁保护与针对 CDN 断流 (TLS EOF) 的弹性自愈机制。
+        """
+        if not self.is_available():
+            return {"success": False, "error": "mineru-open-api binary not found", "dfs": [], "markdown": ""}
+
+        if not os.path.exists(file_path) and not file_path.startswith(("http://", "https://")):
+            return {"success": False, "error": f"File not found: {file_path}", "dfs": [], "markdown": ""}
+
+        if os.path.isfile(file_path) and os.path.getsize(file_path) < 30:
+            return {"success": False, "error": "file size < 30B, invalid document", "dfs": [], "markdown": ""}
+
+        if page_ranges is None and pages is not None:
+            page_ranges = pages
+        page_ranges_str = format_page_ranges(page_ranges)
+
+        temp_dir_obj = None
+        if not output_dir:
+            temp_dir_obj = tempfile.TemporaryDirectory(prefix="mineru_cli_")
+            target_out = temp_dir_obj.name
+        else:
+            target_out = os.path.abspath(output_dir)
+            os.makedirs(target_out, exist_ok=True)
+
+        target_file = os.path.abspath(file_path) if os.path.exists(file_path) else file_path
+        cmd = [self.cli_path, "extract", target_file, "-o", target_out, "-f", formats]
+        if page_ranges_str:
+            cmd.extend(["--pages", page_ranges_str])
+        if model:
+            cmd.extend(["--model", model])
+        if timeout:
+            cmd.extend(["--timeout", str(int(timeout))])
+        if self.api_key:
+            cmd.extend(["--token", self.api_key])
+        if self.api_base and self.api_base != "https://mineru.net":
+            cmd.extend(["--base-url", self.api_base])
+        if is_ocr:
+            cmd.append("--ocr")
+        if not enable_table:
+            cmd.append("--table=false")
+        if not enable_formula:
+            cmd.append("--formula=false")
+
+        env = os.environ.copy()
+        if self.api_key:
+            env["MINERU_TOKEN"] = self.api_key
+        if self.api_base and self.api_base != "https://mineru.net":
+            env["MINERU_BASE_URL"] = self.api_base
+
+        try:
+            print(f"[MinerU CLI] 启动命令: {' '.join(cmd[:6])} ...")
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env
+            )
+
+            stdout, stderr = "", ""
+            start_t = time.time()
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    return {"success": False, "error": "cancelled", "dfs": [], "markdown": ""}
+
+                remaining = timeout - (time.time() - start_t)
+                if remaining <= 0:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    return {"success": False, "error": f"timeout ({timeout}s)", "dfs": [], "markdown": ""}
+
+                try:
+                    stdout, stderr = proc.communicate(timeout=min(0.5, max(0.1, remaining)))
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+
+            if proc.returncode != 0:
+                err_msg = stderr.strip() or stdout.strip() or f"exit code {proc.returncode}"
+                # 检查是否为下载 ZIP 时的 CDN 断流 / 网络抖动异常：若是，从 stderr 提取 URL 自动自愈下载解压
+                cdn_url_match = re.search(r'Get "(https://[^"]+\.zip)":', err_msg)
+                recovered = False
+                if cdn_url_match:
+                    cdn_zip_url = cdn_url_match.group(1)
+                    print(f"[MinerU CLI] 捕获 CLI 下载 ZIP 时的 CDN 断流，启动弹性直连自愈: {cdn_zip_url}")
+                    zip_bytes = download_resilient_asset(cdn_zip_url, timeout=120)
+                    if zip_bytes:
+                        try:
+                            with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+                                zf.extractall(target_out)
+                            recovered = True
+                            print("[MinerU CLI] 弹性自愈解压产物包成功！")
+                        except Exception as e_unzip:
+                            logger.debug(f"[MinerU CLI] 自愈解压异常: {e_unzip}")
+
+                if not recovered:
+                    print(f"[MinerU CLI] 执行失败 (code={proc.returncode}): {err_msg[:200]}")
+                    return {"success": False, "error": err_msg, "dfs": [], "markdown": ""}
+
+            # 成功解析：从 target_out 目录中直接解析结构化表格 (复用 DirArchive)
+            dfs = extract_mineru_structured_archive(target_out)
+            for df in dfs:
+                if df is not None and hasattr(df, "attrs"):
+                    df.attrs.setdefault("extractor", "mineru_api")
+                    df.attrs["mineru_source"] = "cli"
+
+            md_text = self._read_markdown_from_dir(target_out) or stdout
+
+            return {
+                "success": True,
+                "output_dir": target_out if output_dir else None,
+                "dfs": dfs,
+                "markdown": md_text,
+                "error": None
+            }
+        except Exception as e:
+            print(f"[MinerU CLI] 运行异常: {e}")
+            return {"success": False, "error": str(e), "dfs": [], "markdown": ""}
+        finally:
+            if temp_dir_obj and not output_dir:
+                try:
+                    temp_dir_obj.cleanup()
+                except Exception:
+                    pass
+
+    def flash_extract(
+        self,
+        file_path: str,
+        output_dir: Optional[str] = None,
+        page_ranges: Optional[Union[str, List[int]]] = None,
+        pages: Optional[Union[str, List[int]]] = None,
+        timeout: int = 300,
+        cancel_event=None,
+        is_ocr: bool = False,
+        enable_table: bool = True,
+        enable_formula: bool = True,
+        language: str = "ch",
+    ) -> Dict[str, Any]:
+        """
+        通过 mineru-open-api flash-extract 执行零 Token 快速抽取 (<=10MB, <=20页)。
+        具备管道防死锁保护与针对 Markdown CDN 断流的弹性自愈机制。
+        """
+        if not self.is_available():
+            return {"success": False, "error": "mineru-open-api binary not found", "dfs": [], "markdown": ""}
+
+        if not os.path.exists(file_path) and not file_path.startswith(("http://", "https://")):
+            return {"success": False, "error": f"File not found: {file_path}", "dfs": [], "markdown": ""}
+
+        if os.path.isfile(file_path) and os.path.getsize(file_path) < 30:
+            return {"success": False, "error": "file size < 30B, invalid document", "dfs": [], "markdown": ""}
+
+        if page_ranges is None and pages is not None:
+            page_ranges = pages
+        page_ranges_str = format_page_ranges(page_ranges)
+
+        temp_dir_obj = None
+        if not output_dir:
+            temp_dir_obj = tempfile.TemporaryDirectory(prefix="mineru_flash_")
+            target_out = temp_dir_obj.name
+        else:
+            target_out = os.path.abspath(output_dir)
+            os.makedirs(target_out, exist_ok=True)
+
+        target_file = os.path.abspath(file_path) if os.path.exists(file_path) else file_path
+        cmd = [self.cli_path, "flash-extract", target_file, "-o", target_out]
+        if page_ranges_str:
+            cmd.extend(["--pages", page_ranges_str])
+        if timeout:
+            cmd.extend(["--timeout", str(int(timeout))])
+        if is_ocr:
+            cmd.append("--ocr")
+        if not enable_table:
+            cmd.append("--table=false")
+        if not enable_formula:
+            cmd.append("--formula=false")
+        if language and language != "ch":
+            cmd.extend(["--language", language])
+        if self.api_key:
+            cmd.extend(["--token", self.api_key])
+        if self.api_base and self.api_base != "https://mineru.net":
+            cmd.extend(["--base-url", self.api_base])
+
+        env = os.environ.copy()
+        if self.api_key:
+            env["MINERU_TOKEN"] = self.api_key
+        if self.api_base and self.api_base != "https://mineru.net":
+            env["MINERU_BASE_URL"] = self.api_base
+
+        try:
+            print(f"[MinerU CLI] 启动 flash-extract: {' '.join(cmd[:5])} ...")
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env
+            )
+
+            stdout, stderr = "", ""
+            start_t = time.time()
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    return {"success": False, "error": "cancelled", "dfs": [], "markdown": ""}
+
+                remaining = timeout - (time.time() - start_t)
+                if remaining <= 0:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    return {"success": False, "error": f"timeout ({timeout}s)", "dfs": [], "markdown": ""}
+
+                try:
+                    stdout, stderr = proc.communicate(timeout=min(0.5, max(0.1, remaining)))
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+
+            if proc.returncode != 0:
+                err_msg = stderr.strip() or stdout.strip() or f"exit code {proc.returncode}"
+                cdn_url_match = re.search(r'Get "(https://[^"]+(?:\.md|\.zip|full\.md))":', err_msg)
+                recovered = False
+                if cdn_url_match:
+                    cdn_url = cdn_url_match.group(1)
+                    print(f"[MinerU CLI] 捕获 flash-extract 下载 Markdown 时的 CDN 断流，启动弹性直连自愈: {cdn_url}")
+                    asset_bytes = download_resilient_asset(cdn_url, timeout=120)
+                    if asset_bytes:
+                        try:
+                            if cdn_url.endswith(".zip"):
+                                with zipfile.ZipFile(io.BytesIO(asset_bytes)) as zf:
+                                    zf.extractall(target_out)
+                            else:
+                                with open(os.path.join(target_out, "output.md"), "wb") as f_out:
+                                    f_out.write(asset_bytes)
+                            recovered = True
+                            print("[MinerU CLI] flash 弹性自愈 Markdown 成功！")
+                        except Exception as e_rec:
+                            logger.debug(f"[MinerU CLI] flash 自愈异常: {e_rec}")
+
+                if not recovered:
+                    return {"success": False, "error": err_msg, "dfs": [], "markdown": ""}
+
+            md_text = self._read_markdown_from_dir(target_out) or stdout
+            dfs = []
+            if parse_structured_vlm_content is not None and md_text:
+                try:
+                    dfs = parse_structured_vlm_content(md_text)
+                    for df in dfs:
+                        if df is not None and hasattr(df, "attrs"):
+                            df.attrs.setdefault("extractor", "mineru_api")
+                            df.attrs["mineru_source"] = "cli_flash"
+                except Exception:
+                    dfs = []
+
+            return {
+                "success": True,
+                "output_dir": target_out if output_dir else None,
+                "dfs": dfs,
+                "markdown": md_text,
+                "error": None
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e), "dfs": [], "markdown": ""}
+        finally:
+            if temp_dir_obj and not output_dir:
+                try:
+                    temp_dir_obj.cleanup()
+                except Exception:
+                    pass
+
+    def _read_markdown_from_dir(self, directory: str) -> str:
+        """从输出目录中寻找并读取 Markdown 文件内容。"""
+        if not os.path.isdir(directory):
+            return ""
+        for root, dirs, files in os.walk(directory):
+            for f in sorted(files):
+                if f.lower().endswith(".md"):
+                    try:
+                        with open(os.path.join(root, f), "r", encoding="utf-8", errors="replace") as fp:
+                            return fp.read()
+                    except Exception:
+                        pass
+        return ""
+
+
+mineru_cli_client = MinerUCLIClient()
+
+
 def call_mineru_api(
     file_path: str,
     config: Optional[dict] = None,
@@ -1288,16 +1874,59 @@ def call_mineru_api(
     pages: Optional[Union[str, List[int]]] = None,
 ) -> str:
     """
-    通过 MinerU 官方云端 API 进行高保真多模态解析并返回 Markdown 表格字符串。
+    通过 MinerU 进行高保真多模态解析并返回 Markdown 表格字符串。
+    支持 Open API CLI 双引擎调度与优雅 REST API 回退。
     """
     if page_ranges is None and pages is not None:
         page_ranges = pages
     if config is None:
         config = load_config()
-    client = MinerUClient(
-        api_key=config.get("MINERU_API_KEY", ""),
-        api_base=config.get("MINERU_API_BASE", "https://mineru.net")
-    )
+
+    token = resolve_mineru_token(config)
+    api_base = config.get("MINERU_API_BASE", "https://mineru.net") or "https://mineru.net"
+    cli_mode = str(config.get("MINERU_USE_CLI", os.getenv("MINERU_USE_CLI", "auto"))).lower().strip()
+    should_try_cli = cli_mode in ("auto", "cli", "true", "1") and is_mineru_cli_available(config)
+
+    if should_try_cli:
+        cli_client = MinerUCLIClient(
+            cli_path=config.get("MINERU_CLI_PATH"),
+            api_key=token,
+            api_base=api_base
+        )
+        try:
+            print("[MinerU] 检测到 mineru-open-api CLI，通过官方 CLI 抽取 Markdown...")
+            if not token and isinstance(file_path, str) and os.path.exists(file_path) and os.path.getsize(file_path) <= 10 * 1024 * 1024:
+                cli_res = cli_client.flash_extract(
+                    file_path=file_path,
+                    page_ranges=page_ranges,
+                    timeout=timeout,
+                    cancel_event=cancel_event
+                )
+            else:
+                cli_res = cli_client.extract(
+                    file_path=file_path,
+                    formats="md",
+                    page_ranges=page_ranges,
+                    model=config.get("MINERU_MODEL") or None,
+                    timeout=timeout,
+                    cancel_event=cancel_event
+                )
+            if cli_res.get("success"):
+                md = cli_res.get("markdown") or ""
+                if md:
+                    print("[MinerU CLI] Markdown 抽取成功！")
+                return md
+            elif cli_mode in ("cli", "true", "1"):
+                print(f"[MinerU CLI] 任务未成功 (强制 CLI 模式): {cli_res.get('error')}")
+                return ""
+            else:
+                print(f"[MinerU CLI] CLI 执行异常 ({cli_res.get('error')})，自动平滑回退至官方 Python REST API...")
+        except Exception as e_cli:
+            if cli_mode in ("cli", "true", "1"):
+                raise e_cli
+            print(f"[MinerU CLI] 运行异常: {e_cli}，自动平滑回退至官方 Python REST API...")
+
+    client = MinerUClient(api_key=token, api_base=api_base)
     task_id = client.submit_task(file_path, page_ranges=page_ranges)
     if not task_id:
         return ""
@@ -1316,16 +1945,61 @@ def call_mineru_structured_api(
     pages: Optional[Union[str, List[int]]] = None,
 ) -> List[pd.DataFrame]:
     """
-    通过 MinerU 官方云端 API 进行高保真多模态解析，直接返回高质量结构化 DataFrame 列表。
+    通过 MinerU 进行高保真多模态解析，直接返回高质量结构化 DataFrame 列表。
+    支持 Open API CLI 双引擎调度与优雅 REST API 回退。
     """
     if page_ranges is None and pages is not None:
         page_ranges = pages
     if config is None:
         config = load_config()
-    client = MinerUClient(
-        api_key=config.get("MINERU_API_KEY", ""),
-        api_base=config.get("MINERU_API_BASE", "https://mineru.net")
-    )
+
+    token = resolve_mineru_token(config)
+    api_base = config.get("MINERU_API_BASE", "https://mineru.net") or "https://mineru.net"
+    cli_mode = str(config.get("MINERU_USE_CLI", os.getenv("MINERU_USE_CLI", "auto"))).lower().strip()
+    should_try_cli = cli_mode in ("auto", "cli", "true", "1") and is_mineru_cli_available(config)
+
+    if should_try_cli:
+        cli_client = MinerUCLIClient(
+            cli_path=config.get("MINERU_CLI_PATH"),
+            api_key=token,
+            api_base=api_base
+        )
+        try:
+            print("[MinerU] 检测到 mineru-open-api CLI，通过官方 CLI 执行结构化抽取（免去手动上传、轮询与解压）...")
+            if not token and isinstance(file_path, str) and os.path.exists(file_path) and os.path.getsize(file_path) <= 10 * 1024 * 1024:
+                cli_res = cli_client.flash_extract(
+                    file_path=file_path,
+                    page_ranges=page_ranges,
+                    timeout=timeout,
+                    cancel_event=cancel_event
+                )
+            else:
+                cli_res = cli_client.extract(
+                    file_path=file_path,
+                    formats="json,md",
+                    page_ranges=page_ranges,
+                    model=config.get("MINERU_MODEL") or None,
+                    timeout=timeout,
+                    cancel_event=cancel_event
+                )
+            if cli_res.get("success"):
+                extracted_dfs = cli_res.get("dfs", [])
+                if extracted_dfs:
+                    print(f"[MinerU CLI] 抽取成功，获得 {len(extracted_dfs)} 个结构化表格")
+                else:
+                    print("[MinerU CLI] 抽取完成，文档未包含结构化表格")
+                return extracted_dfs
+            elif cli_mode in ("cli", "true", "1"):
+                print(f"[MinerU CLI] 任务未成功 (强制 CLI 模式): {cli_res.get('error')}")
+                return []
+            else:
+                print(f"[MinerU CLI] CLI 执行异常 ({cli_res.get('error')})，自动平滑回退至官方 Python REST API...")
+        except Exception as e_cli:
+            if cli_mode in ("cli", "true", "1"):
+                raise e_cli
+            print(f"[MinerU CLI] 运行异常: {e_cli}，自动平滑回退至官方 Python REST API...")
+
+    client = MinerUClient(api_key=token, api_base=api_base)
     task_id = client.submit_task(file_path, page_ranges=page_ranges)
     if not task_id:
         return []
@@ -1342,17 +2016,21 @@ mineru_client = MinerUClient()
 def is_mineru_available(config: Optional[dict] = None, file_path: Optional[str] = None) -> bool:
     """
     检查 MinerU 是否可用：
-    1. 配置了 MINERU_API_KEY；
-    2. 或文件符合零 Token 备用 Agent API 条件 (文件存在、<=10MB 且 <=20 页)。
+    1. 配置了有效 Token (MINERU_TOKEN / MINERU_API_KEY / ~/.mineru/config.yaml)；
+    2. 或本地安装了 mineru-open-api CLI 且文件符合零 Token flash-extract 条件 (文件存在、<=10MB 且 <=20 页)；
+    3. 或文件符合官方零 Token 备用 Agent API 条件 (文件存在、<=10MB 且 <=20 页)。
     """
     if config is None:
         try:
             config = load_config()
         except Exception:
             config = {}
-    key = config.get("MINERU_API_KEY", "") or os.getenv("MINERU_API_KEY", "")
+
+    key = resolve_mineru_token(config)
     if key:
         return True
+
+    # 未配置 Token 时：仅当文件存在且满足 <=10MB, <=20 页时可用 (支持 flash-extract 或 Agent API)
     if file_path and isinstance(file_path, str) and os.path.exists(file_path):
         try:
             if os.path.getsize(file_path) <= 10 * 1024 * 1024:
@@ -1364,6 +2042,12 @@ def is_mineru_available(config: Optional[dict] = None, file_path: Optional[str] 
                     return True
         except Exception:
             pass
+        return False
+
+    # 若未提供 file_path 且无 Token，若 CLI 就绪则整体视为可用 (可随时处理合规小文件)
+    if is_mineru_cli_available(config):
+        return True
+
     return False
 
 
@@ -2387,19 +3071,44 @@ class MinerUBackend(OCRBackend):
             "crops": False,
             "dense_tables": True,
             "wireless_tables": True,
+            "cli_supported": True,
         }
 
     def probe_health(self) -> Dict[str, Any]:
         try:
             cfg = load_config()
-            key = os.getenv("MINERU_API_KEY", "") or cfg.get("MINERU_API_KEY", "")
         except Exception:
-            key = os.getenv("MINERU_API_KEY", "")
-        healthy = bool(key)
-        return {
-            "status": "healthy" if healthy else "agent_fallback",
-            "message": "API key configured" if healthy else "Using Agent API fallback (<=10MB, <=20 pages)"
-        }
+            cfg = {}
+        token = resolve_mineru_token(cfg)
+        cli_avail = is_mineru_cli_available(cfg)
+        cli_bin = find_mineru_cli_binary(cfg.get("MINERU_CLI_PATH")) if cli_avail else None
+
+        if cli_avail and token:
+            return {
+                "status": "healthy",
+                "message": f"mineru-open-api CLI ready ({cli_bin}) with API Token",
+                "cli_available": True,
+                "cli_path": cli_bin,
+            }
+        elif cli_avail:
+            return {
+                "status": "healthy",
+                "message": f"mineru-open-api CLI ready ({cli_bin}) (supports flash-extract & CLI token)",
+                "cli_available": True,
+                "cli_path": cli_bin,
+            }
+        elif token:
+            return {
+                "status": "healthy",
+                "message": "REST API client configured (mineru-open-api CLI not installed)",
+                "cli_available": False,
+            }
+        else:
+            return {
+                "status": "agent_fallback",
+                "message": "Using Agent API fallback (<=10MB, <=20 pages; install mineru-open-api CLI for enhanced extraction)",
+                "cli_available": False,
+            }
 
     def extract(self, file_path: str, **kwargs) -> Any:
         if "page_ranges" not in kwargs and "pages" in kwargs:

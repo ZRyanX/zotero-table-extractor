@@ -971,6 +971,20 @@ class DependencyChecker:
             c_print(f"[!] 依赖自动安装出错: {e}", COLOR_YELLOW)
             return False
 
+    def check_mineru_cli(self) -> Dict[str, Any]:
+        """检查 mineru-open-api CLI 是否安装并输出建议。"""
+        try:
+            from ocr_client import find_mineru_cli_binary
+            cli_path = find_mineru_cli_binary()
+        except Exception:
+            cli_path = shutil.which("mineru-open-api")
+        if cli_path:
+            c_print(f"  [✓] MinerU Open API CLI 已就绪: {cli_path}", COLOR_GREEN)
+            return {"installed": True, "path": cli_path}
+        else:
+            c_print("  [-] MinerU Open API CLI 未安装 (建议: npm install -g mineru-open-api 可省去文件上传与状态轮询)", COLOR_YELLOW)
+            return {"installed": False, "path": None}
+
 
 # ---------------------------------------------------------------------------
 # 6. 统一技能更新与配置保护门面控制器 (SkillUpdater)
@@ -1099,6 +1113,7 @@ class SkillUpdater:
             self.dep_checker.install_requirements(uv_index_url=uv_url)
         else:
             c_print("  [*] 跳过依赖自动安装（可使用 --install-deps 进行依赖自动同步）", COLOR_GRAY)
+        self.dep_checker.check_mineru_cli()
 
         # 5. 打印敏感凭证与关键路径保留证明（全量动态搜寻并列出所有敏感与路径键）
         c_print("\n" + "─" * 72, COLOR_BLUE)
@@ -1109,6 +1124,8 @@ class SkillUpdater:
             "FIRECRAWL_API_KEY",
             "ELSEVIER_API_KEY",
             "PADDLEOCR_MCP_AISTUDIO_ACCESS_TOKEN",
+            "MINERU_TOKEN",
+            "MINERU_API_KEY",
             "LLM_API_KEY",
             "PAPER_TABLES_DIR",
             "ZOTERO_DIR",

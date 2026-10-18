@@ -85,6 +85,7 @@ description: 从 Zotero 选中条目（依赖 ai4paper-zotero MCP 获取物理�
 | `olmOCR 2 边界与尾注分离` | 思想借鉴与本地实现 | 参考 olmOCR 设计思想的学术表格边界与注释行剥离算法，将 `* p < 0.05` / `Note:` 等抽离存入 `footnotes` 属性 |
 | `openpyxl CellRichText` | 本地格式渲染 | 原生 Excel 单元格富文本渲染，高保真呈现 `10^{-3}`、`CaCO_3`、`H_2O` 等学术上下标 |
 | `MinerU 4-Way 跨页续表判定` | 思想借鉴与本地实现 | 参考 MinerU/DeepDoc 启发式多维判定：列名 Jaccard + 页宽比 + 表头一致性 + (续)标记命中 |
+| `MinerU Open API CLI 集成` | 官方生态 CLI 赋能 | 集成官方 `mineru-open-api`，一键代管文档上传、异步轮询、结果下载与解压，双引擎智能调度，无 CLI 时优雅平滑回退至纯 Python REST 客户端 |
 | [`OmniDocBench (CVPR 2025)`](https://github.com/opendatalab/OmniDocBench) | 评测度量体系 | 标准化表格 TEDS、表格检测 mAP (严格 PR 曲线面积) 与端到端召回率评测 |
 | `LLM 语义化表格评测` | 本地评估算法 | 单元格数值完整性、表头语义一致性与元组关联性判分，用于大模型修复验收与语义等价判定 |
 | `OCR-Hub 后端注册表与多云容灾` | 框架机制 | 可插拔统一后端（PaddleOCR-VL / MinerU 2.5 / TeleOCR / Docling / RapidTable），动态能力发现与健康探测 |
@@ -319,6 +320,9 @@ python update.py --check --json
 | `DOCLAYOUT_ENGINE` | string | `"ensemble"` | 本地版面检测引擎选择 (`yolo`, `pp_doclayoutv3`, `ensemble`) |
 | `PP_DOCLAYOUT_ENABLED` | boolean | `true` | 是否启用 PP-DocLayoutV3 25 类细粒度版面识别与多边形贴合 |
 | `MINERU_TABLE_MERGE_ENABLE` | boolean | `true` | 是否启用 MinerU 4-way 联合判定与小表保护跨页续表合并总开关 |
+| `MINERU_USE_CLI` | string | `"auto"` | MinerU 执行方式：`"auto"` (优先 CLI，失败自动回退 REST API), `"cli"` (仅 CLI), `"api"` (仅 Python REST) |
+| `MINERU_CLI_PATH` | string | `""` | 可选自定义 `mineru-open-api` 二进制路径（为空时自动探测 PATH/NVM/Go 安装路径） |
+| `MINERU_TOKEN` | string | `""` | MinerU API Token（与 `MINERU_API_KEY` 等价，亦支持读取 `~/.mineru/config.yaml`） |
 | `TELEOCR_API_BASE` | string | `""` | TeleOCR vLLM / OpenAI-compatible 视觉推理服务 URL |
 | `TELEOCR_MODEL` | string | `"TeleOCR"` | TeleOCR 模型标识符 |
 | `OMNIDOCBENCH_ENABLED` | boolean | `true` | 是否开启 OmniDocBench (CVPR 2025) 标准化度量自检 |

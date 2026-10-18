@@ -117,6 +117,14 @@ def load_config():
         data["MINERU_API_KEY"] = ""
     if "MINERU_API_BASE" not in data:
         data["MINERU_API_BASE"] = "https://mineru.net"
+    if "MINERU_TOKEN" not in data:
+        data["MINERU_TOKEN"] = ""
+    if "MINERU_USE_CLI" not in data:
+        data["MINERU_USE_CLI"] = "auto"
+    if "MINERU_CLI_PATH" not in data:
+        data["MINERU_CLI_PATH"] = ""
+    if "MINERU_MODEL" not in data:
+        data["MINERU_MODEL"] = "vlm"
     if "OCR_ENGINE" not in data:
         data["OCR_ENGINE"] = "auto"
     if "DOCLING_ENABLED" not in data:
@@ -147,6 +155,10 @@ def load_config():
         'PADDLEOCR_MCP_AISTUDIO_ACCESS_TOKEN': 'PADDLEOCR_ACCESS_TOKEN',
         'MINERU_API_KEY': 'MINERU_API_KEY',
         'MINERU_API_BASE': 'MINERU_API_BASE',
+        'MINERU_TOKEN': 'MINERU_TOKEN',
+        'MINERU_USE_CLI': 'MINERU_USE_CLI',
+        'MINERU_CLI_PATH': 'MINERU_CLI_PATH',
+        'MINERU_MODEL': 'MINERU_MODEL',
         'OCR_ENGINE': 'OCR_ENGINE',
         'DOCLING_ENABLED': 'DOCLING_ENABLED',
         'DOCLING_OFFLINE_FALLBACK': 'DOCLING_OFFLINE_FALLBACK',
@@ -168,6 +180,12 @@ def load_config():
                 data[config_key] = False
             else:
                 data[config_key] = env_val
+
+    # 自动同步 MINERU_TOKEN 与 MINERU_API_KEY
+    if data.get("MINERU_TOKEN") and not data.get("MINERU_API_KEY"):
+        data["MINERU_API_KEY"] = data["MINERU_TOKEN"]
+    elif data.get("MINERU_API_KEY") and not data.get("MINERU_TOKEN"):
+        data["MINERU_TOKEN"] = data["MINERU_API_KEY"]
 
     return data
 

@@ -570,6 +570,14 @@ def print_system_diagnostics():
     print(f"  • 定向审计数据库:      {get_targeted_audit_db_path()}")
     print(f"  • Playwright Profile:  {get_playwright_profile_dir()}")
     print(f"  • Chrome Debug Profile:{get_chrome_debug_profile_dir()}")
+    try:
+        from ocr_client import find_mineru_cli_binary
+        m_cli_bin = find_mineru_cli_binary()
+    except Exception:
+        import shutil
+        m_cli_bin = shutil.which("mineru-open-api")
+    m_cli_str = f"{m_cli_bin} [已就绪 / 自动代管上传、轮询与解压]" if m_cli_bin else "未安装 (可选增强: npm i -g mineru-open-api)"
+    print(f"  • MinerU Open API CLI: {m_cli_str}")
     print("-" * 70)
     # 模拟展示 Windows 环境下对应的映射标准
     win_aihub = find_windows_aihub_root()

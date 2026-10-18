@@ -4018,8 +4018,22 @@ def _do_extract_tables_from_pdf(
             if not primary_succeeded and ocr_client:
                 pdf_p = Path(pdf_path)
                 cache_zip = pdf_p.parent / "mineru_cache" / f"{pdf_p.stem}.zip"
+                cache_dir = pdf_p.parent / "mineru_cache" / pdf_p.stem
                 mineru_dfs = []
-                if cache_zip.exists():
+                if cache_dir.exists() and cache_dir.is_dir():
+                    logs.append(f"  发现本地 MinerU 结构化缓存目录: {cache_dir.name}")
+                    try:
+                        mineru_dfs = ocr_client.extract_mineru_structured_archive(str(cache_dir))
+                    except Exception as e_c:
+                        logs.append(f"  读取 MinerU 缓存目录异常: {e_c}")
+                        mineru_dfs = []
+                    if not mineru_dfs:
+                        logs.append(f"  [Warning] 本地 MinerU 缓存目录损坏或为空 ({cache_dir.name})，自动清理失效缓存...")
+                        try:
+                            shutil.rmtree(cache_dir, ignore_errors=True)
+                        except Exception:
+                            pass
+                if not mineru_dfs and cache_zip.exists():
                     logs.append(f"  发现本地 MinerU 结构化缓存包: {cache_zip.name}")
                     try:
                         mineru_dfs = ocr_client.extract_mineru_structured_archive(str(cache_zip))
@@ -4032,11 +4046,11 @@ def _do_extract_tables_from_pdf(
                             cache_zip.unlink(missing_ok=True)
                         except Exception:
                             pass
-                if not mineru_dfs and ocr_client.is_mineru_available(file_path=pdf_path):
+                if not mineru_dfs and ocr_client.is_mineru_available(config=_cfg, file_path=pdf_path):
                     page_desc = [p + 1 for p in native_target_pages] if native_target_pages else "all"
                     logs.append(f"  调用 MinerU 官方高保真结构化主抽取 (页码: {page_desc})")
                     try:
-                        mineru_dfs = ocr_client.call_mineru_structured_api(pdf_path, page_ranges=native_target_pages)
+                        mineru_dfs = ocr_client.call_mineru_structured_api(pdf_path, config=_cfg, page_ranges=native_target_pages)
                     except Exception as e_mineru:
                         logs.append(f"  MinerU 结构化主抽取异常: {e_mineru}")
                         mineru_dfs = []

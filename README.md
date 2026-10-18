@@ -341,6 +341,9 @@ cp config.example.json config.json
 | `GMFT_ENABLED` | boolean | `true` | 是否启用 GMFT (TATR Transformer) 参与 Native PDF 多方投票 |
 | `IMG2TABLE_ENABLED` | boolean | `true` | 是否启用 img2table 纯 OpenCV 方案参与 Native PDF 多方投票 |
 | `OCR_ENGINE` | string | `"auto"` | 首选 OCR/VLM 引擎 (`auto`, `paddleocr`, `docling`, `mineru`) |
+| `MINERU_USE_CLI` | string | `"auto"` | MinerU 执行方式：`auto`（优先 CLI，失败自动回退 REST API）、`cli`、`api` |
+| `MINERU_CLI_PATH` | string | `""` | 可选自定义 `mineru-open-api` 可执行文件路径 |
+| `MINERU_TOKEN` | string | `""` | MinerU API Token（亦支持自动读取 `~/.mineru/config.yaml`） |
 | `ZOTERO_SYNC_ENABLED` | boolean | `false` | 是否启用 PyZotero 与 Better-Notes 生态联动（默认严格保持关闭） |
 | `ZOTERO_API_KEY` | string | `""` | Zotero 官方 Web API 访问密钥（用于挂载附件与笔记） |
 | `ZOTERO_USER_ID` | string | `""` | Zotero 个人用户 ID 或群组 ID |
@@ -364,7 +367,18 @@ cp config.example.json config.json
 2. 点击 **Create API Key**，输入应用名称与所在机构域名；
 3. 将生成的 API Key 填入 `config.json` 的 `ELSEVIER_API_KEY`。配置后可直接以 100% 数字保真度提取 Elsevier 旗下所有论文的表格。
 
-#### 3. Firecrawl API Key（可选）
+#### 3. MinerU API Token 与 Open API CLI（强烈推荐，用于官方高保真结构化表格抽取）
+1. 访问 [MinerU 官方平台](https://mineru.net/) 注册/登录，在 [API Token 管理](https://mineru.net/apiManage/token) 获取 Token；
+2. 安装官方 Open API CLI 工具（支持 npm 或 Go 安装）：
+   ```bash
+   npm install -g mineru-open-api
+   # 或 macOS/Linux (Go):
+   go install github.com/opendatalab/MinerU-Ecosystem/cli/mineru-open-api@latest
+   ```
+3. 运行 `mineru-open-api auth` 绑定 Token，或在 `config.json` 中配置 `"MINERU_TOKEN": "your-token"`；
+4. 安装后，本技能将自动启用 Open API CLI 双引擎调度，由官方 CLI 一键代管文档上传、异步轮询、结果下载与解压，且在无 CLI 环境中无缝平滑回退至纯 Python REST 客户端！
+
+#### 4. Firecrawl API Key（可选）
 1. 访问 [Firecrawl 官网](https://www.firecrawl.dev/) 注册并获取 API Key；
 2. 填入 `config.json` 的 `FIRECRAWL_API_KEY`。
 

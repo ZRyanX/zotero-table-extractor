@@ -379,6 +379,15 @@ def run_interactive_wizard():
         if f_in:
             cfg["FIRECRAWL_API_KEY"] = f_in
 
+        # MinerU API Token / Key
+        old_mineru = cfg.get("MINERU_TOKEN") or cfg.get("MINERU_API_KEY", "")
+        mask_mineru = (old_mineru[:6] + "..." + old_mineru[-4:]) if len(old_mineru) > 10 else (old_mineru or "[未设置]")
+        c_print(f"    MinerU API Token (用于 mineru.net 官方高精抽取与 Open API CLI): 当前 {mask_mineru}")
+        m_in = input("    请输入新 Token (直接按 [Enter] 保持原样): ").strip()
+        if m_in:
+            cfg["MINERU_TOKEN"] = m_in
+            cfg["MINERU_API_KEY"] = m_in
+
     # 打印最终变更汇总
     c_print("\n" + "─" * 72, COLOR_BLUE)
     c_print("【配置变更汇总预览】", COLOR_BOLD + COLOR_GREEN)
@@ -468,6 +477,23 @@ def show_status():
     token = cfg.get("PADDLEOCR_MCP_AISTUDIO_ACCESS_TOKEN", "")
     t_status = f"{COLOR_GREEN}[已配置]{COLOR_RESET}" if token else f"{COLOR_YELLOW}[未配置]{COLOR_RESET}"
     print(f"  • PADDLEOCR TOKEN           : {t_status}")
+    try:
+        from scripts.ocr_client import resolve_mineru_token, find_mineru_cli_binary
+        resolved_tok = resolve_mineru_token(cfg)
+        cli_bin = find_mineru_cli_binary(cfg.get("MINERU_CLI_PATH"))
+    except Exception:
+        resolved_tok = cfg.get("MINERU_TOKEN") or cfg.get("MINERU_API_KEY", "")
+        cli_bin = shutil.which("mineru-open-api")
+
+    if cfg.get("MINERU_TOKEN") or cfg.get("MINERU_API_KEY"):
+        m_status = f"{COLOR_GREEN}[已配置 (来自 config.json)]{COLOR_RESET}"
+    elif resolved_tok:
+        m_status = f"{COLOR_GREEN}[已配置 (自动继承 ~/.mineru/config.yaml)]{COLOR_RESET}"
+    else:
+        m_status = f"{COLOR_YELLOW}[未配置 (可免 Token 使用 flash-extract)]{COLOR_RESET}"
+    print(f"  • MINERU TOKEN / KEY        : {m_status}")
+    cli_stat = f"{COLOR_GREEN}[已就绪 ({cli_bin})]{COLOR_RESET}" if cli_bin else f"{COLOR_GRAY}[未安装 (npm i -g mineru-open-api)]{COLOR_RESET}"
+    print(f"  • MINERU OPEN API CLI       : {cli_stat}")
     els = cfg.get("ELSEVIER_API_KEY", "")
     e_status = f"{COLOR_GREEN}[已配置]{COLOR_RESET}" if els else f"{COLOR_YELLOW}[未配置]{COLOR_RESET}"
     print(f"  • ELSEVIER API KEY          : {e_status}")

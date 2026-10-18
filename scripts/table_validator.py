@@ -500,7 +500,7 @@ def verify_table_numeric_integrity(
                     is_norm_1000 = True
                 elif b_fmt in ("points", "pt"):
                     is_norm_1000 = False
-                elif df.attrs.get("extractor") == "mineru_api":
+                elif df.attrs.get("extractor") in ("mineru_api", "mineru_cli"):
                     is_norm_1000 = True
 
             if 0 <= bx0 <= 1 and 0 <= bx1 <= 1 and 0 <= by0 <= 1 and 0 <= by1 <= 1 and (bx1 - bx0 < 1.0 or by1 - by0 < 1.0):

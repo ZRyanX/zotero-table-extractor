@@ -777,7 +777,19 @@ def strip_embedded_duplicate_headers(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def _clean_vlm_dataframe(df: pd.DataFrame, original_attrs: dict) -> pd.DataFrame:
-    """针对 PaddleOCR-VL-1.6 的零破坏直通管道 (Zero-Destructive Pass-Through)。"""
+    """针对 PaddleOCR-VL-1.6 / MinerU 的零破坏直通管道 (Zero-Destructive Pass-Through)。"""
+    # 0. 若表头为纯默认数字或系统占位符 (如 0, 1, 2 或 Col_1, Col_2)，检查首行是否应提升为表头
+    is_default_cols = all(
+        isinstance(c, (int, np.integer)) or (isinstance(c, str) and (c.strip().isdigit() or re.match(r'^(?:Col[_\s]*\d+|Unnamed\b)', c.strip(), re.IGNORECASE)))
+        for c in df.columns
+    )
+    if is_default_cols and len(df) > 0:
+        first_row = [clean_latex_and_ocr(clean_text(str(x))).strip() for x in df.iloc[0]]
+        has_text = any(len(c) > 0 and not c.replace('.', '').replace('-', '').replace(',', '').isdigit() for c in first_row)
+        if has_text:
+            df = df.iloc[1:].reset_index(drop=True)
+            df.columns = first_row
+
     # 1. 规范化表头字符（保留 MultiIndex 展开的真实列名）
     df.columns = [clean_latex_and_ocr(clean_text(str(c))) if c is not None else f"Col_{i+1}" for i, c in enumerate(df.columns)]
     
@@ -1182,9 +1194,10 @@ def postprocess_dataframe(df, headers=None):
     extractor_name = str(original_attrs.get('extractor', '')).lower()
     source_name = str(original_attrs.get('source', '')).lower()
     is_vlm = (
-        original_attrs.get('extractor') == 'mineru_api' or
-        extractor_name in ('paddleocr_vl', 'mineru_api', 'mineru', 'docling', 'teleocr') or
-        source_name in ('paddleocr_vl', 'mineru_api', 'mineru', 'docling', 'teleocr') or
+        original_attrs.get('extractor') in ('mineru_api', 'mineru_cli') or
+        str(original_attrs.get('mineru_source', '')).lower() in ('cli', 'api', 'cli_flash') or
+        extractor_name in ('paddleocr_vl', 'mineru_api', 'mineru_cli', 'mineru', 'docling', 'teleocr') or
+        source_name in ('paddleocr_vl', 'mineru_api', 'mineru_cli', 'mineru', 'docling', 'teleocr') or
         extractor_name.startswith('vlm')
     )
 
