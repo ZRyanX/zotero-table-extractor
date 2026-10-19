@@ -4,6 +4,7 @@ import os
 import re
 import sqlite3
 import urllib.parse
+import urllib.request
 import uuid
 import requests
 
@@ -49,19 +50,31 @@ def get_doi_from_zotero_db(pdf_path, db_path=None):
         print(f"Zotero DB not found at: {db_path}")
         return None, None, None
         
-    import shutil
-    import tempfile
-    
-    # Copy to a temporary database file to avoid locking issues when Zotero is running
-    temp_db_path = os.path.join(tempfile.gettempdir(), f'zotero_extractor_{os.getpid()}_{uuid.uuid4().hex[:6]}.sqlite')
+    temp_db_path = None
+    conn = None
     try:
-        shutil.copy2(db_path, temp_db_path)
-    except Exception as e:
-        print(f"Warning: Failed to copy Zotero DB: {e}")
-        temp_db_path = db_path # Fallback to direct read
-        
+        # 优先使用 SQLite URI 只读不可变模式（mode=ro&immutable=1）：零磁盘拷贝、零文件锁冲突
+        abs_db = os.path.abspath(db_path)
+        uri = f"file:{urllib.request.pathname2url(abs_db)}?mode=ro&immutable=1"
+        conn = sqlite3.connect(uri, uri=True)
+    except Exception:
+        # 回退至临时文件拷贝只读连接
+        import shutil
+        import tempfile
+        temp_db_path = os.path.join(tempfile.gettempdir(), f'zotero_extractor_{os.getpid()}_{uuid.uuid4().hex[:6]}.sqlite')
+        try:
+            shutil.copy2(db_path, temp_db_path)
+            conn = sqlite3.connect(temp_db_path)
+        except Exception as e:
+            print(f"Warning: Failed to copy Zotero DB: {e}")
+            temp_db_path = db_path
+            conn = sqlite3.connect(db_path)
+
+    doi = None
+    title = None
+    url = None
+
     try:
-        conn = sqlite3.connect(temp_db_path)
         cursor = conn.cursor()
         parent_id = None
         
@@ -103,9 +116,6 @@ def get_doi_from_zotero_db(pdf_path, db_path=None):
                 WHERE id.itemID = ? AND f.fieldName IN ('DOI', 'title', 'url')
             """, (parent_id,))
             rows = cursor.fetchall()
-            doi = None
-            title = None
-            url = None
             for fieldName, value in rows:
                 if fieldName == 'DOI':
                     doi = value.strip()
@@ -116,28 +126,24 @@ def get_doi_from_zotero_db(pdf_path, db_path=None):
                     title = _re.sub(r'<[^>]+>', '', value).strip()
                 elif fieldName == 'url':
                     url = value.strip()
-            conn.close()
-            # Clean up temp file
-            if temp_db_path != db_path and os.path.exists(temp_db_path):
-                try:
-                    os.remove(temp_db_path)
-                except Exception:
-                    pass
             if doi or title or url:
                 print(f"Zotero DB match found: DOI={doi}, Title={title}, URL={url}")
-                return doi, title, url
-
-        conn.close()
     except Exception as e:
         print(f"Warning: Zotero DB lookup failed: {e}")
-        
-    # Clean up temp file in case of exception
-    if temp_db_path != db_path and os.path.exists(temp_db_path):
-        try:
-            os.remove(temp_db_path)
-        except Exception:
-            pass
-            
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        if temp_db_path and temp_db_path != db_path and os.path.exists(temp_db_path):
+            try:
+                os.remove(temp_db_path)
+            except Exception:
+                pass
+
+    if doi or title or url:
+        return doi, title, url
     return None, None, None
 
 

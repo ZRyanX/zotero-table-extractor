@@ -45,6 +45,14 @@ except ImportError:
     except ImportError:
         find_playwright_chromium = lambda: None
 
+try:
+    from .online.cdp_detector import find_active_cdp_endpoint
+except ImportError:
+    try:
+        from online.cdp_detector import find_active_cdp_endpoint
+    except ImportError:
+        find_active_cdp_endpoint = None
+
 PUBLISHERS = {
     "A": ("中国知网 (CNKI)", "https://www.cnki.net/"),
     "B": ("Springer Link", "https://link.springer.com/"),
@@ -127,9 +135,14 @@ def launch_chrome_debug_mode(profile_dir):
         subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     print("正在拉起 Chrome 调试版本体...")
-    # Wait for the port to open (up to 5 seconds)
-    for _ in range(10):
+
+    for _ in range(12):
         time.sleep(0.5)
+        if find_active_cdp_endpoint:
+            ep = find_active_cdp_endpoint(timeout=0.8, user_data_dir=profile_dir)
+            if ep:
+                print(f"Chrome 调试端点开启成功: {ep['cdp_url']}！")
+                return True
         try:
             import urllib.request
             with urllib.request.urlopen("http://127.0.0.1:9222/json/version", timeout=1.0) as response:
@@ -215,7 +228,12 @@ def publishers_main():
         print("\n正在通过 CDP 连接并打开各大出版社网站...")
         with sync_playwright() as p:
             try:
-                browser = p.chromium.connect_over_cdp("http://127.0.0.1:9222")
+                cdp_url = "http://127.0.0.1:9222"
+                if find_active_cdp_endpoint:
+                    ep = find_active_cdp_endpoint(timeout=1.0, user_data_dir=default_chrome_debug_profile)
+                    if ep:
+                        cdp_url = ep["cdp_url"]
+                browser = p.chromium.connect_over_cdp(cdp_url)
                 context = browser.contexts[0] if browser.contexts else browser.new_context()
 
                 # Open pages for all publishers
@@ -274,10 +292,15 @@ def publishers_main():
 
     # Choice 2: Import cookies from already running Chrome
     elif choice == "2":
-        print("\n正在连接到运行在 9222 端口的 Google Chrome 浏览器...")
+        cdp_url = "http://127.0.0.1:9222"
+        if find_active_cdp_endpoint:
+            ep = find_active_cdp_endpoint(timeout=1.0)
+            if ep:
+                cdp_url = ep["cdp_url"]
+        print(f"\n正在连接到 Google Chrome 浏览器 ({cdp_url})...")
         with sync_playwright() as p:
             try:
-                browser = p.chromium.connect_over_cdp("http://127.0.0.1:9222")
+                browser = p.chromium.connect_over_cdp(cdp_url)
                 context = browser.contexts[0] if browser.contexts else browser.new_context()
                 cookies = context.cookies()
                 if not cookies:

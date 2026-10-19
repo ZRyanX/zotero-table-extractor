@@ -14,6 +14,7 @@
 import os
 import re
 import threading
+import contextlib
 import urllib.parse
 import concurrent.futures
 import requests
@@ -41,6 +42,51 @@ except ImportError:
 get_cnki_cookies_path = common.get_cnki_cookies_path
 load_config = common.load_config
 browser_extraction_lock = common.browser_extraction_lock
+
+
+@contextlib.contextmanager
+def browser_task_concurrency_guard(user_data_dir=None, config=None):
+    """
+    智能浏览器任务并发调度（吸收 web-access 单物理实例 + Tab 隔离机制）：
+    - 若探测到活动 CDP 端点（DevToolsActivePort 动态端口或 9222），说明复用已存在的物理浏览器实例：
+      跳过全局粗粒度跨进程锁，采用 Tab 级轻量并发信号量，允许多任务并行在各自后台 Tab 中抽取；
+    - 若未探测到 CDP 端点，需要自启独立持久化浏览器实例并占用磁盘 user_data_dir：
+      获取全局 browser_extraction_lock，防止 SingletonLock 冲突与数据损坏。
+    """
+    has_cdp = False
+    try:
+        from .cdp_detector import find_active_cdp_endpoint
+        ep = find_active_cdp_endpoint(timeout=0.6, user_data_dir=user_data_dir, config=config)
+        has_cdp = ep is not None
+    except Exception:
+        has_cdp = False
+
+    if has_cdp:
+        try:
+            from .cdp_detector import cdp_tab_slot_guard
+            with cdp_tab_slot_guard():
+                yield True
+            return
+        except Exception:
+            sem = None
+            try:
+                from .cdp_detector import get_cdp_tab_semaphore
+                sem = get_cdp_tab_semaphore()
+                sem.acquire()
+            except Exception:
+                sem = None
+
+            if sem is not None:
+                try:
+                    yield True
+                finally:
+                    sem.release()
+                return
+
+    with browser_extraction_lock():
+        yield False
+
+
 
 from .doi_resolver import (
     _resolve_pii_to_doi,
@@ -414,8 +460,8 @@ class PlaywrightCNKINode(ExtractionNode):
             else:
                 user_data_dir = get_domain_profile_dir(url)
             
-        # 共享浏览器状态（调试端口 / user-data-dir）在并行模式下必须串行
-        with browser_extraction_lock():
+        # 共享浏览器状态调度：若已有 CDP 实例则免全局锁走 Tab 隔离并发，否则全局加锁保护 profile
+        with browser_task_concurrency_guard(user_data_dir=user_data_dir, config=config):
             res = extract_cnki_tables_via_playwright(url, table_idx, headed, user_data_dir, cookies_path)
         if isinstance(res, tuple):
             dfs, resolved_title = res
@@ -470,8 +516,8 @@ class PlaywrightGeneralNode(ExtractionNode):
             
         from . import general_html_extractor
             
-        # 共享浏览器状态（调试端口 9222 / user-data-dir）在并行模式下必须串行
-        with browser_extraction_lock():
+        # 共享浏览器状态调度：若已有 CDP 实例则免全局锁走 Tab 隔离并发，否则全局加锁保护 profile
+        with browser_task_concurrency_guard(user_data_dir=user_data_dir, config=config):
             res = general_html_extractor.extract_general_html_tables(url, table_idx, headed, user_data_dir, api_key)
         if isinstance(res, tuple):
             dfs, resolved_title = res

@@ -294,6 +294,7 @@ python update.py --check --json
 | `UV_INDEX_URL` | string | 清华源镜像 | Python 包安装索引镜像源 |
 | `FIRECRAWL_MAX_AGE_MS` | int | `86400000` | Firecrawl 页面缓存生命周期 (毫秒) |
 | `FIRECRAWL_PAGE_TIMEOUT_MS` | int | `30000` | Firecrawl 单页请求超时时间 |
+| `CDP_URL` | string | `""` | 通用浏览器 CDP 远程调试连接地址（为空时自动按 DevToolsActivePort 动态探测） |
 | `CRAWL4AI_CDP_URL` | string | `""` | Crawl4AI CDP 远程调试连接地址 |
 | `DOCLAYOUT_YOLO_ENABLED` | boolean | `true` | 是否启用本地 DocLayout-YOLO 离线检测 |
 | `DOCLAYOUT_MODEL_DIR` | string | `"./models"` | YOLO 模型权重存放目录 |

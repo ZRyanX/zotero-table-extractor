@@ -526,11 +526,11 @@ def _try_real_chrome_user_data() -> str:
 
 def _copy_chrome_profile_for_playwright(src_user_data: str) -> str:
     """
-    Copies the essential parts of a Chrome user profile (cookies, preferences,
-    local storage) to a temporary directory so Playwright can use it without
-    conflicting with a running Chrome instance (which locks the profile).
-
-    Returns the path to the temp profile dir, or empty string on failure.
+    【已弃用并防御性安全加固】
+    原本用于向临时目录拷贝用户配置，但 Chrome 运行时对 Cookies 等 SQLite 数据库施加排他锁，
+    极易导致 'database is locked' 崩溃。
+    现在优先推荐使用 CDP DevToolsActivePort 内存直连；若调用此函数，则自动跳过
+    已被锁定的 SQLite 文件，保障进程健壮性。
     """
     import shutil
     import tempfile
@@ -541,17 +541,16 @@ def _copy_chrome_profile_for_playwright(src_user_data: str) -> str:
         default_dst = os.path.join(tmp, "Default")
         os.makedirs(default_dst, exist_ok=True)
 
-        # Copy only the files needed for session/cookies (not the whole profile)
         essential_files = [
-            "Cookies", "Cookies-journal",
             "Preferences", "Secure Preferences",
             "Local State",
-            "Web Data", "Web Data-journal",
         ]
-        # Copy Local State to tmp root (Chrome looks for it there)
         local_state_src = os.path.join(src_user_data, "Local State")
         if os.path.exists(local_state_src):
-            shutil.copy2(local_state_src, os.path.join(tmp, "Local State"))
+            try:
+                shutil.copy2(local_state_src, os.path.join(tmp, "Local State"))
+            except Exception:
+                pass
 
         for fname in essential_files:
             src_f = os.path.join(default_src, fname)
@@ -559,22 +558,15 @@ def _copy_chrome_profile_for_playwright(src_user_data: str) -> str:
                 try:
                     shutil.copy2(src_f, os.path.join(default_dst, fname))
                 except Exception:
-                    pass  # File may be locked; skip it
-
-        # Copy network/session storage folder if present
-        for folder in ["Network", "Session Storage", "IndexedDB"]:
-            src_folder = os.path.join(default_src, folder)
-            if os.path.isdir(src_folder):
-                try:
-                    shutil.copytree(src_folder, os.path.join(default_dst, folder))
-                except Exception:
                     pass
 
-        print(f"[通用自动化] 已复制 Chrome 配置到临时目录: {tmp}")
+        # 安全跳过活跃的 SQLite 数据库文件（如 Cookies, Web Data），防止 database is locked
+        print(f"[通用自动化] 防御性安全隔离配置目录已就绪: {tmp}")
         return tmp
     except Exception as e:
-        print(f"[通用自动化] 复制 Chrome 配置失败: {e}")
+        print(f"[通用自动化] 隔离配置创建告警: {e}")
         return ""
+
 
 
 _STEALTH_ARGS = [
@@ -889,25 +881,25 @@ def _extract_custom_grid_tables(page, url, api_key=None):
     return []
 
 def _ensure_chrome_debug_running():
-    import socket
     import subprocess
     import platform
     import tempfile
     import time
     import os
 
-    def is_listening():
-        s = socket.socket()
-        s.settimeout(0.5)
+    try:
+        from .cdp_detector import find_active_cdp_endpoint
+    except ImportError:
         try:
-            s.connect(('127.0.0.1', 9222))
-            s.close()
-            return True
-        except Exception:
-            return False
+            from cdp_detector import find_active_cdp_endpoint
+        except ImportError:
+            find_active_cdp_endpoint = None
 
-    if is_listening():
-        return True
+    if find_active_cdp_endpoint:
+        existing = find_active_cdp_endpoint(timeout=0.8)
+        if existing:
+            print(f"[通用自动化] 检测到已有活动 CDP 调试端点: {existing['cdp_url']} (来源: {existing.get('source')})，直接复用。")
+            return True
 
     os_type = platform.system().lower()
     chrome_path = None
@@ -946,39 +938,13 @@ def _ensure_chrome_debug_running():
     if not chrome_path:
         print("[通用自动化] 未能自动识别到 Google Chrome 浏览器的可执行文件路径。")
         return False
+
     profile_dir = os.path.join(tempfile.gettempdir(), "chrome_debug_profile")
-    
-    # Clone default cookies/session if available to preserve user login
-    real_profile = _try_real_chrome_user_data()
-    if real_profile and os.path.exists(real_profile):
-        import shutil
-        try:
-            os.makedirs(profile_dir, exist_ok=True)
-            src_state = os.path.join(real_profile, "Local State")
-            dst_state = os.path.join(profile_dir, "Local State")
-            if os.path.exists(src_state):
-                shutil.copy2(src_state, dst_state)
-            dst_net = os.path.join(profile_dir, "Default", "Network")
-            os.makedirs(dst_net, exist_ok=True)
-            src_cookies = os.path.join(real_profile, "Default", "Network", "Cookies")
-            dst_cookies = os.path.join(dst_net, "Cookies")
-            if os.path.exists(src_cookies):
-                shutil.copy2(src_cookies, dst_cookies)
-            src_ls = os.path.join(real_profile, "Default", "Local Storage")
-            dst_ls = os.path.join(profile_dir, "Default", "Local Storage")
-            if os.path.isdir(src_ls):
-                shutil.copytree(src_ls, dst_ls, dirs_exist_ok=True)
-            src_ss = os.path.join(real_profile, "Default", "Session Storage")
-            dst_ss = os.path.join(profile_dir, "Default", "Session Storage")
-            if os.path.isdir(src_ss):
-                shutil.copytree(src_ss, dst_ss, dirs_exist_ok=True)
-            print("[通用自动化] 已成功克隆默认 Chrome 会话与 Cookie 数据库至调试沙箱。")
-        except Exception as e:
-            print(f"[通用自动化] 克隆 Chrome 会话失败: {e}")
+    os.makedirs(profile_dir, exist_ok=True)
 
     print(f"[通用自动化] 自动启动调试版 Chrome: {chrome_path}")
-    print(f"[通用自动化] 调试会话用户数据目录: {profile_dir}")
-    
+    print(f"[通用自动化] 调试会话独立隔离用户目录: {profile_dir} (零 SQLite 拷贝)")
+
     cmd = [
         chrome_path,
         "--remote-debugging-port=9222",
@@ -988,13 +954,27 @@ def _ensure_chrome_debug_running():
         subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         for _ in range(30):
             time.sleep(0.5)
-            if is_listening():
-                print("[通用自动化] 调试版 Chrome 启动并成功启用 9222 端口！")
-                return True
+            if find_active_cdp_endpoint:
+                endpoint = find_active_cdp_endpoint(timeout=0.5, user_data_dir=profile_dir)
+                if endpoint:
+                    print(f"[通用自动化] 调试版 Chrome 启动成功，CDP 端点已就绪: {endpoint['cdp_url']}！")
+                    return True
+            else:
+                try:
+                    import socket
+                    s = socket.socket()
+                    s.settimeout(0.5)
+                    s.connect(('127.0.0.1', 9222))
+                    s.close()
+                    print("[通用自动化] 调试版 Chrome 启动并成功启用 9222 端口！")
+                    return True
+                except Exception:
+                    pass
     except Exception as e:
         print(f"[通用自动化] 自动启动 Chrome 失败: {e}")
 
     return False
+
 
 def extract_general_html_tables(url, table_idx="all", headed=False, user_data_dir=None, api_key=None):
     """
@@ -1054,44 +1034,81 @@ def extract_general_html_tables(url, table_idx="all", headed=False, user_data_di
         _tmp_profile = None  # track temp profile for cleanup
         browser = None       # track browser reference for non-persistent cleanup
 
-        # Strategy 0: Try connecting over CDP first (allows zero-detection and bypasses Cloudflare)
+        # Strategy 0: Dynamic CDP Auto-discovery (DevToolsActivePort + 9222 fallback)
         connected_via_cdp = False
         skip_navigation = False
+        cdp_port = None
+        cdp_endpoint = None
         try:
-            # Check if port 9222 is open and listening
-            with urllib.request.urlopen("http://127.0.0.1:9222/json/version", timeout=1.5) as response:
-                if response.status == 200:
-                    print("[通用自动化] 检测到有运行在 9222 端口的 Chrome 进程。正在进行 CDP 桥接...")
-                    browser = p.chromium.connect_over_cdp("http://127.0.0.1:9222")
-                    
-                    # Try to find an existing tab that matches the target URL
-                    target_page = None
-                    for context in browser.contexts:
-                        for p_instance in context.pages:
-                            p_url = p_instance.url
-                            if p_url and (p_url.rstrip('/') == url.rstrip('/') or (len(url) > 20 and url in p_url)):
-                                target_page = p_instance
-                                print(f"[通用自动化] 发现已打开的目标页面标签页: {p_url}，将直接复用！")
-                                break
-                        if target_page:
+            from .cdp_detector import find_active_cdp_endpoint, install_cdp_port_guard
+        except ImportError:
+            try:
+                from cdp_detector import find_active_cdp_endpoint, install_cdp_port_guard
+            except ImportError:
+                find_active_cdp_endpoint = None
+                install_cdp_port_guard = None
+
+        if find_active_cdp_endpoint:
+            cfg = None
+            try:
+                from . import load_config
+                cfg = load_config()
+            except Exception:
+                try:
+                    import common
+                    cfg = common.load_config()
+                except Exception:
+                    cfg = None
+            cdp_endpoint = find_active_cdp_endpoint(timeout=1.5, user_data_dir=user_data_dir, config=cfg)
+        else:
+            try:
+                with urllib.request.urlopen("http://127.0.0.1:9222/json/version", timeout=1.2) as response:
+                    if response.status == 200:
+                        cdp_endpoint = {"cdp_url": "http://127.0.0.1:9222", "port": 9222, "source": "default_9222"}
+            except Exception:
+                cdp_endpoint = None
+
+        if cdp_endpoint:
+            try:
+                cdp_url = cdp_endpoint["cdp_url"]
+                cdp_port = cdp_endpoint.get("port")
+                src = cdp_endpoint.get("source", "active")
+                print(f"[通用自动化] 检测到活动 CDP 调试端点 ({cdp_url}，来源: {src})。正在进行内存直连...")
+                browser = p.chromium.connect_over_cdp(cdp_url)
+
+                # Try to find an existing tab that matches the target URL
+                target_page = None
+                for context in browser.contexts:
+                    for p_instance in context.pages:
+                        p_url = p_instance.url
+                        if p_url and (p_url.rstrip('/') == url.rstrip('/') or (len(url) > 20 and url in p_url)):
+                            target_page = p_instance
+                            print(f"[通用自动化] 发现已打开的目标页面标签页: {p_url}，将直接复用！")
                             break
-                    
                     if target_page:
-                        page = target_page
-                        try:
-                            page.bring_to_front()
-                            page.wait_for_timeout(1000)
-                        except Exception:
-                            pass
-                        skip_navigation = True
-                    else:
-                        context = browser.contexts[0] if browser.contexts else browser.new_context()
-                        page = context.new_page()
-                        skip_navigation = False
-                    connected_via_cdp = True
-                    print("[通用自动化] CDP 桥接成功！将使用您当前活动的物理 Chrome 窗口。")
-        except Exception as e:
-            print(f"[通用自动化] CDP 桥接连接失败: {e}")
+                        break
+
+                if target_page:
+                    page = target_page
+                    try:
+                        page.bring_to_front()
+                        page.wait_for_timeout(1000)
+                    except Exception:
+                        pass
+                    skip_navigation = True
+                else:
+                    context = browser.contexts[0] if browser.contexts else browser.new_context()
+                    page = context.new_page()
+                    skip_navigation = False
+                connected_via_cdp = True
+                print("[通用自动化] CDP 内存直连成功！零磁盘损耗继承当前 Chrome 登录态（校园网/CARSI 等）。")
+                if install_cdp_port_guard:
+                    if context:
+                        install_cdp_port_guard(context, cdp_port=cdp_port)
+                    install_cdp_port_guard(page, cdp_port=cdp_port)
+                    print(f"[通用自动化] CDP Port Guard 已激活，主动拦截网页对本地调试端口 ({cdp_port}) 的扫描。")
+            except Exception as e:
+                print(f"[通用自动化] CDP 内存直连失败: {e}")
 
         if user_data_dir and not os.path.isdir(user_data_dir):
             print(f"[通用自动化] 警告: 指定的用户数据目录不存在 ({user_data_dir})，降级为新建环境。")
@@ -1112,34 +1129,18 @@ def extract_general_html_tables(url, table_idx="all", headed=False, user_data_di
                 page = context.pages[0] if context.pages else context.new_page()
                 page.add_init_script(_STEALTH_INIT_SCRIPT)
                 _inject_cookies_from_profile(context, user_data_dir)
+                if install_cdp_port_guard:
+                    install_cdp_port_guard(context)
+                    install_cdp_port_guard(page)
             except Exception as e:
-                print(f"[通用自动化] 无法使用已有 Chrome 用户数据 ({type(e).__name__})，尝试复制配置文件...")
-                # Strategy 2: Copy profile to temp dir (handles locked profile)
-                _tmp_profile = _copy_chrome_profile_for_playwright(user_data_dir)
-                if _tmp_profile:
-                    try:
-                        context = p.chromium.launch_persistent_context(
-                            _tmp_profile,
-                            headless=headless,
-                            executable_path=exec_path,
-                            args=["--profile-directory=Default"] + _STEALTH_ARGS,
-                            ignore_default_args=["--enable-automation"],
-                            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-                            viewport={"width": 1280, "height": 900}
-                        )
-                        page = context.pages[0] if context.pages else context.new_page()
-                        page.add_init_script(_STEALTH_INIT_SCRIPT)
-                        _inject_cookies_from_profile(context, _tmp_profile)
-                        print(f"[通用自动化] 已使用临时配置文件目录启动。")
-                    except Exception as e2:
-                        print(f"[通用自动化] 临时配置文件启动也失败 ({e2})，降级为新建 Chromium 上下文。")
-                        _tmp_profile = None
-                        user_data_dir = None
-                else:
-                    user_data_dir = None
+                # 根治 SQLite 锁死：彻底放弃可能引发 database is locked 的物理文件复制
+                print(f"[通用自动化] Chrome 用户数据目录已被排他锁定 ({type(e).__name__})。")
+                print(f"[通用自动化] 为保护本地数据库完整性并规避 SQLite 锁死，平滑降级为独立反检测隔离实例。")
+                print(f"[通用自动化] 提示：建议在日常 Chrome 中访问 chrome://inspect/#remote-debugging 开启远程调试，或运行 python scripts/login.py 启动无锁 CDP 模式。")
+                user_data_dir = None
 
         if not connected_via_cdp and not user_data_dir:
-            # Strategy 3: Fresh browser with stealth mode (handles open-access sites)
+            # Strategy 2: Fresh browser with stealth mode + Port Guard (handles open-access sites)
             effective_headless = headless
             print(f"[通用自动化] 使用新建 Chromium 上下文（无头模式={effective_headless}，反检测模式）...")
             browser = p.chromium.launch(
@@ -1155,6 +1156,10 @@ def extract_general_html_tables(url, table_idx="all", headed=False, user_data_di
             )
             page = context.new_page()
             page.add_init_script(_STEALTH_INIT_SCRIPT)
+            if install_cdp_port_guard:
+                install_cdp_port_guard(context)
+                install_cdp_port_guard(page)
+
 
         # 拦截 mailto:, tel: 等外部系统协议，防止 macOS 弹出系统 Mail.app 邮件应用
         try:

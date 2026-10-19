@@ -1912,28 +1912,34 @@ def _crawl4ai_record(url, hard_failure):
 
 def _crawl4ai_cdp_url():
     """
-    确定 Crawl4AI 是否通过 CDP 接管技能已有的调试 Chrome（9222 端口）。
-    config CRAWL4AI_CDP_URL 显式指定优先；为空时自动探测 127.0.0.1:9222
+    确定 Crawl4AI 是否通过 CDP 接管技能已有的调试 Chrome。
+    config CRAWL4AI_CDP_URL / CDP_URL 显式指定优先；为空时自动动态探测 DevToolsActivePort / 9222
     （每进程仅探测一次）。返回 None 表示自启独立 stealth 浏览器。
     """
     config = load_config()
-    explicit = (config.get("CRAWL4AI_CDP_URL") or "").strip()
+    explicit = (config.get("CRAWL4AI_CDP_URL") or config.get("CDP_URL") or "").strip()
     if explicit:
         return explicit
     if _CRAWL4AI_CDP_CACHE["checked"]:
         return _CRAWL4AI_CDP_CACHE["url"]
     probe = None
     try:
-        import urllib.request
-        with urllib.request.urlopen("http://127.0.0.1:9222/json/version", timeout=0.8) as resp:
-            if resp.status == 200:
-                probe = "http://127.0.0.1:9222"
+        from .cdp_detector import find_active_cdp_endpoint
+        ep = find_active_cdp_endpoint(timeout=0.8, config=config)
+        if ep:
+            probe = ep["cdp_url"]
+            print(f"[Crawl4AI] 检测到活动 CDP 调试 Chrome ({probe}，来源: {ep.get('source')})，将经 CDP 复用该浏览器（免启动、继承登录态）。")
     except Exception:
-        probe = None
+        try:
+            import urllib.request
+            with urllib.request.urlopen("http://127.0.0.1:9222/json/version", timeout=0.8) as resp:
+                if resp.status == 200:
+                    probe = "http://127.0.0.1:9222"
+                    print("[Crawl4AI] 检测到 9222 调试 Chrome，将经 CDP 复用该浏览器（免启动、继承登录态）。")
+        except Exception:
+            probe = None
     _CRAWL4AI_CDP_CACHE["checked"] = True
     _CRAWL4AI_CDP_CACHE["url"] = probe
-    if probe:
-        print("[Crawl4AI] 检测到 9222 调试 Chrome，将经 CDP 复用该浏览器（免启动、继承登录态）。")
     return probe
 
 
@@ -1973,8 +1979,9 @@ def extract_tables_via_crawl4ai(url, table_idx="all", cancel_event=None):
     Crawl4AI 抓取目标 URL 并解析表格。
 
     相对旧版的优化：
-    - 优先经 CDP 接管技能已有的 9222 调试 Chrome（CRAWL4AI_CDP_URL，默认自动探测）：
+    - 优先经 CDP 接管技能已有的 9222 / 动态端口调试 Chrome（支持动态 DevToolsActivePort 发现）：
       零启动开销、直接继承日常登录态；探测不到则回退自启 stealth 浏览器；
+    - 标签页级隔离并发：CDP 模式下免除全局排他进程锁，直接实现多 Tab 隔离并行；
     - page_timeout（CRAWL4AI_PAGE_TIMEOUT_MS）+ wait_for（表格出现或加载 3s 即返回），
       竞速输家不再变僵尸浏览器；
     - Cookie 按目标域名过滤注入（CDP 模式下无需注入）；
@@ -1998,12 +2005,15 @@ def extract_tables_via_crawl4ai(url, table_idx="all", cancel_event=None):
     cdp_url = _crawl4ai_cdp_url()
 
     sem = _crawl4ai_semaphore()
-    # CDP 模式与 Playwright 桥接共用同一个 9222 调试 Chrome：纳入共享浏览器锁
-    # （线程锁 + 跨进程文件锁），避免与 Playwright 渠道并发驱动同一浏览器。
-    lock_ctx = common.browser_extraction_lock("browser_extraction") if cdp_url else None
-    if lock_ctx is not None:
+    # CDP 模式下通过标签页隔离并发，无需全局排他锁；
+    # 仅在非 CDP 模式且指定了共享磁盘目录时才加锁，防止多子进程冲突。
+    lock_ctx = None
+    if not cdp_url and config.get("PLAYWRIGHT_USER_DATA_DIR"):
+        lock_ctx = common.browser_extraction_lock("browser_extraction")
         lock_ctx.__enter__()
+
     sem.acquire()
+
     try:
         if cancel_event is not None and cancel_event.is_set():
             return []
@@ -2115,9 +2125,15 @@ def extract_tables_via_crawl4ai(url, table_idx="all", cancel_event=None):
                     return dfs
         return []
     finally:
-        sem.release()
+        try:
+            sem.release()
+        except Exception:
+            pass
         if lock_ctx is not None:
-            lock_ctx.__exit__(None, None, None)
+            try:
+                lock_ctx.__exit__(None, None, None)
+            except Exception:
+                pass
 
 
 def extract_tables_via_unpaywall(doi, table_idx="all", cancel_event=None):

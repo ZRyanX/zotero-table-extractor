@@ -80,6 +80,7 @@
 - **多出版商自适应分流**：原生覆盖 Elsevier / ScienceDirect、Springer Link、Wiley、Nature、IEEE Xplore、Taylor & Francis、MDPI、ACS、RSC、GeoSciWorld 等。
 - **中国知网 (CNKI) 专属适配**：内置 Scrapling 极速爬取与 Playwright 动态渲染引擎，支持滑块验证码绕过、地质特殊符号还原及文献 HTML 阅读页表格提取。
 - **附表 (Supplementary Tables) 自动探测**：自动嗅探并提取论文正文及关联的在线附表。
+- **CDP 动态端口自愈与 Port Guard 防反爬**：打破 9222 端口硬编码，自动探测 Chromium 家族 `DevToolsActivePort` 动态端口直连，免重启内存复用校园网/CARSI 学术认证，根除 SQLite 锁死；通过 CDP Port Guard 拦截前端针对本地调试端口的反爬嗅探并伪装 `ConnectionRefused`；结合跨进程槽位文件锁实现多 Tab 隔离高并发抽取。
 - **完备性门禁**：若在线提取得到的表数量低于 PDF 文本层扫描出的表格 caption 数量，系统自动触发增量补偿，防止在线版本漏表。
 
 ### 2. 本地原生 PDF 8 引擎投票与 IBM TEDS 拓扑共识
@@ -333,6 +334,7 @@ cp config.example.json config.json
 | `FIRECRAWL_API_KEY` | string | `""` | Firecrawl 智能爬虫 API Key（用于通用网页清洗） |
 | `FIRECRAWL_MAX_AGE_MS` | int | `86400000` | Firecrawl 网页缓存生命周期（毫秒，默认 24h） |
 | `CNKI_STRATEGY` | string | `"auto"` | 知网提取策略：`auto`（自动尝试）、`scrapling`、`playwright` |
+| `CDP_URL` | string | `""` | 通用浏览器 CDP 远程调试连接地址（为空时自动按 DevToolsActivePort 动态探测或 9222 兜底） |
 | `PLAYWRIGHT_HEADED` | boolean | `false` | 是否以可见窗口启动浏览器（调试或人工验证时设为 `true`） |
 | `DOCLAYOUT_YOLO_ENABLED` | boolean | `true` | 是否启用本地 DocLayout-YOLO 视觉版面检测兜底 |
 | `DOCLAYOUT_CONF_THRESHOLD` | float | `0.25` | YOLO 目标检测置信度阈值 |

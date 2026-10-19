@@ -176,20 +176,54 @@ def extract_cnki_html_tables(url, cookies_path=None, table_idx="all", headed=Fal
         print(f"[Playwright] 使用自动识别的 Chromium 路径: {exec_path}")
     connected_via_cdp = False
     with sync_playwright() as p:
-        browser = None
+        cdp_endpoint = None
+        cdp_port = None
         try:
-            import urllib.request
-            # Check if port 9222 is open and listening
-            with urllib.request.urlopen("http://127.0.0.1:9222/json/version", timeout=1.5) as response:
-                if response.status == 200:
-                    print("[知网自动化] 检测到有运行在 9222 端口的 Chrome 进程。正在进行 CDP 桥接...")
-                    browser = p.chromium.connect_over_cdp("http://127.0.0.1:9222")
-                    context = browser.contexts[0] if browser.contexts else browser.new_context()
-                    page = context.new_page()
-                    connected_via_cdp = True
-                    print("[知网自动化] CDP 桥接成功！将使用您当前活动的物理 Chrome 窗口（可直接免去验证码）。")
-        except Exception:
-            pass
+            from .cdp_detector import find_active_cdp_endpoint, install_cdp_port_guard
+        except ImportError:
+            try:
+                from cdp_detector import find_active_cdp_endpoint, install_cdp_port_guard
+            except ImportError:
+                find_active_cdp_endpoint = None
+                install_cdp_port_guard = None
+
+        if find_active_cdp_endpoint:
+            cfg = None
+            try:
+                from . import load_config
+                cfg = load_config()
+            except Exception:
+                try:
+                    import common
+                    cfg = common.load_config()
+                except Exception:
+                    cfg = None
+            cdp_endpoint = find_active_cdp_endpoint(timeout=1.5, user_data_dir=user_data_dir, config=cfg)
+        else:
+            try:
+                with urllib.request.urlopen("http://127.0.0.1:9222/json/version", timeout=1.2) as response:
+                    if response.status == 200:
+                        cdp_endpoint = {"cdp_url": "http://127.0.0.1:9222", "port": 9222, "source": "default_9222"}
+            except Exception:
+                cdp_endpoint = None
+
+        if cdp_endpoint:
+            try:
+                cdp_url = cdp_endpoint["cdp_url"]
+                cdp_port = cdp_endpoint.get("port")
+                src = cdp_endpoint.get("source", "active")
+                print(f"[知网自动化] 检测到活动 CDP 调试端点 ({cdp_url}，来源: {src})。正在进行内存直连...")
+                browser = p.chromium.connect_over_cdp(cdp_url)
+                context = browser.contexts[0] if browser.contexts else browser.new_context()
+                page = context.new_page()
+                connected_via_cdp = True
+                print("[知网自动化] CDP 内存直连成功！将使用您当前活动的物理 Chrome 窗口（直接继承知网登录态与验证状态）。")
+                if install_cdp_port_guard:
+                    if context:
+                        install_cdp_port_guard(context, cdp_port=cdp_port)
+                    install_cdp_port_guard(page, cdp_port=cdp_port)
+            except Exception as e:
+                print(f"[知网自动化] CDP 内存直连失败: {e}")
 
         if not connected_via_cdp:
             if user_data_dir:
@@ -201,6 +235,9 @@ def extract_cnki_html_tables(url, cookies_path=None, table_idx="all", headed=Fal
                     viewport={"width": 1280, "height": 800}
                 )
                 page = context.pages[0] if context.pages else context.new_page()
+                if install_cdp_port_guard:
+                    install_cdp_port_guard(context)
+                    install_cdp_port_guard(page)
                 cookies_json = os.path.join(user_data_dir, "cookies.json")
                 if os.path.exists(cookies_json):
                     try:
@@ -219,6 +256,9 @@ def extract_cnki_html_tables(url, cookies_path=None, table_idx="all", headed=Fal
                     viewport={"width": 1280, "height": 800}
                 )
                 page = context.new_page()
+                if install_cdp_port_guard:
+                    install_cdp_port_guard(context)
+                    install_cdp_port_guard(page)
 
         # 拦截 mailto:, tel: 等外部系统协议，防止 macOS 弹出系统 Mail.app 邮件应用
         try:
@@ -228,6 +268,7 @@ def extract_cnki_html_tables(url, cookies_path=None, table_idx="all", headed=Fal
             )
         except Exception:
             pass
+
             
         # Load cookies
         if cookies_path and os.path.exists(cookies_path):
@@ -239,84 +280,91 @@ def extract_cnki_html_tables(url, cookies_path=None, table_idx="all", headed=Fal
                 except Exception as e:
                     print(f"[知网自动化] 加载 Cookie 报错: {e}")
                     
-        print(f"[知网自动化] 正在载入详情页: {url}")
-        page.goto(url, wait_until="networkidle", timeout=60000)
-        
-        # ── China DOI (chndoi.org / chinadoi.cn) Multi-resolution Chooser ──
-        if "chndoi.org" in page.url or "chinadoi.cn" in page.url or page.locator("text=多重解析地址").count() > 0:
-            print("[知网自动化] 检测到 China DOI 多重解析页面，自动提取【境内】知网地址...")
-            try:
-                link_el = page.locator("li:has-text('境内') a, a:has-text('境内')").first
-                if link_el.count() > 0:
-                    dom_url = link_el.get_attribute("href")
-                    if dom_url:
-                        print(f"[知网自动化] 自动跳转至境内地址: {dom_url}")
-                        page.goto(dom_url, wait_until="networkidle", timeout=60000)
-            except Exception:
-                pass
-
-        # Click HTML Reading button
-        html_button = page.locator("a:has-text('HTML阅读')").first
-        if not html_button.is_visible(timeout=5000):
-            print("[知网自动化] 未找到 'HTML阅读' 按钮，可能未登录或无阅读权限。")
-            if connected_via_cdp:
+        dfs = []
+        page_title = None
+        new_page = None
+        try:
+            print(f"[知网自动化] 正在载入详情页: {url}")
+            page.goto(url, wait_until="networkidle", timeout=60000)
+            
+            # ── China DOI (chndoi.org / chinadoi.cn) Multi-resolution Chooser ──
+            if "chndoi.org" in page.url or "chinadoi.cn" in page.url or page.locator("text=多重解析地址").count() > 0:
+                print("[知网自动化] 检测到 China DOI 多重解析页面，自动提取【境内】知网地址...")
                 try:
-                    page.close()
+                    link_el = page.locator("li:has-text('境内') a, a:has-text('境内')").first
+                    if link_el.count() > 0:
+                        dom_url = link_el.get_attribute("href")
+                        if dom_url:
+                            print(f"[知网自动化] 自动跳转至境内地址: {dom_url}")
+                            page.goto(dom_url, wait_until="networkidle", timeout=60000)
                 except Exception:
                     pass
+
+            # Click HTML Reading button
+            html_button = page.locator("a:has-text('HTML阅读')").first
+            if not html_button.is_visible(timeout=5000):
+                print("[知网自动化] 未找到 'HTML阅读' 按钮，可能未登录或无阅读权限。")
+                return [], None
+                
+            print("[知网自动化] 发现 'HTML阅读' 按钮，正在跳转至阅读页面...")
+            with context.expect_page() as new_page_info:
+                html_button.click()
+                
+            new_page = new_page_info.value
+            new_page.wait_for_load_state("networkidle", timeout=60000)
+            new_page.wait_for_timeout(3000)
+            
+            # Check for slider verification
+            wrapper = new_page.query_selector(".slider-wrapper")
+            if wrapper:
+                print("[知网自动化] 检测到滑动验证，正在启动自动滑块模拟...")
+                wrapper_box = wrapper.bounding_box()
+                handler = new_page.query_selector("#js-handler")
+                handler_box = handler.bounding_box()
+                
+                if wrapper_box and handler_box:
+                    drag_distance = wrapper_box["width"] - handler_box["width"] + 10
+                    try:
+                        simulate_human_drag(new_page, "#js-handler", drag_distance)
+                        new_page.wait_for_timeout(5000) # Wait for page contents to render
+                    except Exception as e:
+                        print(f"【错误】模拟滑动失败: {e}")
+                else:
+                    print("【错误】未能获取滑块的布局尺寸，跳过滑动。")
+            else:
+                print("[知网自动化] 无需滑动验证，直接提取表格。")
+                
+            # Parse tables and get paper title from the page title
+            page_title = new_page.title()
+            if page_title:
+                for pattern in [" - 中国知网", " - 手机知网", " - kns.cnki.net", "-中国知网", "-手机知网", "HTML阅读-", "HTML阅读_"]:
+                    if pattern in page_title:
+                        page_title = page_title.replace(pattern, "").strip()
+            print(f"[知网自动化] 获取到文献标题: {page_title}")
+            
+            dfs = extract_tables_from_page(new_page, table_idx)
+            return dfs, page_title
+        finally:
+            if connected_via_cdp:
+                if page:
+                    try:
+                        page.close()
+                    except Exception:
+                        pass
+                if new_page:
+                    try:
+                        new_page.close()
+                    except Exception:
+                        pass
             elif not user_data_dir:
-                browser.close()
+                if browser:
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
             else:
-                context.close()
-            return [], None
-            
-        print("[知网自动化] 发现 'HTML阅读' 按钮，正在跳转至阅读页面...")
-        with context.expect_page() as new_page_info:
-            html_button.click()
-            
-        new_page = new_page_info.value
-        new_page.wait_for_load_state("networkidle", timeout=60000)
-        new_page.wait_for_timeout(3000)
-        
-        # Check for slider verification
-        wrapper = new_page.query_selector(".slider-wrapper")
-        if wrapper:
-            print("[知网自动化] 检测到滑动验证，正在启动自动滑块模拟...")
-            wrapper_box = wrapper.bounding_box()
-            handler = new_page.query_selector("#js-handler")
-            handler_box = handler.bounding_box()
-            
-            if wrapper_box and handler_box:
-                drag_distance = wrapper_box["width"] - handler_box["width"] + 10
-                try:
-                    simulate_human_drag(new_page, "#js-handler", drag_distance)
-                    new_page.wait_for_timeout(5000) # Wait for page contents to render
-                except Exception as e:
-                    print(f"【错误】模拟滑动失败: {e}")
-            else:
-                print("【错误】未能获取滑块的布局尺寸，跳过滑动。")
-        else:
-            print("[知网自动化] 无需滑动验证，直接提取表格。")
-            
-        # Parse tables and get paper title from the page title
-        page_title = new_page.title()
-        if page_title:
-            for pattern in [" - 中国知网", " - 手机知网", " - kns.cnki.net", "-中国知网", "-手机知网", "HTML阅读-", "HTML阅读_"]:
-                if pattern in page_title:
-                    page_title = page_title.replace(pattern, "").strip()
-        print(f"[知网自动化] 获取到文献标题: {page_title}")
-        
-        dfs = extract_tables_from_page(new_page, table_idx)
-        
-        if connected_via_cdp:
-            try:
-                page.close()
-                new_page.close()
-            except Exception:
-                pass
-        elif not user_data_dir:
-            browser.close()
-        else:
-            context.close()
-            
-        return dfs, page_title
+                if context:
+                    try:
+                        context.close()
+                    except Exception:
+                        pass

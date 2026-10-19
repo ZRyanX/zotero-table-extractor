@@ -76,6 +76,14 @@ from .strategies import (
     extract_tables_via_ncbi_pmc,
     _parse_jats_xml_tables,
 )
+from .cdp_detector import (
+    find_active_devtools_port,
+    find_active_cdp_endpoint,
+    get_active_cdp_url,
+    install_cdp_port_guard,
+    get_cdp_tab_semaphore,
+    cdp_tab_slot_guard,
+)
 from .graph import (
     ExtractionNode,
     ExtractionGraph,
@@ -117,6 +125,8 @@ __all__ = [
     'has_image_based_tables', 'interactive_cnki_cookie_capture', 'load_config',
     'load_cookies_from_file', 'parse_tables_from_html', 'parse_tables_from_markdown',
     'requests_impersonate', 'resolve_chinese_doi', 'resolve_doi_canonical_url',
+    'find_active_devtools_port', 'find_active_cdp_endpoint', 'get_active_cdp_url',
+    'install_cdp_port_guard', 'get_cdp_tab_semaphore', 'cdp_tab_slot_guard',
     'resolve_pmcid_from_doi'
 ]
 
