@@ -125,9 +125,12 @@ def run_benchmark_suite(
     selected_groups: List[str],
     output_dir: Path,
     verbose: bool = False,
+    mineru_mode: str = 'fixture',
 ) -> Dict[str, Any]:
     """Execute the empirical benchmark suite and collect quantitative results."""
     ensure_benchmark_assets()
+    if mineru_mode not in ('fixture', 'live'):
+        raise ValueError('mineru_mode must be fixture or live')
 
     output_dir.mkdir(parents=True, exist_ok=True)
     papers_dir = BENCHMARK_DIR / "papers"
@@ -179,7 +182,10 @@ def run_benchmark_suite(
             p_func = p_cfg["func"]
 
             print(f"    • Running {p_name}...", end="", flush=True)
-            extracted_tables, elapsed_s, logs = p_func(str(pdf_path))
+            if p_id == 'p2':
+                extracted_tables, elapsed_s, logs = p_func(str(pdf_path), mineru_mode=mineru_mode)
+            else:
+                extracted_tables, elapsed_s, logs = p_func(str(pdf_path))
             print(f" done in {elapsed_s:.3f}s. Extracted {len(extracted_tables)} tables.")
 
             # Evaluate against Ground Truth
@@ -191,6 +197,8 @@ def run_benchmark_suite(
             )
             eval_res["group_id"] = grp["id"]
             eval_res["pipeline_id"] = p_id
+            eval_res['input_source'] = ('synthetic_ground_truth' if mineru_mode == 'fixture' else 'live_service') if p_id == 'p2' else 'local_pdf_extraction'
+            eval_res['logs'] = logs
 
             if verbose:
                 for l in logs[:5]:
@@ -233,6 +241,9 @@ def run_benchmark_suite(
     # Save Reports
     report_data = {
         "benchmark_timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        'mineru_mode': mineru_mode,
+        'evidence_scope': 'postprocessing_regression' if mineru_mode == 'fixture' else 'synthetic_pdf_live_extraction',
+        'mineru_service_latency_included': mineru_mode == 'live',
         "summary": aggregated_by_pipeline,
         "detailed_results": results_matrix,
     }
@@ -242,7 +253,7 @@ def run_benchmark_suite(
         json.dump(report_data, f, ensure_ascii=False, indent=2)
 
     md_report_path = output_dir / "benchmark_report.md"
-    generate_markdown_report(md_report_path, target_groups, target_pipelines, results_matrix, aggregated_by_pipeline)
+    generate_markdown_report(md_report_path, target_groups, target_pipelines, results_matrix, aggregated_by_pipeline, mineru_mode=mineru_mode)
 
     print(f"\n[✓] Benchmark Report JSON written to: {json_report_path}")
     print(f"[✓] Benchmark Report Markdown written to: {md_report_path}")
@@ -295,10 +306,14 @@ def print_console_summary(groups, pipelines_list, results_matrix, aggregated):
     print("=" * 96 + "\n")
 
 
-def generate_markdown_report(md_path: Path, groups, pipelines_list, results_matrix, aggregated):
+def generate_markdown_report(md_path: Path, groups, pipelines_list, results_matrix, aggregated, *, mineru_mode='fixture'):
     """Write publication-grade Markdown benchmark report."""
     lines = []
-    lines.append("# Empirical Table Extraction Benchmark Report\n")
+    lines.append("# Table Extraction Benchmark Report\n")
+    if mineru_mode == 'fixture':
+        lines.append('**Scope: postprocessing regression only.** Pipeline 2 consumes synthetic tables generated from ground truth. Its accuracy does not measure MinerU recognition, and its elapsed time excludes model/service processing. Cross-pipeline speedup claims are invalid in this mode.\n\n')
+    else:
+        lines.append('**Scope: live extraction of synthetic PDFs.** Generated MinerU caches are excluded; elapsed time includes the service call. Generalization to real papers requires independently annotated real documents.\n\n')
     lines.append(f"**Generated at**: `{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}`\n")
     lines.append("## 1. Executive Summary\n")
     lines.append("This benchmark evaluates three distinct PDF table extraction pipelines across 5 representative scientific document categories.\n")
@@ -317,31 +332,16 @@ def generate_markdown_report(md_path: Path, groups, pipelines_list, results_matr
         )
     lines.append("\n")
 
-    # Key Empirical Insights
-    lines.append("### Key Empirical Findings & Root Cause Analysis\n\n")
-    lines.append(
-        "1. **False Agreement in Baseline Voting (Pipeline 1)**:\n"
-        "   - In **Group D (Multi-Page Continuation Tables)**, multiple native engines (`pdf_inspector` and `find_tables`) "
-        "consistently agreed on the first page fragment (25 rows) while failing to stitch the continuation segments on pages 2 and 3. "
-        "Because their similarity met the ≥75% threshold (`cross_validated = True`, sim=0.76), `three_way_vote` produced a **False Agreement**, "
-        "certifying high confidence on a severely truncated table and silently discarding **55 data rows** (66.67% sampled cell truncation error).\n"
-        "   - Proposed **Pipeline 2** completely solved this via `verify_table_numeric_integrity` and Monotone DP continuation table stitching (`merge_continuation_tables`), retaining all **80 rows** across all 3 pages (0 truncated rows, 0.00% error rate).\n\n"
-        "2. **Multi-Level Spanning Header Hierarchy Loss (Group B)**:\n"
-        "   - In **Group B (Multi-level Complex Spanning Headers)**, native vector extractors lack DOM tree parsing and flatten multi-tiered headers into un-grouped leaf column names (`Spot`, `Domain`, `U`, `Th/U`), stripping the semantic grouping hierarchy (`Sample Info`, `Trace Elements (ppm)`, `Isotopic Ratios`, `Apparent Ages`). "
-        "Pure local greedy heuristics (Pipeline 3) completely collapsed headers, resulting in **100% Value Error Rate**.\n"
-        "   - Pipeline 2 parsed the HTML DOM structure, preserving full hierarchical headers (`Parent_Child` format) with **100% Cell Accuracy**.\n\n"
-        "3. **Zero-Text Scanned Document Failure (Group E)**:\n"
-        "   - On **Group E (Low-Contrast Scanned Archival Records)**, native vector engines found zero vector text, resulting in total table omission (`Missed Tables = 1`, 16 truncated rows) in both Pipeline 1 and Pipeline 3.\n"
-        "   - Pipeline 2's local numeric gate identified `scanned_or_empty_text_layer`, bypassed vector text rejection, and safely recovered the full structured table via vision OCR.\n\n"
-    )
-    t1 = aggregated.get("p1", {}).get("total_time_s", 0.0)
-    t2 = aggregated.get("p2", {}).get("total_time_s", 0.0)
-    speedup_str = f" ({t1 / t2:.1f}x faster)" if t2 > 0 and t1 > t2 else ""
-    lines.append(
-        "4. **Execution Latency Efficiency**:\n"
-        f"   - Pipeline 1 required **~{t1:.2f}s** due to running 5 native engines in redundant parallel loops and pairwise similarity voting.\n"
-        f"   - Pipeline 2 completed in **~{t2:.2f}s**{speedup_str} through single structured primary extraction validated by lightweight local numeric verification.\n\n"
-    )
+    # Report observations from this run, never a prewritten success narrative.
+    lines.append("### Observed results\n\n")
+    for row in results_matrix:
+        lines.append(
+            f"- Group {row['group_id']} / {row['pipeline_id']}: "
+            f"{row['missed_tables_count']} missed tables, "
+            f"{row['total_truncated_rows']} truncated rows, "
+            f"{row['value_error_rate_pct']:.2f}% sampled value error.\n"
+        )
+    lines.append("\n")
 
     # Detailed Group Breakdown Table
     lines.append("## 2. Quantitative Group-by-Group Breakdown\n\n")
@@ -370,6 +370,7 @@ def main():
     parser.add_argument("--groups", type=str, default="A,B,C,D,E", help="Comma-separated test groups: A,B,C,D,E")
     parser.add_argument("--output-dir", type=str, default=str(BENCHMARK_DIR / "reports"), help="Output reports directory")
     parser.add_argument("--verbose", action="store_true", help="Print verbose step logs")
+    parser.add_argument('--mineru-mode', choices=['fixture', 'live'], default='fixture', help='fixture: synthetic postprocessing regression; live: submit PDFs to MinerU and measure extraction')
 
     args = parser.parse_args()
 
@@ -382,6 +383,7 @@ def main():
         selected_groups=selected_groups,
         output_dir=out_dir,
         verbose=args.verbose,
+        mineru_mode=args.mineru_mode,
     )
 
 

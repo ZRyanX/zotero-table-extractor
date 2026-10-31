@@ -317,7 +317,11 @@ def parse_tables_from_html(html_content, table_idx="all"):
     """
     try:
         # Wrap literal HTML in StringIO to avoid deprecation warnings
-        dfs = pd.read_html(io.StringIO(html_content))
+        try:
+            from ..table_postprocess import read_html_preserving_text
+        except ImportError:
+            from table_postprocess import read_html_preserving_text
+        dfs = read_html_preserving_text(html_content)
         if not dfs:
             return []
             

@@ -49,12 +49,14 @@ except ImportError:
     from common import load_config, clean_text, clean_latex_and_ocr, TABLE_LABEL_RE, format_table_label
 
 try:
-    from .table_postprocess import parse_structured_vlm_content
+    from .table_postprocess import parse_structured_vlm_content, should_promote_first_row, is_default_or_unnamed_columns, read_html_preserving_text
 except ImportError:
     try:
-        from table_postprocess import parse_structured_vlm_content
+        from table_postprocess import parse_structured_vlm_content, should_promote_first_row, is_default_or_unnamed_columns, read_html_preserving_text
     except ImportError:
         parse_structured_vlm_content = None
+        should_promote_first_row = None
+        is_default_or_unnamed_columns = None
 
 try:
     from .pdf_page_filter import page_may_contain_tables
@@ -236,8 +238,7 @@ def _parse_mineru_table_html(table_html_or_md: str) -> List[pd.DataFrame]:
         try:
             converted_content = _convert_sub_sup(content)
             # 锁定单元格为 str，避免自动将样号 001、范围 10-20、编码等误转为数值/日期
-            conv = collections.defaultdict(lambda: str)
-            dfs = pd.read_html(io.StringIO(converted_content), keep_default_na=False, converters=conv)
+            dfs = read_html_preserving_text(converted_content)
             cleaned_dfs = []
             for df in dfs:
                 if df is None or df.empty:
@@ -259,15 +260,18 @@ def _parse_mineru_table_html(table_html_or_md: str) -> List[pd.DataFrame]:
                     df.columns = _make_columns_unique(flat_cols)
                 else:
                     # 检查是否为未识别出 <th> 的默认数字列名 (0, 1, 2...)
-                    is_default_int_cols = all(
-                        isinstance(c, int) or (np is not None and isinstance(c, np.integer)) or (isinstance(c, str) and c.strip().isdigit())
-                        for c in df.columns
-                    )
-                    if is_default_int_cols and len(df) > 0:
-                        first_row = [clean_latex_and_ocr(clean_text(str(x))).strip() for x in df.iloc[0]]
-                        # 若首行包含至少一个文本标签，则将首行作为表头提升
-                        has_text = any(len(c) > 0 and not c.replace('.', '').replace('-', '').replace(',', '').isdigit() for c in first_row)
-                        if has_text:
+                    if is_default_or_unnamed_columns is not None:
+                        is_default_int_cols = df.attrs.get('header_source') != 'explicit' and is_default_or_unnamed_columns(df.columns)
+                    else:
+                        is_default_int_cols = (
+                            isinstance(df.columns, pd.RangeIndex) or
+                            list(df.columns) == list(range(len(df.columns))) or
+                            [str(c).strip() for c in df.columns] == [str(i) for i in range(len(df.columns))]
+                        )
+                    if is_default_int_cols:
+                        promote = should_promote_first_row(df) if should_promote_first_row is not None else False
+                        if promote:
+                            first_row = [clean_latex_and_ocr(clean_text(str(x))).strip() for x in df.iloc[0]]
                             df = df.iloc[1:].reset_index(drop=True)
                             df.columns = _make_columns_unique(first_row)
                         else:
@@ -293,12 +297,30 @@ def _parse_mineru_table_html(table_html_or_md: str) -> List[pd.DataFrame]:
     return []
 
 
+class HostHeaderSSLAdapter(requests.adapters.HTTPAdapter):
+    """确保在通过直连 IP 访问时，TLS SNI 与证书校验严格绑定至原始目标主机名。"""
+    def __init__(self, host: str, **kwargs):
+        self.expected_host = host
+        super().__init__(**kwargs)
+
+    def init_poolmanager(self, *args, **kwargs):
+        kwargs['assert_hostname'] = self.expected_host
+        kwargs['server_hostname'] = self.expected_host
+        super().init_poolmanager(*args, **kwargs)
+
+    def proxy_manager_for(self, proxy, **proxy_kwargs):
+        # HTTPS target identity must survive HTTP CONNECT / SOCKS pooling too.
+        proxy_kwargs['assert_hostname'] = self.expected_host
+        proxy_kwargs['server_hostname'] = self.expected_host
+        return super().proxy_manager_for(proxy, **proxy_kwargs)
+
+
 def download_resilient_asset(url: str, timeout: int = 60) -> Optional[bytes]:
     """
     高可用弹性下载器，专为 OpenXLab CDN 与代理/TUN 环境网络加固。
     1. 首选标准 requests.get 下载；
     2. 若触发 SSL_ERROR_SYSCALL、UNEXPECTED_EOF_WHILE_READING、ConnectionError 或握手中断：
-       自动通过 AliDNS / Tencent DoH 获取真实公网 CDN 节点 IP，并以原始 Host 直连重试；
+       自动通过 AliDNS / Tencent DoH 获取真实公网 CDN 节点 IP，并以原始 Host 直连重试（保持 TLS 身份校验）；
     3. 成功下载后返回 bytes 数据，失败返回 None。
     """
     if not url or not isinstance(url, str) or not url.startswith(("http://", "https://")):
@@ -313,7 +335,9 @@ def download_resilient_asset(url: str, timeout: int = 60) -> Optional[bytes]:
 
     from urllib.parse import urlparse
     parsed = urlparse(url)
-    host = parsed.netloc
+    host = parsed.hostname
+    if not host:
+        return None
     path = parsed.path
     if parsed.query:
         path += "?" + parsed.query
@@ -338,18 +362,15 @@ def download_resilient_asset(url: str, timeout: int = 60) -> Optional[bytes]:
         except Exception:
             pass
 
-    # 3. 预设知名 CDN 节点池兜底 (如 cdn-mineru.openxlab.org.cn)
-    fallback_pool = ["171.107.77.45", "124.227.186.47", "116.253.28.241", "120.240.159.96"]
-    for ip in fallback_pool:
-        if ip not in ips:
-            ips.append(ip)
-
-    # 逐个直连 IP
+    # 仅尝试当前域名经 DoH 解析出的公网节点 IP，严格禁止跨域硬编码固定 IP 兜底，并强制保留原始主机名的 TLS 证书校验
     for ip in ips[:4]:
         try:
-            direct_url = f"{parsed.scheme}://{ip}{path}"
-            headers = {"Host": host}
-            r = requests.get(direct_url, headers=headers, verify=False, timeout=timeout)
+            authority = f"{ip}:{parsed.port}" if parsed.port else ip
+            direct_url = f"{parsed.scheme}://{authority}{path}"
+            headers = {"Host": parsed.netloc}
+            with requests.Session() as session:
+                session.mount(f"{parsed.scheme}://{authority}/", HostHeaderSSLAdapter(host))
+                r = session.get(direct_url, headers=headers, timeout=timeout)
             if r.status_code == 200 and r.content:
                 logger.debug(f"[ResilientDownloader] 通过直连 IP {ip} 成功下载资产 ({len(r.content)} bytes)")
                 return r.content
@@ -440,7 +461,7 @@ def extract_mineru_structured_archive(archive_input: Any) -> List[pd.DataFrame]:
     zf = None
     should_close = False
     try:
-        if isinstance(archive_input, zipfile.ZipFile):
+        if isinstance(archive_input, (zipfile.ZipFile, DirArchive)):
             zf = archive_input
         elif isinstance(archive_input, (bytes, bytearray)):
             zf = zipfile.ZipFile(io.BytesIO(archive_input))
@@ -476,6 +497,12 @@ def extract_mineru_structured_archive(archive_input: Any) -> List[pd.DataFrame]:
                 if "<table" in obj.lower() or "\n|" in obj or obj.strip().startswith("|"):
                     return obj.strip(), None
                 return None, None
+            if isinstance(obj, list):
+                for child in obj:
+                    body, bbox = _find_table_body_and_box(child)
+                    if body:
+                        return body, bbox
+                return None, None
             if isinstance(obj, dict):
                 bbox = obj.get("bbox") or obj.get("box") or obj.get("rect")
                 # Direct body keys
@@ -493,7 +520,7 @@ def extract_mineru_structured_archive(archive_input: Any) -> List[pd.DataFrame]:
                 if isinstance(c, str) and c.strip():
                     if "<table" in c.lower() or "\n|" in c or c.strip().startswith("|"):
                         return c.strip(), bbox
-                elif isinstance(c, dict):
+                elif isinstance(c, (dict, list)):
                     sub_b, sub_box = _find_table_body_and_box(c)
                     if sub_b:
                         return sub_b, bbox or sub_box
@@ -623,11 +650,12 @@ def extract_mineru_structured_archive(archive_input: Any) -> List[pd.DataFrame]:
             if re.search(r'content_list', base, re.IGNORECASE):
                 priority = 1
             elif re.search(r'middle', base, re.IGNORECASE):
-                priority = 2
-            elif re.search(r'structured_content', base, re.IGNORECASE):
                 priority = 3
+            elif re.search(r'structured_content', base, re.IGNORECASE):
+                priority = 2
             else:
-                priority = 4
+                # 官方 CLI 产物如 paper.json / coordinate.json 为最终结构化结果，优先级高于中间态 middle.json
+                priority = 1
             json_candidates.append((priority, name))
 
         json_candidates.sort(key=lambda x: (x[0], len(x[1])))
@@ -639,6 +667,10 @@ def extract_mineru_structured_archive(archive_input: Any) -> List[pd.DataFrame]:
                 raw_scan = zf.read(jname)
                 scan_data = json.loads(raw_scan.decode('utf-8', errors='replace'))
                 if isinstance(scan_data, dict):
+                    layout = scan_data.get('extensions', {}).get('docvortex_layout', {})
+                    for pg in layout.get('pages', []):
+                        if isinstance(pg, dict) and pg.get('page_idx') is not None and pg.get('width_pt') and pg.get('height_pt'):
+                            known_page_sizes[int(pg['page_idx'])] = [pg['width_pt'], pg['height_pt']]
                     for p_info in scan_data.get("pdf_info", []):
                         if isinstance(p_info, dict):
                             pidx = p_info.get("page_idx")
@@ -672,13 +704,28 @@ def extract_mineru_structured_archive(archive_input: Any) -> List[pd.DataFrame]:
                 if not raw_items:
                     continue
 
-                is_content_list = bool(re.search(r'content_list', os.path.basename(json_name), re.IGNORECASE))
+                # Determine units from the payload contract, not a paper title.
+                schema = data.get('schema', '') if isinstance(data, dict) else ''
+                modern_layout = isinstance(data, dict) and 'docvortex_layout' in data.get('extensions', {})
+                unit_bbox = schema in ('docvortex.middle', 'docvortex.model') or modern_layout
+                if isinstance(data, dict) and 'pdf_info' in data:
+                    coord_format = 'points'  # legacy middle JSON
+                elif unit_bbox:
+                    coord_format = 'norm_1000'  # normalize modern 0..1 below
+                elif isinstance(data, list):
+                    coord_format = 'norm_1000'  # content list V1/V2, any basename
+                elif re.search(r'(?:^|_)middle(?:_json)?\.json$', os.path.basename(json_name), re.I):
+                    coord_format = 'points'  # legacy wrapped middle without schema
+                else:
+                    coord_format = 'norm_1000'
                 extracted_dfs = []
                 for item, default_page in raw_items:
                     try:
                         table_body, box = _find_table_body_and_box(item)
                         if not table_body:
                             continue
+                        if unit_bbox and box:
+                            box = [float(v) * 1000 for v in box]
 
                         raw_p = item.get("page_idx")
                         if raw_p is None:
@@ -747,12 +794,8 @@ def extract_mineru_structured_archive(archive_input: Any) -> List[pd.DataFrame]:
                                 df.attrs['bbox'] = box
                                 if page_idx in known_page_sizes:
                                     df.attrs['page_size'] = known_page_sizes[page_idx]
-                                if is_content_list:
-                                    df.attrs['bbox_format'] = 'norm_1000'
-                                    df.attrs['coord_format'] = 'norm_1000'
-                                else:
-                                    df.attrs['bbox_format'] = 'points'
-                                    df.attrs['coord_format'] = 'points'
+                                df.attrs['bbox_format'] = coord_format
+                                df.attrs['coord_format'] = coord_format
                                 df.attrs['table_title'] = caption
                                 df.attrs['table_footnote'] = footnote
                                 df.attrs['footnotes'] = [footnote] if footnote else []
@@ -1826,7 +1869,7 @@ class MinerUCLIClient:
                     dfs = parse_structured_vlm_content(md_text)
                     for df in dfs:
                         if df is not None and hasattr(df, "attrs"):
-                            df.attrs.setdefault("extractor", "mineru_api")
+                            df.attrs["extractor"] = "mineru_api"
                             df.attrs["mineru_source"] = "cli_flash"
                 except Exception:
                     dfs = []
@@ -1916,15 +1959,23 @@ def call_mineru_api(
                 if md:
                     print("[MinerU CLI] Markdown 抽取成功！")
                 return md
+            elif cli_res.get("error") == "cancelled" or (cancel_event is not None and cancel_event.is_set()):
+                print("[MinerU CLI] 任务已取消，终止执行")
+                return ""
             elif cli_mode in ("cli", "true", "1"):
                 print(f"[MinerU CLI] 任务未成功 (强制 CLI 模式): {cli_res.get('error')}")
                 return ""
             else:
                 print(f"[MinerU CLI] CLI 执行异常 ({cli_res.get('error')})，自动平滑回退至官方 Python REST API...")
         except Exception as e_cli:
+            if cancel_event is not None and cancel_event.is_set():
+                return ""
             if cli_mode in ("cli", "true", "1"):
                 raise e_cli
             print(f"[MinerU CLI] 运行异常: {e_cli}，自动平滑回退至官方 Python REST API...")
+
+    if cancel_event is not None and cancel_event.is_set():
+        return ""
 
     client = MinerUClient(api_key=token, api_base=api_base)
     task_id = client.submit_task(file_path, page_ranges=page_ranges)
@@ -1989,15 +2040,23 @@ def call_mineru_structured_api(
                 else:
                     print("[MinerU CLI] 抽取完成，文档未包含结构化表格")
                 return extracted_dfs
+            elif cli_res.get("error") == "cancelled" or (cancel_event is not None and cancel_event.is_set()):
+                print("[MinerU CLI] 任务已取消，终止执行")
+                return []
             elif cli_mode in ("cli", "true", "1"):
                 print(f"[MinerU CLI] 任务未成功 (强制 CLI 模式): {cli_res.get('error')}")
                 return []
             else:
                 print(f"[MinerU CLI] CLI 执行异常 ({cli_res.get('error')})，自动平滑回退至官方 Python REST API...")
         except Exception as e_cli:
+            if cancel_event is not None and cancel_event.is_set():
+                return []
             if cli_mode in ("cli", "true", "1"):
                 raise e_cli
             print(f"[MinerU CLI] 运行异常: {e_cli}，自动平滑回退至官方 Python REST API...")
+
+    if cancel_event is not None and cancel_event.is_set():
+        return []
 
     client = MinerUClient(api_key=token, api_base=api_base)
     task_id = client.submit_task(file_path, page_ranges=page_ranges)

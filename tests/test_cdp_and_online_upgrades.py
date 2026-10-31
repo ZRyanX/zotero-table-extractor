@@ -436,6 +436,7 @@ class TestLoginCli(unittest.TestCase):
             login.publishers_main()
 
 
+@unittest.skipUnless(os.getenv('ZOTERO_RUN_LIVE_BROWSER') == '1', 'Set ZOTERO_RUN_LIVE_BROWSER=1 to run live browser tests')
 class TestLivePlaywrightIntegration(unittest.TestCase):
     """Live Playwright tests testing dynamic port detection, Port Guard, and concurrent tabs."""
 

@@ -1062,6 +1062,7 @@ def main():
         print(f"Processing PDF target: {target}")
         success = process_single_pdf(target, args)
         print(f"\nCompleted! Processed 1 file: {'Success' if success else 'Failed'}")
+        return 0 if success else 1
     else:
         workers = getattr(args, 'workers', 4) or 4
         print(f"=== Starting batch extraction of {len(pdf_list)} PDF files (workers={workers}) ===")
@@ -1083,6 +1084,7 @@ def main():
                     fail_count += 1
                     print(f"[Batch Error] {os.path.basename(p)}: {e}")
         print(f"\nBatch Completed! Total: {len(pdf_list)}, Success: {success_count}, Failed: {fail_count}")
+        return 1 if fail_count else 0
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

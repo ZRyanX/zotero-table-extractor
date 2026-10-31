@@ -391,7 +391,8 @@ class TestTier1LosslessPageRemediation(unittest.TestCase):
         doc.save(pdf_path)
         doc.close()
 
-        results, logs = pte.extract_tables_from_pdf(pdf_path, use_ocr_fallback=False)
+        with patch('ocr_client.call_mineru_structured_api', return_value=[]):
+            results, logs = pte.extract_tables_from_pdf(pdf_path, use_ocr_fallback=False)
         self.assertTrue(any("Tier 1 页面方向探测" in log for log in logs))
 
 

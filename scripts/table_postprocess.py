@@ -11,6 +11,7 @@ import io
 import os
 import re
 import math
+from collections import defaultdict
 from typing import List, Optional, Tuple, Dict, Any, Union
 
 import numpy as np
@@ -31,6 +32,24 @@ def clean_text(val):
     val = val.encode('utf-8', 'ignore').decode('utf-8')
     return val.strip()
 
+
+def read_html_preserving_text(content, **kwargs):
+    """Expand HTML spans without losing identifiers or literal NA strings.
+
+    Type inference belongs to postprocessing. Record actual header markup so
+    numeric labels such as <th>1</th> are not confused with generated columns.
+    """
+    from bs4 import BeautifulSoup
+    dfs = pd.read_html(io.StringIO(content), converters=defaultdict(lambda: str),
+                       keep_default_na=False, thousands=None, **kwargs)
+    tables = BeautifulSoup(content, 'html.parser').find_all('table')
+    for df, tag in zip(dfs, tables):
+        first = tag.find('tr')
+        cells = first.find_all(['td', 'th'], recursive=False) if first else []
+        if tag.find('thead') is not None or (cells and all(c.name == 'th' for c in cells)):
+            df.attrs['header_source'] = 'explicit'
+    return dfs
+
 def parse_structured_vlm_content(content):
     """
     Parses full-document Markdown & HTML text output by PaddleOCR-VL-1.6 / Layout VLM into DataFrames with table labels.
@@ -50,6 +69,13 @@ def parse_structured_vlm_content(content):
         table_html = match.group(0)
         chunk_before = content[prev_end : match.start()]
         prev_end = match.end()
+        # Parse only the inter-table text, never the interior of an HTML cell.
+        markdown_tables = parse_structured_markdown_tables(chunk_before)
+        tables.extend(markdown_tables)
+        if markdown_tables:
+            md_rows = list(re.finditer(r'(?m)^[ \t]*\|[^\n]*\|[ \t]*$', chunk_before))
+            if md_rows:
+                chunk_before = chunk_before[md_rows[-1].end():]
         
         # 提取 chunk_before 尾部的所有 <div> 标签（PaddleOCR-VL 标准 caption 格式）
         divs = [clean_text(m.group(1)) for m in div_all_re.finditer(chunk_before[-1000:]) if clean_text(m.group(1))]
@@ -109,7 +135,7 @@ def parse_structured_vlm_content(content):
             curr_label = ""
         
         try:
-            dfs = pd.read_html(io.StringIO(table_html))
+            dfs = read_html_preserving_text(table_html)
             if dfs:
                 df = dfs[0]
                 if isinstance(df.columns, pd.MultiIndex):
@@ -131,9 +157,8 @@ def parse_structured_vlm_content(content):
         except Exception:
             pass
             
-    # 2. Parse Markdown |---| tables if HTML tables are not present
-    if not tables:
-        tables = parse_structured_markdown_tables(content)
+    # Preserve Markdown tables after (or in the absence of) HTML tables.
+    tables.extend(parse_structured_markdown_tables(content[prev_end:]))
         
     return tables
 
@@ -156,14 +181,16 @@ def parse_structured_markdown_tables(md_content):
             clean_lines = [line for line in table_lines if not is_markdown_separator(line)]
             if len(clean_lines) < 1:
                 return None
-            csv_data = "\n".join([line.strip("|") for line in clean_lines])
+            csv_data = "\n".join([line.strip()[1:-1] for line in clean_lines])
             if len(clean_lines) == 1:
-                raw_cells = [c.strip() for c in clean_lines[0].split('|') if c.strip()]
-                if not raw_cells:
+                raw_cells = [c.strip() for c in clean_lines[0].strip()[1:-1].split('|')]
+                if not any(raw_cells):
                     return None
                 df = pd.DataFrame([raw_cells], columns=[f"Col_{i+1}" for i in range(len(raw_cells))])
             else:
-                df = pd.read_csv(io.StringIO(csv_data), sep=r'\s*\|\s*', engine='python')
+                df = pd.read_csv(io.StringIO(csv_data), sep=r'\s*\|\s*', engine='python',
+                                 dtype=str, keep_default_na=False, na_filter=False)
+                df.attrs['header_source'] = 'explicit'
             
             # 碎片化检测：列数 >30 且填充率 <30% -> 跳过
             if df.shape[1] > 30:
@@ -178,6 +205,7 @@ def parse_structured_markdown_tables(md_content):
                 df.attrs['label'] = label
             if caption:
                 df.attrs['table_title'] = caption
+            df.attrs['extractor'] = 'paddleocr_vl'
             return df
         except Exception:
             return None
@@ -776,19 +804,150 @@ def strip_embedded_duplicate_headers(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
+_HEADER_KEYWORDS = {
+    'sample', 'specimen', 'id', 'name', 'title', 'type', 'category', 'group',
+    'item', 'date', 'year', 'month', 'time', 'author', 'description', 'lithology',
+    'mineral', 'location', 'formation', 'unit', 'station', 'site', 'method',
+    'parameter', 'value', 'total', 'mean', 'average', 'std', 'score', 'ratio',
+    'status', 'result', 'note', 'label', 'index', 'variable', 'factor', 'element',
+    'country', 'city', 'state', 'province', 'region', 'target', 'source', 'model',
+    'class', 'rank', 'level', 'code', 'sum', 'count',
+    '样品', '矿物', '岩性', '编号', '点号', '类别', '类型', '名称', '地层', '位置', '含量'
+}
+
+
+def is_default_or_unnamed_columns(cols) -> bool:
+    """
+    智能判定表头是否为解析器/pandas默认生成的占位列名（如 0, 1, 2 或 Col_1, Col_2, Unnamed: 0 等），
+    绝不能将真实数值/年份表头（如 2020, 2021）误判为系统默认列名。
+    """
+    if cols is None:
+        return True
+    cols_list = list(cols)
+    n = len(cols_list)
+    if n == 0:
+        return True
+
+    # 1. 0-based 默认整数序列: [0, 1, ..., n-1] 或 ['0', '1', ..., str(n-1)]
+    if cols_list == list(range(n)) or [str(c).strip() for c in cols_list] == [str(i) for i in range(n)]:
+        return True
+
+    # 3. 检查是否每个列名都是系统生成的无意义占位符 (如 Col_1, Unnamed, nan, 空字符串)
+    all_placeholders = all(
+        pd.isna(c) or
+        str(c).strip() == "" or
+        re.match(r'^(?:col[_\s]*\d+|unnamed(?::|\b.*)?|none|nan)$', str(c).strip(), re.IGNORECASE)
+        for c in cols_list
+    )
+    if all_placeholders:
+        return True
+
+    return False
+
+
+def should_promote_first_row(df: pd.DataFrame) -> bool:
+    """
+    智能判定默认或无表头表格的首行是否应提升为列名。
+    防吞数据与防表消失原则：
+    1. 单行表 (len(df) < 2) 绝对禁止提升首行（避免整表消失，造成数据吞噬）；
+    2. 首行若包含普通数值/科学计数法且该列后续行也是数值（如 A01/13、1e-3/2e-3），该单元格必为数据值而非列名，禁止提升；
+    3. 支持科学年份表头（如 2020 / 2021），当首行为年份且后续行为普通数值（非年份）时，识别为年份列名；
+    4. 支持文本列名覆盖在数值数据列上（如 Sample, Concentration），允许提升；
+    5. 全文本表首行包含常见显式表头关键词时允许提升。
+    """
+    if df is None or len(df) < 2:
+        return False
+
+    def _is_num(val):
+        if val is None or pd.isna(val):
+            return False
+        s = str(val).strip().replace(',', '')
+        if not s:
+            return False
+        if re.fullmatch(r'(?:[<>≤≥]\s*)?[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?', s):
+            return True
+        if re.fullmatch(r'(?:n\.?\s*d\.?|b\.?d\.?l\.?|n/?a|none|[-–—]+)', s, re.I):
+            return True
+        try:
+            float(s)
+            return True
+        except (ValueError, TypeError):
+            return False
+
+    def _is_yr(val):
+        if val is None or pd.isna(val):
+            return False
+        s = str(val).strip()
+        if re.match(r'^(?:18\d\d|19\d\d|20\d\d|2100)$', s):
+            return True
+        if re.match(r'^(?:FY\s*)?(?:18\d\d|19\d\d|20\d\d)(?:[-/](?:18\d\d|19\d\d|20\d\d|\d{2}))?(?:[A-Za-z])?$', s, re.IGNORECASE):
+            return True
+        return False
+
+    first_row = [str(x).strip() if pd.notna(x) else '' for x in df.iloc[0]]
+    rest_df = df.iloc[1:]
+
+    # 如果首行单元格本身就是系统占位符 (Col_1, Col_2, Unnamed)，绝不能作为表头
+    if any(re.match(r'^(?:Col[_\s]*\d+|Unnamed\b)', c, re.IGNORECASE) for c in first_row if c):
+        return False
+
+    has_text_over_numeric = False
+    has_year_headers = False
+    all_year_headers = True
+
+    for col_idx in range(len(first_row)):
+        c0 = first_row[col_idx]
+        sub_vals = [str(x).strip() for x in rest_df.iloc[:, col_idx] if pd.notna(x) and str(x).strip() != '']
+        if not sub_vals:
+            all_year_headers = False
+            continue
+
+        c0_is_num = _is_num(c0)
+        c0_is_yr = _is_yr(c0)
+        sub_num_count = sum(1 for v in sub_vals if _is_num(v))
+        sub_is_mostly_num = (sub_num_count / len(sub_vals)) >= 0.5
+        sub_yr_count = sum(1 for v in sub_vals if _is_yr(v))
+        sub_is_mostly_yr = (sub_yr_count / len(sub_vals)) >= 0.5
+
+        if not c0_is_yr or sub_is_mostly_yr:
+            all_year_headers = False
+
+        if c0_is_num and not c0_is_yr:
+            # 首行该单元格是普通数字或科学计数法 (如 13, 1e-3)
+            if sub_is_mostly_num:
+                # 后续行也是数值 -> 这是数据列，首行绝非表头
+                return False
+
+        if c0_is_yr and sub_is_mostly_num and not sub_is_mostly_yr:
+            # 首行为年份，后续行为普通数值指标 -> 真实年份表头
+            has_year_headers = True
+
+        if not c0_is_num and c0 and sub_is_mostly_num:
+            # 首行为文本标签，后续行为数值 -> 文本表头
+            has_text_over_numeric = True
+
+    if has_year_headers or all_year_headers:
+        return True
+    if has_text_over_numeric:
+        return True
+
+    has_header_kw = any(c.lower() in _HEADER_KEYWORDS for c in first_row if c)
+    if has_header_kw:
+        return True
+
+    return False
+
+
 def _clean_vlm_dataframe(df: pd.DataFrame, original_attrs: dict) -> pd.DataFrame:
     """针对 PaddleOCR-VL-1.6 / MinerU 的零破坏直通管道 (Zero-Destructive Pass-Through)。"""
     # 0. 若表头为纯默认数字或系统占位符 (如 0, 1, 2 或 Col_1, Col_2)，检查首行是否应提升为表头
-    is_default_cols = all(
-        isinstance(c, (int, np.integer)) or (isinstance(c, str) and (c.strip().isdigit() or re.match(r'^(?:Col[_\s]*\d+|Unnamed\b)', c.strip(), re.IGNORECASE)))
-        for c in df.columns
-    )
-    if is_default_cols and len(df) > 0:
+    is_default_cols = original_attrs.get('header_source') != 'explicit' and is_default_or_unnamed_columns(df.columns)
+    if is_default_cols and should_promote_first_row(df):
         first_row = [clean_latex_and_ocr(clean_text(str(x))).strip() for x in df.iloc[0]]
-        has_text = any(len(c) > 0 and not c.replace('.', '').replace('-', '').replace(',', '').isdigit() for c in first_row)
-        if has_text:
-            df = df.iloc[1:].reset_index(drop=True)
-            df.columns = first_row
+        df = df.iloc[1:].reset_index(drop=True)
+        df.columns = first_row
+    elif is_default_cols:
+        df.columns = [f"Col_{i+1}" for i in range(len(df.columns))]
 
     # 1. 规范化表头字符（保留 MultiIndex 展开的真实列名）
     df.columns = [clean_latex_and_ocr(clean_text(str(c))) if c is not None else f"Col_{i+1}" for i, c in enumerate(df.columns)]
@@ -820,8 +979,6 @@ def _clean_vlm_dataframe(df: pd.DataFrame, original_attrs: dict) -> pd.DataFrame
         if isinstance(x, float) and np.isnan(x):
             return ""
         s = str(x)
-        if s.strip().lower() == 'nan':
-            return ""
         return clean_latex_and_ocr(clean_text(s))
 
     df = df_map(df, _clean_cell)
@@ -1634,6 +1791,7 @@ def merge_cross_page_split_cells(prev_df: pd.DataFrame, next_df: pd.DataFrame) -
 
 
 def combine_df_group(group):
+    group = [df for df in group if df is not None and not df.empty] if group else []
     if not group:
         return None
     if len(group) == 1:
@@ -1668,42 +1826,22 @@ def combine_df_group(group):
                 is_horizontal = True
                 
     if is_horizontal:
+        # Duplicate row keys do not prove an occurrence-to-occurrence mapping.
+        # Return an explicit non-merge result; callers retain every fragment.
+        if any(not g.iloc[:, 0].astype(str).is_unique or
+               g.iloc[:, 0].isna().any() or
+               g.iloc[:, 0].astype(str).str.strip().eq('').any() for g in group):
+            return None
         merged = group[0].copy()
         first_col = merged.columns[0]
         merged[first_col] = merged[first_col].astype(str)
         
-        c_series = merged[first_col].iloc[:, 0] if isinstance(merged[first_col], pd.DataFrame) else merged[first_col]
-        use_merge = bool(c_series.is_unique)
         for next_df in group[1:]:
             if next_df is None or next_df.empty:
                 continue
             next_renamed = next_df.rename(columns={next_df.columns[0]: first_col})
             next_renamed[first_col] = next_renamed[first_col].astype(str)
-            n_series = next_renamed[first_col].iloc[:, 0] if isinstance(next_renamed[first_col], pd.DataFrame) else next_renamed[first_col]
-            if use_merge and bool(n_series.is_unique):
-                merged = pd.merge(merged, next_renamed, on=first_col, how='outer')
-            else:
-                use_merge = False
-                merged = merged.reset_index(drop=True)
-                next_renamed = next_renamed.reset_index(drop=True)
-                max_rows = max(len(merged), len(next_renamed))
-                if len(merged) < max_rows:
-                    merged = merged.reindex(range(max_rows))
-                next_aligned = next_renamed.reindex(range(max_rows))
-                next_aligned = next_aligned.drop(columns=[first_col], errors='ignore')
-                existing_cols = set(merged.columns)
-                new_cols = []
-                for c in next_aligned.columns:
-                    c_str = str(c)
-                    if c_str in existing_cols:
-                        suffix_idx = 2
-                        while f"{c_str}_part{suffix_idx}" in existing_cols or f"{c_str}_part{suffix_idx}" in new_cols:
-                            suffix_idx += 1
-                        new_cols.append(f"{c_str}_part{suffix_idx}")
-                    else:
-                        new_cols.append(c_str)
-                next_aligned.columns = new_cols
-                merged = pd.concat([merged, next_aligned], axis=1)
+            merged = pd.merge(merged, next_renamed, on=first_col, how='outer', validate='one_to_one')
         merged.attrs = base_df.attrs.copy()
         return merged
         
@@ -1722,7 +1860,7 @@ def combine_df_group(group):
         # 检查 next_df 的 columns 是否实质上是第一行数据（续表无表头时常见现象）
         next_cols = [str(c).strip() for c in next_df.columns]
         data_col_count = sum(1 for c in next_cols if is_pure_data_value(c))
-        is_data_in_columns = (not is_seq_int) and (data_col_count / max(1, len(next_cols)) >= 0.4)
+        is_data_in_columns = next_df.attrs.get('header_source') != 'explicit' and (not is_seq_int) and (data_col_count / max(1, len(next_cols)) >= 0.4)
         
         if is_data_in_columns:
             # 将 next_df.columns 转回为数据首行，并基于 DeepDoc/MinerU 列投影对齐至 base_cols
@@ -1790,7 +1928,9 @@ def combine_df_group(group):
                 # 续表标题横幅行 (如 "Table 1 (continued)", "Table 1 Continued", "接上表", "Table 1 (cont'd)")
                 is_cont_banner = bool(re.search(r'(?:table\s*\d+|表\s*\d+|续表|接上表|续上表|continued|cont\'?d|\(cont\b|cont\.)', row_str)) and len([c for c in first_row if c]) <= 3
                 # 跨页重复子表头分类行 (如 "Major elements (wt%)", "Trace elements", "Rare earth elements" 等)
-                is_category_banner = len([c for c in first_row if c]) <= 2 and any(kw in row_str for kw in ['major element', 'trace element', 'rare earth', 'ree', 'oxide', 'isotope', 'sample', 'host rock', 'mineral', '主量', '微量', '稀土', '同位素', '元素', '氧化物', '样品'])
+                banner_cells = [c for c in first_row if c]
+                is_category_banner = (not first_row_is_data and len(set(banner_cells)) == 1 and
+                    bool(re.fullmatch(r'(?:major elements?|trace elements?|rare earth(?: elements?)?|ree|oxides?|isotopes?|samples?|host rocks?|minerals?|主量(?:元素)?|微量(?:元素)?|稀土(?:元素)?|同位素|元素|氧化物|样品)(?:\s*\([^)]*\))?', banner_cells[0], re.I)))
                 if is_index_row or is_repeat_header or is_unit_row or is_cont_banner or is_category_banner:
                     next_df = next_df.iloc[1:].reset_index(drop=True)
                 else:
@@ -2141,6 +2281,13 @@ def merge_continuation_tables(dfs):
 
     def _finalize_merged_group(grp):
         res_combined = combine_df_group(grp)
+        if res_combined is None:
+            for fragment in grp:
+                preserved = fragment.copy()
+                preserved.attrs['merge_warning'] = 'ambiguous_horizontal_row_keys'
+                preserved.attrs['preserve_fragment'] = True
+                merged_dfs.append(preserved)
+            return None
         if res_combined is not None:
             all_pages = []
             for g in grp:
@@ -2214,7 +2361,7 @@ def merge_continuation_tables(dfs):
             list(df.columns) == list(range(len(df.columns))) or
             [str(c).strip() for c in df.columns] == [str(i) for i in range(len(df.columns))]
         )
-        cols_are_data = (not is_seq_int) and (sum(1 for c in df.columns if is_pure_data_value(c)) / max(1, len(df.columns)) >= 0.3)
+        cols_are_data = df.attrs.get('header_source') != 'explicit' and (not is_seq_int) and (sum(1 for c in df.columns if is_pure_data_value(c)) / max(1, len(df.columns)) >= 0.3)
 
         # MinerU 跨页续表判定 2: 表格页宽/宽度比例对齐 (Page Width Ratio Alignment)
         prev_bbox = prev_df.attrs.get('bbox')

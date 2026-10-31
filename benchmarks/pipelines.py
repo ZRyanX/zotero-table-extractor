@@ -131,7 +131,7 @@ def run_pipeline_1_baseline(pdf_path: str) -> Tuple[List[Dict[str, Any]], float,
 # =============================================================================
 # PIPELINE 2: Proposed MinerU Structured + Local Numeric Gate + Targeted Recovery
 # =============================================================================
-def run_pipeline_2_proposed(pdf_path: str) -> Tuple[List[Dict[str, Any]], float, List[str]]:
+def run_pipeline_2_proposed(pdf_path: str, *, mineru_mode: str = 'fixture') -> Tuple[List[Dict[str, Any]], float, List[str]]:
     """
     Pipeline 2 (Proposed):
     - Primary: MinerU structured extraction (using structured ZIP archive or API)
@@ -140,6 +140,8 @@ def run_pipeline_2_proposed(pdf_path: str) -> Tuple[List[Dict[str, Any]], float,
     - Monotone DP cross-page continuation table stitching
     """
     t0 = time.perf_counter()
+    if mineru_mode not in ('fixture', 'live'):
+        raise ValueError('mineru_mode must be fixture or live')
     logs = []
     pdf_file = Path(pdf_path)
     paper_stem = pdf_file.stem
@@ -148,29 +150,19 @@ def run_pipeline_2_proposed(pdf_path: str) -> Tuple[List[Dict[str, Any]], float,
     cache_zip = pdf_file.parent / "mineru_cache" / f"{paper_stem}.zip"
     mineru_dfs = []
 
-    if cache_zip.exists():
-        logs.append(f"MinerU structured archive found in cache: {cache_zip.name}")
-        try:
-            mineru_dfs = ocr_client.extract_mineru_structured_archive(str(cache_zip))
-        except Exception as e_c:
-            logs.append(f"MinerU structured archive cache corrupt: {e_c}")
-            mineru_dfs = []
+    if mineru_mode == 'fixture':
+        logs.append('Synthetic ground-truth fixture: postprocessing regression only; no model accuracy or service latency claim.')
+        if not cache_zip.exists():
+            raise FileNotFoundError(f'Missing synthetic fixture: {cache_zip}')
+        mineru_dfs = ocr_client.extract_mineru_structured_archive(str(cache_zip))
         if not mineru_dfs:
-            logs.append(f"MinerU cache {cache_zip.name} was corrupt or empty; purging and falling back to live API")
-            try:
-                cache_zip.unlink(missing_ok=True)
-            except Exception:
-                pass
-
-    if not mineru_dfs:
-        # Attempt live MinerU structured API if configured
-        if ocr_client.is_mineru_available(file_path=str(pdf_file)):
-            logs.append("Invoking live MinerU structured API...")
-            try:
-                mineru_dfs = ocr_client.call_mineru_structured_api(str(pdf_file))
-            except Exception as e_mineru:
-                logs.append(f"MinerU live API call failed: {e_mineru}")
-                mineru_dfs = []
+            raise ValueError(f'Empty or corrupt synthetic fixture: {cache_zip}')
+    else:
+        # Live mode deliberately ignores all generated ground-truth caches.
+        if not ocr_client.is_mineru_available(file_path=str(pdf_file)):
+            raise RuntimeError('Live benchmark requires an available MinerU service')
+        logs.append('Invoking live MinerU; generated caches are excluded.')
+        mineru_dfs = ocr_client.call_mineru_structured_api(str(pdf_file))
 
     logs.append(f"Primary MinerU extracted {len(mineru_dfs)} structured tables")
 
@@ -253,7 +245,7 @@ def run_pipeline_2_proposed(pdf_path: str) -> Tuple[List[Dict[str, Any]], float,
                 logs.append(f"  Stage 1 error: {e_s1}")
 
         # Stage 2: DocLayout-YOLO crop + PaddleOCR / OCR
-        if unresolved_pages:
+        if unresolved_pages and mineru_mode == 'live':
             try:
                 crop_pages = list(unresolved_pages)
                 crop_res = pte.extract_via_paddleocr_crops(str(pdf_file), crop_pages)

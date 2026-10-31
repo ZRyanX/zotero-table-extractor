@@ -74,6 +74,7 @@ class TestAuditOct15Fixes(unittest.TestCase):
                 stack.enter_context(patch.object(pte, 'is_table_low_quality', return_value=False))
                 stack.enter_context(patch.object(pte, 'reconcile_table_captions', side_effect=lambda r, p: r))
                 crops_mock = stack.enter_context(patch.object(pte, 'extract_via_paddleocr_crops', return_value=[crop_item]))
+                stack.enter_context(patch.object(oc, 'call_mineru_structured_api', return_value=[]))
 
                 results, logs = pte._do_extract_tables_from_pdf(pdf_path)
 

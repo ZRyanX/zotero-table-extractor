@@ -651,6 +651,14 @@ zotero-table-extractor/
 
 ---
 
+## 回归测试与评测范围
+
+安装项目依赖后，使用 `python tests/run_offline.py` 运行回归测试。该入口在临时副本中执行，不复制个人 `config.json`，阻断网络连接和外部服务进程；真实浏览器测试默认跳过。可用 `--pattern test_audit_oct30_integrity.py` 单独验证数据完整性修复。
+
+基准默认使用 `python benchmarks/run_benchmark.py --mineru-mode fixture`：MinerU 输入来自标准答案生成的模拟缓存，仅验证解析、质量检查与续表后处理，不代表真实模型准确率，也不包含服务调用耗时。显式使用 `--mineru-mode live` 会向 MinerU 提交测试 PDF，并忽略模拟缓存。真实论文的效果仍需独立人工标注样本验证。
+
+`--pdf-only` 表示跳过出版社网页抓取；PDF 流程中的 MinerU/OCR 仍可能使用云端服务。
+
 ## 📄 开源协议与免责声明
 
 - **开源协议**：本项目基于 [Apache License 2.0](LICENSE) 协议开源。

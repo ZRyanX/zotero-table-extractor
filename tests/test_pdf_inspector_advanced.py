@@ -396,7 +396,8 @@ class TestPdfInspectorAdvanced(unittest.TestCase):
     # -----------------------------------------------------------------------
     def test_extract_tables_from_pdf_pipeline(self):
         pdf_path = self._create_synthetic_native_pdf()
-        results, logs = pte.extract_tables_from_pdf(pdf_path, use_ocr_fallback=False)
+        with patch('ocr_client.call_mineru_structured_api', return_value=[]), patch('scripts.ocr_client.call_mineru_structured_api', return_value=[]):
+            results, logs = pte.extract_tables_from_pdf(pdf_path, use_ocr_fallback=False)
         self.assertTrue(len(results) >= 1)
         df = results[0]["df"]
         self.assertTrue(df.shape[0] >= 2)

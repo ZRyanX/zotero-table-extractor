@@ -40,6 +40,10 @@ def _save_mineru_zip(cache_path: Path, content_list: List[Dict[str, Any]]):
     bio = io.BytesIO()
     with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("content_list.json", json.dumps(content_list, ensure_ascii=False, indent=2))
+        zf.writestr('_benchmark_provenance.json', json.dumps({
+            'source': 'synthetic_ground_truth', 'scope': 'postprocessing_regression',
+            'includes_model_inference': False,
+        }))
     with open(cache_path, "wb") as f:
         f.write(bio.getvalue())
 

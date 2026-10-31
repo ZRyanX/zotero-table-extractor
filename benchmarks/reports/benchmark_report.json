@@ -1,4 +1,7 @@
 {
+  "evidence_scope": "historical_synthetic_fixture_regression",
+  "mineru_service_latency_included": false,
+  "valid_for_model_accuracy_or_speedup_claims": false,
   "benchmark_timestamp": "2026-10-16T13:10:13Z",
   "summary": {
     "p1": {

@@ -214,6 +214,19 @@ def _load_excel_with_attrs(tbl_path, output_path=None):
     return existing_df
 
 
+def _write_table_atomic(df, path, title=None, footnotes=None):
+    """Do not truncate a previously valid workbook if serialization fails."""
+    fd, temporary = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(path)), suffix='.xlsx', prefix='tbl_export_')
+    os.close(fd)
+    try:
+        df.to_excel(temporary, index=False)
+        autofit_excel_columns(temporary, title=title, footnotes=footnotes)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.remove(temporary)
+
+
 def save_tables_to_excel(dataframes, output_path, headers=None, single_file=True, skip_labels=None, skip_supplementary=False):
     """
     Saves a list of DataFrames to Excel.
@@ -611,6 +624,7 @@ def save_tables_to_excel(dataframes, output_path, headers=None, single_file=True
                         '(续)' in str(df.attrs.get('table_title', '')) or
                         bool(df.attrs.get('is_continuation'))
                     )
+                    is_cont_part = is_cont_part and not df.attrs.get('preserve_fragment')
                     
                     curr_p = df.attrs.get('page_idx')
                     existing_p = existing_df.attrs.get('page_idx')
@@ -625,6 +639,13 @@ def save_tables_to_excel(dataframes, output_path, headers=None, single_file=True
                         from table_postprocess import combine_df_group
                         print("-> Detected continuation fragment. Merging with existing table...")
                         df_to_save = combine_df_group([existing_df, df])
+                        if df_to_save is None:
+                            # Ambiguous row keys: preserve the new fragment separately.
+                            part = 2
+                            while os.path.exists(tbl_path) or tbl_path in written_files:
+                                tbl_path = os.path.join(output_path, f"{safe_label}_part{part}.xlsx")
+                                part += 1
+                            df_to_save = df
                     elif is_distant_table:
                         # 检查是否为同名但位于不同章节/页面的独立数据表（如论文作者笔误重复表号，或远隔页面）
                         p_num = curr_p + 1 if curr_p is not None else idx + 1
@@ -635,7 +656,7 @@ def save_tables_to_excel(dataframes, output_path, headers=None, single_file=True
                             suffix_i += 1
                         df_to_save = df
                         print(f"-> Detected distinct table on page {p_num} sharing label {safe_label}. Saving as {tbl_path}...")
-                    elif is_conflicting_or_distinct_version(existing_df, df):
+                    elif df.attrs.get('preserve_fragment') or existing_df.attrs.get('preserve_fragment') or is_conflicting_or_distinct_version(existing_df, df):
                         # 冲突独立版本另存为独立版本文件，杜绝覆盖导致数据丢失
                         tbl_path = os.path.join(output_path, f"{safe_label}_v2.xlsx")
                         suffix_i = 3
@@ -672,15 +693,14 @@ def save_tables_to_excel(dataframes, output_path, headers=None, single_file=True
                         df_to_save.attrs = {}
                     df_to_save.attrs.update(saved_attrs)
                         
-                    df_to_save.to_excel(tbl_path, index=False)
-                    autofit_excel_columns(tbl_path, title=df_to_save.attrs.get('table_title') or title or file_label, footnotes=df_to_save.attrs.get('footnotes') or df_to_save.attrs.get('table_footnote'))
+                    _write_table_atomic(df_to_save, tbl_path, title=df_to_save.attrs.get('table_title') or title or file_label, footnotes=df_to_save.attrs.get('footnotes') or df_to_save.attrs.get('table_footnote'))
                     written_files[tbl_path] = df_to_save
                     print(f"Saved: {tbl_path}")
                 except Exception as e:
                     print(f"Error merging dataframes for {tbl_path}: {e}")
+                    raise
             else:
-                df.to_excel(tbl_path, index=False)
-                autofit_excel_columns(tbl_path, title=title or file_label, footnotes=df.attrs.get('footnotes') or df.attrs.get('table_footnote'))
+                _write_table_atomic(df, tbl_path, title=title or file_label, footnotes=df.attrs.get('footnotes') or df.attrs.get('table_footnote'))
                 written_files[tbl_path] = df
                 print(f"Saved: {tbl_path}")
             

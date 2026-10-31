@@ -381,7 +381,8 @@ class TestMinerUCLIClientExecution(unittest.TestCase):
                 raise requests.exceptions.SSLError("UNEXPECTED_EOF_WHILE_READING")
 
         mock_requests_get.side_effect = fake_get
-        content = ocr_client.download_resilient_asset("https://cdn-mineru.openxlab.org.cn/test.zip")
+        with patch('requests.Session.get', side_effect=fake_get):
+            content = ocr_client.download_resilient_asset("https://cdn-mineru.openxlab.org.cn/test.zip")
         self.assertEqual(content, b"ZIP_CONTENT_SUCCESS")
 
     @patch("ocr_client.resolve_mineru_token", return_value="")

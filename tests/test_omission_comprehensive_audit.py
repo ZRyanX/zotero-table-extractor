@@ -355,7 +355,8 @@ class TestOmissionComprehensiveAudit(unittest.TestCase):
         doc.save(path)
         doc.close()
 
-        results, logs = extract_tables_from_pdf(path, use_ocr_fallback=False)
+        with patch('ocr_client.call_mineru_structured_api', return_value=[]), patch('scripts.ocr_client.call_mineru_structured_api', return_value=[]):
+            results, logs = extract_tables_from_pdf(path, use_ocr_fallback=False)
         self.assertGreaterEqual(len(results), 1, "Native tables should be returned even with use_ocr_fallback=False")
         self.assertEqual(results[0]["df"].attrs.get("label"), "Table 1")
 

@@ -259,6 +259,30 @@ class TestPipelineExecutionAcrossGroups(unittest.TestCase):
             self.assertIn("p2", report["summary"])
             self.assertTrue((out_dir / "benchmark_report.json").exists())
             self.assertTrue((out_dir / "benchmark_report.md").exists())
+            self.assertEqual(report['evidence_scope'], 'postprocessing_regression')
+            self.assertFalse(report['mineru_service_latency_included'])
+            md = (out_dir / 'benchmark_report.md').read_text()
+            self.assertIn('postprocessing regression only', md)
+            self.assertNotIn('55 data rows', md)
+            self.assertNotIn('x faster', md)
+
+    def test_fixture_mode_never_falls_back_to_service(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as td, patch.object(pipelines.ocr_client, 'call_mineru_structured_api') as cloud:
+            with self.assertRaises(FileNotFoundError):
+                pipelines.run_pipeline_2_proposed(str(Path(td) / 'missing.pdf'), mineru_mode='fixture')
+            cloud.assert_not_called()
+
+    def test_live_mode_ignores_generated_cache(self):
+        from unittest.mock import patch
+        pdf = PROJECT_ROOT / 'benchmarks' / 'papers' / 'group_a_dense_three_line.pdf'
+        with patch.object(pipelines.ocr_client, 'is_mineru_available', return_value=True), \
+             patch.object(pipelines.ocr_client, 'call_mineru_structured_api', side_effect=RuntimeError('mock live service')) as cloud, \
+             patch.object(pipelines.ocr_client, 'extract_mineru_structured_archive') as cache:
+            with self.assertRaisesRegex(RuntimeError, 'mock live service'):
+                pipelines.run_pipeline_2_proposed(str(pdf), mineru_mode='live')
+            cloud.assert_called_once_with(str(pdf))
+            cache.assert_not_called()
 
 
 if __name__ == "__main__":

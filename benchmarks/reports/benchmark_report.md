@@ -1,4 +1,6 @@
 # Empirical Table Extraction Benchmark Report
+> Historical synthetic-fixture regression report, not a real MinerU recognition benchmark. Pipeline 2 consumed tables generated from ground truth; its elapsed time excludes model/service processing. The historical narrative and cross-pipeline speedup claims below are not validated evidence. Regenerate with the current runner for explicit provenance and observations derived from the actual run.
+
 **Generated at**: `2026-10-16 13:10:13 UTC`
 ## 1. Executive Summary
 This benchmark evaluates three distinct PDF table extraction pipelines across 5 representative scientific document categories.

@@ -201,7 +201,7 @@ python scripts/extract_zotero_table.py --pdf /path/to/pdfs_dir --output /path/to
 | `--single-file` | 标志 | `False` | 将提取到的所有表格汇聚写入单个 Excel 文件（多个 Sheet） |
 | `--enable-llm` | 标志 | `False` | 启用大模型语义分析，纠正断裂列名与深层多级复合表头 |
 | `--table-idx` | 字符串 | `"all"` | 提取指定索引表格：`"all"`, `"first"`, 或具体 0-based 整数序号 |
-| `--pdf-only` | 标志 | `False` | 跳过在线抓取竞速，直接从本地 PDF 运行多方投票提取 |
+| `--pdf-only` | 标志 | `False` | 跳过出版社网页抓取，进入 PDF 提取流程；其中 MinerU/OCR 仍可能调用云端服务 |
 | `--online-only` | 标志 | `False` | 仅抓取在线 HTML/XML 表格，不执行本地 PDF 提取回退 |
 | `--skip-supplementary` | 标志 | `False` | 跳过 Supplementary Material 附录表格 |
 | `--workers` | 整数 | `4` | 目录批量提取时的并发工作线程数 |
@@ -330,6 +330,10 @@ python update.py --check --json
 | `SMART_HEADER_FLATTEN_ENABLED` | boolean | `true` | 是否启用 SMART 多级表头语义展平与伪代码推理模式 |
 
 ## 目录与版本控制规范
+
+- **回归验证**：使用 `python tests/run_offline.py`，在临时副本中运行测试，隔离个人配置、网络连接和外部服务进程。真实浏览器测试默认跳过；单独执行它们需要设置 `ZOTERO_RUN_LIVE_BROWSER=1`。
+- **评测口径**：`benchmarks/run_benchmark.py --mineru-mode fixture` 使用从标准答案生成的模拟结果，仅验证后处理。`--mineru-mode live` 会提交 PDF 到 MinerU，忽略模拟缓存。不得用 fixture 模式的准确率、耗时声称真实模型识别效果或服务加速倍数。
+- **无法对齐的续表**：重复行标识不足以证明横向对应关系时，保留独立片段；不得将按行号拼接的结果当作已核验的数据。
 
 - **敏感凭据与会话隔离**：
   - `config.json` 包含私有 API 密钥，受 `.gitignore` 保护，严禁入库；请通过复制 `config.example.json` 生成本地私有配置；

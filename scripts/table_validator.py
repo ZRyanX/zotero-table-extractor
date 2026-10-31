@@ -782,12 +782,20 @@ def cross_check_missed_tables(
             'label': fmt_lbl or raw_lbl,
             'title': title,
             'page_idx': p_idx,
+            'covered_pages': list(df.attrs.get('covered_pages', [])) if df is not None else [],
         })
 
     missed_tables = []
     for d in declared_tables:
         lbl = d['label']
-        if lbl and lbl not in extracted_labels:
+        matching = [info for info in extracted_info if info['label'] == lbl]
+        # Unique labels remain usable for sources without page provenance.
+        # Reused labels, however, require independent page coverage.
+        repeated = sum(other['label'] == lbl for other in declared_tables) > 1
+        covered = bool(matching) and (not repeated or any(
+            d['page_idx'] == info['page_idx'] or d['page_idx'] in info['covered_pages']
+            for info in matching))
+        if lbl and not covered:
             missed_tables.append(d)
 
     # 扫描页检测（低字符量且含图像的页面，其表格无法由文本声明检出，属于“覆盖度未知”）

@@ -4241,6 +4241,47 @@ def _do_extract_tables_from_pdf(
             all_results = valid_fused
             pages_requiring_ocr.update(pages_req)
 
+        def _unique_valid_page_tables(p, results):
+            unique = []
+            for result in results:
+                df = result.get('df')
+                if result.get('page_idx') != p or is_table_low_quality(df):
+                    continue
+                raw_label = str(result.get('label') or df.attrs.get('label') or '')
+                label = (format_table_label(raw_label) or raw_label).strip().lower()
+                box = result.get('pdf_bbox') or df.attrs.get('pdf_bbox') or result.get('bbox') or df.attrs.get('bbox')
+                fmt = 'points' if (result.get('pdf_bbox') or df.attrs.get('pdf_bbox')) else df.attrs.get('bbox_format')
+                duplicate = False
+                for other, other_label, other_box, other_fmt in unique:
+                    if label and other_label and label != other_label:
+                        continue
+                    # Identical values in spatially separate regions are separate tables.
+                    if box and other_box and fmt == other_fmt:
+                        iou, iom = _compute_bbox_iou(box, other_box)
+                        if iom < 0.1:
+                            continue
+                        if iom >= 0.8:
+                            duplicate = True
+                            break
+                    if (label and label == other_label) or _table_similarity(df, other['df']) >= 0.90:
+                        duplicate = True
+                        break
+                if not duplicate:
+                    unique.append((result, label, box, fmt))
+            return unique
+
+        def _page_covered(p, results):
+            unique = _unique_valid_page_tables(p, results)
+            decls = [d for d in page_decls.get(p, []) if not d.get('is_continuation')]
+            expected = max(len(decls), len([t for t in inspector_tables if t.get('page_idx') == p]), 1)
+            if len(unique) < expected:
+                return False
+            labels = {label for _, label, _, _ in unique if label}
+            # Named but different tables cannot satisfy a declared missing table.
+            if len(labels) == len(unique):
+                return all(not d.get('label') or (format_table_label(str(d['label'])) or str(d['label'])).strip().lower() in labels for d in decls)
+            return True
+
         # 若检验发现任何问题、缺陷或低置信度页面，优先通过 DocLayout-YOLO 目标切图送入 PaddleOCR-VL 独立接管提取
         if pages_requiring_ocr and use_ocr_fallback:
             ocr_candidate_pages = sorted(list(pages_requiring_ocr))
@@ -4249,19 +4290,11 @@ def _do_extract_tables_from_pdf(
             ocr_results = []
             unresolved_ocr_pages = set(ocr_candidate_pages)
 
-            def _get_page_needed_count(p):
-                decls = [d for d in page_decls.get(p, []) if not d.get('is_continuation')]
-                cand_count = len([t for t in inspector_tables if t.get('page_idx') == p])
-                exp_count = max(len(decls), cand_count, 1)
-                valid_native = len([r for r in valid_fused if r.get('page_idx') == p and not is_table_low_quality(r.get('df'))])
-                return max(1, exp_count - valid_native)
-
             def _update_unresolved_pages():
                 nonlocal unresolved_ocr_pages
                 for p in list(unresolved_ocr_pages):
-                    needed_count = _get_page_needed_count(p)
-                    valid_on_page = [r for r in ocr_results if r.get('page_idx') == p and not is_table_low_quality(r.get('df'))]
-                    if len(valid_on_page) >= needed_count:
+                    has_repair = any(r.get('page_idx') == p and not is_table_low_quality(r.get('df')) for r in ocr_results)
+                    if has_repair and _page_covered(p, list(valid_fused) + ocr_results):
                         unresolved_ocr_pages.discard(p)
 
             # 阶段 1: 优先尝试 RapidTable ONNX 结构识别快速挽救
@@ -4314,13 +4347,7 @@ def _do_extract_tables_from_pdf(
 
         # Step 3c: 仍未覆盖且未在 OCR 中成功产出表格的页面 → text_alignment
         extracted_pages = set(r.get('page_idx', -1) for r in all_results if r.get('page_idx') is not None and not is_table_low_quality(r.get('df')))
-        ocr_successfully_resolved_pages = set(r.get('page_idx') for r in ocr_results if r.get('page_idx') is not None and not is_table_low_quality(r.get('df'))) if 'ocr_results' in locals() and ocr_results else set()
-        def _get_page_expected_count(p):
-            decls_cnt = len([d for d in page_decls.get(p, []) if not d.get('is_continuation')])
-            cands_cnt = len([t for t in inspector_tables if t.get('page_idx') == p])
-            return max(decls_cnt, cands_cnt, 1)
-
-        still_missing = sorted(p for p in target_pages if (p not in extracted_pages or len([r for r in all_results if r.get('page_idx') == p and not is_table_low_quality(r.get('df'))]) < _get_page_expected_count(p)) and p not in ocr_successfully_resolved_pages)
+        still_missing = sorted(p for p in target_pages if not _page_covered(p, all_results))
         if still_missing:
             logs.append(f"→ Step 3c: 对仍未覆盖/表数不足的 {[p+1 for p in still_missing]} 页尝试文本对齐提取")
             text_align_results = extract_via_text_alignment(pdf_path, pages=still_missing)
@@ -4328,7 +4355,7 @@ def _do_extract_tables_from_pdf(
                 ta_page = ta.get('page_idx', -1)
                 if not is_table_low_quality(ta['df']):
                     existing_on_page = [r for r in all_results if r.get('page_idx') == ta_page]
-                    duplicate = any(_table_similarity(r['df'], ta['df']) >= 0.70 for r in existing_on_page)
+                    duplicate = len(_unique_valid_page_tables(ta_page, existing_on_page + [ta])) == len(_unique_valid_page_tables(ta_page, existing_on_page))
                     if not duplicate:
                         all_results = [r for r in all_results if not (r.get('page_idx') == ta_page and is_table_low_quality(r.get('df')))]
                         all_results.append(ta)

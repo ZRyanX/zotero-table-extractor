@@ -62,26 +62,10 @@ def browser_task_concurrency_guard(user_data_dir=None, config=None):
         has_cdp = False
 
     if has_cdp:
-        try:
-            from .cdp_detector import cdp_tab_slot_guard
-            with cdp_tab_slot_guard():
-                yield True
-            return
-        except Exception:
-            sem = None
-            try:
-                from .cdp_detector import get_cdp_tab_semaphore
-                sem = get_cdp_tab_semaphore()
-                sem.acquire()
-            except Exception:
-                sem = None
-
-            if sem is not None:
-                try:
-                    yield True
-                finally:
-                    sem.release()
-                return
+        from .cdp_detector import cdp_tab_slot_guard
+        with cdp_tab_slot_guard():
+            yield True
+        return
 
     with browser_extraction_lock():
         yield False

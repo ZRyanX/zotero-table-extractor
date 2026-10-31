@@ -298,18 +298,17 @@ class RapidTableExtractor:
 
         try:
             import io
-            # 1. 若包含 <th> 标签，默认解析 (pandas 自动将 <th> 识别为列名)
-            # 2. 若全为 <td>，尝试 header=0 将首行作为表头；若单行或导致空表，回退无指定 header 解析
-            dfs = None
-            if "<th" in html_str.lower():
-                dfs = pd.read_html(io.StringIO(html_str))
-            else:
-                try:
-                    dfs = pd.read_html(io.StringIO(html_str), header=0)
-                    if dfs and dfs[0].empty:
-                        dfs = pd.read_html(io.StringIO(html_str))
-                except Exception:
-                    dfs = pd.read_html(io.StringIO(html_str))
+            try:
+                from .table_postprocess import read_html_preserving_text, should_promote_first_row
+            except ImportError:
+                from table_postprocess import read_html_preserving_text, should_promote_first_row
+            # Preserve explicit headers; infer an all-td header only with evidence.
+            dfs = read_html_preserving_text(html_str)
+            for parsed in dfs:
+                if parsed.attrs.get('header_source') != 'explicit' and should_promote_first_row(parsed):
+                    parsed.columns = parsed.iloc[0].tolist()
+                    parsed.drop(parsed.index[0], inplace=True)
+                    parsed.reset_index(drop=True, inplace=True)
 
             if dfs:
                 df = dfs[0]
