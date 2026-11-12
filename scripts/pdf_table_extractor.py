@@ -58,9 +58,9 @@ except ImportError:
     pd = None
 
 try:
-    from .common import format_table_label, TABLE_LABEL_PATTERN, TABLE_LABEL_RE, is_table_squeezed, is_table_low_quality, is_markdown_separator, df_map, make_unique_columns, teds_similarity
+    from .common import format_table_label, TABLE_LABEL_PATTERN, TABLE_LABEL_RE, is_table_squeezed, is_table_low_quality, is_metadata_table, is_markdown_separator, df_map, make_unique_columns, teds_similarity
 except ImportError:
-    from common import format_table_label, TABLE_LABEL_PATTERN, TABLE_LABEL_RE, is_table_squeezed, is_table_low_quality, is_markdown_separator, df_map, make_unique_columns, teds_similarity
+    from common import format_table_label, TABLE_LABEL_PATTERN, TABLE_LABEL_RE, is_table_squeezed, is_table_low_quality, is_metadata_table, is_markdown_separator, df_map, make_unique_columns, teds_similarity
 
 
 import sys
@@ -269,6 +269,8 @@ def extract_via_structure_tree(pdf_path: str, pages: Optional[List[int]] = None)
                     text = ' '.join(it.text.strip() for it in its_sorted if it.text.strip())
                     avg_x = sum(it.x for it in its) / len(its)
                     avg_y = sum(it.y for it in its) / len(its)
+                    top_y = max(it.y for it in its)
+                    min_y = min(it.y for it in its)
                     min_x = min(it.x for it in its)
                     max_x = max(it.x + it.width for it in its)
                     cells.append({
@@ -276,7 +278,10 @@ def extract_via_structure_tree(pdf_path: str, pages: Optional[List[int]] = None)
                         'role': x.role,
                         'text': text,
                         'x': avg_x,
-                        'y': avg_y,
+                        'y': top_y,
+                        'avg_y': avg_y,
+                        'min_y': min_y,
+                        'max_y': top_y,
                         'min_x': min_x,
                         'max_x': max_x,
                     })
@@ -310,7 +315,7 @@ def extract_via_structure_tree(pdf_path: str, pages: Optional[List[int]] = None)
                     cur_r = []
                     cur_y = None
                     for c in th_by_y:
-                        if cur_y is None or abs(c['y'] - cur_y) < 4.0:
+                        if cur_y is None or abs(c['y'] - cur_y) < 6.0:
                             cur_r.append(c)
                             if cur_y is None:
                                 cur_y = c['y']
@@ -406,21 +411,27 @@ def extract_via_structure_tree(pdf_path: str, pages: Optional[List[int]] = None)
                 if n_cols == 0:
                     continue
 
-                # 始终使用物理 y 坐标行聚类 + x 轴物理列投影重建数据行，
-                # 严禁因单元格总数恰好整除便盲目顺序切片，杜绝空单元格缺失引发的全表跨行错移
-                data_by_y = sorted(data_cells, key=lambda c: -c['y'])
+                # 始终使用单元格顶行物理 y 坐标 (top_y) 行聚类 + 垂直区间重叠辅助 + x 轴物理列投影重建数据行，
+                # 防止多行折行 <TD> 因平均 y 下移而被误切分为多行
+                data_by_y = sorted(data_cells, key=lambda c: (-c['y'], c['x']))
                 curr_r = []
                 curr_y = None
+                curr_min_y = None
                 rows_grouped = []
                 for c in data_by_y:
-                    if curr_y is None or abs(c['y'] - curr_y) < 4.5:
+                    c_col = min(range(n_cols), key=lambda i: abs(tbl_col_centers[i] - c['x']))
+                    used_cols = {min(range(n_cols), key=lambda i: abs(tbl_col_centers[i] - x['x'])) for x in curr_r}
+                    vert_overlap = (curr_min_y is not None and c['y'] >= curr_min_y - 2.0 and c_col not in used_cols)
+                    if curr_y is None or abs(c['y'] - curr_y) < 6.5 or vert_overlap:
                         curr_r.append(c)
                         if curr_y is None:
                             curr_y = c['y']
+                        curr_min_y = min(curr_min_y, c.get('min_y', c['y'])) if curr_min_y is not None else c.get('min_y', c['y'])
                     else:
                         rows_grouped.append(sorted(curr_r, key=lambda x: x['x']))
                         curr_r = [c]
                         curr_y = c['y']
+                        curr_min_y = c.get('min_y', c['y'])
                 if curr_r:
                     rows_grouped.append(sorted(curr_r, key=lambda x: x['x']))
 
@@ -441,8 +452,8 @@ def extract_via_structure_tree(pdf_path: str, pages: Optional[List[int]] = None)
             unique_cols = make_unique_columns(tbl_headers)
             df = pd.DataFrame(tbl_rows, columns=unique_cols)
 
-            tbl_min_y = min(c['y'] for c in cells)
-            tbl_max_y = max(c['y'] for c in cells)
+            tbl_min_y = min(c.get('min_y', c['y']) for c in cells)
+            tbl_max_y = max(c.get('max_y', c['y']) for c in cells)
 
             matched_cap = None
             avail_caps = [c for c in captions if c['text'] not in used_captions]
@@ -462,9 +473,9 @@ def extract_via_structure_tree(pdf_path: str, pages: Optional[List[int]] = None)
             df.attrs['has_semantic_th'] = True
             if matched_cap:
                 df.attrs['table_title'] = matched_cap
-                m_lbl = re.search(r'((?:Table|Tab\.|表)\s*\d+)', matched_cap, re.IGNORECASE)
+                m_lbl = TABLE_LABEL_RE.search(matched_cap)
                 if m_lbl:
-                    df.attrs['label'] = m_lbl.group(1)
+                    df.attrs['label'] = format_table_label(m_lbl.group(0))
 
             b_x0 = min(c['min_x'] for c in cells)
             b_x1 = max(c['max_x'] for c in cells)
@@ -484,6 +495,9 @@ def extract_via_structure_tree(pdf_path: str, pages: Optional[List[int]] = None)
                     bbox = [raw_r.x0, raw_r.y0, raw_r.x1, raw_r.y1]
             except Exception:
                 bbox = None
+
+            if bbox is not None:
+                df.attrs['bbox'] = bbox
 
             results.append({
                 'df': df,
@@ -553,6 +567,7 @@ def classify_and_extract_via_inspector(pdf_path: str, caption_page_map: Optional
         # 1. 优先尝试从 Tagged PDF / PDF/UA 语义结构树中直接提取表格 (最高精度)
         try:
             struct_tbls = extract_via_structure_tree(pdf_path)
+            result['_structure_tree_ran'] = True
             if struct_tbls:
                 result['structure_tables'] = struct_tbls
         except Exception as e_st:
@@ -583,11 +598,17 @@ def classify_and_extract_via_inspector(pdf_path: str, caption_page_map: Optional
                                 tbl_df.attrs['page_idx'] = actual_page
                                 if not tbl_df.attrs.get('label'):
                                     tbl_df.attrs['label'] = f"Table {len(result['tables'])+1}"
+                                st_bbox = tbl_df.attrs.get('bbox')
+                                if st_bbox is None and result['structure_tables']:
+                                    same_p_st = [s for s in result['structure_tables'] if s.get('page_idx') == actual_page and s.get('bbox')]
+                                    if len(same_p_st) == 1 and len(p_tables) == 1:
+                                        st_bbox = same_p_st[0]['bbox']
+                                        tbl_df.attrs['bbox'] = st_bbox
                                 result['tables'].append({
                                     'df': tbl_df,
                                     'page_idx': actual_page,
                                     'table_idx': len(result['tables']),
-                                    'bbox': None,
+                                    'bbox': st_bbox,
                                 })
                     result['markdown'] = "\n\n".join(full_md_list)
                 except Exception as e_epm:
@@ -610,11 +631,17 @@ def classify_and_extract_via_inspector(pdf_path: str, caption_page_map: Optional
                         df.attrs['page_idx'] = page_hint
                     if not df.attrs.get('label'):
                         df.attrs['label'] = f"Table {i+1}"
+                    st_bbox = df.attrs.get('bbox')
+                    if st_bbox is None and result['structure_tables'] and page_hint is not None:
+                        same_p_st = [s for s in result['structure_tables'] if s.get('page_idx') == page_hint and s.get('bbox')]
+                        if len(same_p_st) == 1:
+                            st_bbox = same_p_st[0]['bbox']
+                            df.attrs['bbox'] = st_bbox
                     result['tables'].append({
                         'df': df,
                         'page_idx': page_hint,
                         'table_idx': i,
-                        'bbox': None,
+                        'bbox': st_bbox,
                     })
 
         print(f"[pdf-inspector] type={result['pdf_type']}, confidence={result['confidence']:.2f}, "
@@ -669,10 +696,10 @@ def _parse_markdown_tables(markdown: str, caption_page_map: Optional[Dict[str, i
             p_num = next(g for g in page_match.groups() if g is not None)
             page_hint = int(p_num) - 1
 
-        cap_m = re.search(r'\b((?:Table|TABLE|表)\s*[S]?[0-9]+(?:\.[0-9]+)?)', line)
+        cap_m = TABLE_LABEL_RE.search(line)
         if cap_m and not (line.startswith('|') and line.endswith('|')):
             curr_caption = line
-            curr_label = cap_m.group(1).replace(' ', '').capitalize()
+            curr_label = format_table_label(cap_m.group(0))
 
         # 检测 Markdown 表格起始
         if line.startswith('|') and line.endswith('|'):
@@ -687,10 +714,10 @@ def _parse_markdown_tables(markdown: str, caption_page_map: Optional[Dict[str, i
                     break
 
             df = _markdown_lines_to_df(table_lines)
-            if df is not None and not df.empty and len(df) >= 2:
+            if df is not None and not df.empty and len(df) >= 1:
                 resolved_page = page_hint
-                if resolved_page is None and curr_label and caption_page_map and curr_label in caption_page_map:
-                    resolved_page = caption_page_map[curr_label]
+                if resolved_page is None and curr_label and caption_page_map:
+                    resolved_page = caption_page_map.get(curr_label) or caption_page_map.get(curr_label.replace(' ', ''))
                 if resolved_page is None:
                     resolved_page = default_page
                 if curr_label:
@@ -720,9 +747,16 @@ def _markdown_lines_to_df(table_lines: List[str]):
 
     try:
         csv_data = '\n'.join(l.strip('|') for l in clean_lines)
-        df = pd.read_csv(io.StringIO(csv_data), sep=r'\s*\|\s*', engine='python')
-        # 清理列名
+        df = pd.read_csv(
+            io.StringIO(csv_data),
+            sep=r'\s*\|\s*',
+            engine='python',
+            dtype=str,
+            keep_default_na=False,
+        )
+        # 清理列名与单元格空白
         df.columns = [str(c).strip() for c in df.columns]
+        df = df_map(df, lambda x: str(x).strip() if x is not None else "")
         return df
     except Exception:
         return None
@@ -1001,42 +1035,67 @@ def extract_via_pdfplumber(pdf_path: str, pages: Optional[List[int]] = None) -> 
                 if page_idx >= len(pdf.pages):
                     continue
                 page = pdf.pages[page_idx]
-                tables = page.find_tables()
                 fitz_page = doc_fitz[page_idx] if doc_fitz and page_idx < len(doc_fitz) else None
-                for tbl_idx, table in enumerate(tables):
+
+                def _parse_plumber_tables(tbl_objs):
+                    parsed = []
+                    for tbl_idx, table in enumerate(tbl_objs or []):
+                        try:
+                            data = table.extract()
+                            if not data or len(data) < 1:
+                                continue
+                            clean_rows = []
+                            for row in data:
+                                clean_row = [("" if cell is None else str(cell).strip()) for cell in row]
+                                if any(c for c in clean_row):
+                                    clean_rows.append(clean_row)
+                            if len(clean_rows) < 1:
+                                continue
+                            if len(clean_rows) == 1:
+                                df = pd.DataFrame(clean_rows, columns=[f"Col_{i+1}" for i in range(len(clean_rows[0]))])
+                            else:
+                                df = pd.DataFrame(clean_rows[1:], columns=make_unique_columns(clean_rows[0]))
+                            df.attrs['extractor'] = 'pdfplumber'
+                            df.attrs['page_idx'] = page_idx
+                            t_bbox = list(table.bbox) if getattr(table, 'bbox', None) else None
+                            if t_bbox:
+                                df.attrs['bbox'] = t_bbox
+                            if fitz_page:
+                                label, caption = extract_table_caption_from_page(fitz_page, t_bbox)
+                                df.attrs['label'] = label if label else None
+                                if caption:
+                                    df.attrs['table_title'] = caption
+                            else:
+                                df.attrs['label'] = None
+                            parsed.append({
+                                'df': df,
+                                'page_idx': page_idx,
+                                'table_idx': tbl_idx,
+                                'bbox': t_bbox,
+                            })
+                        except Exception as e:
+                            logger.debug(f"pdfplumber table parse error: {e}")
+                    return parsed
+
+                tables = page.find_tables()
+                page_parsed = _parse_plumber_tables(tables)
+                # 若默认 lines 策略未检出有效多列表格（如无竖线学术三线表），回退尝试 vertical_strategy="text"
+                if not any(r['df'].shape[1] >= 2 for r in page_parsed):
                     try:
-                        data = table.extract()
-                        if not data or len(data) < 1:
-                            continue
-                        clean_rows = []
-                        for row in data:
-                            clean_row = [("" if cell is None else str(cell).strip()) for cell in row]
-                            if any(c for c in clean_row):
-                                clean_rows.append(clean_row)
-                        if len(clean_rows) < 1:
-                            continue
-                        if len(clean_rows) == 1:
-                            df = pd.DataFrame(clean_rows, columns=[f"Col_{i+1}" for i in range(len(clean_rows[0]))])
-                        else:
-                            df = pd.DataFrame(clean_rows[1:], columns=clean_rows[0])
-                        df.attrs['extractor'] = 'pdfplumber'
-                        df.attrs['page_idx'] = page_idx
-                        t_bbox = list(table.bbox) if table.bbox else None
-                        if fitz_page:
-                            label, caption = extract_table_caption_from_page(fitz_page, t_bbox)
-                            df.attrs['label'] = label if label else None
-                            if caption:
-                                df.attrs['table_title'] = caption
-                        else:
-                            df.attrs['label'] = None
-                        results.append({
-                            'df': df,
-                            'page_idx': page_idx,
-                            'table_idx': tbl_idx,
-                            'bbox': t_bbox,
-                        })
-                    except Exception as e:
-                        logger.debug(f"pdfplumber table parse error: {e}")
+                        fallback_tables = page.find_tables(
+                            table_settings={
+                                "vertical_strategy": "text",
+                                "horizontal_strategy": "lines",
+                                "intersection_y_tolerance": 5,
+                            }
+                        )
+                        fb_parsed = [r for r in _parse_plumber_tables(fallback_tables) if r['df'].shape[1] >= 2 and r['df'].shape[0] >= 1]
+                        if fb_parsed:
+                            page_parsed = fb_parsed
+                    except Exception as e_fb:
+                        logger.debug(f"pdfplumber text-strategy fallback notice: {e_fb}")
+
+                results.extend(page_parsed)
         if doc_fitz:
             doc_fitz.close()
     except ImportError:
@@ -1077,8 +1136,14 @@ def extract_via_camelot(pdf_path: str, pages: Optional[List[int]] = None) -> Lis
         return []
 
     results = []
+    doc_fitz = None
     try:
         import camelot
+
+        try:
+            doc_fitz = fitz.open(pdf_path)
+        except Exception:
+            doc_fitz = None
 
         # Camelot uses 1-indexed page strings
         if pages is not None:
@@ -1092,22 +1157,50 @@ def extract_via_camelot(pdf_path: str, pages: Optional[List[int]] = None) -> Lis
                 tables = camelot.read_pdf(pdf_path, flavor=flavor, pages=page_str)
                 if tables and len(tables) > 0:
                     for tbl_idx, table in enumerate(tables):
+                        report = getattr(table, 'parsing_report', None)
+                        if isinstance(report, dict):
+                            acc = report.get('accuracy', 100.0)
+                            if isinstance(acc, (int, float)) and acc < 50.0:
+                                continue
                         df = table.df
                         if df is None or df.empty or len(df) < 1:
                             continue
                         page_idx = int(getattr(table, 'page', 1)) - 1
+                        df = df_map(df, lambda x: str(x).strip() if x is not None else "")
+                        # Camelot 的 table.df 默认使用 RangeIndex(0..N-1) 列名，首行即表头
+                        if len(df) >= 2 and all(isinstance(c, int) or str(c).isdigit() for c in df.columns):
+                            header_vals = [str(v).strip() for v in df.iloc[0].tolist()]
+                            if any(header_vals):
+                                df = df.iloc[1:].reset_index(drop=True)
+                                df.columns = make_unique_columns(header_vals)
+
                         if flavor == 'stream':
                             existing_on_page = [r['df'] for r in results if r.get('page_idx') == page_idx]
                             if any(_table_similarity(ex, df) >= 0.50 for ex in existing_on_page):
                                 continue
-                        df = df_map(df, lambda x: str(x).strip() if x is not None else "")
+
+                        t_bbox = None
+                        raw_bbox = getattr(table, '_bbox', None) or getattr(table, 'bbox', None)
+                        if isinstance(raw_bbox, (list, tuple)) and len(raw_bbox) == 4:
+                            try:
+                                x0, y0_b, x1, y1_t = [float(v) for v in raw_bbox]
+                                if doc_fitz is not None and 0 <= page_idx < len(doc_fitz) and y1_t > y0_b:
+                                    p_h = float(doc_fitz[page_idx].rect.height)
+                                    t_bbox = [x0, max(0.0, p_h - y1_t), x1, min(p_h, p_h - y0_b)]
+                                else:
+                                    t_bbox = [x0, y0_b, x1, y1_t]
+                            except Exception:
+                                t_bbox = None
+
                         df.attrs['extractor'] = f'camelot_{flavor}'
                         df.attrs['page_idx'] = page_idx
+                        if t_bbox:
+                            df.attrs['bbox'] = t_bbox
                         results.append({
                             'df': df,
                             'page_idx': page_idx,
                             'table_idx': tbl_idx,
-                            'bbox': None,
+                            'bbox': t_bbox,
                         })
                         pages_with_camelot.add(page_idx)
             except Exception as e:
@@ -1117,6 +1210,12 @@ def extract_via_camelot(pdf_path: str, pages: Optional[List[int]] = None) -> Lis
         print("[Camelot] 未安装，跳过")
     except Exception as e:
         logger.warning(f"Camelot error: {e}")
+    finally:
+        if doc_fitz is not None:
+            try:
+                doc_fitz.close()
+            except Exception:
+                pass
 
     if results:
         print(f"[Camelot] 提取到 {len(results)} 个表格")
@@ -1129,6 +1228,8 @@ def extract_via_camelot(pdf_path: str, pages: Optional[List[int]] = None) -> Lis
 
 _IMG2TABLE_CHECKED = False
 _IMG2TABLE_AVAILABLE = False
+_IMG2TABLE_OCR_CHECKED = False
+_IMG2TABLE_OCR_INSTANCE = None
 
 
 def is_img2table_available() -> bool:
@@ -1145,6 +1246,24 @@ def is_img2table_available() -> bool:
             _IMG2TABLE_AVAILABLE = False
         _IMG2TABLE_CHECKED = True
     return _IMG2TABLE_AVAILABLE
+
+
+def _get_img2table_ocr():
+    """按需初始化并缓存 img2table 本地 OCR 实例（若环境可用）。"""
+    global _IMG2TABLE_OCR_CHECKED, _IMG2TABLE_OCR_INSTANCE
+    if _IMG2TABLE_OCR_CHECKED:
+        return _IMG2TABLE_OCR_INSTANCE
+    _IMG2TABLE_OCR_CHECKED = True
+    try:
+        from common import load_config
+        cfg = load_config() if callable(load_config) else {}
+        if not cfg.get("IMG2TABLE_USE_OCR", False):
+            return None
+        from img2table.ocr import PaddleOCR as Img2TablePaddleOCR
+        _IMG2TABLE_OCR_INSTANCE = Img2TablePaddleOCR(lang="ch")
+    except Exception:
+        _IMG2TABLE_OCR_INSTANCE = None
+    return _IMG2TABLE_OCR_INSTANCE
 
 
 def extract_via_img2table(
@@ -1180,7 +1299,15 @@ def extract_via_img2table(
         target_pages = [int(p) for p in raw_pages] if raw_pages is not None else None
         doc = PDF(src=pdf_path, pages=target_pages, detect_rotation=False, pdf_text_extraction=True)
 
-        extracted = doc.extract_tables(borderless_tables=True)
+        ocr_inst = _get_img2table_ocr()
+        try:
+            if ocr_inst is not None:
+                extracted = doc.extract_tables(ocr=ocr_inst, borderless_tables=True, implicit_rows=True)
+            else:
+                extracted = doc.extract_tables(borderless_tables=True)
+        except TypeError:
+            extracted = doc.extract_tables(borderless_tables=True)
+
         if extracted:
             for p_num, tbl_list in extracted.items():
                 for tbl_idx, tbl in enumerate(tbl_list):
@@ -1188,6 +1315,13 @@ def extract_via_img2table(
                     if df is None or df.empty or len(df) < 1:
                         continue
                     df = df_map(df, lambda x: str(x).strip() if x is not None else "")
+                    # img2table 默认返回整数索引列名 (0, 1, 2...)，首行通常为表头
+                    if len(df) >= 2 and all(isinstance(c, int) or str(c).isdigit() for c in df.columns):
+                        header_vals = [str(v).strip() for v in df.iloc[0].tolist()]
+                        if any(header_vals):
+                            df = df.iloc[1:].reset_index(drop=True)
+                            df.columns = make_unique_columns(header_vals)
+
                     df.attrs['extractor'] = 'img2table'
                     df.attrs['page_idx'] = p_num
                     if getattr(tbl, 'title', None):
@@ -1208,6 +1342,7 @@ def extract_via_img2table(
                             getattr(b, 'y2', 0) * pt_scale,
                         ]
                         bbox = raw_bbox
+                        df.attrs['bbox'] = pdf_bbox
 
                     results.append({
                         'df': df,
@@ -1230,6 +1365,10 @@ def extract_via_img2table(
 
 _GMFT_CHECKED = False
 _GMFT_AVAILABLE = False
+_GMFT_DETECTOR = None
+_GMFT_FORMATTER = None
+_GMFT_DETECTOR_CLS = None
+_GMFT_FORMATTER_CLS = None
 
 
 def is_gmft_available() -> bool:
@@ -1249,6 +1388,26 @@ def is_gmft_available() -> bool:
             _GMFT_AVAILABLE = False
         _GMFT_CHECKED = True
     return _GMFT_AVAILABLE
+
+
+def _get_gmft_models():
+    """获取或初始化 GMFT 单例 Detector 与 Formatter（开启多级表头与跨单元格支持）。"""
+    global _GMFT_DETECTOR, _GMFT_FORMATTER, _GMFT_DETECTOR_CLS, _GMFT_FORMATTER_CLS
+    from gmft.auto import AutoTableDetector, AutoTableFormatter
+    if _GMFT_DETECTOR is None or _GMFT_DETECTOR_CLS is not AutoTableDetector:
+        _GMFT_DETECTOR = AutoTableDetector()
+        _GMFT_DETECTOR_CLS = AutoTableDetector
+    if _GMFT_FORMATTER is None or _GMFT_FORMATTER_CLS is not AutoTableFormatter:
+        fmt_inst = None
+        try:
+            from gmft.auto import AutoFormatConfig
+            cfg_obj = AutoFormatConfig(enable_multi_header=True, semantic_spanning_cells=True)
+            fmt_inst = AutoTableFormatter(config=cfg_obj)
+        except Exception:
+            fmt_inst = AutoTableFormatter()
+        _GMFT_FORMATTER = fmt_inst
+        _GMFT_FORMATTER_CLS = AutoTableFormatter
+    return _GMFT_DETECTOR, _GMFT_FORMATTER
 
 
 def extract_via_gmft(pdf_path: str, pages: Optional[List[int]] = None) -> List[Dict[str, Any]]:
@@ -1273,12 +1432,10 @@ def extract_via_gmft(pdf_path: str, pages: Optional[List[int]] = None) -> List[D
 
     results = []
     try:
-        from gmft.auto import AutoTableDetector, AutoTableFormatter
         from gmft.pdf_bindings import PyPDFium2Document
 
         doc = PyPDFium2Document(pdf_path)
-        detector = AutoTableDetector()
-        formatter = AutoTableFormatter()
+        detector, formatter = _get_gmft_models()
 
         total_pages = len(doc)
         target_pages = [p for p in pages if 0 <= p < total_pages] if pages is not None else list(range(total_pages))
@@ -1295,6 +1452,13 @@ def extract_via_gmft(pdf_path: str, pages: Optional[List[int]] = None) -> List[D
                     df = ft.df()
                     if df is None or df.empty or len(df) < 1:
                         continue
+
+                    if isinstance(df.columns, pd.MultiIndex):
+                        try:
+                            from table_postprocess import smart_flatten_headers
+                            df.columns = make_unique_columns(smart_flatten_headers(df.columns))
+                        except Exception:
+                            df.columns = make_unique_columns([" ".join(str(x).strip() for x in col if str(x).strip()) for col in df.columns])
 
                     df = df_map(df, lambda x: str(x).strip() if x is not None else "")
                     df.attrs['extractor'] = 'gmft_tatr'
@@ -1325,6 +1489,9 @@ def extract_via_gmft(pdf_path: str, pages: Optional[List[int]] = None) -> List[D
                             bbox = [r.x0, r.y0, r.x1, r.y1]
                     elif hasattr(tbl, 'bbox') and _is_valid_bbox(tbl.bbox):
                         bbox = list(tbl.bbox)
+
+                    if bbox:
+                        df.attrs['bbox'] = bbox
 
                     results.append({
                         'df': df,
@@ -1395,9 +1562,36 @@ def extract_via_pymupdf4llm(pdf_path: str, pages: Optional[List[int]] = None) ->
         total_pages = len(doc)
         target_pages = [p for p in pages if 0 <= p < total_pages] if pages is not None else list(range(total_pages))
 
+        # 优先一次性批量调用 to_markdown(..., page_chunks=True) 避免逐页重复扫描全文档字库
+        page_md_map: Dict[int, str] = {}
+        batch_done = False
+        if target_pages:
+            try:
+                chunks = pymupdf4llm.to_markdown(doc, pages=target_pages, page_chunks=True)
+                if isinstance(chunks, list):
+                    for idx_c, ch in enumerate(chunks):
+                        if isinstance(ch, dict):
+                            meta = ch.get("metadata") or {}
+                            p_num = meta.get("page")
+                            p_i = (int(p_num) - 1) if isinstance(p_num, int) and p_num >= 1 else (
+                                target_pages[idx_c] if idx_c < len(target_pages) else idx_c
+                            )
+                            page_md_map[p_i] = ch.get("text") or ""
+                    batch_done = True
+                elif isinstance(chunks, str) and len(target_pages) == 1:
+                    page_md_map[target_pages[0]] = chunks
+                    batch_done = True
+            except TypeError:
+                batch_done = False
+            except Exception:
+                batch_done = False
+
         for p_idx in target_pages:
             try:
-                md_text = pymupdf4llm.to_markdown(doc, pages=[p_idx])
+                if batch_done:
+                    md_text = page_md_map.get(p_idx, "")
+                else:
+                    md_text = pymupdf4llm.to_markdown(doc, pages=[p_idx])
                 if not md_text or "|" not in md_text:
                     continue
 
@@ -1417,6 +1611,15 @@ def extract_via_pymupdf4llm(pdf_path: str, pages: Optional[List[int]] = None) ->
                     if parse_tables_from_markdown:
                         dfs = parse_tables_from_markdown(md_text)
 
+                ft_tables = []
+                try:
+                    p_tab_finder = doc[p_idx].find_tables()
+                    if p_tab_finder and p_tab_finder.tables:
+                        ft_tables = list(p_tab_finder.tables)
+                except Exception:
+                    ft_tables = []
+
+                used_ft_indices = set()
                 for tbl_idx, df in enumerate(dfs or []):
                     if df is None or df.empty or len(df) < 1:
                         continue
@@ -1424,13 +1627,42 @@ def extract_via_pymupdf4llm(pdf_path: str, pages: Optional[List[int]] = None) ->
                     df.attrs['extractor'] = 'pymupdf4llm'
                     df.attrs['page_idx'] = p_idx
                     bbox = None
-                    try:
-                        p_tab_finder = doc[p_idx].find_tables()
-                        if p_tab_finder and p_tab_finder.tables:
-                            if tbl_idx < len(p_tab_finder.tables):
-                                bbox = list(p_tab_finder.tables[tbl_idx].bbox)
-                    except Exception:
-                        pass
+                    if ft_tables:
+                        if len(ft_tables) == len(dfs) and tbl_idx < len(ft_tables):
+                            bbox = list(ft_tables[tbl_idx].bbox)
+                        else:
+                            # 按单元格内容与行列尺寸相似度匹配对应 bbox，避免同页漏检/多检时按下标错配
+                            df_tokens = set(
+                                str(v).strip().lower()
+                                for v in df.values.flatten()
+                                if v is not None and str(v).strip()
+                            )
+                            best_ft_idx = None
+                            best_ft_score = -1.0
+                            for f_i, f_tab in enumerate(ft_tables):
+                                if f_i in used_ft_indices:
+                                    continue
+                                try:
+                                    f_rows = f_tab.extract() or []
+                                    f_tokens = set(
+                                        str(c).strip().lower()
+                                        for r in f_rows for c in (r or [])
+                                        if c is not None and str(c).strip()
+                                    )
+                                    overlap = len(df_tokens & f_tokens) / max(len(df_tokens | f_tokens), 1) if (df_tokens or f_tokens) else 0.0
+                                    f_c = getattr(f_tab, 'col_count', len(f_rows[0]) if f_rows else 0) or 0
+                                    col_sim = min(df.shape[1], max(f_c, 1)) / max(df.shape[1], max(f_c, 1))
+                                    score = 0.75 * overlap + 0.25 * col_sim
+                                    if score > best_ft_score and score >= 0.25:
+                                        best_ft_score = score
+                                        best_ft_idx = f_i
+                                except Exception:
+                                    continue
+                            if best_ft_idx is not None:
+                                used_ft_indices.add(best_ft_idx)
+                                bbox = list(ft_tables[best_ft_idx].bbox)
+                    if bbox:
+                        df.attrs['bbox'] = bbox
                     results.append({
                         'df': df,
                         'page_idx': p_idx,
@@ -1788,17 +2020,17 @@ def three_way_vote(
             # 若选出的候选表存在列挤压（如数值挤在同一单元格），且同页有未挤压的候选表，则自动切换为未挤压版本
             if best_result is not None and is_table_squeezed(best_result['df']):
                 for alt_name in ['pdf_inspector_structure', 'gmft', 'img2table', 'text_alignment', 'pdfplumber', 'camelot', 'pdf_inspector']:
-                    if alt_name in candidates and not is_table_squeezed(candidates[alt_name]['df']) and not is_table_low_quality(candidates[alt_name]['df']):
+                    if alt_name in candidates and not is_table_squeezed(candidates[alt_name]['df']) and not _is_table_low_quality_after_clean(candidates[alt_name]):
                         logs.append(f"Page {page+1} Table {tbl_idx+1}: {best_extractor} 存在列挤压问题 → 自动切换为未挤压的 {alt_name}")
                         best_result = candidates[alt_name]
                         best_extractor = alt_name
                         break
 
-            # 低质量/损坏表格检查：
+            # 低质量/损坏表格检查（先尝试 postprocess_dataframe 清洗修复表头/占位列/尾注后再判定）：
             # 若选出的候选表混入正文段落、章节标题或有效数据极度稀疏，检查是否有合格候选；若全不合格则剔除，留待 Step 3b PaddleOCR-VL 识别
-            if best_result is not None and is_table_low_quality(best_result['df']):
+            if best_result is not None and _is_table_low_quality_after_clean(best_result):
                 for alt_name in priority:
-                    if alt_name in candidates and not is_table_low_quality(candidates[alt_name]['df']):
+                    if alt_name in candidates and not _is_table_low_quality_after_clean(candidates[alt_name]):
                         logs.append(f"Page {page+1} Table {tbl_idx+1}: {best_extractor} 提取质量低劣 → 切换为 {alt_name}")
                         best_result = candidates[alt_name]
                         best_extractor = alt_name
@@ -1835,6 +2067,91 @@ def three_way_vote(
     return fused, logs, vote_summary
 
 
+def _is_table_low_quality_after_clean(item_or_df: Any) -> bool:
+    """
+    在判定表格是否为低质量/元数据噪音前，若原始 DataFrame 未通过检查，
+    先尝试通过 postprocess_dataframe 执行表头提升、空占位列剥离与尾注分离，
+    防止可被标准后处理修复的真实科学表格被前置质检器误杀。
+    """
+    is_dict = isinstance(item_or_df, dict)
+    df = item_or_df.get('df') if is_dict else item_or_df
+    if df is None or not hasattr(df, 'empty') or df.empty:
+        return True
+    if not is_table_low_quality(df) and not is_metadata_table(df):
+        return False
+    try:
+        try:
+            from .table_postprocess import postprocess_dataframe
+        except ImportError:
+            from table_postprocess import postprocess_dataframe
+        cleaned = postprocess_dataframe(df.copy())
+        if cleaned is not None and not cleaned.empty and not is_table_low_quality(cleaned) and not is_metadata_table(cleaned):
+            if is_dict:
+                item_or_df['df'] = cleaned
+            return False
+    except Exception:
+        pass
+    return True
+
+
+def _resolve_ocr_table_page(
+    df: Any,
+    tbl_idx: int,
+    total_tbls: int,
+    pages: Optional[List[int]],
+    pdf_path: str,
+    caption_page_map: Optional[Dict[str, int]] = None,
+) -> int:
+    """
+    精准解析 OCR/VLM 提取表格对应的 0-indexed PDF 页码，避免同页多表或无表页时按 pages[i] 错配。
+    """
+    p_idx = df.attrs.get('page_idx') if (df is not None and hasattr(df, 'attrs')) else None
+    if isinstance(p_idx, int) and p_idx >= 0:
+        if not pages or p_idx in pages:
+            return p_idx
+        if 0 <= p_idx < len(pages):
+            return pages[p_idx]
+
+    # 尝试通过表号映射定位真实页码
+    if df is not None and hasattr(df, 'attrs'):
+        raw_lbl = df.attrs.get('label') or df.attrs.get('table_title') or ''
+        fmt_lbl = format_table_label(str(raw_lbl)) if raw_lbl else None
+        if fmt_lbl and caption_page_map:
+            mapped_p = caption_page_map.get(fmt_lbl) or caption_page_map.get(fmt_lbl.replace(' ', ''))
+            if mapped_p is not None and (not pages or mapped_p in pages):
+                return mapped_p
+
+    # 若候选页有多个且存在 PDF 原文，按页面文本与表格内容的词汇/数字重合度匹配
+    if pages and len(pages) > 1 and pdf_path and os.path.exists(pdf_path) and df is not None:
+        try:
+            df_tokens = set(
+                str(v).strip().lower()
+                for v in df.values.flatten()
+                if v is not None and len(str(v).strip()) >= 2
+            )
+            if df_tokens:
+                best_p = None
+                best_hits = 0
+                with fitz.open(pdf_path) as doc:
+                    for cand_p in pages:
+                        if 0 <= cand_p < len(doc):
+                            p_txt = doc[cand_p].get_text("text").lower()
+                            hits = sum(1 for tok in df_tokens if tok in p_txt)
+                            if hits > best_hits:
+                                best_hits = hits
+                                best_p = cand_p
+                if best_p is not None and best_hits >= 2:
+                    return best_p
+        except Exception:
+            pass
+
+    if pages:
+        if total_tbls == len(pages) and tbl_idx < len(pages):
+            return pages[tbl_idx]
+        return pages[0]
+    return int(p_idx) if isinstance(p_idx, int) and p_idx >= 0 else 0
+
+
 # ===========================================================================
 # 6. OCR 兜底
 # ===========================================================================
@@ -1865,6 +2182,20 @@ def extract_via_ocr(pdf_path: str, pages: Optional[List[int]] = None) -> List[Di
     except ImportError:
         from table_postprocess import parse_structured_vlm_content
 
+    caption_page_map: Dict[str, int] = {}
+    if pdf_path and os.path.exists(pdf_path):
+        try:
+            try:
+                from .table_validator import scan_pdf_table_declarations
+            except ImportError:
+                from table_validator import scan_pdf_table_declarations
+            for p_k, decls in scan_pdf_table_declarations(pdf_path).items():
+                for d in decls:
+                    if not d.get('is_continuation') and d.get('label'):
+                        caption_page_map.setdefault(d['label'], p_k)
+        except Exception:
+            pass
+
     # 0. 若配置首选引擎为 MinerU，优先直接调用 MinerU 高精度多模态提取
     if engine == "mineru":
         try:
@@ -1879,15 +2210,7 @@ def extract_via_ocr(pdf_path: str, pages: Optional[List[int]] = None) -> List[Di
                 for i, df in enumerate(dfs):
                     if df is not None and not df.empty:
                         df.attrs['extractor'] = 'mineru_api'
-                        p_idx = df.attrs.get('page_idx')
-                        if pages:
-                            if p_idx is None or p_idx not in pages:
-                                if p_idx is not None and isinstance(p_idx, int) and 0 <= p_idx < len(pages):
-                                    p_idx = pages[p_idx]
-                                else:
-                                    p_idx = pages[min(i, len(pages) - 1)]
-                        elif p_idx is None:
-                            p_idx = 0
+                        p_idx = _resolve_ocr_table_page(df, i, len(dfs), pages, pdf_path, caption_page_map)
                         df.attrs['page_idx'] = p_idx
                         results.append({
                             'df': df,
@@ -1912,7 +2235,7 @@ def extract_via_ocr(pdf_path: str, pages: Optional[List[int]] = None) -> List[Di
                     df.attrs['extractor'] = 'ppstructure_vlm'
                     if not df.attrs.get('label'):
                         df.attrs['label'] = f"Table {i+1}"
-                    p_idx = pages[i] if (pages and i < len(pages)) else (pages[0] if pages else 0)
+                    p_idx = _resolve_ocr_table_page(df, i, len(dfs), pages, pdf_path, caption_page_map)
                     df.attrs['page_idx'] = p_idx
                     results.append({
                         'df': df,
@@ -1950,7 +2273,17 @@ def extract_via_ocr(pdf_path: str, pages: Optional[List[int]] = None) -> List[Di
                 try:
                     b = registry.get_backend(backend_name)
                     if b and b.probe_health().get("status") in ("healthy", "agent_fallback"):
-                        res_out = b.extract(pdf_path, pages=pages)
+                        res_out = None
+                        if backend_name == "mineru":
+                            try:
+                                res_out = b.extract(pdf_path, structured=True, pages=pages)
+                            except TypeError:
+                                res_out = None
+                            if not res_out:
+                                res_out = b.extract(pdf_path, pages=pages)
+                        else:
+                            res_out = b.extract(pdf_path, pages=pages)
+
                         if isinstance(res_out, str) and res_out.strip():
                             try:
                                 from .table_postprocess import parse_structured_vlm_content
@@ -1960,22 +2293,44 @@ def extract_via_ocr(pdf_path: str, pages: Optional[List[int]] = None) -> List[Di
                             for i, df in enumerate(dfs):
                                 if df is not None and not df.empty:
                                     df.attrs['extractor'] = backend_name
-                                    p_idx = pages[i] if (pages and i < len(pages)) else (pages[0] if pages else 0)
+                                    p_idx = _resolve_ocr_table_page(df, i, len(dfs), pages, pdf_path, caption_page_map)
                                     df.attrs['page_idx'] = p_idx
                                     results.append({
                                         'df': df,
                                         'page_idx': p_idx,
                                         'table_idx': i,
-                                        'bbox': None,
+                                        'bbox': df.attrs.get('bbox'),
                                         'extractor': backend_name,
                                     })
                             if results:
                                 print(f"[OCR] OCR-Hub 动态调度成功: {backend_name} 提取到 {len(results)} 个表格")
                                 break
                         elif isinstance(res_out, list) and res_out:
-                            results.extend(res_out)
-                            print(f"[OCR] OCR-Hub 动态调度成功: {backend_name} 提取到 {len(res_out)} 个表格")
-                            break
+                            for i, item in enumerate(res_out):
+                                if isinstance(item, dict) and item.get('df') is not None:
+                                    df_item = item['df']
+                                    p_idx = item.get('page_idx')
+                                    if p_idx is None:
+                                        p_idx = _resolve_ocr_table_page(df_item, i, len(res_out), pages, pdf_path, caption_page_map)
+                                        item['page_idx'] = p_idx
+                                    if hasattr(df_item, 'attrs'):
+                                        df_item.attrs['page_idx'] = p_idx
+                                        df_item.attrs.setdefault('extractor', backend_name)
+                                    results.append(item)
+                                elif hasattr(item, 'empty') and not item.empty:
+                                    item.attrs['extractor'] = backend_name
+                                    p_idx = _resolve_ocr_table_page(item, i, len(res_out), pages, pdf_path, caption_page_map)
+                                    item.attrs['page_idx'] = p_idx
+                                    results.append({
+                                        'df': item,
+                                        'page_idx': p_idx,
+                                        'table_idx': i,
+                                        'bbox': item.attrs.get('bbox'),
+                                        'extractor': backend_name,
+                                    })
+                            if results:
+                                print(f"[OCR] OCR-Hub 动态调度成功: {backend_name} 提取到 {len(results)} 个表格")
+                                break
                 except Exception as e_backend:
                     logger.debug(f"[OCR-Hub] Backend {backend_name} 调度异常: {e_backend}")
                     continue
@@ -2502,25 +2857,40 @@ def group_continuation_atomic_blocks(pdf_path: str, pages: List[int]) -> List[Li
                     if re.match(r'^\d+\.\d+\s+[A-Za-z\u4e00-\u9fa5]', lines[0]) or any(kw in lines[0] for kw in ['参考文献', 'References', '致谢', 'Acknowledgements', '附录一', '附录二']):
                         break
 
-                    # 终止条件 3：正文段落密度检测（累计出现 >= 3 个完整陈述句句号，且文本字符数 > 300）
-                    sentence_count = sum(1 for l in lines if l.endswith(('。', '！', '？')) or (l.endswith('.') and len(l.split()) >= 8))
-                    if sentence_count >= 3 and len(next_text) >= 300:
-                        # 已回归大篇幅正文叙述，立即停止累加
-                        break
-
                     # 累加判定条件 1：显式续表关键字（续表、续附表、（续）、(cont.)、Continued Table）
                     is_explicit_cont = bool(re.search(r'(?:续表|续附表|接上表|（续）|\(续\)|\(cont\.?\)|\(continued\)|continued\s+table)', next_text[:500], re.IGNORECASE))
 
-                    # 累加判定条件 2：高密度表格/数值数据流（数字、化学式、同位素、测试样品代号占比 >= 50%）
-                    data_token_count = sum(1 for l in lines if re.match(r'^-?\d+(?:\.\d+)?$', l) or l in ('/', '-', '—', '–', 'n.d.', 'bdl', 'b.d.l.') or re.match(r'^[A-Za-z0-9\-_–—/\.\(\)]+$', l))
-                    is_dense_data_table = len(lines) >= 15 and (data_token_count / len(lines) >= 0.50)
+                    # 累加判定条件 2：高密度表格/数值数据流（数字、化学式、同位素、测试样品代号占比 >= 45%）
+                    data_token_count = sum(1 for l in lines if re.match(r'^-?\d+(?:\.\d+)?%?$', l) or l in ('/', '-', '—', '–', 'n.d.', 'bdl', 'b.d.l.') or re.match(r'^[A-Za-z0-9\-_–—/\.\(\)±]+$', l))
+                    is_dense_data_table = len(lines) >= 10 and (data_token_count / len(lines) >= 0.45)
 
-                    # 累加判定条件 3：稀疏无框多列对齐续表探测
+                    # 累加判定条件 3：稀疏无框多列对齐续表探测或 2 线/3 线矢量横线表探测
                     is_sparse_cont = False
                     try:
                         is_sparse_cont = _check_sparse_continuation_table(doc[next_p - 1], doc[next_p])
+                        if not is_sparse_cont:
+                            from pdf_tables import probe_disjoint_native_tables
+                            if probe_disjoint_native_tables(doc[next_p]) > 0:
+                                is_sparse_cont = True
                     except Exception:
                         pass
+
+                    # 终止条件 3：正文段落密度检测（排除显式续表与含 et al. 文献引用的数据行）
+                    if not is_explicit_cont and not is_dense_data_table:
+                        def _is_true_prose_sentence(ln: str) -> bool:
+                            if ln.endswith(('。', '！', '？')):
+                                return len(ln) >= 20
+                            if ln.endswith('.') and len(ln.split()) >= 10:
+                                if re.search(r'(?:et\s+al\.|fig\.|tab\.|no\.|vol\.|pp?\.|wt\.|ca\.|\d+\.)$', ln, re.IGNORECASE):
+                                    return False
+                                num_w = sum(1 for w in ln.split() if re.search(r'\d', w))
+                                return (num_w / max(1, len(ln.split()))) < 0.20
+                            return False
+
+                        sentence_count = sum(1 for l in lines if _is_true_prose_sentence(l))
+                        if sentence_count >= 3 and len(next_text) >= 350 and not is_sparse_cont:
+                            # 已回归大篇幅正文叙述，立即停止累加
+                            break
 
                     if is_explicit_cont or is_dense_data_table or is_sparse_cont:
                         all_target_pages.add(next_p)
@@ -3597,6 +3967,16 @@ def extract_tables_from_pdf(
         else:
             was_remediated = bool(remediated)
 
+        if candidate_pages is not None:
+            try:
+                return _do_extract_tables_from_pdf(
+                    pdf_path,
+                    use_ocr_fallback=use_ocr_fallback,
+                    was_remediated=was_remediated,
+                    candidate_pages=candidate_pages,
+                )
+            except TypeError:
+                pass
         return _do_extract_tables_from_pdf(pdf_path, use_ocr_fallback=use_ocr_fallback, was_remediated=was_remediated)
     finally:
         if temp_pdf_to_clean and os.path.exists(temp_pdf_to_clean):
@@ -3610,6 +3990,7 @@ def _do_extract_tables_from_pdf(
     pdf_path: str,
     use_ocr_fallback: bool = True,
     was_remediated: bool = False,
+    candidate_pages: Optional[List[int]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
     """
     统一 PDF 表格提取核心实现。
@@ -3713,13 +4094,17 @@ def _do_extract_tables_from_pdf(
         logs.append(f"  pdf-inspector 表格 [{lbl or '未命名'}] 页码映射回退至 Page {fallback_p+1}")
 
     # ── 候选表格页面决策与多信号并集体系 ──
-    # 结合 Caption 声明、全图扫描页、结构树语义表格、pdf-inspector 检出页与矢量网格探测
+    # 结合外层传入 candidate_pages、Caption 声明、全图扫描页、结构树语义表格、pdf-inspector 检出页与矢量网格探测
     candidate_sources = {}
     def _add_candidate(page_idx: int, src: str):
         if page_idx not in candidate_sources:
             candidate_sources[page_idx] = set()
         candidate_sources[page_idx].add(src)
 
+    if candidate_pages:
+        for p in candidate_pages:
+            if isinstance(p, int) and p >= 0:
+                _add_candidate(p, 'caller_candidate')
     for p in caption_pages:
         _add_candidate(p, 'caption')
     for p in image_table_pages:
@@ -3836,12 +4221,16 @@ def _do_extract_tables_from_pdf(
                 data_token_count = sum(1 for l in lines if re.match(r'^-?\d+(?:\.\d+)?%?$', l) or l in ('/', '-', '—', '–', 'n.d.', 'bdl', 'b.d.l.', 'nd', 'N/A') or re.match(r'^[A-Z0-9\-_–—/]{1,8}$', l))
                 cond_dense = len(lines) >= 4 and (data_token_count / max(1, len(lines)) >= 0.45)
 
-                # 3. 矢量线框表格判定 (续表往往带有表格水平/垂直网格线)
+                # 3. 矢量线框表格判定 (续表往往带有表格水平/垂直网格线或 2 条水平三线表边线)
                 cond_vec_table = False
                 try:
                     f_tabs = next_page.find_tables()
                     if f_tabs and f_tabs.tables:
                         if any(tb.row_count >= 2 for tb in f_tabs.tables):
+                            cond_vec_table = True
+                    if not cond_vec_table:
+                        from pdf_tables import probe_disjoint_native_tables
+                        if probe_disjoint_native_tables(next_page) > 0:
                             cond_vec_table = True
                 except Exception:
                     pass
@@ -3961,15 +4350,34 @@ def _do_extract_tables_from_pdf(
         pages_requiring_ocr = set()
         original_native_results = []
         valid_fused = []
+        valid_struct_tables = []
+
+        # 复用 Step 1 已执行的结构树结果（若 Step 1 为 mock 且未运行结构树，则最多补跑并缓存 1 次）
+        _cached_struct_ran = bool(inspector_result.get('_structure_tree_ran'))
+        _cached_struct_all = list(inspector_result.get('structure_tables') or [])
+
+        def _get_structure_tree_tables(pages_filter: Optional[List[int]] = None) -> List[Dict[str, Any]]:
+            nonlocal _cached_struct_ran, _cached_struct_all
+            if not _cached_struct_ran and not _cached_struct_all:
+                _cached_struct_all = extract_via_structure_tree(pdf_path, pages=pages_filter) or []
+                _cached_struct_ran = True
+            if not _cached_struct_all:
+                return []
+            if pages_filter is None:
+                return list(_cached_struct_all)
+            p_set = set(pages_filter)
+            return [
+                t for t in _cached_struct_all
+                if t.get('page_idx', t['df'].attrs.get('page_idx', 0) if (t.get('df') is not None and hasattr(t.get('df'), 'attrs')) else 0) in p_set
+            ]
 
         if not use_legacy_voting:
             logs.append("→ Step 2: native PDF，启动主抽取管线 (Tagged PDF 结构树 -> MinerU 结构化主抽取 -> 本地数值门禁)")
 
             # 1. Tagged PDF / PDF/UA 语义结构树快速通道 (Fast-path: 最高保真度)
-            structure_results = extract_via_structure_tree(pdf_path, pages=native_target_pages)
+            structure_results = _get_structure_tree_tables(native_target_pages)
             if structure_results:
                 logs.append(f"  Tagged PDF 结构树快速通道提取到 {len(structure_results)} 个语义表格")
-                valid_struct_tables = []
                 for s_item in structure_results:
                     s_df = s_item.get('df')
                     p_i = s_item.get('page_idx', s_df.attrs.get('page_idx', 0) if hasattr(s_df, 'attrs') else 0)
@@ -4046,27 +4454,35 @@ def _do_extract_tables_from_pdf(
                             cache_zip.unlink(missing_ok=True)
                         except Exception:
                             pass
-                if not mineru_dfs and ocr_client.is_mineru_available(config=_cfg, file_path=pdf_path):
-                    page_desc = [p + 1 for p in native_target_pages] if native_target_pages else "all"
-                    logs.append(f"  调用 MinerU 官方高保真结构化主抽取 (页码: {page_desc})")
+                if not mineru_dfs:
                     try:
-                        mineru_dfs = ocr_client.call_mineru_structured_api(pdf_path, config=_cfg, page_ranges=native_target_pages)
-                    except Exception as e_mineru:
-                        logs.append(f"  MinerU 结构化主抽取异常: {e_mineru}")
-                        mineru_dfs = []
+                        mineru_ok = ocr_client.is_mineru_available(config=_cfg, file_path=pdf_path, pages=native_target_pages)
+                    except TypeError:
+                        mineru_ok = ocr_client.is_mineru_available(config=_cfg, file_path=pdf_path)
+                    if mineru_ok:
+                        page_desc = [p + 1 for p in native_target_pages] if native_target_pages else "all"
+                        logs.append(f"  调用 MinerU 官方高保真结构化主抽取 (页码: {page_desc})")
+                        try:
+                            mineru_dfs = ocr_client.call_mineru_structured_api(pdf_path, config=_cfg, page_ranges=native_target_pages)
+                        except Exception as e_mineru:
+                            logs.append(f"  MinerU 结构化主抽取异常: {e_mineru}")
+                            mineru_dfs = []
 
                 if mineru_dfs:
                     logs.append(f"  MinerU 结构化主抽取解析出 {len(mineru_dfs)} 个表格，启动本地数值一致性门禁核验...")
                     accepted_mineru = []
                     unverified_mineru = []
                     for i_m, m_df in enumerate(mineru_dfs):
-                        p_idx = m_df.attrs.get('page_idx', native_target_pages[i_m] if (native_target_pages and i_m < len(native_target_pages)) else (native_target_pages[0] if native_target_pages else 0))
-                        bbox = m_df.attrs.get('bbox')
+                        p_idx = m_df.attrs.get('page_idx') if hasattr(m_df, 'attrs') else None
+                        if p_idx is None:
+                            p_idx = _resolve_ocr_table_page(m_df, i_m, len(mineru_dfs), native_target_pages, pdf_path, caption_page_map)
+                        bbox = m_df.attrs.get('bbox') if hasattr(m_df, 'attrs') else None
                         is_valid, info = table_validator.verify_table_numeric_integrity(
                             df=m_df, pdf_path=pdf_path, page_idx=p_idx, bbox=bbox, min_match_ratio=0.7
                         )
                         converted_bbox = info.get("converted_bbox") or bbox
                         if hasattr(m_df, 'attrs'):
+                            m_df.attrs['page_idx'] = p_idx
                             m_df.attrs['bbox'] = converted_bbox
                             m_df.attrs['bbox_format'] = 'points'
                         logs.append(
@@ -4093,35 +4509,25 @@ def _do_extract_tables_from_pdf(
                                     'unverified': True,
                                 })
 
-                    # 交叉核对全文声明漏表与扫描页覆盖未知
-                    try:
-                        report = table_validator.cross_check_missed_tables([t['df'] for t in accepted_mineru], pdf_path)
-                        if not report.get("is_complete", True) or report.get("coverage_unknown", False):
-                            for missed in report.get("missed_tables", []):
-                                p_m = missed.get("page_idx")
-                                if p_m is not None:
-                                    pages_requiring_ocr.add(p_m)
-                                    logs.append(f"  交叉核验发现未覆盖声明表 {missed.get('label')} (Page {p_m+1})")
-                            for p_scan in report.get("uncovered_scanned_pages", []):
-                                pages_requiring_ocr.add(p_scan)
-                                logs.append(f"  扫描页 {p_scan+1} 覆盖未知，加入定向修复")
-                    except Exception as e_cc:
-                        logger.debug(f"Cross check error: {e_cc}")
+                    # 保留并合并部分覆盖的已校验结构树表格 (valid_struct_tables)，以及前置探测与矢量探测候选表
+                    supp_candidates = list(valid_struct_tables) + list(inspector_tables)
+                    if accepted_mineru:
+                        try:
+                            covered_pages_now = sorted(list(set(t['page_idx'] for t in accepted_mineru if t.get('page_idx') is not None)))
+                            if covered_pages_now:
+                                supp_candidates.extend(extract_via_find_tables(pdf_path, pages=covered_pages_now))
+                        except Exception:
+                            pass
 
-                    covered_m_pages = set(t['page_idx'] for t in accepted_mineru)
-                    for p_req in (native_target_pages or []):
-                        if p_req not in covered_m_pages:
-                            pages_requiring_ocr.add(p_req)
-
-                    # 保留并核对前置探测发现的独立表格候选区域 (bounding boxes)
-                    for cand in inspector_tables:
+                    for cand in supp_candidates:
+                        c_df = cand.get('df')
                         c_p = cand.get('page_idx')
-                        if c_p is None and cand.get('df') is not None and hasattr(cand['df'], 'attrs'):
-                            c_p = cand['df'].attrs.get('page_idx')
+                        if c_p is None and c_df is not None and hasattr(c_df, 'attrs'):
+                            c_p = c_df.attrs.get('page_idx')
                         if c_p is None:
                             continue
-                        c_box = cand.get('bbox') or (cand['df'].attrs.get('bbox') if cand.get('df') is not None and hasattr(cand.get('df'), 'attrs') else None)
-                        c_lbl = cand.get('label') or (cand['df'].attrs.get('label') if cand.get('df') is not None and hasattr(cand.get('df'), 'attrs') else None)
+                        c_box = cand.get('bbox') or (c_df.attrs.get('bbox') if c_df is not None and hasattr(c_df, 'attrs') else None)
+                        c_lbl = cand.get('label') or (c_df.attrs.get('label') if c_df is not None and hasattr(c_df, 'attrs') else None)
                         c_fmt = format_table_label(c_lbl) if c_lbl else None
 
                         is_covered = False
@@ -4141,26 +4547,55 @@ def _do_extract_tables_from_pdf(
                                 if iou >= 0.20 or iom >= 0.35:
                                     is_covered = True
                                     break
+                            if c_df is not None and m_df is not None and _table_similarity(c_df, m_df) >= 0.65:
+                                is_covered = True
+                                break
                         if not is_covered:
                             pages_requiring_ocr.add(c_p)
-                            logs.append(f"  前置候选表格区域在 Page {c_p+1} 未被 MinerU 覆盖 (bbox={c_box})，触发补漏救助")
-                            # 若前置候选表格具备有效数据并通过数值校验，予以保留备份
-                            cand_df = cand.get('df')
-                            if cand_df is not None and not cand_df.empty:
-                                c_ok, _ = table_validator.verify_table_numeric_integrity(
-                                    cand_df, pdf_path, c_p, c_box, min_match_ratio=0.7
-                                )
+                            logs.append(f"  前置/结构树候选表格区域在 Page {c_p+1} 未被 MinerU 覆盖 (bbox={c_box})，触发补漏救助")
+                            if c_df is not None and not c_df.empty:
+                                c_ok = cand in valid_struct_tables
+                                if not c_ok:
+                                    c_ok, _ = table_validator.verify_table_numeric_integrity(
+                                        c_df, pdf_path, c_p, c_box, min_match_ratio=0.7
+                                    )
                                 if c_ok:
                                     cand_copy = dict(cand)
                                     cand_copy['page_idx'] = c_p
                                     cand_copy['bbox'] = c_box
-                                    cand_copy['extractor'] = cand_df.attrs.get('extractor', 'pdf_inspector')
-                                    if hasattr(cand_df, 'attrs'):
-                                        cand_df.attrs['page_idx'] = c_p
-                                        cand_df.attrs['bbox'] = c_box
-                                        if not cand_df.attrs.get('extractor'):
-                                            cand_df.attrs['extractor'] = 'pdf_inspector'
+                                    cand_copy['extractor'] = c_df.attrs.get('extractor', 'pdf_inspector')
+                                    if hasattr(c_df, 'attrs'):
+                                        c_df.attrs['page_idx'] = c_p
+                                        c_df.attrs['bbox'] = c_box
+                                        if not c_df.attrs.get('extractor'):
+                                            c_df.attrs['extractor'] = 'pdf_inspector'
                                     accepted_mineru.append(cand_copy)
+
+                    # 交叉核对全文声明漏表与扫描页覆盖未知
+                    try:
+                        report = table_validator.cross_check_missed_tables([t['df'] for t in accepted_mineru], pdf_path)
+                        if not report.get("is_complete", True) or report.get("coverage_unknown", False):
+                            for missed in report.get("missed_tables", []):
+                                p_m = missed.get("page_idx")
+                                if p_m is not None:
+                                    pages_requiring_ocr.add(p_m)
+                                    logs.append(f"  交叉核验发现未覆盖声明表 {missed.get('label')} (Page {p_m+1})")
+                            for p_scan in report.get("uncovered_scanned_pages", []):
+                                pages_requiring_ocr.add(p_scan)
+                                logs.append(f"  扫描页 {p_scan+1} 覆盖未知，加入定向修复")
+                    except Exception as e_cc:
+                        logger.debug(f"Cross check error: {e_cc}")
+
+                    covered_m_pages = set(t['page_idx'] for t in accepted_mineru)
+                    for p_req in (native_target_pages or []):
+                        if p_req not in covered_m_pages:
+                            pages_requiring_ocr.add(p_req)
+                        else:
+                            # 同页多表核对：若该页声明表数大于已通过表数，仍需加入待修复页
+                            decls_on_p = [d for d in page_decls.get(p_req, []) if not d.get('is_continuation')]
+                            acc_on_p = [t for t in accepted_mineru if t.get('page_idx') == p_req]
+                            if len(decls_on_p) > len(acc_on_p):
+                                pages_requiring_ocr.add(p_req)
 
                     if accepted_mineru:
                         all_results = list(accepted_mineru)
@@ -4182,7 +4617,7 @@ def _do_extract_tables_from_pdf(
         # 3. 若未启用主抽取或主抽取未产出有效表格，平滑降级进入原生多方投票备用管线 (Legacy Fallback)
         if not primary_succeeded:
             logs.append("→ Step 2: 进入原生多方投票备用管线 (pdf-inspector + PyMuPDF4LLM + GMFT + Camelot/img2table + pdfplumber + find_tables)")
-            structure_results = extract_via_structure_tree(pdf_path, pages=native_target_pages)
+            structure_results = valid_struct_tables if valid_struct_tables else _get_structure_tree_tables(native_target_pages)
             if structure_results:
                 logs.append(f"  Tagged PDF 结构树提取到 {len(structure_results)} 个语义表格 (pdf_inspector_structure)")
 
@@ -4244,9 +4679,9 @@ def _do_extract_tables_from_pdf(
         def _unique_valid_page_tables(p, results):
             unique = []
             for result in results:
-                df = result.get('df')
-                if result.get('page_idx') != p or is_table_low_quality(df):
+                if result.get('page_idx') != p or _is_table_low_quality_after_clean(result):
                     continue
+                df = result.get('df')
                 raw_label = str(result.get('label') or df.attrs.get('label') or '')
                 label = (format_table_label(raw_label) or raw_label).strip().lower()
                 box = result.get('pdf_bbox') or df.attrs.get('pdf_bbox') or result.get('bbox') or df.attrs.get('bbox')
@@ -4293,7 +4728,7 @@ def _do_extract_tables_from_pdf(
             def _update_unresolved_pages():
                 nonlocal unresolved_ocr_pages
                 for p in list(unresolved_ocr_pages):
-                    has_repair = any(r.get('page_idx') == p and not is_table_low_quality(r.get('df')) for r in ocr_results)
+                    has_repair = any(r.get('page_idx') == p and not _is_table_low_quality_after_clean(r) for r in ocr_results)
                     if has_repair and _page_covered(p, list(valid_fused) + ocr_results):
                         unresolved_ocr_pages.discard(p)
 
@@ -4302,7 +4737,7 @@ def _do_extract_tables_from_pdf(
                 try:
                     rapid_pages = sorted(list(unresolved_ocr_pages))
                     rapid_res = extract_via_rapid_table(pdf_path, pages=rapid_pages)
-                    valid_rapid = [r for r in (rapid_res or []) if not is_table_low_quality(r.get('df'))]
+                    valid_rapid = [r for r in (rapid_res or []) if not _is_table_low_quality_after_clean(r)]
                     if valid_rapid:
                         logs.append(f"  RapidTable 本地中间层试跑成功提取到 {len(valid_rapid)} 个表格 (免调用在线 VLM)")
                         ocr_results.extend(valid_rapid)
@@ -4315,7 +4750,7 @@ def _do_extract_tables_from_pdf(
                 crop_pages = sorted(list(unresolved_ocr_pages))
                 logs.append(f"  优先通过 DocLayout-YOLO 切图送入 PaddleOCR-VL-1.6 独立接管提取 (待修复页: {[p+1 for p in crop_pages]})")
                 crop_res = extract_via_paddleocr_crops(pdf_path, crop_pages)
-                valid_crops = [r for r in (crop_res or []) if not is_table_low_quality(r.get('df'))]
+                valid_crops = [r for r in (crop_res or []) if not _is_table_low_quality_after_clean(r)]
                 if valid_crops:
                     ocr_results.extend(valid_crops)
                     _update_unresolved_pages()
@@ -4326,7 +4761,7 @@ def _do_extract_tables_from_pdf(
                     import ocr_client
                     docling_pages = sorted(list(unresolved_ocr_pages))
                     docling_results = ocr_client.extract_via_docling(pdf_path, pages=docling_pages)
-                    valid_docling = [r for r in (docling_results or []) if not is_table_low_quality(r.get('df'))]
+                    valid_docling = [r for r in (docling_results or []) if not _is_table_low_quality_after_clean(r)]
                     if valid_docling:
                         logs.append(f"  Docling (TableFormer) 离线接管提取到 {len(valid_docling)} 个表格")
                         ocr_results.extend(valid_docling)
@@ -4346,18 +4781,18 @@ def _do_extract_tables_from_pdf(
                 all_results = original_native_results
 
         # Step 3c: 仍未覆盖且未在 OCR 中成功产出表格的页面 → text_alignment
-        extracted_pages = set(r.get('page_idx', -1) for r in all_results if r.get('page_idx') is not None and not is_table_low_quality(r.get('df')))
+        extracted_pages = set(r.get('page_idx', -1) for r in all_results if r.get('page_idx') is not None and not _is_table_low_quality_after_clean(r))
         still_missing = sorted(p for p in target_pages if not _page_covered(p, all_results))
         if still_missing:
             logs.append(f"→ Step 3c: 对仍未覆盖/表数不足的 {[p+1 for p in still_missing]} 页尝试文本对齐提取")
             text_align_results = extract_via_text_alignment(pdf_path, pages=still_missing)
             for ta in text_align_results:
                 ta_page = ta.get('page_idx', -1)
-                if not is_table_low_quality(ta['df']):
+                if not _is_table_low_quality_after_clean(ta):
                     existing_on_page = [r for r in all_results if r.get('page_idx') == ta_page]
                     duplicate = len(_unique_valid_page_tables(ta_page, existing_on_page + [ta])) == len(_unique_valid_page_tables(ta_page, existing_on_page))
                     if not duplicate:
-                        all_results = [r for r in all_results if not (r.get('page_idx') == ta_page and is_table_low_quality(r.get('df')))]
+                        all_results = [r for r in all_results if not (r.get('page_idx') == ta_page and _is_table_low_quality_after_clean(r))]
                         all_results.append(ta)
                         extracted_pages.add(ta_page)
 
@@ -4790,50 +5225,71 @@ def _extract_page_via_text_alignment(doc, page_idx: int, pdf_path: str) -> List[
 
     captions_on_page = []
 
-    # 1. 优先使用 extract_table_caption_from_page 获取全页最准确的 table caption
+    # 1. 扫描全文获取页面上所有独立的表题（支持同页多表，并记录真实 text_pos）
     page_label, page_caption = extract_table_caption_from_page(page)
-    if page_label:
-        rect = page.search_for(page_label)
-        if not rect and page_caption:
-            rect = page.search_for(page_caption[:10])
-        if not rect:
-            for m in TABLE_LABEL_RE.finditer(text):
+    used_rects = []
+    for m in TABLE_LABEL_RE.finditer(text):
+        label = format_table_label(m.group(0))
+        pos = m.start()
+        before = text[max(0, pos - 30):pos]
+        after = text[pos + len(m.group(0)):pos + len(m.group(0)) + 80]
+
+        ref_prefixes = ['从', '见', '如', '由', '根据', '（', '(', '在']
+        ref_suffixes = ['中', '可以', '所示', '）', ')', '可知', '看出', '中数据']
+        if any(before.rstrip().endswith(p) for p in ref_prefixes):
+            continue
+        if any(after.lstrip().startswith(s) for s in ref_suffixes):
+            continue
+
+        after_clean = after.lstrip()
+        if len(after_clean) > 3 and not after_clean.startswith(('中', '）', ')')):
+            title_line = after_clean.split('\n')[0].strip()
+            full_title = f"{label} {title_line}" if title_line else label
+            rect = page.search_for(f"{m.group(0)}{after[:min(12, len(after))].splitlines()[0]}")
+            if not rect:
                 rect = page.search_for(m.group(0))
-                if rect:
-                    break
-        caption_y = rect[-1].y1 if rect else unrot_h * 0.05
-        captions_on_page.append({
-            'label': page_label,
-            'title': page_caption or page_label,
-            'y': caption_y,
-            'text_pos': 0,
-        })
-    else:
-        for m in TABLE_LABEL_RE.finditer(text):
-            label = format_table_label(m.group(0))
-            pos = m.start()
-            before = text[max(0, pos-30):pos]
-            after = text[pos + len(m.group(0)):pos + len(m.group(0)) + 80]
-            
-            ref_prefixes = ['从', '见', '如', '由', '根据', '（', '(', '在']
-            ref_suffixes = ['中', '可以', '所示', '）', ')', '可知', '看出', '中数据']
-            if any(before.rstrip().endswith(p) for p in ref_prefixes):
-                continue
-            if any(after.lstrip().startswith(s) for s in ref_suffixes):
-                continue
-            
-            after_clean = after.lstrip()
-            if len(after_clean) > 3 and not after_clean.startswith(('中', '）', ')')):
-                rect = page.search_for(m.group(0))
-                caption_y = rect[-1].y1 if rect else None
-                title_line = after_clean.split('\n')[0].strip()
-                full_title = f"{label} {title_line}" if title_line else label
+            chosen_r = None
+            if rect:
+                for r_cand in rect:
+                    if not any(abs(r_cand.y1 - ur.y1) < 4.0 and abs(r_cand.x0 - ur.x0) < 10.0 for ur in used_rects):
+                        chosen_r = r_cand
+                        break
+                if chosen_r is None:
+                    chosen_r = rect[-1]
+                used_rects.append(chosen_r)
+            caption_y = chosen_r.y1 if chosen_r is not None else None
+            if not any(c['label'] == label and (c['y'] is not None and caption_y is not None and abs(c['y'] - caption_y) < 12.0) for c in captions_on_page):
                 captions_on_page.append({
                     'label': label,
                     'title': full_title,
                     'y': caption_y,
                     'text_pos': m.start(),
                 })
+
+    if page_label:
+        fmt_page_lbl = format_table_label(page_label) or page_label
+        if not any(format_table_label(c['label']) == fmt_page_lbl for c in captions_on_page):
+            rect = page.search_for(page_label)
+            if not rect and page_caption:
+                rect = page.search_for(page_caption[:10])
+            if not rect:
+                for m in TABLE_LABEL_RE.finditer(text):
+                    rect = page.search_for(m.group(0))
+                    if rect:
+                        break
+            caption_y = rect[-1].y1 if rect else unrot_h * 0.05
+            t_pos = text.find(page_label)
+            if t_pos < 0 and page_caption:
+                t_pos = text.find(page_caption[:12])
+            captions_on_page.append({
+                'label': page_label,
+                'title': page_caption or page_label,
+                'y': caption_y,
+                'text_pos': max(0, t_pos),
+            })
+
+    if len(captions_on_page) > 1:
+        captions_on_page.sort(key=lambda c: (c['y'] if c['y'] is not None else 0.0, c.get('text_pos', 0)))
 
     if not captions_on_page:
         # 回退：搜索裸表号（如 "4.11  庆家沟锑矿床..."）
@@ -4952,18 +5408,21 @@ def _extract_page_via_text_alignment(doc, page_idx: int, pdf_path: str) -> List[
         if cap['y'] is None:
             continue
 
-        # 确定表格的 y 范围：从 caption 下方到下一个 caption 或下一个章节标题或页面底部 (unrotated 坐标系)
+        # 确定表格的 y 范围：从 caption 下方到下一个 caption 或下一个位于表格下方的章节标题或页面底部 (unrotated 坐标系)
         table_y_start = cap['y'] + 5  # caption 下方
-        if ci + 1 < len(captions_on_page) and captions_on_page[ci + 1]['y'] is not None:
+        if ci + 1 < len(captions_on_page) and captions_on_page[ci + 1]['y'] is not None and captions_on_page[ci + 1]['y'] > table_y_start + 10:
             table_y_end = captions_on_page[ci + 1]['y'] - 5
         else:
             table_y_end = unrot_h * 0.92
             after_pos = cap.get('text_pos', 0) + len(cap.get('title', ''))
-            sec_m = re.search(r'^[ \t]*([1-9]\d*(?:\.[1-9]\d*){1,2}[ \t]+[\u4e00-\u9fa5]{2,})', text[after_pos:], re.MULTILINE)
-            if sec_m:
+            for sec_m in re.finditer(r'^[ \t]*([1-9]\d*(?:\.[1-9]\d*){1,2}[ \t]+[\u4e00-\u9fa5]{2,})', text[after_pos:], re.MULTILINE):
                 sec_rect = page.search_for(sec_m.group(1).strip()[:10])
-                if sec_rect:
-                    table_y_end = min(table_y_end, sec_rect[0].y0 - 2)
+                below_rects = [r for r in (sec_rect or []) if r.y0 > table_y_start + 15.0]
+                if below_rects:
+                    table_y_end = min(table_y_end, below_rects[0].y0 - 2.0)
+                    break
+        if table_y_end <= table_y_start + 8.0:
+            table_y_end = unrot_h * 0.92
 
         # 优先尝试基于 pdf_inspector extract_text_with_positions 的样式感知对齐
         pos_df = None

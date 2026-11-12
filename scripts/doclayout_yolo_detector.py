@@ -170,6 +170,25 @@ def ensure_model_file(model_dir: Optional[str] = None) -> str:
     raise FileNotFoundError(f"未找到 DocLayout-YOLO 模型，且下载失败: {target_path}")
 
 
+def _select_onnx_providers() -> List[str]:
+    """根据当前硬件环境优先选择 CUDA / CoreML 加速 Provider，回退至 CPUExecutionProvider。"""
+    if ort is None or not hasattr(ort, "get_available_providers"):
+        return ["CPUExecutionProvider"]
+    try:
+        avail = set(ort.get_available_providers() or [])
+        preferred = []
+        import sys
+        order = ("CoreMLExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider") if sys.platform == "darwin" else ("CUDAExecutionProvider", "CoreMLExecutionProvider", "CPUExecutionProvider")
+        for p in order:
+            if p in avail:
+                preferred.append(p)
+        if "CPUExecutionProvider" not in preferred:
+            preferred.append("CPUExecutionProvider")
+        return preferred
+    except Exception:
+        return ["CPUExecutionProvider"]
+
+
 class DocLayoutYoloDetector:
     _session = None
     _loaded_model_path = None
@@ -186,9 +205,15 @@ class DocLayoutYoloDetector:
 
         if DocLayoutYoloDetector._session is None or DocLayoutYoloDetector._loaded_model_path != model_path:
             print(f"[DocLayout-YOLO] 正在初始化 ONNX 推理会话: {os.path.basename(model_path)}")
-            DocLayoutYoloDetector._session = ort.InferenceSession(
-                model_path, providers=["CPUExecutionProvider"]
-            )
+            providers = _select_onnx_providers()
+            try:
+                DocLayoutYoloDetector._session = ort.InferenceSession(
+                    model_path, providers=providers
+                )
+            except Exception:
+                DocLayoutYoloDetector._session = ort.InferenceSession(
+                    model_path, providers=["CPUExecutionProvider"]
+                )
             DocLayoutYoloDetector._loaded_model_path = model_path
 
             in_w, in_h = 1280, 1280
@@ -443,14 +468,14 @@ class DocLayoutYoloDetector:
                 # 情况 A: 位于表格上方 (允许 15px 框容差)
                 if cy1 < ty2 and cy2 <= ty1 + 15:
                     gap = max(0.0, ty1 - cy2)
-                    max_gap = max(50.0, min(t_h * 0.25, 90.0))
+                    max_gap = max(100.0, min(max(t_h * 0.40, 200.0), max(220.0, orig_h * 0.12)))
                     if gap <= max_gap:
                         cost = gap + (1.0 - overlap_ratio) * 30.0
 
                 # 情况 B: 位于表格下方 (允许 15px 框容差，附加优先级惩罚项)
                 elif cy2 > ty1 and cy1 >= ty2 - 15:
                     gap = max(0.0, cy1 - ty2)
-                    max_gap = max(40.0, min(t_h * 0.20, 70.0))
+                    max_gap = max(60.0, min(max(t_h * 0.25, 120.0), max(140.0, orig_h * 0.08)))
                     if gap <= max_gap:
                         cost = gap + 25.0 + (1.0 - overlap_ratio) * 30.0
 
@@ -488,7 +513,7 @@ class DocLayoutYoloDetector:
                 # 脚注恒位于表格下方
                 if fy2 >= ty2 and fy1 >= ty2 - 20:
                     gap = max(0.0, fy1 - ty2)
-                    max_gap = max(50.0, min(t_h * 0.30, 90.0))
+                    max_gap = max(80.0, min(max(t_h * 0.35, 150.0), max(180.0, orig_h * 0.10)))
                     if gap <= max_gap:
                         cost = gap + (1.0 - overlap_ratio) * 30.0
                         if cost < min_cost:
@@ -634,12 +659,12 @@ def assemble_extended_table_regions(
             cost = None
             if cy1 < ty2 and cy2 <= ty1 + 15:
                 gap = max(0.0, ty1 - cy2)
-                max_gap = max(50.0, min(t_h * 0.25, 90.0))
+                max_gap = max(80.0, min(max(t_h * 0.35, 150.0), max(180.0, orig_h * 0.10)))
                 if gap <= max_gap:
                     cost = gap + (1.0 - overlap_ratio) * 30.0
             elif cy2 > ty1 and cy1 >= ty2 - 15:
                 gap = max(0.0, cy1 - ty2)
-                max_gap = max(40.0, min(t_h * 0.20, 70.0))
+                max_gap = max(60.0, min(max(t_h * 0.25, 120.0), max(140.0, orig_h * 0.08)))
                 if gap <= max_gap:
                     cost = gap + 25.0 + (1.0 - overlap_ratio) * 30.0
 
@@ -675,7 +700,7 @@ def assemble_extended_table_regions(
 
             if fy2 >= ty2 and fy1 >= ty2 - 20:
                 gap = max(0.0, fy1 - ty2)
-                max_gap = max(50.0, min(t_h * 0.30, 90.0))
+                max_gap = max(80.0, min(max(t_h * 0.35, 150.0), max(180.0, orig_h * 0.10)))
                 if gap <= max_gap:
                     cost = gap + (1.0 - overlap_ratio) * 30.0
                     if cost < min_cost:
@@ -837,7 +862,11 @@ class PPDocLayoutV3Detector:
                     if os.path.isfile(p) and os.path.getsize(p) > 1024 * 1024:
                         self.model_path = p
                         try:
-                            self._session = ort.InferenceSession(self.model_path, providers=['CPUExecutionProvider'])
+                            providers = _select_onnx_providers()
+                            try:
+                                self._session = ort.InferenceSession(self.model_path, providers=providers)
+                            except Exception:
+                                self._session = ort.InferenceSession(self.model_path, providers=['CPUExecutionProvider'])
                             self._available = True
                             break
                         except Exception as e_s:
@@ -898,7 +927,18 @@ class PPDocLayoutV3Detector:
                 out_arr = outputs[0]
                 if len(out_arr.shape) == 3:
                     out_arr = out_arr[0]
-                for det in out_arr:
+                poly_arr = None
+                if len(outputs) > 1 and outputs[1] is not None:
+                    try:
+                        cand_poly = outputs[1]
+                        if hasattr(cand_poly, "shape") and len(cand_poly.shape) >= 2:
+                            if len(cand_poly.shape) == 4:
+                                cand_poly = cand_poly[0]
+                            if len(cand_poly) == len(out_arr):
+                                poly_arr = cand_poly
+                    except Exception:
+                        poly_arr = None
+                for det_idx, det in enumerate(out_arr):
                     if len(det) >= 6:
                         if det[1] <= 1.0 and det[0] in PP_DOCLAYOUT_V3_CLASSES:
                             cls_id = int(det[0])
@@ -908,6 +948,22 @@ class PPDocLayoutV3Detector:
                             cls_id = int(det[5])
                             score = float(det[4])
                             box = [float(det[0]), float(det[1]), float(det[2]), float(det[3])]
+
+                        if len(det) >= 14 and len(det) % 2 == 0:
+                            poly_pts = [[float(det[k]), float(det[k + 1])] for k in range(6, len(det) - 1, 2)]
+                            tight = self.polygon_to_tight_bbox(poly_pts)
+                            if tight[2] > tight[0] and tight[3] > tight[1]:
+                                box = tight
+                        elif poly_arr is not None:
+                            try:
+                                p_item = poly_arr[det_idx]
+                                pts = np.asarray(p_item, dtype=np.float32).reshape(-1, 2).tolist()
+                                if len(pts) >= 3:
+                                    tight = self.polygon_to_tight_bbox(pts)
+                                    if tight[2] > tight[0] and tight[3] > tight[1]:
+                                        box = tight
+                            except Exception:
+                                pass
 
                         if score >= conf_threshold:
                             # 官方 PaddleDetection 模型结合 scale_factor 后处理已自动恢复原图坐标；

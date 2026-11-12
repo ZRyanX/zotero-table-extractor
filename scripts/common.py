@@ -582,8 +582,8 @@ def is_table_low_quality(df) -> bool:
         if any(kw in row_str.lower() for kw in article_metadata_kws):
             prose_pollution_count += 1
             continue
-        # 匹配章节标题（如 1.2 地质背景）
-        if re.match(r'^\d+\.\d+(?:\.\d+)?\s+[\u4e00-\u9fa5]{2,}', row_str):
+        # 匹配章节标题（如 1.2 地质背景）：仅在单格或极窄行且首格自身即为章节编号+标题时触发，杜绝首列浮点数 + 次列中文矿物名被误杀
+        if len(row_cells) <= 2 and row_cells and re.match(r'^\d+\.\d+(?:\.\d+)?\s+[\u4e00-\u9fa5]{2,}', row_cells[0]):
             prose_pollution_count += 1
             continue
         # 匹配大面积正文陈述句（整行只有 1 个单元格且包含句号长句）
@@ -591,15 +591,22 @@ def is_table_low_quality(df) -> bool:
             prose_pollution_count += 1
             continue
 
-    # 只要包含 2 行以上论文正文/元数据污染行，判定为污染表
-    if prose_pollution_count >= 2:
+    # 只要包含 2 行以上论文正文/元数据污染行，且占比超过 30%，判定为污染表
+    if prose_pollution_count >= 2 and (df.shape[0] <= 4 or prose_pollution_count / max(1, df.shape[0]) >= 0.3):
         return True
 
-    # 2. 检查是否有竖排文字拆行导致的碎片化（例如某列连续多行只有单个汉字：木、利、锑、矿、床）
+    # 2. 检查是否有竖排文字拆行导致的碎片化（例如某列连续多行只有单个汉字且无其他有效列支撑）
+    common_single_cn_tokens = {
+        '金', '银', '铜', '铁', '铅', '锌', '钨', '锡', '钼', '锑', '汞', '砷', '硫', '碳', '氧', '硅', '铝', '钙', '镁', '钾', '钠',
+        '是', '否', '有', '无', '高', '中', '低', '强', '弱', '大', '小', '优', '良', '差', '男', '女',
+        '甲', '乙', '丙', '丁', '戊', '己', '庚', '辛', '一', '二', '三', '四', '五', '六', '七', '八', '九', '十', '东', '西', '南', '北',
+    }
+    total_cells = df.shape[0] * df.shape[1]
+    non_empty = sum(1 for v in df.values.flatten() if v is not None and str(v).strip() and str(v).strip().lower() not in ['', 'nan', 'none'])
     for c in range(min(3, df.shape[1])):
         col_vals = [str(df.iat[r, c]).strip() for r in range(df.shape[0]) if str(df.iat[r, c]).strip() not in ['', 'nan', 'none']]
-        single_chars = [v for v in col_vals if len(v) == 1 and re.match(r'[\u4e00-\u9fa5]', v)]
-        if len(single_chars) >= 4:
+        single_chars = [v for v in col_vals if len(v) == 1 and re.match(r'[\u4e00-\u9fa5]', v) and v not in common_single_cn_tokens]
+        if len(single_chars) >= 6 and (len(single_chars) / max(1, len(col_vals)) >= 0.85) and (df.shape[1] <= 2 or (non_empty / max(1, total_cells)) < 0.35):
             return True
 
     # 3. 检查空单元格占比（稀疏度过高通常为错位散文或误切）
@@ -615,8 +622,6 @@ def is_table_low_quality(df) -> bool:
     col_str_joined = " ".join(str(c) for c in df.columns)
     is_geochem_table = bool(re.search(geo_elem_pattern, col_str_joined, re.IGNORECASE))
 
-    total_cells = df.shape[0] * df.shape[1]
-    non_empty = sum(1 for v in df.values.flatten() if v is not None and str(v).strip() and str(v).strip().lower() not in ['', 'nan', 'none'])
     if df.shape[0] >= 3 and df.shape[1] >= 3 and (non_empty / total_cells) < 0.25:
         # 通用科学稀疏矩阵保护：若有明确表头且含数值或单位，或符合领域特征，予以保留（稀疏豁免不局限于单一学科）
         has_numeric = any(re.search(r'\d', str(v)) for v in df.values.flatten() if v is not None)
@@ -634,13 +639,15 @@ def is_table_low_quality(df) -> bool:
         if all_empty_cols >= 2:
             return True
 
-    # 5. 检查是否为散点图/直方图坐标轴与图表刻度残片（如含 Watson et al 2006, 700, 900, kbar, T , °C）
+    # 5. 检查是否为散点图/直方图坐标轴与图表刻度残片（仅针对明确的坐标轴对比如 'δ34s (‰) vs'，严禁将 'et al., 20' 或 'wt% sio2' 等正常地球化学特征词判为残片）
     all_cells_flat = [str(df.iat[r, c]).strip() for r in range(df.shape[0]) for c in range(df.shape[1]) if str(df.iat[r, c]).strip() not in ['', 'nan', 'none']]
     all_str_concat = " ".join(all_cells_flat).lower()
-    if any(kw in all_str_concat for kw in ['et al 200', 'et al 199', 'et al., 20', 'kbar', 't , °c', 't (°c)', 'wt% tio2', 'wt% sio2']):
-        # 若没有明确的数据列字段名且行数较少，判定为图表坐标轴残片
-        has_named_header = any(str(c).lower().strip() in ['sample', 'mineral', 'au', 'sb', 'fe', 'as', '样品', '矿物', '含量'] for c in df.columns)
-        if not has_named_header and df.shape[0] <= 20:
+    if any(kw in all_str_concat for kw in ['δ34s (‰) vs', 'watson et al 2006', 'tomkins et al']):
+        has_named_header = any(
+            bool(str(c).strip() and not str(c).startswith(('Unnamed', 'Col')) and not str(c).strip().isdigit())
+            for c in df.columns
+        )
+        if not has_named_header and df.shape[0] <= 10 and (non_empty / max(1, total_cells)) < 0.45:
             return True
 
     return False
@@ -711,9 +718,17 @@ def is_metadata_table(df):
     except Exception:
         pass
 
+    has_explicit_table_label = bool(
+        hasattr(df, 'attrs') and (
+            TABLE_LABEL_RE.search(str(df.attrs.get('label', '') or '')) or
+            TABLE_LABEL_RE.search(str(df.attrs.get('table_title', '') or ''))
+        )
+    )
     is_valid_summary_table = (
-        not has_prose_headers and 
-        any(any(kw == sub.lower() or (kw in sub.lower() and len(sub) <= 12) for kw in valid_summary_kws) for c in header_col_strs for sub in (c.split('_') if '_' in c else [c]))
+        has_explicit_table_label or (
+            not has_prose_headers and 
+            any(any(kw == sub.lower() or (kw in sub.lower() and len(sub) <= 12) for kw in valid_summary_kws) for c in header_col_strs for sub in (c.split('_') if '_' in c else [c]))
+        )
     )
 
     # 统计元数据列命中数（需多特征共现或强特征命中，防止单列 DOI/被引 误杀文献计量表）
@@ -725,7 +740,7 @@ def is_metadata_table(df):
         col_str = str(col).lower().strip()
         for kw in metadata_keywords:
             if kw in col_only_keywords:
-                if kw in ("参考文献", "references", "reference") and (col_str == kw or col_str.startswith(kw)) and not is_valid_summary_table:
+                if kw in ("参考文献", "references", "reference") and (col_str == kw or col_str.startswith(kw)) and not is_valid_summary_table and df.shape[1] <= 2:
                     return True
                 continue
             if kw.isascii():
@@ -742,20 +757,18 @@ def is_metadata_table(df):
     if strong_metadata_hits >= 1 or (weak_metadata_hits >= 2 and (df.shape[0] <= 3 or not has_numbers)):
         return True
 
-    # 3c. 过滤插图说明 / 图注（Fig. / Figure / 图 / 附图）
-    # 扫描表头及前 4 行的所有单元格内容
-    top_cells_text = []
-    for col in df.columns:
-        top_cells_text.append(str(col).strip())
-    for r in range(min(4, len(df))):
-        for c in range(min(6, len(df.columns))):
-            val = str(df.iloc[r, c]).strip()
-            if val and val != 'nan':
-                top_cells_text.append(val)
-                
-    for txt in top_cells_text:
-        if re.search(r'^(?:Fig(?:ure|\.)?|图\s*\d+|附图\s*\d+|Plate\s*\d+|Photo\s*\d+)\s*[:.\s\d]', txt, re.IGNORECASE):
-            return True
+    # 3c. 过滤插图说明 / 图注（Fig. / Figure / 图 / 附图）：
+    # 仅当表格窄小（列数 <= 2 且行数 <= 3）且无正规表号、表头或首格本身为长句图注时才判定为图注，杜绝数据格引用 "Fig. 1" / "图1" 时一票否决整表
+    if not has_explicit_table_label and df.shape[1] <= 2 and df.shape[0] <= 3:
+        top_cells_text = [str(col).strip() for col in df.columns]
+        for r in range(min(2, len(df))):
+            for c in range(min(2, len(df.columns))):
+                val = str(df.iloc[r, c]).strip()
+                if val and val != 'nan':
+                    top_cells_text.append(val)
+        for txt in top_cells_text:
+            if len(txt) >= 15 and re.search(r'^(?:Fig(?:ure|\.)?|图\s*\d+|附图\s*\d+|Plate\s*\d+|Photo\s*\d+)\s*[:.\s\d]', txt, re.IGNORECASE):
+                return True
 
     # 检查表头是否全部为页码与期刊运行眉题（如 216 F. An, Y. Zhu / Ore Geology Reviews）
     header_str = " ".join(str(c) for c in df.columns).lower()
@@ -767,11 +780,13 @@ def is_metadata_table(df):
                 return True
 
     # 3d. 过滤无编号文献列表 / 参考文献段落（Harvard 格式等）
+    # 识别包含 ±、区间 –/-、不等号 <、百分号/千分号的科学数值，避免把带文献列的同位素/矿床汇总表误判为 References
     all_table_text = " ".join(str(v) for v in df.values.flatten() if v is not None and str(v) != 'nan').translate(str.maketrans('０１２３４５６７８９', '0123456789'))
     year_citations = len(re.findall(r'\b(?:19|20)\d{2}\b', all_table_text))
     et_al_hits = len(re.findall(r'\b(?:et\s+al\.|pp\.|vol\.|journal|thesis|dissertation)\b', all_table_text, re.IGNORECASE))
-    if (year_citations >= 5 or et_al_hits >= 3 or '参考文献' in all_table_text) and len(df) >= 4 and not is_valid_summary_table:
-        numeric_count = sum(1 for v in df.values.flatten() if v is not None and re.match(r'^-?\d+(?:\.\d+)?$', str(v).strip()))
+    if (year_citations >= 5 or et_al_hits >= 3 or '参考文献' in all_table_text) and len(df) >= 4 and not is_valid_summary_table and df.shape[1] <= 3:
+        sci_num_re = re.compile(r'^(?:[<>≤≥±~]?\s*[-+]?\d+(?:\.\d+)?(?:\s*(?:[±/–\-~至]\s*[-+]?\d+(?:\.\d+)?)?)?\s*(?:[%‰]|ppm|ppb|wt%|Ma|Ga|ka|°C)?)$', re.IGNORECASE)
+        numeric_count = sum(1 for v in df.values.flatten() if v is not None and sci_num_re.match(str(v).strip()))
         num_ratio = numeric_count / max(1, df.size)
         if num_ratio < 0.15:
             return True
@@ -801,26 +816,34 @@ def is_metadata_table(df):
             is_en_prose = (len(val_str) > 30 and ' ' in val_str and ('.' in val_str or ';' in val_str))
             if is_cn_prose or is_en_prose:
                 long_prose_cells += 1
-            if re.search(r'\d+(?:[.\-～~]\d+)?\s*(?:Ma|Ga|ka|ppm|ppb|‰|％|%|°C|bar|kbar|Mpa|Gpa)?', val_str):
-                if re.search(r'\b\d+(?:\.\d+)?\b', val_str):
+            if re.search(r'[-+]?\d+(?:[.\-–～~±]\d+)?\s*(?:Ma|Ga|ka|ppm|ppb|‰|％|%|°C|bar|kbar|Mpa|Gpa)?', val_str):
+                if re.search(r'\d+(?:\.\d+)?', val_str):
                     numeric_cells += 1
         if total_cells > 0:
             numeric_ratio = numeric_cells / total_cells
             prose_ratio = long_prose_cells / total_cells
-            if prose_ratio >= 0.40:
-                return True
-            if prose_ratio > 0.25 and numeric_ratio < 0.15 and not is_valid_summary_table:
+            if not is_valid_summary_table:
+                if prose_ratio >= 0.40 and (numeric_ratio < 0.15 or df.shape[1] <= 2):
+                    return True
+                if prose_ratio > 0.25 and numeric_ratio < 0.15:
+                    return True
+            elif prose_ratio >= 0.80 and numeric_ratio == 0 and df.shape[1] <= 2 and not has_explicit_table_label:
                 return True
             named_cols = [c for c in df.columns if str(c).strip() and not str(c).strip().isdigit() and not str(c).startswith('Col') and not str(c).startswith('Unnamed') and not str(c).startswith('_')]
             if len(named_cols) == 0 and prose_ratio > 0.20 and numeric_ratio < 0.15:
                 return True
 
-    # 2. Check first few rows (多特征共现与强特征命中，避免单单元格出现 "doi:" 或 "email" 误杀文献计量表/调查表)
+    # 2. Check first few rows (多特征共现与强特征命中，防止单行粘连页脚误杀多行真实数据表)
     text_content = ""
-    for idx, row in df.head(8).iterrows():
-        text_content += " ".join(str(val) for val in row).lower() + " "
+    strong_meta_row_count = 0
+    head_rows = df.head(8)
+    for idx, row in head_rows.iterrows():
+        row_lower = " ".join(str(val) for val in row).lower()
+        text_content += row_lower + " "
+        if any((re.search(r'\b' + re.escape(kw) + r'\b', row_lower) if kw.isascii() else (kw in row_lower)) for kw in strong_metadata_kws):
+            strong_meta_row_count += 1
 
-    if any((re.search(r'\b' + re.escape(kw) + r'\b', text_content) if kw.isascii() else (kw in text_content)) for kw in strong_metadata_kws):
+    if strong_meta_row_count >= 1 and (df.shape[0] <= 3 or strong_meta_row_count / max(1, len(head_rows)) >= 0.5):
         return True
 
     content_weak_hits = 0

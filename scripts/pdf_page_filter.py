@@ -40,21 +40,29 @@ CONTINUATION_HINT = re.compile(
 def _has_dense_data_rows(page_text: str, min_rows: int = 3) -> bool:
     """
     启发式检测页面是否包含多行密集数据（跨页续表或纯数据页）。
-    判据：至少 min_rows 行，每行含 >=2 个数字 token 且行长度短（< 120 字符）。
+    判据：
+    1) 至少 min_rows 行，每行含 >=2 个数字 token 且行长度短（< 120 字符）；或
+    2) 针对 PyMuPDF get_text("text") 按单元格折行的情况，页面存在至少 min_rows * 2 个独立数值/检测限单元格行。
     """
     if not page_text:
         return False
     lines = page_text.split('\n')
     data_row_count = 0
+    single_cell_num_count = 0
     for line in lines:
         line = line.strip()
         if not line or len(line) > 120:
             continue
-        num_tokens = len(re.findall(r'\b\d+(?:\.\d+)?\b', line))
+        num_tokens = len(re.findall(r'(?:^|(?<![A-Za-z_]))[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?', line))
         if num_tokens >= 2:
             data_row_count += 1
             if data_row_count >= min_rows:
                 return True
+        elif num_tokens == 1 and len(line) <= 25:
+            if re.match(r'^(?:[<>≤≥±~]?\s*[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?(?:\s*[±/–\-]\s*\d+(?:\.\d+)?)?[%‰]?)$', line):
+                single_cell_num_count += 1
+                if single_cell_num_count >= max(6, min_rows * 2):
+                    return True
     return False
 
 

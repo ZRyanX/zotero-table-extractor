@@ -921,8 +921,15 @@ def _race_extract(state, cancel_event=None):
     if pmc_enabled and (pmc_cand or doi):
         tier1.append(("NCBIPMC", lambda: extract_tables_via_ncbi_pmc(pmc_cand or doi, table_idx)))
     if url:
-        tier1.append(("DirectHTTP", lambda: extract_tables_via_direct_http(url, table_idx, cancel_event=cancel_event)))
-        tier1.append(("ImpersonatedHTTP", _impersonated))
+        def _direct_then_impersonated():
+            res = extract_tables_via_direct_http(url, table_idx, cancel_event=cancel_event)
+            if res:
+                return res
+            if cancelled():
+                return []
+            return _impersonated()
+
+        tier1.append(("DirectHTTP", _direct_then_impersonated))
     if _is_elsevier():
         tier1.append(("ElsevierXML", _elsevier_xml))
     if doi:

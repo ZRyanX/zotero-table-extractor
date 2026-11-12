@@ -153,6 +153,33 @@ def format_page_ranges(page_ranges: Optional[Union[str, List[int]]]) -> Optional
     return str(page_ranges)
 
 
+def _count_requested_pages(page_ranges: Optional[Union[str, List[int]]], default_total: int) -> int:
+    """计算实际请求提取的目标页数（兼容 0-based 列表或 '1-3,5' 字符串范围）。"""
+    if not page_ranges:
+        return default_total
+    if isinstance(page_ranges, (list, tuple, set)):
+        return len(set(page_ranges)) if page_ranges else default_total
+    if isinstance(page_ranges, str):
+        pages_set = set()
+        for part in page_ranges.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "-" in part:
+                try:
+                    s_p, e_p = part.split("-", 1)
+                    s_i, e_i = int(s_p.strip()), int(e_p.strip())
+                    if e_i >= s_i > 0:
+                        pages_set.update(range(s_i, e_i + 1))
+                except Exception:
+                    pass
+            elif part.isdigit():
+                pages_set.add(int(part))
+        if pages_set:
+            return len(pages_set)
+    return default_total
+
+
 def _extract_polymorphic_text(val: Any) -> str:
     """多态文本提取辅助函数：统一兼容字符串、字典、字典列表或多层嵌套。"""
     if not val:
@@ -578,22 +605,22 @@ def extract_mineru_structured_archive(archive_input: Any) -> List[pd.DataFrame]:
 
                 # 1. pages tree (docvortex / middle v2)
                 if "pages" in data and isinstance(data["pages"], list):
-                    for pg in data["pages"]:
+                    for pg_i, pg in enumerate(data["pages"]):
                         p_idx = pg.get("page_idx")
                         if p_idx is None:
                             p_no = pg.get("page_no")
-                            p_idx = (p_no - 1) if (isinstance(p_no, int) and p_no > 0) else curr_page
+                            p_idx = (p_no - 1) if (isinstance(p_no, int) and p_no > 0) else (curr_page if curr_page is not None else pg_i)
                         blocks = pg.get("blocks", []) or pg.get("content", [])
                         results.extend(_collect_table_candidates(blocks, p_idx))
                     return results
 
                 # 2. pdf_info tree
                 if "pdf_info" in data and isinstance(data["pdf_info"], list):
-                    for p_info in data["pdf_info"]:
+                    for pg_i, p_info in enumerate(data["pdf_info"]):
                         p_idx = p_info.get("page_idx")
                         if p_idx is None:
                             p_no = p_info.get("page_no")
-                            p_idx = (p_no - 1) if (isinstance(p_no, int) and p_no > 0) else curr_page
+                            p_idx = (p_no - 1) if (isinstance(p_no, int) and p_no > 0) else (curr_page if curr_page is not None else pg_i)
                         blocks = p_info.get("preproc_blocks", []) + p_info.get("blocks", []) + p_info.get("tables", [])
                         results.extend(_collect_table_candidates(blocks, p_idx))
                     return results
@@ -736,14 +763,14 @@ def extract_mineru_structured_archive(archive_input: Any) -> List[pd.DataFrame]:
                                 try:
                                     page_idx = max(0, int(p_no) - 1)
                                 except Exception:
-                                    page_idx = default_page if default_page is not None else 0
+                                    page_idx = default_page
                             else:
-                                page_idx = default_page if default_page is not None else 0
+                                page_idx = default_page
                         else:
                             try:
                                 page_idx = int(raw_p)
                             except Exception:
-                                page_idx = default_page if default_page is not None else 0
+                                page_idx = default_page
 
                         content_obj = {}
                         container_children = item.get("content") or item.get("blocks") or []
@@ -1003,7 +1030,7 @@ class MinerUClient:
         page_ranges_str = format_page_ranges(page_ranges)
 
         if not self.api_key:
-            # 零 Token Agent 备用 API 触发检查 (文件大小 <= 10MB 且页数 <= 20)
+            # 零 Token Agent 备用 API 触发检查 (文件大小 <= 10MB 且请求目标页数 <= 20)
             is_eligible = False
             file_size_bytes = 0
             page_count = 1
@@ -1015,11 +1042,12 @@ class MinerUClient:
                             page_count = len(doc)
                     except Exception:
                         page_count = 1
-                if file_size_bytes <= 10 * 1024 * 1024 and page_count <= 20:
+                effective_pages = _count_requested_pages(page_ranges, page_count)
+                if file_size_bytes <= 10 * 1024 * 1024 and effective_pages <= 20:
                     is_eligible = True
 
             if is_eligible:
-                print(f"[MinerU Agent API] 未配置 MINERU_API_KEY，且文件满足免费额度限制 (大小: {file_size_bytes / (1024*1024):.2f}MB <= 10MB, 页数: {page_count} <= 20)，触发零 Token Agent 备用 API 提交...")
+                print(f"[MinerU Agent API] 未配置 MINERU_API_KEY，且文件满足免费额度限制 (大小: {file_size_bytes / (1024*1024):.2f}MB <= 10MB, 请求页数: {_count_requested_pages(page_ranges, page_count)} <= 20)，触发零 Token Agent 备用 API 提交...")
                 return self._submit_agent_task(file_path, page_ranges=page_ranges_str)
             else:
                 print("[MinerU] 提示: 未配置 MINERU_API_KEY，无法提交任务")
@@ -1356,25 +1384,25 @@ class MinerUClient:
                 return dfs
 
         if isinstance(result_data, dict):
-            md_url = result_data.get("markdown_url")
-            if md_url:
-                try:
-                    md_b = download_resilient_asset(md_url, timeout=60)
-                    if md_b:
-                        text = md_b.decode("utf-8", errors="replace")
-                        dfs = parse_structured_vlm_content(text) if parse_structured_vlm_content is not None else []
-                        for df in dfs:
-                            if df is not None and not df.empty:
-                                df.attrs['extractor'] = 'mineru_api'
-                        if dfs:
-                            return dfs
-                except Exception:
-                    pass
-
             extract_results = result_data.get("extract_result") or result_data.get("extract_results") or []
             if isinstance(extract_results, list) and extract_results:
                 first_res = extract_results[0]
                 if isinstance(first_res, dict):
+                    # 1. 优先解析含完整坐标 (page_idx/bbox)、表题与表注的结构化 ZIP 归档或内联 JSON
+                    zip_url = first_res.get("full_zip_url") or first_res.get("result_url") or first_res.get("zip_url")
+                    if zip_url:
+                        dfs = extract_mineru_structured_archive(zip_url)
+                        if dfs:
+                            return dfs
+                    if "content_list" in first_res or "pdf_info" in first_res or "elements" in first_res:
+                        bio = io.BytesIO()
+                        with zipfile.ZipFile(bio, 'w') as zf:
+                            zf.writestr("content_list.json", json.dumps(first_res))
+                        bio.seek(0)
+                        dfs = extract_mineru_structured_archive(bio)
+                        if dfs:
+                            return dfs
+                    # 2. 回退至 markdown_url 或直接内联 markdown
                     first_md_url = first_res.get("markdown_url")
                     if first_md_url:
                         try:
@@ -1396,19 +1424,8 @@ class MinerUClient:
                                 df.attrs['extractor'] = 'mineru_api'
                         if dfs:
                             return dfs
-                    zip_url = first_res.get("full_zip_url") or first_res.get("result_url") or first_res.get("zip_url")
-                    if zip_url:
-                        dfs = extract_mineru_structured_archive(zip_url)
-                        if dfs:
-                            return dfs
-                    if "content_list" in first_res or "pdf_info" in first_res or "elements" in first_res:
-                        bio = io.BytesIO()
-                        with zipfile.ZipFile(bio, 'w') as zf:
-                            zf.writestr("content_list.json", json.dumps(first_res))
-                        bio.seek(0)
-                        return extract_mineru_structured_archive(bio)
 
-            zip_url = result_data.get("result_url") or result_data.get("full_zip_url")
+            zip_url = result_data.get("result_url") or result_data.get("full_zip_url") or result_data.get("zip_url")
             if zip_url:
                 dfs = extract_mineru_structured_archive(zip_url)
                 if dfs:
@@ -1419,7 +1436,24 @@ class MinerUClient:
                 with zipfile.ZipFile(bio, 'w') as zf:
                     zf.writestr("content_list.json", json.dumps(result_data))
                 bio.seek(0)
-                return extract_mineru_structured_archive(bio)
+                dfs = extract_mineru_structured_archive(bio)
+                if dfs:
+                    return dfs
+
+            md_url = result_data.get("markdown_url")
+            if md_url:
+                try:
+                    md_b = download_resilient_asset(md_url, timeout=60)
+                    if md_b:
+                        text = md_b.decode("utf-8", errors="replace")
+                        dfs = parse_structured_vlm_content(text) if parse_structured_vlm_content is not None else []
+                        for df in dfs:
+                            if df is not None and not df.empty:
+                                df.attrs['extractor'] = 'mineru_api'
+                        if dfs:
+                            return dfs
+                except Exception:
+                    pass
 
             if "markdown" in result_data and result_data["markdown"] and parse_structured_vlm_content is not None:
                 dfs = parse_structured_vlm_content(result_data["markdown"])
@@ -2072,12 +2106,17 @@ def call_mineru_structured_api(
 mineru_client = MinerUClient()
 
 
-def is_mineru_available(config: Optional[dict] = None, file_path: Optional[str] = None) -> bool:
+def is_mineru_available(
+    config: Optional[dict] = None,
+    file_path: Optional[str] = None,
+    pages: Optional[Union[str, List[int]]] = None,
+    page_ranges: Optional[Union[str, List[int]]] = None,
+) -> bool:
     """
     检查 MinerU 是否可用：
     1. 配置了有效 Token (MINERU_TOKEN / MINERU_API_KEY / ~/.mineru/config.yaml)；
-    2. 或本地安装了 mineru-open-api CLI 且文件符合零 Token flash-extract 条件 (文件存在、<=10MB 且 <=20 页)；
-    3. 或文件符合官方零 Token 备用 Agent API 条件 (文件存在、<=10MB 且 <=20 页)。
+    2. 或本地安装了 mineru-open-api CLI 且文件符合零 Token flash-extract 条件 (文件存在、<=10MB 且请求目标页数 <=20 页)；
+    3. 或文件符合官方零 Token 备用 Agent API 条件 (文件存在、<=10MB 且请求目标页数 <=20 页)。
     """
     if config is None:
         try:
@@ -2089,13 +2128,16 @@ def is_mineru_available(config: Optional[dict] = None, file_path: Optional[str] 
     if key:
         return True
 
-    # 未配置 Token 时：仅当文件存在且满足 <=10MB, <=20 页时可用 (支持 flash-extract 或 Agent API)
+    target_ranges = page_ranges if page_ranges is not None else pages
+
+    # 未配置 Token 时：仅当文件存在且满足 <=10MB, 请求页数 <=20 页时可用 (支持 flash-extract 或 Agent API)
     if file_path and isinstance(file_path, str) and os.path.exists(file_path):
         try:
             if os.path.getsize(file_path) <= 10 * 1024 * 1024:
                 if file_path.lower().endswith(".pdf"):
                     with fitz.open(file_path) as doc:
-                        if len(doc) <= 20:
+                        effective_pages = _count_requested_pages(target_ranges, len(doc))
+                        if effective_pages <= 20:
                             return True
                 else:
                     return True
@@ -2821,6 +2863,9 @@ def is_docling_available() -> bool:
     return _DOCLING_AVAILABLE
 
 
+_DOCLING_CONVERTER_CACHE: Dict[Tuple[bool, int], Any] = {}
+
+
 def extract_via_docling(
     pdf_path: str,
     pages: Optional[List[int]] = None,
@@ -2920,21 +2965,33 @@ def extract_via_docling(
         if config and ("do_ocr" in config or "DO_OCR" in config):
             needs_ocr = bool(config.get("do_ocr", config.get("DO_OCR", needs_ocr)))
 
-        pipeline_options = PdfPipelineOptions()
-        pipeline_options.do_table_structure = True
-        pipeline_options.do_ocr = needs_ocr
-
-        format_opts = {
-            InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
-        }
-        if hasattr(InputFormat, "IMAGE"):
+        cache_key = (bool(needs_ocr), id(DocumentConverter))
+        converter = _DOCLING_CONVERTER_CACHE.get(cache_key)
+        if converter is None:
+            pipeline_options = PdfPipelineOptions()
+            pipeline_options.do_table_structure = True
+            pipeline_options.do_ocr = needs_ocr
             try:
-                from docling.document_converter import ImageFormatOption
-                format_opts[InputFormat.IMAGE] = ImageFormatOption(pipeline_options=pipeline_options)
+                from docling.datamodel.pipeline_options import TableFormerMode
+                if hasattr(pipeline_options, "table_structure_options") and pipeline_options.table_structure_options is not None:
+                    pipeline_options.table_structure_options.mode = TableFormerMode.ACCURATE
+                    if hasattr(pipeline_options.table_structure_options, "do_cell_matching"):
+                        pipeline_options.table_structure_options.do_cell_matching = True
             except Exception:
                 pass
 
-        converter = DocumentConverter(format_options=format_opts)
+            format_opts = {
+                InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
+            }
+            if hasattr(InputFormat, "IMAGE"):
+                try:
+                    from docling.document_converter import ImageFormatOption
+                    format_opts[InputFormat.IMAGE] = ImageFormatOption(pipeline_options=pipeline_options)
+                except Exception:
+                    pass
+
+            converter = DocumentConverter(format_options=format_opts)
+            _DOCLING_CONVERTER_CACHE[cache_key] = converter
 
         conv_res = converter.convert(effective_pdf)
         if not conv_res or not conv_res.document:
@@ -2966,7 +3023,7 @@ def extract_via_docling(
                     df.attrs["raw_html"] = raw_html
 
             # 获取页码与边界框坐标并归一化坐标原点
-            p_idx = 0
+            p_idx = page_index_map.get(0) if (page_index_map and len(page_index_map) == 1) else None
             bbox = None
             if hasattr(tbl, "prov") and tbl.prov:
                 first_prov = tbl.prov[0]
@@ -2987,7 +3044,7 @@ def extract_via_docling(
                     page_h = 792.0
                     try:
                         with fitz.open(pdf_path) as orig_doc:
-                            if 0 <= p_idx < len(orig_doc):
+                            if p_idx is not None and 0 <= p_idx < len(orig_doc):
                                 page_h = orig_doc[p_idx].rect.height
                     except Exception:
                         pass
@@ -3009,6 +3066,8 @@ def extract_via_docling(
 
             df.attrs["extractor"] = "docling_tableformer"
             df.attrs["page_idx"] = p_idx
+            if bbox is not None:
+                df.attrs["bbox"] = bbox
             if caption:
                 df.attrs["table_title"] = caption
 
@@ -3038,12 +3097,16 @@ def call_docling_table_extractor(
     pages: Optional[List[int]] = None,
     config: Optional[Dict[str, Any]] = None,
     cancel_event=None,
-) -> str:
+    return_dfs: bool = False,
+) -> Union[str, List[Dict[str, Any]]]:
     """
-    通过 Docling 离线提取表格并将结果导出为 Markdown 字符串，
-    供上游直接对接 parse_structured_vlm_content 统一后处理管线。
+    通过 Docling 离线提取表格。
+    当 return_dfs=True 时直接返回含 DataFrame、page_idx、bbox 的结构化列表；
+    默认导出为保留 HTML/Markdown 的字符串，供旧接口兼容。
     """
     tbls = extract_via_docling(pdf_path, pages=pages, config=config, cancel_event=cancel_event)
+    if return_dfs:
+        return tbls
     if not tbls:
         return ""
 
@@ -3052,7 +3115,7 @@ def call_docling_table_extractor(
         df = item.get("df")
         if df is None or df.empty:
             continue
-        p = item.get("page_idx", 0)
+        p = item.get("page_idx")
         title = df.attrs.get("table_title", f"Table {idx+1}")
         raw_html = df.attrs.get("raw_html")
         if raw_html and isinstance(raw_html, str) and "<table" in raw_html.lower():
@@ -3066,7 +3129,8 @@ def call_docling_table_extractor(
                 for _, r_data in df.iterrows():
                     lines.append("| " + " | ".join(str(v).replace("\n", " ").strip() for v in r_data.values) + " |")
                 table_md = "\n".join(lines)
-        block = f"### Table {idx+1} (Page {p+1}): {title}\n\n{table_md}\n"
+        page_str = f"Page {p+1}" if p is not None else "Page unknown"
+        block = f"### Table {idx+1} ({page_str}): {title}\n\n{table_md}\n"
         md_blocks.append(block)
 
     return "\n\n".join(md_blocks)
@@ -3172,12 +3236,63 @@ class MinerUBackend(OCRBackend):
     def extract(self, file_path: str, **kwargs) -> Any:
         if "page_ranges" not in kwargs and "pages" in kwargs:
             kwargs["page_ranges"] = kwargs.pop("pages")
-        structured = kwargs.pop("structured", False)
+        explicit_structured = "structured" in kwargs
+        structured = kwargs.pop("structured", True)
         if "config" not in kwargs:
             kwargs["config"] = getattr(self, "config", None) or load_config()
         if structured:
-            return call_mineru_structured_api(file_path, **kwargs)
+            res_s = call_mineru_structured_api(file_path, **kwargs)
+            if res_s or explicit_structured:
+                return res_s
         return call_mineru_api(file_path, **kwargs)
+
+
+def extract_tables_with_fallback(
+    file_path: str,
+    pages: Optional[List[int]] = None,
+    config: Optional[dict] = None,
+    cancel_event=None,
+) -> str:
+    """
+    多引擎表格 OCR/VLM 兜底提取入口：
+    按可用性依次尝试 PaddleOCR-VL / MinerU 双云通道 -> IBM Docling (TableFormer) -> TeleOCR。
+    返回包含 Markdown / HTML 表格的文本。
+    """
+    if config is None:
+        try:
+            config = load_config()
+        except Exception:
+            config = {}
+    if cancel_event is not None and cancel_event.is_set():
+        return ""
+
+    # 1. PaddleOCR-VL / MinerU 统一入口（内含 Docling 离线备用）
+    try:
+        md = run_paddleocr_vl(file_path, pages=pages, cancel_event=cancel_event)
+        if md and md.strip():
+            return md
+    except Exception as e_vl:
+        logger.debug(f"[OCR Fallback] run_paddleocr_vl 提示: {e_vl}")
+
+    # 2. 显式尝试 Docling 离线提取
+    try:
+        docling_md = call_docling_table_extractor(file_path, pages=pages, config=config, cancel_event=cancel_event)
+        if docling_md and str(docling_md).strip():
+            return str(docling_md)
+    except Exception as e_doc:
+        logger.debug(f"[OCR Fallback] call_docling_table_extractor 提示: {e_doc}")
+
+    # 3. 尝试 TeleOCR
+    try:
+        tele = TeleOCRBackend()
+        if tele.client.is_available():
+            tele_md = tele.extract(file_path, pages=pages, cancel_event=cancel_event)
+            if tele_md and tele_md.strip():
+                return tele_md
+    except Exception as e_tele:
+        logger.debug(f"[OCR Fallback] TeleOCR 提示: {e_tele}")
+
+    return ""
 
 
 class TeleOCRClient:
@@ -3291,7 +3406,10 @@ class DoclingBackend(OCRBackend):
             "message": "docling installed" if avail else "docling library not installed"
         }
 
-    def extract(self, file_path: str, **kwargs) -> str:
+    def extract(self, file_path: str, **kwargs) -> Any:
+        if kwargs.pop("structured", False) or kwargs.get("return_dfs", False):
+            kwargs.pop("return_dfs", None)
+            return extract_via_docling(file_path, **kwargs)
         return call_docling_table_extractor(file_path, **kwargs)
 
 

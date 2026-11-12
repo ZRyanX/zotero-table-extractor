@@ -64,24 +64,35 @@ def scan_pdf_table_declarations(pdf_path: str) -> Dict[int, List[Dict[str, Any]]
             if not text or not text.strip():
                 continue
 
-            # 目录页与参考文献页前置过滤（防止目录中的表清单或参考文献引文被误判为正文表格声明）
-            first_100_chars = text[:200].lower()
-            if p_idx < 5 and any(kw in first_100_chars for kw in ['contents', 'table of contents', '目录', '目  录', '插表目录', 'list of tables']):
-                continue
-            if p_idx > num_pages * 0.85 and any(kw in first_100_chars for kw in ['references', 'bibliography', '参考文献', '致谢', 'acknowledgements']):
-                continue
-
-            # 排除前置目录/插表清单页
+            # 目录页前置过滤：仅匹配独立成行的目录标题，严禁用无词边界子串 'contents' 误杀含 "element contents" 的正文页
             first_lines = text[:250]
-            if re.search(r'^(?:目\s*录|Contents|插表清单|表格清单|附表清单)', first_lines, re.MULTILINE):
+            if p_idx < 5 and re.search(
+                r'^\s*(?:table\s+of\s+contents|contents|目\s*录|插表目录|插表清单|表格目录|表格清单|附表清单|list\s+of\s+tables)\s*$',
+                first_lines,
+                re.IGNORECASE | re.MULTILINE,
+            ):
                 continue
 
             lines = text.split('\n')
             page_caps = []
+            in_references_section = False
 
             for idx_l, line in enumerate(lines):
                 line_clean = line.strip().replace('\xa0', ' ').replace('\u3000', ' ').translate(trans_fw)
                 if not line_clean:
+                    continue
+
+                # 排除目录行（末尾带省略号与页码，如 "Table 1 ...... 12"）
+                if re.search(r'(?:\.{3,}|…{2,})\s*\d+\s*$', line_clean):
+                    continue
+
+                # 检测独立成行的参考文献标题（不直接跳过整页，保留同页前置表或后续附录表）
+                if p_idx > num_pages * 0.7 and re.match(
+                    r'^\s*(?:\d+[\.\s]*)?(?:references|bibliography|参\s*考\s*文\s*献)\s*$',
+                    line_clean,
+                    re.IGNORECASE,
+                ):
+                    in_references_section = True
                     continue
 
                 # 1. 检查续表声明（续表、续表1、表1（续）、表1（续一）、Table 1 (continued)、Table 1 (cont.)、Table 2 Continued、cont'd、续上表等）
@@ -162,12 +173,8 @@ def scan_pdf_table_declarations(pdf_path: str) -> Dict[int, List[Dict[str, Any]]
     return page_declarations
 
 
-def validate_native_table_dataframe(df: pd.DataFrame, page_idx: int) -> Tuple[bool, str]:
-    """
-    深度检验单个原生提取出的 DataFrame 数据结构与内容完整性。
-    
-    返回 (is_valid, failure_reason)
-    """
+def _validate_native_table_dataframe_raw(df: pd.DataFrame, page_idx: int) -> Tuple[bool, str]:
+    """对当前 DataFrame 状态执行 6 项原生质量检验。"""
     if df is None or df.empty:
         return False, "表格为空或 DataFrame 为 None"
 
@@ -212,6 +219,34 @@ def validate_native_table_dataframe(df: pd.DataFrame, page_idx: int) -> Tuple[bo
         return False, "表头完全未识别且行数过少，属于残片"
 
     return True, "合格"
+
+
+def validate_native_table_dataframe(df: pd.DataFrame, page_idx: int) -> Tuple[bool, str]:
+    """
+    深度检验单个原生提取出的 DataFrame 数据结构与内容完整性。
+    若原始 DataFrame 因未提升表头、含空白占位列或尾注行而未通过初检，
+    先尝试通过 postprocess_dataframe 清洗修复后再做终判，避免可修复真表被过早误杀。
+    
+    返回 (is_valid, failure_reason)
+    """
+    ok, reason = _validate_native_table_dataframe_raw(df, page_idx)
+    if ok or df is None or df.empty:
+        return ok, reason
+
+    try:
+        try:
+            from .table_postprocess import postprocess_dataframe
+        except ImportError:
+            from table_postprocess import postprocess_dataframe
+        cleaned = postprocess_dataframe(df.copy())
+        if cleaned is not None and not cleaned.empty and cleaned.shape[0] >= 1 and cleaned.shape[1] >= 2:
+            ok_clean, _ = _validate_native_table_dataframe_raw(cleaned, page_idx)
+            if ok_clean:
+                return True, "合格 (经后处理清洗修复)"
+    except Exception:
+        pass
+
+    return ok, reason
 
 validate_table_structure = validate_native_table_dataframe
 
@@ -261,7 +296,23 @@ def validate_native_extraction_pipeline(
         df = r.get('df')
         p_idx = r.get('page_idx', df.attrs.get('page_idx', 0) if df is not None else 0)
         
-        ok, reason = validate_native_table_dataframe(df, p_idx)
+        ok, reason = _validate_native_table_dataframe_raw(df, p_idx)
+        if not ok and df is not None and not df.empty:
+            try:
+                try:
+                    from .table_postprocess import postprocess_dataframe
+                except ImportError:
+                    from table_postprocess import postprocess_dataframe
+                cleaned = postprocess_dataframe(df.copy())
+                if cleaned is not None and not cleaned.empty and cleaned.shape[0] >= 1 and cleaned.shape[1] >= 2:
+                    ok_c, _ = _validate_native_table_dataframe_raw(cleaned, p_idx)
+                    if ok_c:
+                        r['df'] = cleaned
+                        df = cleaned
+                        ok = True
+                        reason = "合格 (经后处理清洗修复)"
+            except Exception:
+                pass
         if not ok:
             validation_logs.append(f"  ❌ Page {p_idx + 1} 原生表格检验未通过: {reason} → 标记重走 PaddleOCR-VL")
             pages_requiring_ocr.add(p_idx)
@@ -607,14 +658,41 @@ def verify_table_numeric_integrity(
         }
 
     # 3. 提取数字多重集 (Bag-of-Numbers)
-    df_nums = []
-    for col in df.columns:
-        for val in df[col]:
-            df_nums.extend(_extract_numeric_tokens(val))
+    # 使用 df.values.flatten() 避免重名列时 df[col] 返回二维 DataFrame 导致只遍历出列名的 bug
+    cell_nums = []
+    for val in df.values.flatten():
+        cell_nums.extend(_extract_numeric_tokens(val))
+
+    header_nums = []
+    col_strs = [str(col).strip() for col in df.columns]
+    is_default_seq_cols = (
+        isinstance(df.columns, pd.RangeIndex)
+        or col_strs == [str(i) for i in range(len(col_strs))]
+        or col_strs == [str(i) for i in range(1, len(col_strs) + 1)]
+    )
+    if not is_default_seq_cols:
+        for col_str in col_strs:
+            if not re.match(r'^(?:Unnamed:\s*\d+|Unnamed.*|Col_?\d+|Column_?\d+)$', col_str, re.IGNORECASE):
+                header_nums.extend(_extract_numeric_tokens(col_str))
 
     pdf_nums = _extract_numeric_tokens(pdf_text)
-    total_df_count = len(df_nums)
     total_pdf_count = len(pdf_nums)
+
+    from collections import Counter
+    pdf_counter = Counter(pdf_nums)
+    cell_counter = Counter(cell_nums)
+    rem_pdf = pdf_counter - (cell_counter & pdf_counter)
+    matched_header_counter = Counter(header_nums) & rem_pdf
+
+    if cell_nums:
+        # 将表头中与原文吻合的数字（或独立纯数字表头）纳入 df_nums，既防止首行数据被提升为表头后丢分，又避免测试用合成列名 Val1/Val2 无端拉低 precision
+        df_nums = list(cell_nums)
+        for h_tok, cnt in matched_header_counter.items():
+            df_nums.extend([h_tok] * cnt)
+    else:
+        df_nums = list(header_nums)
+
+    total_df_count = len(df_nums)
 
     # 4. 扫描件/纯图片无文本层或 BBox 落在空白处校验
     if not pdf_text.strip():
@@ -691,23 +769,26 @@ def verify_table_numeric_integrity(
             "pdf_num_count": total_pdf_count,
         }
 
-    from collections import Counter
     df_counter = Counter(df_nums)
-    pdf_counter = Counter(pdf_nums)
     intersection = df_counter & pdf_counter
     matched_count = sum(intersection.values())
 
     precision = matched_count / total_df_count if total_df_count > 0 else 1.0
     recall = matched_count / total_pdf_count if total_pdf_count > 0 else 1.0
 
+    # 当 bbox 缺失时，pdf_text 为整页文本（可能包含同页其余表格与正文中的大量数字），
+    # 此时不能用整页 total_pdf_count 强行卡死单表 recall，只要单表内部数字精确匹配原文且命中数 > 0 即可通过
+    has_valid_bbox = bool(bbox and len(bbox) >= 4)
+    effective_min_recall = min_recall if has_valid_bbox else (0.01 if matched_count > 0 else min_recall)
+
     # 双向一致性校验：precision 检查提取准确率，recall 检查原文数据完整率
-    is_valid = (precision >= min_match_ratio and recall >= min_recall)
+    is_valid = (precision >= min_match_ratio and recall >= effective_min_recall)
     status = "passed" if is_valid else "failed"
 
     if is_valid:
         reason = f"passed_numeric_integrity (ratio: {precision:.1%})"
-    elif recall < min_recall and precision >= min_match_ratio:
-        reason = f"numeric_completeness_failed: only {matched_count}/{total_pdf_count} PDF numbers recovered ({recall:.1%} < {min_recall:.1%})"
+    elif recall < effective_min_recall and precision >= min_match_ratio:
+        reason = f"numeric_completeness_failed: only {matched_count}/{total_pdf_count} PDF numbers recovered ({recall:.1%} < {effective_min_recall:.1%})"
     else:
         reason = f"numeric_integrity_failed: {matched_count}/{total_df_count} numbers matched ({precision:.1%} < {min_match_ratio:.1%})"
 

@@ -212,7 +212,7 @@ def parse_structured_markdown_tables(md_content):
     
     for l in lines:
         l_str = l.strip()
-        m_lbl = re.search(r'\b(' + TABLE_LABEL_PATTERN + r'[\.\:\s]*[^\n]*)', l_str, re.I)
+        m_lbl = re.search(r'(?:^|(?<![a-zA-Z0-9_]))(' + TABLE_LABEL_PATTERN + r'[\.\:\s]*[^\n]*)', l_str, re.I)
         if m_lbl and not in_table:
             curr_caption = m_lbl.group(1).strip()
             m_num = TABLE_LABEL_RE.search(curr_caption)
@@ -406,7 +406,7 @@ NOTE_PREFIX_PATTERN = re.compile(
     r'Legend\s*[:：]|Abbreviations?\s*[:：]|Abbr\s*[:：]|Remarks?\s*[:：]|'
     r'注\s*[:：]|说明\s*[:：]|数据来源\s*[:：]|附注\s*[:：]|本表\s*[:：]|'
     r'(?:\([a-z0-9]+\)|\[[a-z0-9]+\]|[a-e1-9]\))\s+|'
-    r'(?:[a-e1-9])\s+(?=[A-Z\u4e00-\u9fa5])'
+    r'(?:[a-e])\s+(?=[A-Z\u4e00-\u9fa5])'
     r')',
     re.IGNORECASE
 )
@@ -439,7 +439,18 @@ def is_academic_footnote_row(row_values: list, col_count: Optional[int] = None) 
     full_text_clean = full_text.strip()
 
     # 1. 明确的尾注前缀 (Note:, 注:, * 等)
-    if NOTE_PREFIX_PATTERN.search(full_text_clean):
+    # 若多列行第 0 格为裸序号/括号序号/字母组别，拼接后形如 "1 Granite" 或 "(1) Early stage"，这属于数据行首列编号而非单单元格内的注释前缀
+    is_col0_bare_index = (
+        len(non_empty) >= 2
+        and not all_same
+        and bool(re.match(r'^(?:[a-eA-E]|\d{1,3}|[\(\[（【][a-zA-Z0-9]{1,3}[\)\]）】]|\d{1,3}[\.、\)])$', non_empty[0], re.IGNORECASE))
+    )
+    has_explicit_note_col0 = bool(
+        re.match(r'^(?:Note[s]?[:.\s]|注[:：.\s]|备注[:：.\s]|说明[:：.\s]|Source[s]?[:.\s]|Abbreviation[s]?[:.\s]|[*†‡§¶#]+)', non_empty[0], re.IGNORECASE)
+    )
+    if len(non_empty) >= 3 and not all_same and not has_explicit_note_col0:
+        return False, ""
+    if NOTE_PREFIX_PATTERN.search(full_text_clean) and not is_col0_bare_index:
         has_multi_data = sum(1 for v in non_empty if is_pure_data_value(v)) >= 2
         if col_count > 1 and len(non_empty) > 2 and has_multi_data:
             pass
@@ -1110,15 +1121,27 @@ def smart_flatten_headers(
             continue
 
         # 3. 语义冗余消解 (例如 父="SiO2 (wt%)", 子="SiO2" -> "SiO2 (wt%)")
+        # 采用词边界/Token 级匹配，严禁用无边界子串将短元素名 (如 "S", "C", "O", "Si", "Al") 吞入父表头 (如 "Content", "Composition")
+        def _is_header_token_redundant(short_s: str, long_s: str) -> bool:
+            s_l = short_s.strip().lower()
+            l_l = long_s.strip().lower()
+            if s_l == l_l:
+                return True
+            if len(s_l) <= 2 and s_l.isascii():
+                return False
+            if s_l.isascii():
+                return bool(re.search(r'(?:^|[\s\(\[/,;_\-])' + re.escape(s_l) + r'(?:$|[\s\)\]/,;_\-])', l_l))
+            return s_l in l_l
+
         deduped = []
         for level in col_hierarchy:
             if not deduped:
                 deduped.append(level)
             else:
                 prev = deduped[-1]
-                if prev.lower() in level.lower() and len(level) > len(prev):
+                if len(level) > len(prev) and _is_header_token_redundant(prev, level):
                     deduped[-1] = level
-                elif level.lower() in prev.lower():
+                elif _is_header_token_redundant(level, prev):
                     pass
                 else:
                     deduped.append(level)
@@ -1134,10 +1157,13 @@ def _detect_and_promote_header(df: pd.DataFrame) -> pd.DataFrame:
     first_col_str = str(df.columns[0]).strip()
     unnamed_count = sum(1 for c in df.columns if str(c).startswith('Unnamed:') or str(c) in ('nan', 'None', '', '_1', '_2', '_3') or str(c).isdigit())
     
+    # 严禁将正常的 "Mineral" / "Geol. stage" 首列误判为期刊运行页眉
+    first_col_lower = first_col_str.lower()
     is_running_header = (
         first_col_str.isdigit() or 
         re.match(r'^(?:19|20)\d{2}$', first_col_str) or
-        any(kw in first_col_str.lower() for kw in ['journal', 'reviews', 'geol', 'mineral', 'vol.', 'pp.', 'page', 'et al', 'sciencedirect', 'springer'])
+        any(kw in first_col_lower for kw in ['journal', 'reviews', 'vol.', 'pp.', 'page ', 'et al', 'sciencedirect', 'springer']) or
+        (('geol' in first_col_lower or 'mineral' in first_col_lower) and ('/' in first_col_lower or bool(re.search(r'\b(?:19|20)\d{2}\b', first_col_lower))))
     )
     is_default_cols = all(isinstance(c, int) or (isinstance(c, str) and (c.isdigit() or c.startswith('Col') or c.startswith('Unnamed'))) for c in df.columns)
     is_corrupted_header = is_running_header or (unnamed_count >= max(2, len(df.columns) * 0.4)) or is_default_cols
@@ -1147,12 +1173,26 @@ def _detect_and_promote_header(df: pd.DataFrame) -> pd.DataFrame:
         'composition', 'fluid', 'temperature', 'melting', 'density',
         'th', 'tm', 'formula', 'paragenesis', 'gangue', 'ore',
         'isotope', 'delta', 'δ', 'age', 'date', 'ppm', 'ppb', 'wt', 'wt%', 'at%',
-        'sb', 'au', 'w', 'cu', 'pb', 'zn', 'as', 'fe', 's', 'sio2', 'tio2', 'al2o3',
+        'sb', 'au', 'cu', 'pb', 'zn', 'as', 'fe', 'sio2', 'tio2', 'al2o3',
         '样品', '矿物', '阶段', '流体', '同位素', '年龄', '地层',
         '温阶', '代号', '岩性', '含量', '品位', '深度', '标高',
         'w_b', '10^', '×10', 'icp', 'la-icp', 'epma', '点号', '测点',
         '矿床类型', '矿床名称', '规模', '大地构造', '控矿构造', '赋矿层位', '矿体形态', '蚀变特征', '成矿年龄', '数据来源'
     ]
+
+    def _matches_scientific_header(row_cells_list: list, row_str_low: str) -> bool:
+        cell_low_set = {c.strip().lower() for c in row_cells_list if c.strip()}
+        for kw in scientific_kws:
+            if len(kw) == 1 and kw.isascii():
+                if kw in cell_low_set:
+                    return True
+            elif kw.isascii() and kw.isalpha():
+                if re.search(r'\b' + re.escape(kw) + r'\b', row_str_low):
+                    return True
+            else:
+                if kw in row_str_low:
+                    return True
+        return False
 
     # 检查第一列列名是否为纯浮点数值/纯数据误当表头（如 33.42, 0.025）
     is_numeric_col_name = bool(re.match(r'^-?\d+(?:\.\d+)?$', first_col_str))
@@ -1173,7 +1213,7 @@ def _detect_and_promote_header(df: pd.DataFrame) -> pd.DataFrame:
                 continue
             if '。' in row_str or '以期建立' in row_str or '进而研究' in row_str:
                 continue
-            if any(kw in row_str for kw in scientific_kws):
+            if _matches_scientific_header(row_cells, row_str):
                 best_header_idx = idx
                 break
             if idx < 5 and non_num_cells >= len(row_cells) * 0.4:
@@ -1421,10 +1461,7 @@ def postprocess_dataframe(df, headers=None):
     df = expand_multiline_subrows(df)
     df = populate_section_categories(df)
 
-    # 步骤 C2: olmOCR 2 启发式学术表格边界与尾注分离
-    df = separate_table_footnotes(df)
-
-    # 步骤 D: 噪声过滤与占位列清理
+    # 步骤 D: 噪声过滤、占位列清理与 olmOCR 2 启发式尾注分离（内部统一执行一次 separate_table_footnotes，避免双重剥离）
     df = _filter_noise_and_placeholders(df)
 
 
@@ -1451,7 +1488,12 @@ def postprocess_dataframe(df, headers=None):
             pass
 
     if hasattr(df, 'attrs'):
-        df.attrs.update(original_attrs)
+        new_attrs = df.attrs.copy()
+        merged_attrs = original_attrs.copy()
+        for k, v in new_attrs.items():
+            if v is not None and (k not in merged_attrs or merged_attrs[k] is None or k in ('footnotes', 'table_title', 'label')):
+                merged_attrs[k] = v
+        df.attrs = merged_attrs
         
     return df
 
@@ -1691,14 +1733,18 @@ def is_pure_data_value(s_in):
     s = str(s_in).strip()
     if not s:
         return False
+    s_lower = s.lower().strip()
+    # 1. 常见缺失值与检出限缩写 (<, >, b.d., n.d., BDL, ND, NA, Tr, etc.)
+    # 注意：严格区分化学元素符号 'Na' (钠) / 'Nd' (钕) 与大写/小写检出限缩写 'NA' / 'ND' / 'bdl' / 'tr'
+    if (
+        s_lower in ('-', '—', '–', 'n.d.', 'nd', 'bdl', 'b.d.l.', 'b.d.', 'n/a', 'na', 'n.a.', 'tr', 'trace', 'loq', 'lod', 'dl', 'nil', 'none', 'below detection')
+        and s not in ('Na', 'Nd')
+    ):
+        return True
     # 常见地质化学式/同位素/单位/字段词，属于表头文本，非纯数据
     if (re.match(r'^(?:[A-Z][a-z]?\d*)+$', s) or '/' in s or 'δ' in s or '‰' in s or 
-        '%' in s or any(w in s.lower() for w in ['ppm', 'ppb', 'wt', 'sample', 'spot', 'no.', 'mineral', 'rock', 'age', 'stage', 'type', 'depth'])):
+        '%' in s or any(w in s_lower for w in ['ppm', 'ppb', 'wt', 'sample', 'spot', 'no.', 'mineral', 'rock', 'age', 'stage', 'type', 'depth'])):
         return False
-    s_lower = s.lower().strip()
-    # 1. 常见缺失值与检出限缩写 (<, >, b.d., n.d., etc.)
-    if s_lower in ('-', '—', '–', 'n.d.', 'nd', 'bdl', 'b.d.l.', 'b.d.', 'n/a', 'na', 'n.a.', 'tr', 'trace', 'loq', 'lod', 'dl', 'nil', 'none', 'below detection'):
-        return True
     # 2. 误差与不确定度符号缩写 (±, 1σ, 2σ, etc.)
     if s_lower in ('1σ', '2σ', '1s', '2s', '±', '1sigma', '2sigma', '±1σ', '±2σ'):
         return True
@@ -1821,7 +1867,7 @@ def combine_df_group(group):
             min_rows = min(row_counts) if row_counts else 0
             rows_compatible = max_rows > 0 and min_rows / max_rows >= 0.5
             if (col1_set and col2_set and
-                    len(col1_set & col2_set) / max(1, len(col1_set)) < 0.35 and
+                    len(col1_set & col2_set) / max(1, min(len(col1_set), len(col2_set))) < 0.35 and
                     rows_compatible and first_col_compatible):
                 is_horizontal = True
                 
@@ -1868,7 +1914,7 @@ def combine_df_group(group):
             temp_df = pd.DataFrame(full_data, columns=[f"Col_{i}" for i in range(len(next_df.columns))])
             next_df = align_dataframe_columns(temp_df, base_cols, base_df=base_df)
         else:
-            # 动态语义对齐：当列数不完全相同或列名略有变动时，执行基于相似度的自适应对齐
+            # 动态语义对齐：当列数不完全相同或列名略有变动时，执行基于相似度的自适应对齐（不再因列数差 > 6 静默丢弃续表）
             has_named_cols = sum(1 for c in next_df.columns if not str(c).startswith('Unnamed:') and str(c).strip()) >= 2
             if list(next_df.columns) == list(base_cols):
                 pass
@@ -1877,7 +1923,7 @@ def combine_df_group(group):
                     next_df = align_dataframe_columns(next_df, base_cols, base_df=base_df)
                 else:
                     next_df.columns = base_cols
-            elif abs(len(next_df.columns) - len(base_cols)) <= 6:
+            else:
                 if has_named_cols:
                     next_df = align_dataframe_columns(next_df, base_cols, base_df=base_df)
                 else:
@@ -1890,9 +1936,6 @@ def combine_df_group(group):
                     else:
                         # 运用 DeepDoc / MinerU 列投影自适应映射不同列数分块
                         next_df = align_dataframe_columns(next_df, base_cols, base_df=base_df)
-            else:
-                # 列数差异过大，跳过合并
-                continue
 
             # 逐行剥离 next_df 顶部的多层重复表头行、序号行、单位行与重复子表头/分节横幅行
             while len(next_df) > 0:

@@ -401,10 +401,18 @@ class DocOrientationDetector:
             opts.intra_op_num_threads = 2
             opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
+            avail = set(ort.get_available_providers()) if hasattr(ort, "get_available_providers") else set()
+            providers = []
+            for p_name in ("CUDAExecutionProvider", "CoreMLExecutionProvider", "CPUExecutionProvider"):
+                if p_name in avail:
+                    providers.append(p_name)
+            if not providers:
+                providers = ["CPUExecutionProvider"]
+
             self.session = ort.InferenceSession(
                 resolved_path,
                 sess_options=opts,
-                providers=["CPUExecutionProvider"]
+                providers=providers
             )
             self.input_name = self.session.get_inputs()[0].name
             self.output_name = self.session.get_outputs()[0].name

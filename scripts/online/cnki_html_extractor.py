@@ -101,21 +101,66 @@ def extract_tables_from_page(page, table_idx="all"):
             
         rows_data = []
         rows = t.query_selector_all("tr")
-        for r in rows:
+        span_map = {}  # (row_idx, col_idx) -> text
+        for r_idx, r in enumerate(rows):
             cells = r.query_selector_all("td, th")
-            cells_text = [clean_text(c.inner_text()) for c in cells]
-            if any(cells_text):
-                rows_data.append(cells_text)
-                
+            col_idx = 0
+            row_cells = []
+            while (r_idx, col_idx) in span_map:
+                row_cells.append(span_map.pop((r_idx, col_idx)))
+                col_idx += 1
+            for c in cells:
+                while (r_idx, col_idx) in span_map:
+                    row_cells.append(span_map.pop((r_idx, col_idx)))
+                    col_idx += 1
+                txt = clean_text(c.inner_text())
+                try:
+                    rs_attr = c.get_attribute("rowspan")
+                    rs = max(1, int(rs_attr)) if rs_attr and str(rs_attr).strip().isdigit() else 1
+                except Exception:
+                    rs = 1
+                try:
+                    cs_attr = c.get_attribute("colspan")
+                    cs = max(1, int(cs_attr)) if cs_attr and str(cs_attr).strip().isdigit() else 1
+                except Exception:
+                    cs = 1
+                for dr in range(rs):
+                    for dc in range(cs):
+                        if dr == 0 and dc == 0:
+                            row_cells.append(txt)
+                        elif dr == 0:
+                            row_cells.append(txt)
+                        else:
+                            span_map[(r_idx + dr, col_idx + dc)] = txt
+                col_idx += cs
+            while (r_idx, col_idx) in span_map:
+                row_cells.append(span_map.pop((r_idx, col_idx)))
+                col_idx += 1
+            if any(row_cells):
+                rows_data.append(row_cells)
+
         if rows_data:
             # Pad row columns
             max_cols = max(len(r) for r in rows_data)
             for i in range(len(rows_data)):
                 if len(rows_data[i]) < max_cols:
                     rows_data[i] = rows_data[i] + [""] * (max_cols - len(rows_data[i]))
-                    
-            header_row = rows_data[0]
-            data_rows = rows_data[1:]
+
+            thead_rows = t.query_selector_all("thead tr")
+            num_header_rows = len(thead_rows) if thead_rows and len(thead_rows) < len(rows_data) else 1
+            if num_header_rows > 1:
+                header_row = []
+                for c_i in range(max_cols):
+                    parts = []
+                    for h_r in range(num_header_rows):
+                        val = rows_data[h_r][c_i].strip()
+                        if val and (not parts or parts[-1] != val):
+                            parts.append(val)
+                    header_row.append("_".join(parts))
+                data_rows = rows_data[num_header_rows:]
+            else:
+                header_row = rows_data[0]
+                data_rows = rows_data[1:]
             
             # Make headers unique
             seen = {}

@@ -104,6 +104,10 @@ class RapidTableExtractor:
             self._wired_tsr_engine, self._lineless_tsr_engine
         ])
 
+    def is_available(self) -> bool:
+        """兼容接口：等价于 is_ready()。"""
+        return self.is_ready()
+
     def _init_engine(self):
         if self._initialized:
             return
@@ -450,26 +454,82 @@ class RapidTableExtractor:
                                 "source": "rapid_table",
                             })
                 else:
-                    # 整页图像降级处理 (仅当无法探测子框时)
                     pix = page.get_pixmap(dpi=dpi)
                     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                    df = self.extract_table_from_image(img)
-                    if df is not None and not df.empty:
-                        df.attrs["page_idx"] = page_idx
-                        df.attrs["table_idx"] = 0
-                        results.append({
-                            "df": df,
-                            "page_idx": page_idx,
-                            "table_idx": 0,
-                            "bbox": [0.0, 0.0, page.rect.width, page.rect.height],
-                            "extractor": "rapid_table",
-                            "source": "rapid_table",
-                        })
+                    yolo_regions = []
+                    try:
+                        try:
+                            from .doclayout_yolo_detector import DocLayoutYoloDetector
+                        except ImportError:
+                            from doclayout_yolo_detector import DocLayoutYoloDetector
+                        detector = DocLayoutYoloDetector()
+                        yolo_regions = detector.extract_extended_table_regions(img) or []
+                    except Exception:
+                        yolo_regions = []
+
+                    if yolo_regions:
+                        scale_x = page.rect.width / max(1.0, float(pix.width))
+                        scale_y = page.rect.height / max(1.0, float(pix.height))
+                        for t_idx, reg in enumerate(yolo_regions):
+                            crop_img = reg.get("image")
+                            if crop_img is None:
+                                c_box = reg.get("crop_bbox") or reg.get("table_bbox")
+                                if c_box and len(c_box) >= 4:
+                                    crop_img = img.crop((c_box[0], c_box[1], c_box[2], c_box[3]))
+                            if crop_img is None:
+                                continue
+                            df = self.extract_table_from_image(crop_img)
+                            if df is not None and not df.empty:
+                                raw_b = reg.get("table_bbox") or reg.get("crop_bbox") or [0, 0, pix.width, pix.height]
+                                pt_bbox = [
+                                    float(raw_b[0]) * scale_x,
+                                    float(raw_b[1]) * scale_y,
+                                    float(raw_b[2]) * scale_x,
+                                    float(raw_b[3]) * scale_y,
+                                ]
+                                df.attrs["page_idx"] = page_idx
+                                df.attrs["table_idx"] = t_idx
+                                df.attrs["bbox"] = pt_bbox
+                                results.append({
+                                    "df": df,
+                                    "page_idx": page_idx,
+                                    "table_idx": t_idx,
+                                    "bbox": pt_bbox,
+                                    "extractor": "rapid_table",
+                                    "source": "rapid_table",
+                                })
+                    else:
+                        # 整页图像降级处理 (仅当矢量与版面检测均无法探测子框时)
+                        df = self.extract_table_from_image(img)
+                        if df is not None and not df.empty:
+                            df.attrs["page_idx"] = page_idx
+                            df.attrs["table_idx"] = 0
+                            results.append({
+                                "df": df,
+                                "page_idx": page_idx,
+                                "table_idx": 0,
+                                "bbox": [0.0, 0.0, page.rect.width, page.rect.height],
+                                "extractor": "rapid_table",
+                                "source": "rapid_table",
+                            })
             doc.close()
         except Exception as e:
             logger.warning(f"[RapidTable] PDF 解析异常: {e}")
 
         return results
+
+
+_RAPID_TABLE_EXTRACTOR_SINGLETON: Optional[RapidTableExtractor] = None
+
+
+def get_rapid_table_extractor(model_dir: Optional[str] = None) -> RapidTableExtractor:
+    """获取或初始化全局 RapidTableExtractor 单例。"""
+    global _RAPID_TABLE_EXTRACTOR_SINGLETON
+    if model_dir is not None:
+        return RapidTableExtractor(model_dir=model_dir)
+    if _RAPID_TABLE_EXTRACTOR_SINGLETON is None:
+        _RAPID_TABLE_EXTRACTOR_SINGLETON = RapidTableExtractor()
+    return _RAPID_TABLE_EXTRACTOR_SINGLETON
 
 
 def extract_via_rapid_table(
@@ -478,5 +538,5 @@ def extract_via_rapid_table(
     crop_boxes: Optional[Dict[int, List[List[float]]]] = None,
 ) -> List[Dict[str, Any]]:
     """外部统一调用接口：通过 RapidTable 提取表格并标准化返回。"""
-    extractor = RapidTableExtractor()
+    extractor = get_rapid_table_extractor()
     return extractor.extract_from_pdf(pdf_path, pages=pages, crop_boxes=crop_boxes)

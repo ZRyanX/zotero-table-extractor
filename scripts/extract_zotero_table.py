@@ -868,16 +868,20 @@ def _do_process_single_pdf(pdf_path, orig_pdf_path, args, is_batch=False, plan=N
                 else:
                     print(f"[Online] Got {len(online_dfs)} tables via online HTML source (覆盖全部 {len(online_labels)} 个预期表号). Saving...")
 
-                # 始终保存已成功抓取的在线高保真表格
-                save_ok = save_tables_to_excel(online_dfs, target_output,
-                                              getattr(args, 'headers', None), single_file,
-                                              skip_supplementary=getattr(args, 'skip_supplementary', False))
-                if save_ok:
-                    extracted_online = True
-                    print(f"[Online] Successfully extracted tables via online HTML source -> {target_output}")
-                    if online_only:
+                if is_complete or online_only:
+                    save_ok = save_tables_to_excel(
+                        online_dfs, target_output,
+                        getattr(args, 'headers', None), single_file,
+                        skip_supplementary=getattr(args, 'skip_supplementary', False)
+                    )
+                    if save_ok:
+                        extracted_online = True
+                        print(f"[Online] Successfully extracted tables via online HTML source -> {target_output}")
                         _trigger_zotero_sync(orig_pdf_path, target_output, online_dfs, args)
                         return True
+                else:
+                    # 暂不提前落盘至 target_output，避免第一次写出追加脚注/转换上下标后在合并阶段二次读盘自相冲突产生 _p{N}/_v2 重复文件
+                    extracted_online = True
                     print(f"[Online -> PDF Supplement] 已保留 {len(online_dfs)} 个在线表格，将由本地 PDF 管线补充剩余缺失表格...")
             else:
                 print("[Online] Online extraction returned no tables; falling back to PDF.")
@@ -887,8 +891,16 @@ def _do_process_single_pdf(pdf_path, orig_pdf_path, args, is_batch=False, plan=N
     if online_only:
         print("[Mode] --online-only set. Skipping PDF fallback.")
         if extracted_online:
-            _trigger_zotero_sync(orig_pdf_path, target_output, online_dfs, args)
-        return extracted_online
+            save_ok = save_tables_to_excel(
+                online_dfs, target_output,
+                getattr(args, 'headers', None), single_file,
+                skip_supplementary=getattr(args, 'skip_supplementary', False)
+            )
+            if save_ok:
+                _trigger_zotero_sync(orig_pdf_path, target_output, online_dfs, args)
+                return True
+            return False
+        return False
 
     # 2. PDF 本地提取模式（结构化优先，OCR 兜底）
     print("[PDF] Executing structured table extraction pipeline...")
@@ -963,7 +975,14 @@ def _do_process_single_pdf(pdf_path, orig_pdf_path, args, is_batch=False, plan=N
 
         try:
             print("[PDF -> PP-StructureV3] 正在使用 PP-StructureV3 / 切图识别表格并导出 Excel...")
-            if export_crops_to_excel(pdf_path, target_output, existing_dfs=online_dfs):
+            crop_kwargs = {"existing_dfs": online_dfs}
+            if online_skip_labels:
+                crop_kwargs["skip_labels"] = online_skip_labels
+            try:
+                crop_ok = export_crops_to_excel(pdf_path, target_output, **crop_kwargs)
+            except TypeError:
+                crop_ok = export_crops_to_excel(pdf_path, target_output, existing_dfs=online_dfs)
+            if crop_ok:
                 print(f"[PDF -> PP-StructureV3] 已成功识别并导出表格至: {target_output}")
                 exported_dfs = list(online_dfs) if online_dfs else []
                 _trigger_zotero_sync(orig_pdf_path, target_output, exported_dfs, args)
@@ -971,10 +990,17 @@ def _do_process_single_pdf(pdf_path, orig_pdf_path, args, is_batch=False, plan=N
         except Exception as e:
             print(f"[PDF -> PP-StructureV3 Notice] Export notice: {e}")
 
-    # 如果在线已经提取并保存了部分表格，即使本地补充未抓取到更多表格，也视为任务成功
-    if extracted_online:
-        _trigger_zotero_sync(orig_pdf_path, target_output, online_dfs, args)
-        return True
+    # 如果在线已经提取了部分表格，即使本地补充未抓取到更多表格，在此统一落盘并视为任务成功
+    if extracted_online and online_dfs:
+        save_ok = save_tables_to_excel(
+            online_dfs, target_output,
+            getattr(args, 'headers', None), single_file,
+            skip_supplementary=getattr(args, 'skip_supplementary', False)
+        )
+        if save_ok:
+            _trigger_zotero_sync(orig_pdf_path, target_output, online_dfs, args)
+            return True
+        return False
 
     return False
 

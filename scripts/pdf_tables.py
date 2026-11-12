@@ -42,7 +42,7 @@ try:
     from .pdf_page_filter import page_may_contain_tables
     from .doclayout_yolo_detector import DocLayoutYoloDetector
     from .excel_export import save_tables_to_excel
-    from .table_postprocess import smart_flatten_headers
+    from .table_postprocess import smart_flatten_headers, parse_structured_vlm_content
 except ImportError:
     try:
         from common import load_config, make_unique_columns
@@ -50,7 +50,7 @@ except ImportError:
         from pdf_page_filter import page_may_contain_tables
         from doclayout_yolo_detector import DocLayoutYoloDetector
         from excel_export import save_tables_to_excel
-        from table_postprocess import smart_flatten_headers
+        from table_postprocess import smart_flatten_headers, parse_structured_vlm_content
     except ImportError:
         load_config = lambda: {}
         make_unique_columns = lambda cols: [str(c) for c in cols]
@@ -59,6 +59,7 @@ except ImportError:
         DocLayoutYoloDetector = None
         save_tables_to_excel = None
         smart_flatten_headers = None
+        parse_structured_vlm_content = None
 
 
 def get_page_effective_rotation(page):
@@ -217,12 +218,16 @@ def probe_disjoint_native_tables(page) -> int:
                     if not matched:
                         span_groups.append([l])
 
+                raw_h = getattr(getattr(page, 'rect', None), 'height', 842.0)
+                page_h = float(raw_h) if isinstance(raw_h, (int, float)) and raw_h > 0 else 842.0
+
                 for grp in span_groups:
                     if len(grp) < 2:
                         continue
                     grp.sort(key=lambda b: (b[1] + b[3]) / 2.0)
                     curr_tbl = [grp[0]]
                     has_large_gap = False
+                    max_body_gap = max(700.0, page_h * 0.88) if len(grp) <= 3 else 350.0
 
                     for i in range(1, len(grp)):
                         prev_y = (curr_tbl[-1][1] + curr_tbl[-1][3]) / 2.0
@@ -243,8 +248,8 @@ def probe_disjoint_native_tables(page) -> int:
                                 has_large_gap = False
                             else:
                                 curr_tbl.append(grp[i])
-                        elif gap <= 350.0 and not has_large_gap and len(curr_tbl) <= 2:
-                            # 三线表或双线表表体跨度：允许在表头 1~2 条线后出现一次跨度 (最高 350pt)
+                        elif gap <= max_body_gap and not has_large_gap and len(curr_tbl) <= 2:
+                            # 三线表或双线续表表体跨度：允许在表头 1~2 条线后出现一次大跨度（兼容整页无表题续表的顶线与底线）
                             curr_tbl.append(grp[i])
                             has_large_gap = True
                         else:
@@ -462,8 +467,8 @@ def extract_table_crops_from_pdf(
 
                 # 条件 1：Caption 声明数多于 YOLO 切图数
                 has_caption_deficit = len(decls_on_p) > crops_on_p
-                # 条件 2：页面缺少 Caption 声明（或声明数不足），但原生信号表明存在多个独立表格结构，而 YOLO 检出切图不足 (如仅检出 1 个或更少切图)
-                has_native_multitable_deficit = (crops_on_p < native_cnt_on_p) and (native_cnt_on_p >= 2)
+                # 条件 2：页面缺少 Caption 声明（或声明数不足），但原生信号表明存在独立表格结构，而 YOLO 检出切图不足
+                has_native_multitable_deficit = (crops_on_p < native_cnt_on_p) and (native_cnt_on_p >= 1)
 
                 if (has_caption_deficit or has_native_multitable_deficit) and p not in missing_pages:
                     missing_pages.append(p)
@@ -1049,8 +1054,7 @@ def crop_to_dataframe(pdf_path: str, crop_info: Dict[str, Any], dpi: int = 200) 
         # PP-Structure 或 VLM 产出的结构化 markdown / html 兜底解析
         if crop_info.get("markdown"):
             try:
-                from table_postprocess import parse_structured_vlm_content
-                dfs = parse_structured_vlm_content(crop_info["markdown"])
+                dfs = parse_structured_vlm_content(crop_info["markdown"]) if parse_structured_vlm_content is not None else []
                 if dfs:
                     df = dfs[0]
                     if crop_info.get('label') and not df.attrs.get('label'):
@@ -1091,64 +1095,162 @@ def crop_to_dataframe(pdf_path: str, crop_info: Dict[str, Any], dpi: int = 200) 
         crop_info["ocr_reason"] = reg_info["ocr_reason"]
         crop_info["region_vector_text"] = reg_info["text"]
 
-    # --- 优先: PyMuPDF find_tables() 结构化提取 ---
-    try:
-        finder = page.find_tables()
-        best_table = None
-        best_overlap = 0.0
-        crop_area = crop_rect.width * crop_rect.height
-        for t in finder.tables:
-            t_rect = fitz.Rect(t.bbox)
-            inter = crop_rect & t_rect
-            if inter.is_empty or inter.width <= 0 or inter.height <= 0:
-                continue
-            overlap = (inter.width * inter.height) / crop_area if crop_area > 0 else 0
-            if overlap > best_overlap:
-                best_overlap = overlap
-                best_table = t
-        if best_table is not None and best_overlap > 0.3:
-            rows = best_table.extract()
-            clean_rows = []
-            for row in rows:
-                clean_row = [("" if cell is None else str(cell).strip()) for cell in row]
-                if any(c for c in clean_row):
-                    clean_rows.append(clean_row)
-            if len(clean_rows) >= 2:
-                df = pd.DataFrame(clean_rows[1:], columns=clean_rows[0])
-                df.attrs['label'] = crop_info.get('label', '')
-                df.attrs['table_title'] = crop_info.get('caption', '')
-    except Exception as e:
-        print(f"[PDF-Tables] find_tables() 不可用，回退样式感知/word-level: {e}")
+    force_visual_ocr = bool(crop_info.get("needs_ocr"))
 
-    # --- 增强回退 1: 基于 pdf_inspector 的样式感知多行表头与注脚分离重建 ---
-    if df is None or df.empty:
+    if not force_visual_ocr:
+        # --- 优先: PyMuPDF find_tables() 结构化提取 ---
         try:
-            df, cap_style, fn_style = rebuild_df_with_style_hierarchy(
-                pdf_path, crop_info["page_index"], crop_rect, page.rect.height,
-                crop_bbox=crop_bbox, dpi=crop_dpi
-            )
-            if df is not None and not df.empty:
-                # 质量门禁：检查是否发生列挤压、列数过少或低质量
-                try:
-                    from common import is_table_squeezed, is_table_low_quality
-                    if is_table_squeezed(df) or is_table_low_quality(df) or df.shape[1] < 2:
-                        logger.debug("[PDF-Tables] rebuild_df_with_style_hierarchy 存在列挤压或低质量，回退到后续策略")
-                        df = None
-                except Exception:
-                    pass
-            if df is not None and not df.empty:
-                df.attrs['label'] = crop_info.get('label', '')
-                df.attrs['table_title'] = cap_style or crop_info.get('caption', '')
-                caption = cap_style
-                footnote = fn_style
-        except Exception as e_style:
-            logger.debug(f"[PDF-Tables] rebuild_df_with_style_hierarchy 提示: {e_style}")
+            finder = page.find_tables()
+            best_table = None
+            best_overlap = 0.0
+            crop_area = crop_rect.width * crop_rect.height
+            for t in finder.tables:
+                t_rect = fitz.Rect(t.bbox)
+                inter = crop_rect & t_rect
+                if inter.is_empty or inter.width <= 0 or inter.height <= 0:
+                    continue
+                overlap = (inter.width * inter.height) / crop_area if crop_area > 0 else 0
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_table = t
+            if best_table is not None and best_overlap > 0.3:
+                rows = best_table.extract()
+                clean_rows = []
+                for row in rows:
+                    clean_row = [("" if cell is None else str(cell).strip()) for cell in row]
+                    if any(c for c in clean_row):
+                        clean_rows.append(clean_row)
+                if len(clean_rows) >= 2:
+                    df = pd.DataFrame(clean_rows[1:], columns=clean_rows[0])
+                    df.attrs['label'] = crop_info.get('label', '')
+                    df.attrs['table_title'] = crop_info.get('caption', '')
+        except Exception as e:
+            print(f"[PDF-Tables] find_tables() 不可用，回退样式感知/word-level: {e}")
 
-    # --- 传统兜底 2: word-level 按列聚类重建 ---
+        # --- 增强回退 1: 基于 pdf_inspector 的样式感知多行表头与注脚分离重建 ---
+        if df is None or df.empty:
+            try:
+                df, cap_style, fn_style = rebuild_df_with_style_hierarchy(
+                    pdf_path, crop_info["page_index"], crop_rect, page.rect.height,
+                    crop_bbox=crop_bbox, dpi=crop_dpi
+                )
+                if df is not None and not df.empty:
+                    # 质量门禁：检查是否发生列挤压、列数过少或低质量
+                    try:
+                        from common import is_table_squeezed, is_table_low_quality
+                        if is_table_squeezed(df) or is_table_low_quality(df) or df.shape[1] < 2:
+                            logger.debug("[PDF-Tables] rebuild_df_with_style_hierarchy 存在列挤压或低质量，回退到后续策略")
+                            df = None
+                    except Exception:
+                        pass
+                if df is not None and not df.empty:
+                    df.attrs['label'] = crop_info.get('label', '')
+                    df.attrs['table_title'] = cap_style or crop_info.get('caption', '')
+                    caption = cap_style
+                    footnote = fn_style
+            except Exception as e_style:
+                logger.debug(f"[PDF-Tables] rebuild_df_with_style_hierarchy 提示: {e_style}")
+
+        # --- 传统兜底 2: word-level 按列聚类重建 ---
+        if df is None or df.empty:
+            words = page.get_text("words", clip=crop_rect)
+            if words:
+                df, caption, footnote = _rebuild_df_from_words(words, crop_rect)
+
+    # --- 视觉/OCR 兜底 3: 当 needs_ocr 为真或矢量/word 重建均为空时，调用 RapidTable / Docling / VLM ---
     if df is None or df.empty:
-        words = page.get_text("words", clip=crop_rect)
-        if words:
-            df, caption, footnote = _rebuild_df_from_words(words, crop_rect)
+        crop_img = crop_info.get("image")
+        if crop_img is None and Image is not None:
+            try:
+                pix = page.get_pixmap(clip=crop_rect, dpi=max(200, int(crop_dpi)))
+                crop_img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            except Exception:
+                crop_img = None
+
+        # 3a. RapidTable 局部切图结构识别
+        if crop_img is not None:
+            try:
+                try:
+                    from .rapid_table_extractor import get_rapid_table_extractor
+                except ImportError:
+                    from rapid_table_extractor import get_rapid_table_extractor
+                rt_ext = get_rapid_table_extractor()
+                if rt_ext is not None and rt_ext.is_available():
+                    rt_df = rt_ext.extract_table_from_image(crop_img)
+                    if rt_df is not None and not rt_df.empty:
+                        df = rt_df
+                        df.attrs["extractor"] = "rapid_table_crop"
+            except Exception as e_rt:
+                logger.debug(f"[PDF-Tables] RapidTable 切图兜底提示: {e_rt}")
+
+        p_idx = int(crop_info.get("page_index", 0))
+        t_idx = int(crop_info.get("table_index", 0))
+
+        # 3b. IBM Docling (TableFormer) 离线高精度提取兜底
+        if (df is None or df.empty) and crop_info.get("needs_ocr", True):
+            try:
+                try:
+                    from . import ocr_client as _ocr_mod
+                except ImportError:
+                    import ocr_client as _ocr_mod
+                if hasattr(_ocr_mod, "extract_via_docling"):
+                    docling_items = _ocr_mod.extract_via_docling(pdf_path, pages=[p_idx])
+                    if docling_items:
+                        chosen_docling = None
+                        best_ov = 0.0
+                        c_area = max(1.0, crop_rect.width * crop_rect.height)
+                        for d_item in docling_items:
+                            d_box = d_item.get("bbox")
+                            d_df = d_item.get("df")
+                            if d_df is None or d_df.empty:
+                                continue
+                            if d_box and len(d_box) >= 4:
+                                inter = crop_rect & fitz.Rect(d_box)
+                                if not inter.is_empty and inter.width > 0 and inter.height > 0:
+                                    ov = (inter.width * inter.height) / c_area
+                                    if ov > best_ov:
+                                        best_ov = ov
+                                        chosen_docling = d_df
+                        if chosen_docling is None:
+                            valid_d_dfs = [it["df"] for it in docling_items if it.get("df") is not None and not it["df"].empty]
+                            if valid_d_dfs:
+                                chosen_docling = valid_d_dfs[t_idx] if 0 <= t_idx < len(valid_d_dfs) else valid_d_dfs[0]
+                        if chosen_docling is not None and not chosen_docling.empty:
+                            df = chosen_docling
+                            df.attrs["extractor"] = "docling_crop_fallback"
+            except Exception as e_doc:
+                logger.debug(f"[PDF-Tables] Docling 切图兜底提示: {e_doc}")
+
+        # 3c. OCR / VLM 云端与多引擎回退
+        if (df is None or df.empty) and crop_info.get("needs_ocr", True):
+            try:
+                try:
+                    from . import ocr_client as _ocr_mod
+                except ImportError:
+                    import ocr_client as _ocr_mod
+                md_text = _ocr_mod.extract_tables_with_fallback(pdf_path, pages=[p_idx])
+                if md_text:
+                    _parse_fn = globals().get("parse_structured_vlm_content")
+                    if _parse_fn is None:
+                        try:
+                            import table_postprocess
+                            _parse_fn = getattr(table_postprocess, "parse_structured_vlm_content", None)
+                        except Exception:
+                            _parse_fn = None
+                    if _parse_fn is not None:
+                        ocr_dfs = _parse_fn(md_text)
+                        if ocr_dfs:
+                            df = ocr_dfs[t_idx] if 0 <= t_idx < len(ocr_dfs) else ocr_dfs[0]
+                            df.attrs["extractor"] = "ocr_crop_fallback"
+            except Exception as e_ocr:
+                logger.debug(f"[PDF-Tables] OCR 切图兜底提示: {e_ocr}")
+
+        if df is not None and not df.empty:
+            if not df.attrs.get("label") and crop_info.get("label"):
+                df.attrs["label"] = crop_info.get("label", "")
+            if not df.attrs.get("table_title") and (caption or crop_info.get("caption")):
+                df.attrs["table_title"] = caption or crop_info.get("caption", "")
+            df.attrs["page_idx"] = crop_info.get("page_index", 0)
 
     doc.close()
     return df, caption, footnote
@@ -1159,7 +1261,8 @@ def export_crops_to_excel(
     output_excel_path: str,
     crops: Optional[List[Dict[str, Any]]] = None,
     pages: Optional[List[int]] = None,
-    existing_dfs: Optional[List[pd.DataFrame]] = None
+    existing_dfs: Optional[List[pd.DataFrame]] = None,
+    skip_labels: Optional[Any] = None,
 ) -> bool:
     """
     将 DocLayout-YOLO 检测到的所有表格 Crop 重建并保存至 Excel 文件中。
@@ -1179,9 +1282,51 @@ def export_crops_to_excel(
         print("[PDF-Tables] 未提取到有效的表格 Crop 且无既有表格。")
         return False
 
+    try:
+        from .common import format_table_label as _fmt_lbl, TABLE_LABEL_RE as _lbl_re
+        from .excel_export import make_safe_filename as _safe_fn
+    except ImportError:
+        from common import format_table_label as _fmt_lbl, TABLE_LABEL_RE as _lbl_re
+        from excel_export import make_safe_filename as _safe_fn
+
+    skip_norm = set()
+    for s_lbl in (skip_labels or []):
+        if not s_lbl:
+            continue
+        s_str = str(s_lbl).strip()
+        skip_norm.add(s_str)
+        skip_norm.add(s_str.replace("_", " "))
+        skip_norm.add(s_str.replace(" ", "_"))
+        for variant in (s_str, s_str.replace("_", " ")):
+            fmt_s = _fmt_lbl(variant)
+            if fmt_s:
+                skip_norm.add(fmt_s)
+                skip_norm.add(fmt_s.replace(" ", "_"))
+                skip_norm.add(_safe_fn(fmt_s))
+
+    def _matches_skip_label(*candidates: Any) -> bool:
+        if not skip_norm:
+            return False
+        for cand in candidates:
+            if not cand:
+                continue
+            c_str = str(cand).strip()
+            if not c_str:
+                continue
+            if c_str in skip_norm:
+                return True
+            m = _lbl_re.search(c_str)
+            raw_lbl = m.group(0) if m else c_str
+            fmt_c = _fmt_lbl(raw_lbl)
+            if fmt_c and (fmt_c in skip_norm or _safe_fn(fmt_c) in skip_norm):
+                return True
+        return False
+
     # 先收集有效 df，不触碰磁盘
     valid_tables = []  # list of (df, page_index, table_index)
     for i, crop in enumerate(crops or []):
+        if _matches_skip_label(crop.get("label"), crop.get("caption")):
+            continue
         df, caption, footnote = crop_to_dataframe(pdf_path, crop)
         if df is not None and not df.empty:
             # 附加 caption/footnote 到 attrs
@@ -1189,6 +1334,9 @@ def export_crops_to_excel(
                 df.attrs['table_title'] = caption
             if not df.attrs.get('label') and crop.get('label'):
                 df.attrs['label'] = crop['label']
+            if _matches_skip_label(df.attrs.get('label'), df.attrs.get('table_title'), caption):
+                print(f"[PDF-Tables] Page {crop['page_index']+1} crop#{i+1} 命中 skip_labels，跳过重复导出")
+                continue
             valid_tables.append((df, crop['page_index'], i))
             print(f"[PDF-Tables] Page {crop['page_index']+1} crop#{i+1} -> DataFrame {df.shape}")
         else:
