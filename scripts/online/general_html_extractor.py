@@ -369,85 +369,86 @@ def _extract_anchor_table(page, fragment: str, target_table_num: int):
     3. Extract it as a DataFrame
     """
     try:
-        rows_data = page.evaluate(f"""
-        () => {{
-            // Find anchor element
-            const anchor = document.getElementById('{fragment}') ||
-                           document.querySelector('[data-table="{fragment}"]') ||
-                           document.querySelector('[id="{fragment}"]');
+        rows_data = page.evaluate("""
+        (frag) => {
+            if (!frag) return null;
+            // Find anchor element safely without CSS selector interpolation
+            const anchor = document.getElementById(frag) ||
+                           Array.from(document.querySelectorAll('[data-table]')).find(e => e.getAttribute('data-table') === frag) ||
+                           Array.from(document.querySelectorAll('[id]')).find(e => e.getAttribute('id') === frag);
             if (!anchor) return null;
 
             // Search for a table: first inside the anchor, then walking up siblings
             let tableEl = anchor.querySelector('table');
-            if (!tableEl) {{
+            if (!tableEl) {
                 // Walk up to parent, then look at siblings and their descendants
                 let parent = anchor.parentElement;
-                for (let depth = 0; depth < 5 && parent && !tableEl; depth++) {{
+                for (let depth = 0; depth < 5 && parent && !tableEl; depth++) {
                     tableEl = parent.querySelector('table');
                     parent = parent.parentElement;
-                }}
-            }}
-            if (!tableEl) {{
+                }
+            }
+            if (!tableEl) {
                 // Try next sibling elements
                 let sibling = anchor.nextElementSibling;
-                for (let i = 0; i < 5 && sibling && !tableEl; i++) {{
+                for (let i = 0; i < 5 && sibling && !tableEl; i++) {
                     if (sibling.tagName === 'TABLE') tableEl = sibling;
                     else tableEl = sibling.querySelector('table');
                     sibling = sibling.nextElementSibling;
-                }}
-            }}
+                }
+            }
             if (!tableEl) return null;
 
             // Extract caption/title
             let caption = '';
             const cap = tableEl.querySelector('caption');
             if (cap) caption = cap.innerText.trim();
-            if (!caption) {{
+            if (!caption) {
                 // Try previous sibling heading
                 let prev = tableEl.previousElementSibling || anchor;
-                for (let i = 0; i < 4 && prev; i++) {{
+                for (let i = 0; i < 4 && prev; i++) {
                     const txt = (prev.innerText || prev.textContent || '').trim();
-                    if (txt && (txt.toLowerCase().includes('table') || txt.includes('表'))) {{
+                    if (txt && (txt.toLowerCase().includes('table') || txt.includes('表'))) {
                         caption = txt;
                         break;
-                    }}
+                    }
                     prev = prev.previousElementSibling;
-                }}
-            }}
+                }
+            }
 
             // Extract rows with rowspan/colspan expansion
             const grid = [];
-            const occupied = {{}};
-            const mark = (r, c) => {{ if (!occupied[r]) occupied[r] = {{}}; occupied[r][c] = true; }};
-            const nextFreeCol = (r, startC) => {{ let c = startC; while (occupied[r] && occupied[r][c]) c++; return c; }};
-            tableEl.querySelectorAll('tr').forEach((tr, r) => {{
-                if (!grid[r]) grid[r] = {{}};
+            const occupied = {};
+            const mark = (r, c) => { if (!occupied[r]) occupied[r] = {}; occupied[r][c] = true; };
+            const nextFreeCol = (r, startC) => { let c = startC; while (occupied[r] && occupied[r][c]) c++; return c; };
+            tableEl.querySelectorAll('tr').forEach((tr, r) => {
+                if (!grid[r]) grid[r] = {};
                 let col = 0;
-                tr.querySelectorAll('td, th').forEach(cell => {{
+                tr.querySelectorAll('td, th').forEach(cell => {
                     col = nextFreeCol(r, col);
                     const rs = parseInt(cell.getAttribute('rowspan') || '1', 10);
                     const cs = parseInt(cell.getAttribute('colspan') || '1', 10);
                     const text = (cell.innerText || cell.textContent || '').trim().replace(/\\s+/g, ' ');
-                    for (let dr = 0; dr < rs; dr++) for (let dc = 0; dc < cs; dc++) {{
-                        if (!grid[r+dr]) grid[r+dr] = {{}};
+                    for (let dr = 0; dr < rs; dr++) for (let dc = 0; dc < cs; dc++) {
+                        if (!grid[r+dr]) grid[r+dr] = {};
                         grid[r+dr][col+dc] = text; mark(r+dr, col+dc);
-                    }}
+                    }
                     col += cs;
-                }});
-            }});
+                });
+            });
             const nRows = grid.length;
             let nCols = 0;
-            for (let r = 0; r < nRows; r++) if (grid[r]) {{ const mx = Math.max(...Object.keys(grid[r]).map(Number)); if (mx+1 > nCols) nCols = mx+1; }}
+            for (let r = 0; r < nRows; r++) if (grid[r]) { const mx = Math.max(...Object.keys(grid[r]).map(Number)); if (mx+1 > nCols) nCols = mx+1; }
             const rows = [];
-            for (let r = 0; r < nRows; r++) {{
+            for (let r = 0; r < nRows; r++) {
                 const row = [];
                 for (let c = 0; c < nCols; c++) row.push((grid[r] && grid[r][c] !== undefined) ? grid[r][c] : '');
                 if (row.some(v => v.trim())) rows.push(row);
-            }}
+            }
 
-            return {{ caption, rows }};
-        }}
-        """)
+            return { caption, rows };
+        }
+        """, fragment)
 
         if not rows_data or not rows_data.get('rows'):
             return []
@@ -1242,12 +1243,12 @@ def extract_general_html_tables(url, table_idx="all", headed=False, user_data_di
                 # If fragment target, scroll to anchor element to trigger lazy-loading
                 if fragment:
                     try:
-                        page.evaluate(f"""() => {{
-                            const el = document.getElementById('{fragment}') ||
-                                       document.querySelector('[data-table=\"{fragment}\"]') ||
-                                       document.querySelector('#{fragment}');
-                            if (el) el.scrollIntoView({{behavior: 'instant', block: 'center'}});
-                        }}""")
+                        page.evaluate("""(frag) => {
+                            if (!frag) return;
+                            const el = document.getElementById(frag) ||
+                                       Array.from(document.querySelectorAll('[data-table]')).find(e => e.getAttribute('data-table') === frag);
+                            if (el) el.scrollIntoView({behavior: 'instant', block: 'center'});
+                        }""", fragment)
                         page.wait_for_timeout(2000)  # wait for lazy-loaded content after scroll
                     except Exception:
                         pass
@@ -1332,11 +1333,11 @@ def extract_general_html_tables(url, table_idx="all", headed=False, user_data_di
                                 print(f"     · Table {idx} ({table_id}) 未订阅或被 Cloudflare 拦截。")
                                 consecutive_fails += 1
                             else:
-                                df = pd.read_csv(temp_csv_path)
-                                if not df.empty and len(df.columns) >= 2:
+                                df = pd.read_csv(temp_csv_path, dtype=str, keep_default_na=False)
+                                if not df.empty and len(df.columns) >= 1:
                                     df.columns = [clean_text(c) for c in df.columns]
-                                    for col in df.columns:
-                                        df[col] = df[col].astype(str).apply(clean_text)
+                                    for col_i in range(len(df.columns)):
+                                        df.iloc[:, col_i] = df.iloc[:, col_i].astype(str).apply(clean_text)
                                     df.attrs['table_title'] = f"Table {idx}"
                                     all_dfs.append(df)
                                     print(f"     ✓ 成功下载并解析 Table {idx} (Shape: {df.shape[0]}x{df.shape[1]})")
@@ -1356,9 +1357,17 @@ def extract_general_html_tables(url, table_idx="all", headed=False, user_data_di
                     if consecutive_fails >= 2:
                         print(f"[通用自动化] 连续 {consecutive_fails} 次下载失败或结束，停止 T&F 直连下载。")
                         break
-        # ── NEW: prioritize anchor-targeted table for Springer/Nature inline tables ──
+        # ── NEW: prioritize anchor-targeted table for Springer/Nature inline tables (including iframes) ──
         if fragment and target_table_num is not None:
             anchor_dfs = _extract_anchor_table(page, fragment, target_table_num)
+            if not anchor_dfs:
+                for frame in page.frames:
+                    try:
+                        anchor_dfs = _extract_anchor_table(frame, fragment, target_table_num)
+                        if anchor_dfs:
+                            break
+                    except Exception:
+                        pass
             if anchor_dfs:
                 print(f"[通用自动化] 通过锚点 #{fragment} 直接提取到 {len(anchor_dfs)} 个内联表格。")
                 all_dfs.extend(anchor_dfs)

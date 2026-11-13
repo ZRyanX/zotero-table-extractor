@@ -92,14 +92,17 @@ class LLMTableReasoner:
         response_format: Optional[Dict[str, Any]] = None
     ) -> Optional[str]:
         """统一调用 OpenAI-Compatible Chat Completion 接口。"""
-        if not self.is_available():
+        base_lower = (self.api_base or "").lower()
+        is_local_endpoint = any(h in base_lower for h in ("localhost", "127.0.0.1", "0.0.0.0", "::1"))
+        if not self.enabled or (not self.api_key and not is_local_endpoint):
             return None
 
         url = f"{self.api_base}/chat/completions"
         headers = {
-            "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json"
         }
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
         payload = {
             "model": self.model,
             "messages": messages,

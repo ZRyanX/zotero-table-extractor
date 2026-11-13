@@ -58,6 +58,19 @@ def scan_pdf_table_declarations(pdf_path: str) -> Dict[int, List[Dict[str, Any]]
     try:
         doc = fitz.open(pdf_path)
         num_pages = len(doc)
+        in_references_section = False
+        _ref_heading_re = re.compile(
+            r'^\s*(?:\d+(?:\.\d+)*[\.\s]*)?(?:references|bibliography|literature\s+cited|参\s*考\s*文\s*献)\s*[:：]?\s*$',
+            re.IGNORECASE,
+        )
+        _post_ref_heading_re = re.compile(
+            r'^\s*(?:(?:appendix(?:\s+[a-z0-9]+)?|supplementary(?:\s+(?:information|material|materials|data|tables?))?|supporting\s+information|附\s*录|附\s*表|补充材料|补充表格)\b|(?:list\s+of\s+)?tables?\s*[:：]?\s*$)',
+            re.IGNORECASE,
+        )
+        _citation_marker_re = re.compile(
+            r'(?:\bdoi\s*:|https?://|\bpp\.\s*\d+|\bvol\.\s*\d+|\bet\s+al\.|\(\s*(?:19|20)\d{2}[a-z]?\s*\)|^\s*\[\d+\])',
+            re.IGNORECASE,
+        )
         for p_idx in range(num_pages):
             page = doc[p_idx]
             text = page.get_text("text")
@@ -75,7 +88,6 @@ def scan_pdf_table_declarations(pdf_path: str) -> Dict[int, List[Dict[str, Any]]
 
             lines = text.split('\n')
             page_caps = []
-            in_references_section = False
 
             for idx_l, line in enumerate(lines):
                 line_clean = line.strip().replace('\xa0', ' ').replace('\u3000', ' ').translate(trans_fw)
@@ -86,14 +98,26 @@ def scan_pdf_table_declarations(pdf_path: str) -> Dict[int, List[Dict[str, Any]]
                 if re.search(r'(?:\.{3,}|…{2,})\s*\d+\s*$', line_clean):
                     continue
 
-                # 检测独立成行的参考文献标题（不直接跳过整页，保留同页前置表或后续附录表）
-                if p_idx > num_pages * 0.7 and re.match(
-                    r'^\s*(?:\d+[\.\s]*)?(?:references|bibliography|参\s*考\s*文\s*献)\s*$',
-                    line_clean,
-                    re.IGNORECASE,
-                ):
+                # 检测独立成行的参考文献标题（跨页维持状态，遇到附录/补充表标题时恢复）
+                if p_idx >= int(num_pages * 0.6) and _ref_heading_re.match(line_clean):
                     in_references_section = True
                     continue
+
+                if in_references_section:
+                    # 显式附录/补充材料小节标题，离开参考文献区
+                    if _post_ref_heading_re.match(line_clean) and not _citation_marker_re.search(line_clean):
+                        in_references_section = False
+                    else:
+                        # 若同页或后续直接出现非文献引用格式的附录/补充表格声明（如 Table S1 / Table A1 / 附表1），退出参考文献区
+                        m_app_tbl = re.match(
+                            r'^[ \t]*(?:(?:Supplementary|Supporting|Extended\s+Data|Appendix)\s+Table|Table\s+[SA]\d+|附\s*表|附录表|补充表)\b',
+                            line_clean,
+                            re.IGNORECASE,
+                        )
+                        if m_app_tbl and not _citation_marker_re.search(line_clean):
+                            in_references_section = False
+                        else:
+                            continue
 
                 # 1. 检查续表声明（续表、续表1、表1（续）、表1（续一）、Table 1 (continued)、Table 1 (cont.)、Table 2 Continued、cont'd、续上表等）
                 cont_pattern = (
@@ -133,14 +157,28 @@ def scan_pdf_table_declarations(pdf_path: str) -> Dict[int, List[Dict[str, Any]]
                     if re.match(r'^(?:of\s+contents|of\s+figures|of\s+tables|shows|lists|contains|presents)\b', title_part, re.IGNORECASE):
                         continue
 
-                    # 排除正文引用（如 "如表1所示"、"在表1中"、"由表1可知"、句末点号）
+                    # 排除正文引用（如 "如表1所示"、"在表1中"、"由表1可知"），但保留仅以句号结尾或后接表注/单位的中文规范表标题
                     title_no_brackets = re.sub(r'（.*?）|\(.*?\)', '', title_part)
-                    if any(p in title_no_brackets for p in ['。', '！', '？', '!']):
+                    if any(p in title_no_brackets for p in ['！', '？', '!', '?']):
                         continue
-                    if any(title_part.startswith(p) for p in [')', '）', '中', '可以', '所示', '可知', '看出', '见', '综合表达', '显示', '表明', '为', '是', '由', '在中', '对于', '根据', 'shown', 'listed', 'summarized']):
+                    if '。' in title_no_brackets:
+                        before_dot, after_dot = title_no_brackets.split('。', 1)
+                        after_clean = re.sub(r'[；;,\s]+', '', after_dot)
+                        if after_clean and not re.match(
+                            r'^(?:注|备注|说明|其中|单位|数据来源|资料来源|Note|Notes|\*)\s*[:：]?',
+                            after_dot.strip(),
+                            re.IGNORECASE,
+                        ):
+                            continue
+                        if re.search(r'(?:所示|可知|可见|看出|表明|显示|如下|为此|因此|列出了|给出了|汇总了)$', before_dot.strip()):
+                            continue
+                    if any(title_part.startswith(p) for p in [')', '）', '中', '可以', '所示', '可知', '看出', '见', '综合表达', '显示', '表明', '为', '是', '由', '在中', '对于', '根据', '列出了', '给出了', '汇总了', '统计了', '总结了', '展示了', '反映了', '提供了', '对比了', '分析了', 'shown', 'listed', 'summarized']):
                         continue
                     if any(title_part.endswith(p) for p in ['所示', '可以看出', '表明', '可知', '见表', '来自表', '列入表', 'shown in', 'listed in']):
                         continue
+
+                    if title_part.endswith('。'):
+                        title_part = title_part.rstrip('。 ')
 
                     # 支持跨行标题前瞻
                     if not title_part and idx_l + 1 < len(lines):
@@ -214,7 +252,13 @@ def _validate_native_table_dataframe_raw(df: pd.DataFrame, page_idx: int) -> Tup
 
     # 6. 表头有效性检测（表头不能整行全为 NaN 或全是未命名无意义列）
     header_strs = [str(c).strip() for c in df.columns]
-    unnamed_cnt = sum(1 for c in header_strs if not c or c.startswith('Unnamed:') or c.startswith('Col') or c.isdigit())
+    unnamed_cnt = sum(
+        1
+        for c in header_strs
+        if not c
+        or c.isdigit()
+        or bool(re.match(r'^(?:Unnamed(?:\s*[:_]\s*\d+)?|Col(?:umn)?[_\s]*\d+)$', c, re.IGNORECASE))
+    )
     if unnamed_cnt == len(header_strs) and df.shape[0] <= 3:
         return False, "表头完全未识别且行数过少，属于残片"
 
@@ -839,12 +883,14 @@ def cross_check_missed_tables(
     for idx, t in enumerate(extracted_tables):
         if isinstance(t, pd.DataFrame):
             df = t
-            p_idx = df.attrs.get('page_idx', 0)
+            p_idx = df.attrs.get('page_idx', None)
             raw_lbl = df.attrs.get('label', '')
             title = df.attrs.get('table_title', '')
         elif isinstance(t, dict):
             df = t.get('df')
-            p_idx = t.get('page_idx', df.attrs.get('page_idx', 0) if df is not None and hasattr(df, 'attrs') else 0)
+            p_idx = t.get('page_idx')
+            if p_idx is None and df is not None and hasattr(df, 'attrs'):
+                p_idx = df.attrs.get('page_idx', None)
             raw_lbl = t.get('label') or (df.attrs.get('label') if df is not None and hasattr(df, 'attrs') else '')
             title = t.get('title') or (df.attrs.get('table_title') if df is not None and hasattr(df, 'attrs') else '')
         else:
@@ -892,7 +938,13 @@ def cross_check_missed_tables(
         except Exception:
             pass
 
-    extracted_pages = set(info['page_idx'] for info in extracted_info if info.get('page_idx') is not None)
+    extracted_pages = set()
+    for info in extracted_info:
+        if info.get('page_idx') is not None:
+            extracted_pages.add(info['page_idx'])
+        for cp in info.get('covered_pages', []):
+            if cp is not None:
+                extracted_pages.add(cp)
     uncovered_scanned_pages = [p for p in scanned_pages if p not in extracted_pages]
 
     is_complete = (len(missed_tables) == 0 and len(uncovered_scanned_pages) == 0)

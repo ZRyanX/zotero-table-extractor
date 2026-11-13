@@ -353,6 +353,89 @@ def is_markdown_separator(line: str) -> bool:
     return all(len(c) > 0 and set(c).issubset({'-', ':'}) and '-' in c for c in cells)
 
 
+def ensure_macos_corefoundation():
+    """Preload macOS CoreFoundation with RTLD_GLOBAL before importing curl_cffi/scrapling."""
+    import sys
+    if sys.platform != "darwin":
+        return True
+    try:
+        import ctypes
+        cf_path = "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+        if os.path.exists(cf_path):
+            ctypes.CDLL(cf_path, mode=ctypes.RTLD_GLOBAL)
+        return True
+    except Exception:
+        return False
+
+
+def copy_sqlite_snapshot(src_db: str, dst_db: str) -> str:
+    """Create a WAL-consistent, non-blocking snapshot copy of a SQLite database (e.g. live zotero.sqlite)."""
+    import shutil
+    import sqlite3
+    import time
+
+    dst_dir = os.path.dirname(os.path.abspath(dst_db))
+    if dst_dir:
+        os.makedirs(dst_dir, exist_ok=True)
+
+    # Do NOT call sqlite3.Connection.backup() on a potentially locked live DB:
+    # CPython's backup() loops indefinitely on SQLITE_BUSY/SQLITE_LOCKED.
+    # Instead copy main DB + -wal sidecar cleanly and validate/checkpoint on the private copy.
+    for attempt in range(2):
+        cleanup_sqlite_snapshot(dst_db)
+        shutil.copy2(src_db, dst_db)
+        wal_src = src_db + "-wal"
+        has_wal = os.path.exists(wal_src)
+        if has_wal:
+            try:
+                shutil.copy2(wal_src, dst_db + "-wal")
+            except Exception:
+                has_wal = False
+
+        conn = None
+        try:
+            conn = sqlite3.connect(dst_db)
+            conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+            if has_wal:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            return dst_db
+        except Exception:
+            if attempt == 0:
+                time.sleep(0.05)
+                continue
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    # Final best-effort copy including both -wal and -shm sidecars
+    cleanup_sqlite_snapshot(dst_db)
+    shutil.copy2(src_db, dst_db)
+    for suffix in ("-wal", "-shm"):
+        sidecar = src_db + suffix
+        if os.path.exists(sidecar):
+            try:
+                shutil.copy2(sidecar, dst_db + suffix)
+            except Exception:
+                pass
+    return dst_db
+
+
+def cleanup_sqlite_snapshot(dst_db: str):
+    """Remove temporary SQLite snapshot and any -wal/-shm sidecar files."""
+    if not dst_db:
+        return
+    for suffix in ("", "-wal", "-shm"):
+        target = dst_db + suffix
+        if os.path.exists(target):
+            try:
+                os.remove(target)
+            except Exception:
+                pass
+
+
 def clean_text(val):
     if val is None:
         return ""
@@ -362,15 +445,18 @@ def clean_text(val):
     val = " ".join(val.split())
     return val
 
-def clean_latex_and_ocr(val, enable_chemical_typo_fix: bool = False):
+def clean_latex_and_ocr(val, enable_chemical_typo_fix: bool = False, preserve_scripts: bool = False):
     """Clean raw LaTeX math markup, OCR typos, and garbled symbols.
     Aggressive chemical substitutions (H20 -> H2O, CQ -> CO2, Tin -> Tm) are decoupled
     and disabled by default to prevent destroying legitimate sample codes or mineral abbreviations.
+    When preserve_scripts=True, script markers (^{...}, _{...}, X_n) are preserved for Excel CellRichText rendering.
     """
     if not isinstance(val, str) or not val:
         return val
 
-    # 0. Remove HTML tags if present
+    # 0. Convert HTML sub/sup markup before stripping remaining tags
+    val = re.sub(r'<sub(?:\s+[^>]*)?>(.*?)</sub>', r'_{\1}', val, flags=re.IGNORECASE | re.DOTALL)
+    val = re.sub(r'<sup(?:\s+[^>]*)?>(.*?)</sup>', r'^{\1}', val, flags=re.IGNORECASE | re.DOTALL)
     val = re.sub(r'<[^>]+>', ' ', val)
     val = re.sub(r'\\n', ' ', val)
 
@@ -388,14 +474,26 @@ def clean_latex_and_ocr(val, enable_chemical_typo_fix: bool = False):
     val = val.replace(r'\approx', '≈').replace(r'\leq', '≤').replace(r'\geq', '≥').replace(r'\neq', '≠')
     val = val.replace(r'\Delta', 'Δ').replace(r'\delta', 'δ').replace(r'\mu', 'μ').replace(r'\omega', 'ω').replace(r'\phi', 'φ').replace(r'\beta', 'β').replace(r'\gamma', 'γ')
 
-    # Superscripts / subscripts cleanup: ^{206} -> 206, _{...} -> ...
-    val = re.sub(r'\^\{+([0-9a-zA-Z\+\-\*\s]+)\}+', r'^\1', val)
-    val = re.sub(r'_\{+([0-9a-zA-Z\+\-\*\s]+)\}+', r'_\1', val)
+    # Superscripts / subscripts cleanup: ^{206} -> 206 or preserved as ^{206}
+    val = re.sub(r'\^\{+([0-9a-zA-Z\+\-\*\s]+)\}+', r'^{\1}' if preserve_scripts else r'^\1', val)
+    val = re.sub(r'_\{+([0-9a-zA-Z\+\-\*\s]+)\}+', r'_{\1}' if preserve_scripts else r'_\1', val)
     val = re.sub(r'(?<=\d)\s*times\s*(?=\d)', ' × ', val)
+
+    if preserve_scripts:
+        val = val.replace('^{', '\uE000').replace('_{', '\uE001')
+        val = re.sub('(\uE000|\uE001)([^\uE002{}]*)}', '\\1\\2\uE002', val)
 
     # Strip LaTeX $ delimiters and braces
     val = val.replace('$', '').replace('\\', '').replace('{', '').replace('}', '')
-    val = re.sub(r'([A-Za-z])_([0-9]+)', r'\1\2', val)
+    if preserve_scripts:
+        val = val.replace('\uE000', '^{').replace('\uE001', '_{').replace('\uE002', '}')
+    else:
+        def _strip_chem_sub(m):
+            prefix = val[:m.start()]
+            if re.search(r'(?:^|[^A-Za-z])[a-z]{2,}$', prefix + m.group(1)):
+                return m.group(0)
+            return f"{m.group(1)}{m.group(2)}"
+        val = re.sub(r'([A-Za-z])_([0-9]+)', _strip_chem_sub, val)
     val = re.sub(r'\s*±\s*', ' ± ', val)
     val = re.sub(r'\s*\^\s*([0-9+-]+)\s*', r'^\1', val)
 
@@ -656,10 +754,17 @@ def is_table_low_quality(df) -> bool:
 def is_supplementary(title_or_label):
     if not title_or_label:
         return False
-    title_lower = str(title_or_label).lower()
-    if any(kw in title_lower for kw in ["supplement", "suppl", "supp_", "esm", "appendix", "附表", "si_", "additional"]):
+    s = str(title_or_label).strip()
+    if re.search(
+        r'(?:supplement|suppl\.?|supporting\s+info(?:rmation)?|appendix|extended\s+data\s+table|\badditional\s+(?:file|table|data|material)|\bsupp_|\b(?:table|tab\.?|表)\s*S\d+|附表|附录表|补充表)',
+        s,
+        re.IGNORECASE,
+    ):
         return True
-    if re.search(r'\bS\d+', str(title_or_label)) or re.search(r'Table\s+S\d+', str(title_or_label), re.IGNORECASE) or re.search(r'Tab\.\s+S\d+', str(title_or_label), re.IGNORECASE):
+    # Strict case-sensitive identifiers for SI / ESM / standalone S1 labels (avoids Si_ppm or "Samples S1-S5")
+    if re.search(r'(?:^|[\s/\\])(?:SI|ESM)[_\-\s](?:Table|Tab|\d|[A-Za-z])', s):
+        return True
+    if re.match(r'^\s*S\d+(?:[.\-]\d+)*\s*$', s):
         return True
     return False
 

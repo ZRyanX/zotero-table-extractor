@@ -20,8 +20,9 @@ import uuid
 import shutil
 import sqlite3
 import logging
+import html as _html
 from datetime import datetime
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
@@ -39,14 +40,16 @@ except ImportError:
     PYZOTERO_AVAILABLE = False
 
 try:
-    from .common import load_config
+    from .common import load_config, copy_sqlite_snapshot, cleanup_sqlite_snapshot
     from .system_detector import get_zotero_db_path, get_zotero_storage_dir
 except ImportError:
     try:
-        from common import load_config
+        from common import load_config, copy_sqlite_snapshot, cleanup_sqlite_snapshot
         from system_detector import get_zotero_db_path, get_zotero_storage_dir
     except ImportError:
         load_config = lambda: {}
+        copy_sqlite_snapshot = None
+        cleanup_sqlite_snapshot = None
         get_zotero_db_path = lambda: os.path.expanduser("~/Zotero/zotero.sqlite")
         get_zotero_storage_dir = lambda: os.path.expanduser("~/Zotero/storage")
 
@@ -85,13 +88,19 @@ def resolve_zotero_item_key(
         if len(cand) == 8 and cand.isalnum():
             attachment_key_cand = cand.upper()
 
-    # 安全使用 SQLite 临时副本，防止 Zotero 运行时锁库
+    # 安全使用 SQLite 临时副本（支持 WAL/SHM 快照），防止 Zotero 运行时锁库或丢失未刷盘写入
     import tempfile
     temp_dir = tempfile.gettempdir()
     temp_db = os.path.join(temp_dir, f"zotero_sync_{uuid.uuid4().hex[:8]}.sqlite")
     copied = False
     try:
-        shutil.copy2(db_path, temp_db)
+        if callable(copy_sqlite_snapshot):
+            copy_sqlite_snapshot(db_path, temp_db)
+        else:
+            shutil.copy2(db_path, temp_db)
+            for _sfx in ("-wal", "-shm"):
+                if os.path.exists(db_path + _sfx):
+                    shutil.copy2(db_path + _sfx, temp_db + _sfx)
         target_db = temp_db
         copied = True
     except Exception:
@@ -155,11 +164,16 @@ def resolve_zotero_item_key(
     except Exception as e:
         logger.debug(f"[ZoteroSync] 查询 zotero.sqlite 出错: {e}")
     finally:
-        if copied and os.path.exists(temp_db):
-            try:
-                os.remove(temp_db)
-            except Exception:
-                pass
+        if copied:
+            if callable(cleanup_sqlite_snapshot):
+                cleanup_sqlite_snapshot(temp_db)
+            elif os.path.exists(temp_db):
+                for _sfx in ("", "-wal", "-shm"):
+                    if os.path.exists(temp_db + _sfx):
+                        try:
+                            os.remove(temp_db + _sfx)
+                        except Exception:
+                            pass
 
     return parent_key, attachment_key, meta
 
@@ -167,7 +181,7 @@ def resolve_zotero_item_key(
 def format_better_notes_html(
     dfs: List[Any],
     pdf_path: str,
-    excel_path: str,
+    excel_path: Union[str, List[str]],
     metadata: Optional[Dict[str, Any]] = None,
     max_preview_rows: int = 15,
 ) -> str:
@@ -177,20 +191,32 @@ def format_better_notes_html(
     """
     meta = metadata or {}
     paper_title = meta.get("title") or os.path.splitext(os.path.basename(pdf_path))[0]
-    doi = meta.get("DOI", "")
-    excel_name = os.path.basename(excel_path)
+    doi = str(meta.get("DOI", "") or "")
+    excel_paths = [excel_path] if isinstance(excel_path, str) else [p for p in (excel_path or []) if p]
+    excel_name = ", ".join(os.path.basename(p) for p in excel_paths) if excel_paths else ""
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # 构建 HTML 表头卡片
+    safe_paper_title = _html.escape(str(paper_title), quote=True)
+    safe_doi = _html.escape(doi, quote=True)
+    safe_excel_name = _html.escape(excel_name, quote=True)
+    doi_href = _html.escape(f"https://doi.org/{doi}", quote=True)
+
+    # 构建 HTML 表头卡片（全局唯一 <style> 定义）
     cards_html = []
     cards_html.append(f"""
 <div class="better-notes-table-summary" style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; line-height: 1.5; color: #24292e;">
+  <style>
+    .better-notes-table {{ width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 8px; }}
+    .better-notes-table th {{ background-color: #f1f3f5; color: #333; font-weight: 600; padding: 6px 10px; border: 1px solid #d0d7de; text-align: left; }}
+    .better-notes-table td {{ padding: 5px 10px; border: 1px solid #d0d7de; }}
+    .better-notes-table tr:nth-child(even) {{ background-color: #fafbfc; }}
+  </style>
   <div style="background: linear-gradient(135deg, #f6f8fa 0%, #eef2f7 100%); border-left: 5px solid #0366d6; padding: 14px 18px; border-radius: 6px; margin-bottom: 20px;">
     <h2 style="margin: 0 0 8px 0; font-size: 18px; color: #0366d6;">📊 提取表格概览 (Extracted Tables Preview)</h2>
     <div style="font-size: 13px; color: #586069;">
-      <div><strong>📄 来源文献:</strong> {paper_title}</div>
-      {f"<div><strong>🔗 DOI:</strong> <a href='https://doi.org/{doi}'>{doi}</a></div>" if doi else ""}
-      <div><strong>📁 导出工作簿:</strong> <code>{excel_name}</code></div>
+      <div><strong>📄 来源文献:</strong> {safe_paper_title}</div>
+      {f"<div><strong>🔗 DOI:</strong> <a href='{doi_href}'>{safe_doi}</a></div>" if doi else ""}
+      <div><strong>📁 导出工作簿:</strong> <code>{safe_excel_name}</code></div>
       <div><strong>🔢 表格总数:</strong> {len(dfs)} 个 | <strong>⏱ 提取时间:</strong> {now_str}</div>
     </div>
   </div>
@@ -212,12 +238,17 @@ def format_better_notes_html(
             continue
 
         attrs = getattr(df, "attrs", {})
-        label = attrs.get("label") or f"Table {idx + 1}"
-        title = attrs.get("table_title") or ""
+        label = str(attrs.get("label") or f"Table {idx + 1}")
+        title = str(attrs.get("table_title") or "")
         page_idx = attrs.get("page_idx", 0)
         page_str = f"Page {page_idx + 1}" if isinstance(page_idx, int) else f"Page {page_idx}"
-        extractor = attrs.get("vote_extractor") or attrs.get("extractor") or "auto"
+        extractor = str(attrs.get("vote_extractor") or attrs.get("extractor") or "auto")
         rows_cnt, cols_cnt = df.shape
+
+        safe_label = _html.escape(label, quote=True)
+        safe_title = _html.escape(title, quote=True)
+        safe_page_str = _html.escape(page_str, quote=True)
+        safe_extractor = _html.escape(extractor, quote=True)
 
         # 截取预览行
         preview_df = df.iloc[:max_preview_rows]
@@ -234,21 +265,15 @@ def format_better_notes_html(
         card_html = f"""
   <div class="better-notes-table-card" style="margin-bottom: 24px; border: 1px solid #e1e4e8; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.04);">
     <div style="background-color: #f6f8fa; padding: 10px 16px; border-bottom: 1px solid #e1e4e8; display: flex; justify-content: space-between; align-items: center;">
-      <span style="font-weight: 600; font-size: 15px; color: #24292e;">🏷 {label}{': ' + title if title else ''}</span>
-      <span style="font-size: 12px; color: #586069; background: #e1e4e8; padding: 2px 8px; border-radius: 12px;">{page_str} | {rows_cnt}行 × {cols_cnt}列</span>
+      <span style="font-weight: 600; font-size: 15px; color: #24292e;">🏷 {safe_label}{': ' + safe_title if title else ''}</span>
+      <span style="font-size: 12px; color: #586069; background: #e1e4e8; padding: 2px 8px; border-radius: 12px;">{safe_page_str} | {rows_cnt}行 × {cols_cnt}列</span>
     </div>
     <div style="padding: 12px 16px; font-size: 12px; color: #586069; background: #ffffff;">
-      <span><strong>解析引擎:</strong> {extractor}</span>
+      <span><strong>解析引擎:</strong> {safe_extractor}</span>
     </div>
     <div style="overflow-x: auto; max-height: 420px; padding: 0 16px 12px 16px; background: #ffffff;">
-      <style>
-        .better-notes-table {{ width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 8px; }}
-        .better-notes-table th {{ background-color: #f1f3f5; color: #333; font-weight: 600; padding: 6px 10px; border: 1px solid #d0d7de; text-align: left; }}
-        .better-notes-table td {{ padding: 5px 10px; border: 1px solid #d0d7de; }}
-        .better-notes-table tr:nth-child(even) {{ background-color: #fafbfc; }}
-      </style>
       {table_html}
-      {f"<div style='font-size: 11px; color: #6a737d; margin-top: 6px; font-style: italic;'>... 仅展示前 {max_preview_rows} 行，完整数据请查阅附件 {excel_name}</div>" if is_truncated else ""}
+      {f"<div style='font-size: 11px; color: #6a737d; margin-top: 6px; font-style: italic;'>... 仅展示前 {max_preview_rows} 行，完整数据请查阅附件 {safe_excel_name}</div>" if is_truncated else ""}
     </div>
   </div>
 """
@@ -260,7 +285,7 @@ def format_better_notes_html(
 
 def sync_extracted_tables_to_zotero(
     pdf_path: str,
-    excel_path: str,
+    excel_path: Union[str, List[str]],
     dfs: List[Any],
     config: Optional[Dict[str, Any]] = None,
     force_sync: bool = False
@@ -283,27 +308,32 @@ def sync_extracted_tables_to_zotero(
         logger.debug("[ZoteroSync] ZOTERO_SYNC_ENABLED 为 False，跳过生态联动")
         return False
 
-    if not os.path.exists(excel_path):
+    excel_paths = [excel_path] if isinstance(excel_path, str) else [p for p in (excel_path or []) if p]
+    valid_excel_paths = [p for p in excel_paths if os.path.exists(p)]
+    if not valid_excel_paths:
         logger.debug("[ZoteroSync] 无有效 Excel 文件，跳过联动")
         return False
 
     if not dfs and pd is not None:
-        try:
-            excel_sheets = pd.read_excel(excel_path, sheet_name=None)
-            loaded_dfs = []
-            for sheet_name, sheet_df in excel_sheets.items():
-                if sheet_df is not None and not sheet_df.empty:
-                    sheet_df.attrs["label"] = str(sheet_name)
-                    loaded_dfs.append(sheet_df)
-            dfs = loaded_dfs
-        except Exception as e_rx:
-            logger.debug(f"[ZoteroSync] 从 Excel 读取表格列表失败: {e_rx}")
+        loaded_dfs = []
+        for x_path in valid_excel_paths:
+            try:
+                excel_sheets = pd.read_excel(x_path, sheet_name=None, dtype=str, keep_default_na=False)
+                base_lbl = os.path.splitext(os.path.basename(x_path))[0]
+                for sheet_name, sheet_df in excel_sheets.items():
+                    if sheet_df is not None and not sheet_df.empty:
+                        sheet_df.attrs["label"] = base_lbl if len(excel_sheets) == 1 else str(sheet_name)
+                        loaded_dfs.append(sheet_df)
+            except Exception as e_rx:
+                logger.debug(f"[ZoteroSync] 从 Excel 读取表格列表失败 ({x_path}): {e_rx}")
+        dfs = loaded_dfs
 
     if not dfs:
         logger.debug("[ZoteroSync] 无有效表格数据，跳过联动")
         return False
 
-    print(f"\n[Zotero-Sync] 正在启动 Zotero 与 Better-Notes 生态联动 (Target: {os.path.basename(excel_path)})...")
+    target_desc = ", ".join(os.path.basename(p) for p in valid_excel_paths)
+    print(f"\n[Zotero-Sync] 正在启动 Zotero 与 Better-Notes 生态联动 (Target: {target_desc})...")
 
     # 1. 溯源 Zotero Item
     parent_key, attach_key, metadata = resolve_zotero_item_key(pdf_path, config.get("ZOTERO_DB_PATH"))
@@ -313,8 +343,8 @@ def sync_extracted_tables_to_zotero(
         print("[Zotero-Sync] 未能在本地 Zotero 库中匹配到对应 Parent Item Key (可能为独立 PDF 或未入库文件)")
 
     # 2. 生成本地 Better-Notes HTML 预览卡片快照
-    note_html = format_better_notes_html(dfs, pdf_path, excel_path, metadata=metadata)
-    base_no_ext = os.path.splitext(excel_path)[0]
+    note_html = format_better_notes_html(dfs, pdf_path, valid_excel_paths, metadata=metadata)
+    base_no_ext = os.path.splitext(valid_excel_paths[0])[0]
     local_note_path = f"{base_no_ext}_better_notes.html"
     try:
         with open(local_note_path, "w", encoding="utf-8") as f:
@@ -345,33 +375,64 @@ def sync_extracted_tables_to_zotero(
     try:
         zot = zotero.Zotero(user_id, library_type, api_key)
 
-        # 3.1 挂载 Excel 文件为子附件
+        existing_children = []
+        try:
+            if hasattr(zot, "children"):
+                existing_children = zot.children(parent_key) or []
+        except Exception:
+            existing_children = []
+
+        existing_attachment_names = set()
+        existing_table_note = None
+        for child in existing_children:
+            cdata = child.get("data", {}) if isinstance(child, dict) else {}
+            itype = cdata.get("itemType")
+            if itype == "attachment":
+                fname = cdata.get("filename") or cdata.get("title") or ""
+                if fname:
+                    existing_attachment_names.add(os.path.basename(fname))
+            elif itype == "note":
+                tags = {t.get("tag") for t in cdata.get("tags", []) if isinstance(t, dict)}
+                if {"table-extractor", "better-notes"}.issubset(tags) or "better-notes-table-summary" in cdata.get("note", ""):
+                    existing_table_note = child
+
+        # 3.1 挂载 Excel 文件为子附件（去重，避免重复运行多次挂同一附件）
         if attach_xlsx:
             try:
-                print(f"[Zotero-Sync] 正在挂载 Excel 表格附件至条目 {parent_key}...")
-                zot.attachment_simple([excel_path], parent_key)
-                print(f"[Zotero-Sync] ✓ Excel 表格已成功作为附件挂载至 Zotero 条目 [{parent_key}]！")
+                to_attach = [p for p in valid_excel_paths if os.path.basename(p) not in existing_attachment_names]
+                if to_attach:
+                    print(f"[Zotero-Sync] 正在挂载 {len(to_attach)} 个 Excel 表格附件至条目 {parent_key}...")
+                    zot.attachment_simple(to_attach, parent_key)
+                    print(f"[Zotero-Sync] ✓ Excel 表格已成功作为附件挂载至 Zotero 条目 [{parent_key}]！")
+                else:
+                    print(f"[Zotero-Sync] Excel 附件已存在于条目 [{parent_key}]，跳过重复上传")
             except Exception as e_att:
                 print(f"[Zotero-Sync Warning] 挂载 Excel 附件失败: {e_att}")
 
-        # 3.2 创建 Better-Notes 预览笔记条目
+        # 3.2 创建或更新 Better-Notes 预览笔记条目（避免重复写入多条笔记）
         if better_notes_enabled:
             try:
-                print(f"[Zotero-Sync] 正在为条目 {parent_key} 创建 Better-Notes 表格概览笔记...")
-                note_payload = {
-                    "itemType": "note",
-                    "parentItem": parent_key,
-                    "note": note_html,
-                    "tags": [
-                        {"tag": "table-extractor"},
-                        {"tag": "better-notes"}
-                    ]
-                }
-                res = zot.create_items([note_payload])
-                if res and res.get("successful"):
-                    print(f"[Zotero-Sync] ✓ Better-Notes 概览笔记已成功写入 Zotero (Key: {list(res['successful'].keys())})！")
+                if existing_table_note and hasattr(zot, "update_item") and "data" in existing_table_note:
+                    print(f"[Zotero-Sync] 正在更新条目 {parent_key} 既有 Better-Notes 表格概览笔记...")
+                    existing_table_note["data"]["note"] = note_html
+                    zot.update_item(existing_table_note)
+                    print(f"[Zotero-Sync] ✓ Better-Notes 概览笔记已更新 (Key: {existing_table_note.get('key')})！")
                 else:
-                    print(f"[Zotero-Sync] 创建笔记完成: {res}")
+                    print(f"[Zotero-Sync] 正在为条目 {parent_key} 创建 Better-Notes 表格概览笔记...")
+                    note_payload = {
+                        "itemType": "note",
+                        "parentItem": parent_key,
+                        "note": note_html,
+                        "tags": [
+                            {"tag": "table-extractor"},
+                            {"tag": "better-notes"}
+                        ]
+                    }
+                    res = zot.create_items([note_payload])
+                    if res and res.get("successful"):
+                        print(f"[Zotero-Sync] ✓ Better-Notes 概览笔记已成功写入 Zotero (Key: {list(res['successful'].keys())})！")
+                    else:
+                        print(f"[Zotero-Sync] 创建笔记完成: {res}")
             except Exception as e_note:
                 print(f"[Zotero-Sync Warning] 创建 Better-Notes 笔记失败: {e_note}")
 

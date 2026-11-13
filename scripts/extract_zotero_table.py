@@ -24,6 +24,8 @@ except ImportError:
 import sys
 import os
 import re
+import tempfile
+import urllib.parse
 from decimal import Decimal, InvalidOperation
 import json
 import argparse
@@ -151,6 +153,207 @@ def _count_pdf_table_captions(pdf_path: str) -> int:
     return count
 
 
+def _is_remote_url(path: Any) -> bool:
+    return (
+        isinstance(path, str)
+        and path.startswith(('http://', 'https://'))
+        and not os.path.isfile(path)
+    )
+
+
+def _looks_like_pdf_url(url: str) -> bool:
+    try:
+        parsed = urllib.parse.urlparse(url)
+        path_low = (parsed.path or "").lower()
+        query_low = (parsed.query or "").lower()
+        return path_low.endswith(".pdf") or ".pdf" in query_low
+    except Exception:
+        return False
+
+
+def _download_remote_pdf(url: str, temps_to_clean: list) -> Optional[str]:
+    """
+    Probe and stream-download a remote PDF URL to a temporary local .pdf file.
+    Returns the local temp file path (registered in temps_to_clean) if the URL genuinely
+    serves a PDF (never saves HTML/JSON/XML pages as .pdf); otherwise returns None.
+    """
+    if not _is_remote_url(url):
+        return None
+    try:
+        import requests
+    except ImportError:
+        return None
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; ZoteroTableExtractor/1.0)",
+        "Accept": "application/pdf,application/octet-stream;q=0.9,*/*;q=0.8",
+    }
+    html_like_cts = (
+        "text/html",
+        "application/xhtml+xml",
+        "text/plain",
+        "application/json",
+        "application/xml",
+        "text/xml",
+    )
+    if not _looks_like_pdf_url(url):
+        try:
+            head_resp = requests.head(url, allow_redirects=True, timeout=10, headers=headers)
+            if head_resp is not None and getattr(head_resp, "status_code", 500) < 400:
+                head_ct = (head_resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+                if head_ct in html_like_cts:
+                    return None
+        except Exception:
+            pass
+
+    resp = None
+    tmp_path = None
+    try:
+        resp = requests.get(url, stream=True, allow_redirects=True, timeout=30, headers=headers)
+        if resp is None or getattr(resp, "status_code", 500) >= 400:
+            return None
+
+        ct = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if ct in html_like_cts:
+            return None
+
+        chunks_iter = None
+        if hasattr(resp, "iter_content"):
+            try:
+                chunks_iter = iter(resp.iter_content(chunk_size=65536))
+            except Exception:
+                chunks_iter = None
+
+        head_chunks = []
+        head_len = 0
+        if chunks_iter is not None:
+            for ch in chunks_iter:
+                if isinstance(ch, (bytes, bytearray)) and ch:
+                    bch = bytes(ch)
+                    head_chunks.append(bch)
+                    head_len += len(bch)
+                    if head_len >= 4096:
+                        break
+
+        first_chunk = b"".join(head_chunks)
+        if not first_chunk:
+            raw_bytes = getattr(resp, "content", None)
+            if isinstance(raw_bytes, (bytes, bytearray)) and raw_bytes:
+                first_chunk = bytes(raw_bytes)
+                chunks_iter = iter(())
+
+        if not first_chunk:
+            return None
+
+        stripped_head = first_chunk.lstrip()[:32].lower()
+        if stripped_head.startswith((b"<!doctype", b"<html", b"<head", b"<?xml", b"{")):
+            return None
+
+        has_pdf_magic = b"%PDF-" in first_chunk[:1024]
+        if not has_pdf_magic:
+            return None
+
+        tf = tempfile.NamedTemporaryFile(suffix=".pdf", prefix="zotero_remote_", delete=False)
+        tmp_path = tf.name
+        try:
+            tf.write(first_chunk)
+            if chunks_iter is not None:
+                for ch in chunks_iter:
+                    if isinstance(ch, (bytes, bytearray)) and ch:
+                        tf.write(ch)
+        finally:
+            tf.close()
+
+        temps_to_clean.append(tmp_path)
+        return tmp_path
+    except Exception:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+        return None
+    finally:
+        if resp is not None and hasattr(resp, "close"):
+            try:
+                resp.close()
+            except Exception:
+                pass
+
+
+def _preprocess_local_pdf(local_pdf_path: str, temps_to_clean: list) -> Tuple[str, Optional[List[int]], bool]:
+    """Run Tier-1 lossless orientation remediation, candidate detection, and scanned rotation baking."""
+    import pymupdf as fitz
+
+    target_pdf_path = local_pdf_path
+    cand_pages = None
+    was_remediated = False
+
+    # Tier 1: 页面级无损顺时针方向校准 (Lossless Page Rotation Remediation)
+    try:
+        try:
+            from .doc_orientation_detector import remediate_pdf_pages_lossless
+        except ImportError:
+            from doc_orientation_detector import remediate_pdf_pages_lossless
+
+        try:
+            try:
+                from .pdf_table_extractor import quick_detect_candidate_pages
+            except ImportError:
+                from pdf_table_extractor import quick_detect_candidate_pages
+            cand_pages = quick_detect_candidate_pages(target_pdf_path)
+        except Exception:
+            pass
+
+        lossless_path, was_rotated, tmp_lossless = remediate_pdf_pages_lossless(
+            target_pdf_path,
+            candidate_pages=cand_pages
+        )
+        if was_rotated and tmp_lossless:
+            target_pdf_path = lossless_path
+            temps_to_clean.append(tmp_lossless)
+            was_remediated = True
+    except Exception as e_ori:
+        print(f"[Doc-Ori Tier 1] 无损旋转探测提示: {e_ori}")
+
+    try:
+        from .pdf_table_extractor import has_text_layer, quick_classify_pdf
+    except ImportError:
+        from pdf_table_extractor import has_text_layer, quick_classify_pdf
+
+    # 使用 pdf-inspector quick_classify_pdf (5~10ms) 进行超快速预检
+    clf_res = quick_classify_pdf(target_pdf_path)
+    if clf_res.get('confidence', 0) >= 0.8 and clf_res.get('pdf_type') in ('text_based', 'scanned'):
+        is_native = (clf_res['pdf_type'] == 'text_based')
+    else:
+        is_native = has_text_layer(target_pdf_path)
+
+    has_rotation = False
+    try:
+        doc = fitz.open(target_pdf_path)
+        page_rotations = [get_page_effective_rotation(p) for p in doc]
+        has_rotation = any(r != 0 for r in page_rotations)
+        doc.close()
+    except Exception as e_fitz:
+        print(f"[Doc-Ori Tier 1] 打开 PDF 失败: {e_fitz}")
+        return target_pdf_path, cand_pages, was_remediated
+
+    # 全页像素光栅化烘焙 (baking) 会把页面栅格化为位图图片并彻底抹除原生矢量文本层与 Tagged 结构树。
+    # 因此仅对纯扫描版 PDF 执行旋转烘焙 (以兼容外部 OCR 工具)；
+    # 对 native PDF，保留原生数字化文本层，视口与视觉切图走正向渲染，矢量几何提取已适配 rotation_matrix。
+    if has_rotation and not is_native:
+        print(f"[PDF] 检测到旋转页面或文字方向 (Baking page rotations)...")
+        eff_baked, was_baked, tmp_baked = bake_pdf_rotations(target_pdf_path, dpi=150)
+        if was_baked and tmp_baked:
+            target_pdf_path = eff_baked
+            temps_to_clean.append(tmp_baked)
+            print(f"[PDF] Baked rotated PDF saved to: {target_pdf_path}")
+    elif has_rotation and is_native:
+        print(f"[PDF] Native PDF 存在旋转页面 (保留原生矢量文本层与 Tagged 结构，视口与视觉切图走正向渲染，矢量几何通过 rotation_matrix 归一化)")
+
+    return target_pdf_path, cand_pages, was_remediated
+
+
 def process_single_pdf(pdf_path, args, is_batch=False, plan=None):
     """Processes a single PDF file, extracting tables online or falling back to PDF.
 
@@ -161,68 +364,11 @@ def process_single_pdf(pdf_path, args, is_batch=False, plan=None):
     
     target_pdf_path = pdf_path
     temps_to_clean = []
+    cand_pages = None
+    was_remediated = False
     try:
         if os.path.exists(pdf_path) and os.path.isfile(pdf_path):
-            import pymupdf as fitz
-
-            # Tier 1: 页面级无损顺时针方向校准 (Lossless Page Rotation Remediation)
-            was_remediated = False
-            try:
-                try:
-                    from .doc_orientation_detector import remediate_pdf_pages_lossless
-                except ImportError:
-                    from doc_orientation_detector import remediate_pdf_pages_lossless
-
-                cand_pages = None
-                try:
-                    try:
-                        from .pdf_table_extractor import quick_detect_candidate_pages
-                    except ImportError:
-                        from pdf_table_extractor import quick_detect_candidate_pages
-                    cand_pages = quick_detect_candidate_pages(target_pdf_path)
-                except Exception:
-                    pass
-
-                lossless_path, was_rotated, tmp_lossless = remediate_pdf_pages_lossless(
-                    target_pdf_path,
-                    candidate_pages=cand_pages
-                )
-                if was_rotated and tmp_lossless:
-                    target_pdf_path = lossless_path
-                    temps_to_clean.append(tmp_lossless)
-                    was_remediated = True
-            except Exception as e_ori:
-                print(f"[Doc-Ori Tier 1] 无损旋转探测提示: {e_ori}")
-
-            try:
-                from .pdf_table_extractor import has_text_layer, quick_classify_pdf
-            except ImportError:
-                from pdf_table_extractor import has_text_layer, quick_classify_pdf
-            
-            # 使用 pdf-inspector quick_classify_pdf (5~10ms) 进行超快速预检
-            clf_res = quick_classify_pdf(target_pdf_path)
-            if clf_res.get('confidence', 0) >= 0.8 and clf_res.get('pdf_type') in ('text_based', 'scanned'):
-                is_native = (clf_res['pdf_type'] == 'text_based')
-            else:
-                is_native = has_text_layer(target_pdf_path)
-
-            doc = fitz.open(target_pdf_path)
-            page_rotations = [get_page_effective_rotation(p) for p in doc]
-            has_rotation = any(r != 0 for r in page_rotations)
-            doc.close()
-
-            # 全页像素光栅化烘焙 (baking) 会把页面栅格化为位图图片并彻底抹除原生矢量文本层与 Tagged 结构树。
-            # 因此仅对纯扫描版 PDF 执行旋转烘焙 (以兼容外部 OCR 工具)；
-            # 对 native PDF，保留原生数字化文本层，视口与视觉切图走正向渲染，矢量几何提取已适配 rotation_matrix。
-            if has_rotation and not is_native:
-                print(f"[PDF] 检测到旋转页面或文字方向 (Baking page rotations)...")
-                eff_baked, was_baked, tmp_baked = bake_pdf_rotations(target_pdf_path, dpi=150)
-                if was_baked and tmp_baked:
-                    target_pdf_path = eff_baked
-                    temps_to_clean.append(tmp_baked)
-                    print(f"[PDF] Baked rotated PDF saved to: {target_pdf_path}")
-            elif has_rotation and is_native:
-                print(f"[PDF] Native PDF 存在旋转页面 (保留原生矢量文本层与 Tagged 结构，视口与视觉切图走正向渲染，矢量几何通过 rotation_matrix 归一化)")
+            target_pdf_path, cand_pages, was_remediated = _preprocess_local_pdf(pdf_path, temps_to_clean)
 
         return _do_process_single_pdf(
             target_pdf_path,
@@ -256,10 +402,17 @@ def is_pre_2020_chinese_paper(pdf_path: str, plan: dict = None) -> bool:
     if not has_chinese:
         return False
 
-    # 2. 年份提取
-    m_year = re.search(r'(?:^|[\D_])(19\d{2}|20\d{2})(?:[\D_]|$)', filename)
-    if not m_year and plan and plan.get('year'):
+    # 2. 年份提取（优先采用预解析元数据中的出版年份，避免文件名中的观测年代区间如 1990-2024 劫持判定）
+    m_year = None
+    if plan and plan.get('year'):
         m_year = re.search(r'(?:^|[\D_])(19\d{2}|20\d{2})(?:[\D_]|$)', str(plan.get('year')))
+    if not m_year:
+        all_years = [int(y) for y in re.findall(r'(?:^|[\D_])(19\d{2}|20\d{2})(?=[\D_]|$)', filename) if 1900 <= int(y) <= 2035]
+        if all_years:
+            year = max(all_years)
+            if year < 2020:
+                return True
+            return False
 
     if m_year:
         year = int(m_year.group(1))
@@ -317,15 +470,33 @@ def _trigger_zotero_sync(pdf_path, target_output, dfs, args):
 
         force_sync = getattr(args, 'sync_zotero', False)
         excel_target = None
+        excel_files = []
         if os.path.isfile(target_output) and target_output.endswith('.xlsx'):
             excel_target = target_output
+            excel_files = [target_output]
         elif os.path.isdir(target_output):
             import glob
             xlsxs = sorted(glob.glob(os.path.join(target_output, "*.xlsx")))
             if xlsxs:
-                excel_target = xlsxs[0]
+                excel_files = xlsxs
+                excel_target = xlsxs[0] if len(xlsxs) == 1 else xlsxs
 
-        if excel_target and os.path.exists(excel_target) and dfs:
+        sync_dfs = list(dfs) if dfs else []
+        if excel_files and not sync_dfs:
+            for x_path in excel_files:
+                try:
+                    sheets = pd.read_excel(x_path, sheet_name=None, dtype=str, keep_default_na=False)
+                    base_lbl = os.path.splitext(os.path.basename(x_path))[0]
+                    for s_name, s_df in sheets.items():
+                        if s_df is not None and not s_df.empty:
+                            if not getattr(s_df, 'attrs', None):
+                                s_df.attrs = {}
+                            s_df.attrs.setdefault('label', base_lbl if len(sheets) == 1 else s_name)
+                            sync_dfs.append(s_df)
+                except Exception:
+                    pass
+
+        if excel_target and excel_files and any(os.path.exists(f) for f in excel_files) and sync_dfs:
             cfg = load_config() if callable(load_config) else {}
             if getattr(args, 'zotero_api_key', None):
                 cfg['ZOTERO_API_KEY'] = args.zotero_api_key
@@ -335,7 +506,7 @@ def _trigger_zotero_sync(pdf_path, target_output, dfs, args):
                 cfg['ZOTERO_DB_PATH'] = args.db_path
 
             sync_extracted_tables_to_zotero(
-                pdf_path, excel_target, dfs, config=cfg, force_sync=force_sync
+                pdf_path, excel_target, sync_dfs, config=cfg, force_sync=force_sync
             )
     except Exception as e_sync:
         print(f"[ZoteroSync Hook Notice] {e_sync}")
@@ -727,8 +898,38 @@ def _merge_online_and_pdf_tables(online_list, pdf_list):
 
 
 def _do_process_single_pdf(pdf_path, orig_pdf_path, args, is_batch=False, plan=None, candidate_pages=None, remediated=None):
+    remote_temps = []
+    try:
+        return _do_process_single_pdf_impl(
+            pdf_path,
+            orig_pdf_path,
+            args,
+            is_batch=is_batch,
+            plan=plan,
+            candidate_pages=candidate_pages,
+            remediated=remediated,
+            remote_temps=remote_temps,
+        )
+    finally:
+        for t_p in remote_temps:
+            if t_p and os.path.exists(t_p):
+                try:
+                    os.remove(t_p)
+                except Exception:
+                    pass
+
+
+def _do_process_single_pdf_impl(pdf_path, orig_pdf_path, args, is_batch=False, plan=None, candidate_pages=None, remediated=None, remote_temps=None):
+    if remote_temps is None:
+        remote_temps = []
+    raw_orig_pdf_path = orig_pdf_path
+    downloaded_remote_pdf = None
     output_path = args.output
-    filename_base = os.path.splitext(os.path.basename(orig_pdf_path))[0]
+    if isinstance(orig_pdf_path, str) and orig_pdf_path.startswith(('http://', 'https://')):
+        _u_path = urllib.parse.urlparse(orig_pdf_path).path.rstrip('/')
+        filename_base = os.path.splitext(os.path.basename(_u_path or orig_pdf_path))[0] or "remote_paper"
+    else:
+        filename_base = os.path.splitext(os.path.basename(orig_pdf_path))[0]
     safe_base = make_safe_filename(filename_base)
     user_single_file = getattr(args, 'single_file', False)
 
@@ -787,7 +988,38 @@ def _do_process_single_pdf(pdf_path, orig_pdf_path, args, is_batch=False, plan=N
                 online_dfs = list(res)
                 online_title = None
             if online_dfs:
-                expected_labels, expected_count = scan_pdf_table_expected_labels(orig_pdf_path)
+                is_local_orig_pdf = bool(
+                    orig_pdf_path and isinstance(orig_pdf_path, str) and os.path.isfile(orig_pdf_path)
+                )
+                has_sparse_or_truncated = False
+                for o_df in online_dfs:
+                    if o_df is None or o_df.empty:
+                        has_sparse_or_truncated = True
+                        break
+                    non_empty_count = sum(
+                        1 for v in o_df.values.flatten()
+                        if pd.notna(v) and str(v).strip() not in ('', 'nan', 'none', '-', '—')
+                    )
+                    density = non_empty_count / max(1, o_df.size)
+                    # 允许合法小型双行/三行高密度表（如均值±标准差汇总表），仅拦截空白、极稀疏(<4有效单元格)或明显截断表
+                    has_ellipsis_trunc = any(
+                        str(v).strip() in ('...', '…', 'See full table')
+                        for v in o_df.iloc[-1].values
+                    ) if len(o_df) > 0 else False
+                    if (len(o_df) <= 1 and non_empty_count < 4) or non_empty_count < 4 or density < 0.25 or has_ellipsis_trunc:
+                        has_sparse_or_truncated = True
+                        break
+
+                if not is_local_orig_pdf and _is_remote_url(orig_pdf_path) and (_looks_like_pdf_url(orig_pdf_path) or has_sparse_or_truncated):
+                    dl_pdf = _download_remote_pdf(orig_pdf_path, remote_temps)
+                    if dl_pdf:
+                        downloaded_remote_pdf = dl_pdf
+                        orig_pdf_path = dl_pdf
+                        is_local_orig_pdf = True
+
+                expected_labels, expected_count = (
+                    scan_pdf_table_expected_labels(orig_pdf_path) if is_local_orig_pdf else (set(), 0)
+                )
 
                 # 收集已获取的在线表格标签
                 online_labels = set()
@@ -802,52 +1034,42 @@ def _do_process_single_pdf(pdf_path, orig_pdf_path, args, is_batch=False, plan=N
 
                 missing_labels = (expected_labels - online_labels) if expected_labels else set()
 
-                # 检查 PDF 是否为扫描件/含扫描页，以及是否有潜在表格线框或矢量结构
+                # 检查本地 PDF 是否为扫描件/含扫描页，以及是否有潜在表格线框或矢量结构
                 has_pdf_table_cues = False
                 has_scanned_page = False
-                try:
+                if is_local_orig_pdf:
                     try:
-                        from .pdf_table_extractor import has_text_layer
-                    except ImportError:
-                        from pdf_table_extractor import has_text_layer
-                    if not has_text_layer(orig_pdf_path):
-                        has_scanned_page = True
-                except Exception:
-                    pass
-
-                try:
-                    import pymupdf as fitz
-                    doc = fitz.open(orig_pdf_path)
-                    for page in doc:
-                        txt = page.get_text("text").strip()
-                        imgs = page.get_images()
-                        # 扫描页缺少文本层，无法通过字符排查表格，属于“完整性未知”
-                        if len(txt) <= 50 and (len(imgs) > 0 or not txt):
+                        try:
+                            from .pdf_table_extractor import has_text_layer
+                        except ImportError:
+                            from pdf_table_extractor import has_text_layer
+                        if not has_text_layer(orig_pdf_path):
                             has_scanned_page = True
-                        tabs = page.find_tables()
-                        text_tabs = page.find_tables(strategy="text") if not (tabs and tabs.tables) else None
-                        if (tabs and tabs.tables) or (text_tabs and text_tabs.tables) or len(page.get_drawings()) > 5:
-                            has_pdf_table_cues = True
-                    doc.close()
-                except Exception:
-                    has_scanned_page = True
+                    except Exception:
+                        pass
+
+                    try:
+                        import pymupdf as fitz
+                        doc = fitz.open(orig_pdf_path)
+                        for page in doc:
+                            txt = page.get_text("text").strip()
+                            imgs = page.get_images()
+                            # 扫描页缺少文本层，无法通过字符排查表格，属于“完整性未知”
+                            if len(txt) <= 50 and (len(imgs) > 0 or not txt):
+                                has_scanned_page = True
+                            tabs = page.find_tables()
+                            text_tabs = page.find_tables(strategy="text") if not (tabs and tabs.tables) else None
+                            if (tabs and tabs.tables) or (text_tabs and text_tabs.tables) or len(page.get_drawings()) > 5:
+                                has_pdf_table_cues = True
+                        doc.close()
+                    except Exception:
+                        has_scanned_page = True
 
                 is_complete = False
-                has_sparse_or_truncated = False
-                for o_df in online_dfs:
-                    if o_df is None or len(o_df) <= 3:
-                        has_sparse_or_truncated = True
-                        break
-                    non_empty_count = sum(
-                        1 for v in o_df.values.flatten()
-                        if pd.notna(v) and str(v).strip() not in ('', 'nan', 'none', '-', '—')
-                    )
-                    density = non_empty_count / max(1, o_df.size)
-                    if non_empty_count < 6 or density < 0.25:
-                        has_sparse_or_truncated = True
-                        break
 
-                if has_scanned_page or has_sparse_or_truncated:
+                if not is_local_orig_pdf:
+                    is_complete = bool(online_dfs)
+                elif has_scanned_page or has_sparse_or_truncated:
                     # 扫描页或在线预览截断表，完整性未知，严禁提前判定为完整，必须由本地管线补充核查
                     is_complete = False
                 elif expected_labels:
@@ -877,7 +1099,7 @@ def _do_process_single_pdf(pdf_path, orig_pdf_path, args, is_batch=False, plan=N
                     if save_ok:
                         extracted_online = True
                         print(f"[Online] Successfully extracted tables via online HTML source -> {target_output}")
-                        _trigger_zotero_sync(orig_pdf_path, target_output, online_dfs, args)
+                        _trigger_zotero_sync(raw_orig_pdf_path, target_output, online_dfs, args)
                         return True
                 else:
                     # 暂不提前落盘至 target_output，避免第一次写出追加脚注/转换上下标后在合并阶段二次读盘自相冲突产生 _p{N}/_v2 重复文件
@@ -897,16 +1119,41 @@ def _do_process_single_pdf(pdf_path, orig_pdf_path, args, is_batch=False, plan=N
                 skip_supplementary=getattr(args, 'skip_supplementary', False)
             )
             if save_ok:
-                _trigger_zotero_sync(orig_pdf_path, target_output, online_dfs, args)
+                _trigger_zotero_sync(raw_orig_pdf_path, target_output, online_dfs, args)
                 return True
             return False
         return False
 
     # 2. PDF 本地提取模式（结构化优先，OCR 兜底）
+    structured = getattr(args, 'structured_file', None)
+    if not (structured and os.path.exists(structured)):
+        if downloaded_remote_pdf is None and _is_remote_url(pdf_path):
+            downloaded_remote_pdf = _download_remote_pdf(pdf_path, remote_temps)
+        if downloaded_remote_pdf and _is_remote_url(pdf_path):
+            print(f"[PDF -> Remote] 已将远程 PDF 下载至临时本地文件: {downloaded_remote_pdf}")
+            orig_pdf_path = downloaded_remote_pdf
+            proc_pdf, dl_cand_pages, dl_remediated = _preprocess_local_pdf(downloaded_remote_pdf, remote_temps)
+            pdf_path = proc_pdf
+            candidate_pages = dl_cand_pages
+            remediated = dl_remediated
+
+    is_remote_non_pdf_input = _is_remote_url(pdf_path)
+    if is_remote_non_pdf_input and not (structured and os.path.exists(structured)):
+        if extracted_online and online_dfs:
+            save_ok = save_tables_to_excel(
+                online_dfs, target_output,
+                getattr(args, 'headers', None), single_file,
+                skip_supplementary=getattr(args, 'skip_supplementary', False)
+            )
+            if save_ok:
+                _trigger_zotero_sync(raw_orig_pdf_path, target_output, online_dfs, args)
+                return True
+        print("[Notice] 在线抓取未获取到表格，且输入 URL 非本地 PDF 文件，跳过本地 PDF/OCR 管线。")
+        return False
+
     print("[PDF] Executing structured table extraction pipeline...")
 
     # 本地离线结构化文件支持
-    structured = getattr(args, 'structured_file', None)
     if structured and os.path.exists(structured):
         try:
             with open(structured, encoding='utf-8') as f:
@@ -918,7 +1165,7 @@ def _do_process_single_pdf(pdf_path, orig_pdf_path, args, is_batch=False, plan=N
 
                 if save_tables_to_excel(combined_struct_dfs, target_output, getattr(args, 'headers', None), single_file,
                                         skip_supplementary=getattr(args, 'skip_supplementary', False)):
-                    _trigger_zotero_sync(orig_pdf_path, target_output, combined_struct_dfs, args)
+                    _trigger_zotero_sync(raw_orig_pdf_path, target_output, combined_struct_dfs, args)
                     return True
         except Exception as e:
             print(f"[PDF -> Structured Warning] Failed to parse structured file: {e}")
@@ -948,7 +1195,7 @@ def _do_process_single_pdf(pdf_path, orig_pdf_path, args, is_batch=False, plan=N
                                         skip_supplementary=getattr(args, 'skip_supplementary', False)):
                     print(f"[PDF] Successfully exported tables to: {target_output}")
                     pdf_extracted = True
-                    _trigger_zotero_sync(orig_pdf_path, target_output, combined_dfs, args)
+                    _trigger_zotero_sync(raw_orig_pdf_path, target_output, combined_dfs, args)
                     return True
             else:
                 print("[PDF] 结构化管线未提取到表格，尝试 OCR/切图备用管线...")
@@ -968,12 +1215,17 @@ def _do_process_single_pdf(pdf_path, orig_pdf_path, args, is_batch=False, plan=N
                     if combined_vlm_dfs and save_tables_to_excel(combined_vlm_dfs, target_output, getattr(args, 'headers', None), single_file,
                                                                         skip_supplementary=getattr(args, 'skip_supplementary', False)):
                         print(f"[PDF -> PaddleOCR-VL-1.6] Successfully exported tables to: {target_output}")
-                        _trigger_zotero_sync(orig_pdf_path, target_output, combined_vlm_dfs, args)
+                        _trigger_zotero_sync(raw_orig_pdf_path, target_output, combined_vlm_dfs, args)
                         return True
             except Exception as e:
                 print(f"[PDF -> VLM Notice] VLM execution note: {e}")
 
         try:
+            import glob as _glob_sync
+            _pre_xlsx_mtimes = (
+                {p: os.path.getmtime(p) for p in _glob_sync.glob(os.path.join(target_output, "*.xlsx"))}
+                if os.path.isdir(target_output) else {}
+            )
             print("[PDF -> PP-StructureV3] 正在使用 PP-StructureV3 / 切图识别表格并导出 Excel...")
             crop_kwargs = {"existing_dfs": online_dfs}
             if online_skip_labels:
@@ -985,7 +1237,40 @@ def _do_process_single_pdf(pdf_path, orig_pdf_path, args, is_batch=False, plan=N
             if crop_ok:
                 print(f"[PDF -> PP-StructureV3] 已成功识别并导出表格至: {target_output}")
                 exported_dfs = list(online_dfs) if online_dfs else []
-                _trigger_zotero_sync(orig_pdf_path, target_output, exported_dfs, args)
+                try:
+                    if os.path.isfile(target_output):
+                        _xlsx_cands = [target_output]
+                    else:
+                        _all_xlsxs = sorted(_glob_sync.glob(os.path.join(target_output, "*.xlsx")))
+                        _fresh_xlsxs = [
+                            p for p in _all_xlsxs
+                            if p not in _pre_xlsx_mtimes or os.path.getmtime(p) > _pre_xlsx_mtimes[p]
+                        ]
+                        _xlsx_cands = _fresh_xlsxs if _fresh_xlsxs else _all_xlsxs
+                    if _xlsx_cands:
+                        _loaded = []
+                        for _xp in _xlsx_cands:
+                            try:
+                                _sheets = pd.read_excel(_xp, sheet_name=None, dtype=str, keep_default_na=False)
+                                _base = os.path.splitext(os.path.basename(_xp))[0]
+                                for _sn, _sdf in _sheets.items():
+                                    if _sdf is not None and not _sdf.empty:
+                                        _sdf.attrs.setdefault('label', _base if len(_sheets) == 1 else _sn)
+                                        _loaded.append(_sdf)
+                            except Exception:
+                                pass
+                        if _loaded and (
+                            not exported_dfs
+                            or len(_loaded) > len(exported_dfs)
+                            or (
+                                len(_loaded) == len(exported_dfs)
+                                and any(_loaded[i].shape != exported_dfs[i].shape for i in range(len(_loaded)))
+                            )
+                        ):
+                            exported_dfs = _loaded
+                except Exception:
+                    pass
+                _trigger_zotero_sync(raw_orig_pdf_path, target_output, exported_dfs, args)
                 return True
         except Exception as e:
             print(f"[PDF -> PP-StructureV3 Notice] Export notice: {e}")
@@ -998,7 +1283,7 @@ def _do_process_single_pdf(pdf_path, orig_pdf_path, args, is_batch=False, plan=N
             skip_supplementary=getattr(args, 'skip_supplementary', False)
         )
         if save_ok:
-            _trigger_zotero_sync(orig_pdf_path, target_output, online_dfs, args)
+            _trigger_zotero_sync(raw_orig_pdf_path, target_output, online_dfs, args)
             return True
         return False
 
@@ -1038,6 +1323,9 @@ def main():
     
     args = parser.parse_args()
     
+    if isinstance(getattr(args, 'headers', None), str):
+        args.headers = [h.strip() for h in args.headers.split(',') if h.strip()]
+
     if getattr(args, 'ocr_engine', None) and args.ocr_engine != 'auto':
         os.environ["OCR_ENGINE"] = args.ocr_engine
 
@@ -1085,8 +1373,15 @@ def main():
 
     if len(pdf_list) == 1:
         target = pdf_list[0]
+        cli_plan = {}
+        if getattr(args, 'doi', None):
+            cli_plan['doi'] = args.doi
+        if getattr(args, 'url', None):
+            cli_plan['url'] = args.url
+        if getattr(args, 'title', None):
+            cli_plan['title'] = args.title
         print(f"Processing PDF target: {target}")
-        success = process_single_pdf(target, args)
+        success = process_single_pdf(target, args, plan=(cli_plan or None))
         print(f"\nCompleted! Processed 1 file: {'Success' if success else 'Failed'}")
         return 0 if success else 1
     else:

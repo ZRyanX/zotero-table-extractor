@@ -196,7 +196,10 @@ python scripts/extract_zotero_table.py --pdf /path/to/pdfs_dir --output /path/to
 
 | 参数 | 类型 | 默认值 | 作用说明 |
 | :--- | :--- | :--- | :--- |
-| `--pdf` | 字符串 | 必须 | 待提取 PDF 文件路径、PDF 目录或包含 PDF 路径的 `.txt` 清单 |
+| `--pdf` | 字符串 | 必须 | 待提取 PDF 文件路径、PDF 目录、远程 `http(s)://` URL 或 `.txt` 清单 |
+| `--doi` | 字符串 | `None` | 可选文献 DOI（用于在线 HTML/XML 直取优先调度与补全计划） |
+| `--url` | 字符串 | `None` | 可选论文网页 URL（补充至在线抓取计划） |
+| `--title` | 字符串 | `None` | 可选论文标题（辅助在线检索与 Zotero 元数据匹配） |
 | `--output` | 字符串 | 必须 | 导出结果目录路径；当 `--single-file` 时可为目标 `.xlsx` 文件路径 |
 | `--single-file` | 标志 | `False` | 将提取到的所有表格汇聚写入单个 Excel 文件（多个 Sheet） |
 | `--enable-llm` | 标志 | `False` | 启用大模型语义分析，纠正断裂列名与深层多级复合表头 |
@@ -241,6 +244,7 @@ python scripts/batch_run.py --pdf-only --workers 4
 | `--pdf-only` | 标志 | `False` | 批量运行时跳过在线网络抓取，纯本地 PDF 提取 |
 | `--timeout` | 整数 | `300` | 单篇文献处理超时上限（秒） |
 | `--limit` | 整数 | `0` | 限制处理文献篇数（0 表示全量执行） |
+| `--skip-supplementary` | 标志 | `False` | 显式开启时跳过 Supplementary/附录表格（默认完整提取） |
 
 ### 3. 技能在线安全更新与配置防护 (`update.py` / `setup_paths.py --update`)
 
@@ -324,10 +328,31 @@ python update.py --check --json
 | `MINERU_USE_CLI` | string | `"auto"` | MinerU 执行方式：`"auto"` (优先 CLI，失败自动回退 REST API), `"cli"` (仅 CLI), `"api"` (仅 Python REST) |
 | `MINERU_CLI_PATH` | string | `""` | 可选自定义 `mineru-open-api` 二进制路径（为空时自动探测 PATH/NVM/Go 安装路径） |
 | `MINERU_TOKEN` | string | `""` | MinerU API Token（与 `MINERU_API_KEY` 等价，亦支持读取 `~/.mineru/config.yaml`） |
+| `MINERU_MODEL` | string | `"vlm"` | MinerU 解析模型 (`vlm`, `pipeline`, `html`) |
+| `MINERU_AGENT_BACKEND` | string | `"vlm"` | MinerU 零 Token Agent 备用接口优先后端 (`vlm`, `pipeline`) |
+| `MINERU_ENABLE_FLASH_EXTRACT` | boolean | `true` | 无 Token 小文件是否优先尝试 `flash-extract`（未出表时自动回退 Agent API） |
+| `DOCLING_IMAGES_SCALE` | float | `2.0` | IBM Docling PDF 页面渲染缩放倍率 |
+| `TELEOCR_API_KEY` | string | `""` | TeleOCR API 鉴权密钥 |
 | `TELEOCR_API_BASE` | string | `""` | TeleOCR vLLM / OpenAI-compatible 视觉推理服务 URL |
 | `TELEOCR_MODEL` | string | `"TeleOCR"` | TeleOCR 模型标识符 |
 | `OMNIDOCBENCH_ENABLED` | boolean | `true` | 是否开启 OmniDocBench (CVPR 2025) 标准化度量自检 |
 | `SMART_HEADER_FLATTEN_ENABLED` | boolean | `true` | 是否启用 SMART 多级表头语义展平与伪代码推理模式 |
+| `MINERU_API_BASE` | string | `"https://mineru.net"` | MinerU API 服务端点地址 |
+| `PYMUPDF4LLM_ENABLED` | boolean | `true` | 是否启用 PyMuPDF4LLM（可选包存在时）辅助提取 |
+| `TEDS_METRIC_ENABLED` | boolean | `true` | 是否启用 TEDS 表格结构相似度度量自检 |
+| `ARXIV_HTML_ENABLED` | boolean | `true` | 是否优先尝试 arXiv HTML 直连抽取 |
+| `NCBI_PMC_ENABLED` | boolean | `true` | 是否优先尝试 NCBI PMC JATS XML 抽取 |
+| `PAPER_TABLES_DIR` | string | `""` | 批量输出表格的默认根目录 |
+| `ZOTERO_DIR` | string | `""` | 本地 Zotero 数据目录路径 |
+| `ZOTERO_DB_PATH` | string | `""` | 本地 `zotero.sqlite` 数据库路径 |
+| `ZOTERO_STORAGE_DIR` | string | `""` | 本地 Zotero `storage/` 附件目录路径 |
+| `SUPP_DOWNLOADER_SCRIPT` | string | `""` | 自定义补充材料下载脚本路径 |
+| `PLAYWRIGHT_USER_DATA_DIR_MAC` | string | `""` | macOS 默认 Playwright 用户会话目录 |
+| `PLAYWRIGHT_USER_DATA_DIR_WINDOWS` | string | `""` | Windows 默认 Playwright 用户会话目录 |
+| `FIRECRAWL_CACHE_DIR` | string | `""` | Firecrawl 本地缓存目录 |
+| `FIRECRAWL_CACHE_TTL_S` | int | `86400` | Firecrawl 本地缓存过期秒数 |
+| `CRAWL4AI_PAGE_TIMEOUT_MS` | int | `30000` | Crawl4AI 单页抓取超时（毫秒） |
+| `CRAWL4AI_MAX_CONCURRENT` | int | `4` | Crawl4AI 最大并发页面数 |
 
 ## 目录与版本控制规范
 

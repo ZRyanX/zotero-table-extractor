@@ -2,7 +2,7 @@
 pymupdf>=1.23.0
 pdfplumber>=0.10.0
 camelot-py[cv]>=0.11.0
-pandas>=2.0.0,<3.0.0
+pandas>=2.0.0
 openpyxl>=3.1.0
 requests>=2.28.0
 pillow>=10.0.0
@@ -20,22 +20,21 @@ curl_cffi>=0.6.0
 nest_asyncio>=1.5.0
 websockets>=11.0
 
-# Enhanced Extraction Engines & Pure-Python Alternatives
-img2table>=2.0.0
-gmft>=0.4.0
+# Enhanced Extraction Engines & Pure-Python Alternatives (optional; graceful runtime fallback when absent)
 docling>=2.0.0
-pymupdf4llm>=0.0.17
-rapid-table>=0.3.0
-rapidocr>=3.0.0
-# Optional wireless table engines:
+# img2table>=2.0.0
+# gmft>=0.4.0
+# pymupdf4llm>=0.0.17
+# rapid-table>=0.3.0
+# rapidocr>=3.0.0
 # table-structure-rec>=0.0.1
 # torch>=2.0.0  # Required only if using unitable model
 
+# Ecosystem Integration (Zotero & Better-Notes Sync, optional when ZOTERO_SYNC_ENABLED=true)
+# pyzotero>=1.15.0
 
-# Ecosystem Integration (Zotero & Better-Notes Sync)
-pyzotero>=1.15.0
-
-# Optional / Extended Scrapers (Online Pipeline Enhancement)
+# Optional / Extended Scrapers & External Binaries:
 # scrapling>=0.2.0
 # crawl4ai>=0.3.0
+# External CLI (optional): mineru-open-api (recommended for MinerU extract/flash-extract)
 

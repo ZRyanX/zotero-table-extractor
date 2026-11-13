@@ -308,7 +308,7 @@ def save_tables_to_excel(dataframes, output_path, headers=None, single_file=True
             if safe_check in skip_labels:
                 print(f"[Filter] 表格 {safe_check} 已由先前步骤提取，跳过以避免重复")
                 continue
-        proc = postprocess_dataframe(df, headers)
+        proc = postprocess_dataframe(df, headers, preserve_scripts=True)
         if proc is not None and proc.attrs.get('rejected_reason') == 'paywall':
             raw_rej = proc.attrs.get('rejected_raw_df', df)
             if raw_rej is not None and not raw_rej.empty:

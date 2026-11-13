@@ -135,13 +135,38 @@ def parse_structured_vlm_content(content):
             curr_label = ""
         
         try:
-            dfs = read_html_preserving_text(table_html)
+            html_with_scripts = re.sub(
+                r'<sub\b[^>]*>(.*?)</sub>',
+                lambda m: (
+                    '_{' + re.sub(r'<[^>]+>', '', m.group(1)).strip() + '}'
+                    if re.sub(r'<[^>]+>', '', m.group(1)).strip() else ''
+                ),
+                table_html,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            html_with_scripts = re.sub(
+                r'<sup\b[^>]*>(.*?)</sup>',
+                lambda m: (
+                    '^{' + re.sub(r'<[^>]+>', '', m.group(1)).strip() + '}'
+                    if re.sub(r'<[^>]+>', '', m.group(1)).strip() else ''
+                ),
+                html_with_scripts,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            dfs = read_html_preserving_text(html_with_scripts)
             if dfs:
                 df = dfs[0]
                 if isinstance(df.columns, pd.MultiIndex):
                     flat_cols = []
                     for col_tuple in df.columns:
-                        parts = [clean_latex_and_ocr(clean_text(str(p))).strip() for p in col_tuple if p is not None and str(p).strip() and not str(p).lower().startswith(('unnamed', 'col')) and str(p).lower() not in ['nan', 'none']]
+                        parts = [
+                            clean_latex_and_ocr(clean_text(str(p)), preserve_scripts=True).strip()
+                            for p in col_tuple
+                            if p is not None
+                            and str(p).strip()
+                            and not re.match(r'^(?:unnamed(?:\s*[:_]\s*\d+)?|col(?:umn)?[_\s]*\d+)$', str(p).strip(), re.IGNORECASE)
+                            and str(p).lower() not in ['nan', 'none']
+                        ]
                         dedup_parts = []
                         for p in parts:
                             if not dedup_parts or p != dedup_parts[-1]:
@@ -239,15 +264,18 @@ def parse_structured_markdown_tables(md_content):
             
     return tables
 
-def clean_latex_and_ocr(val, enable_chemical_typo_fix: bool = False):
+def clean_latex_and_ocr(val, enable_chemical_typo_fix: bool = False, preserve_scripts: bool = False):
     """Clean raw LaTeX math markup, OCR typos, and garbled symbols.
     Aggressive chemical substitutions (H20 -> H2O, CQ -> CO2, Tin -> Tm) are decoupled
     and disabled by default to prevent destroying legitimate sample codes or mineral abbreviations.
+    When preserve_scripts=True, script markers (^{...}, _{...}, X_n) are preserved for Excel CellRichText rendering.
     """
     if not isinstance(val, str) or not val:
         return val
     
-    # 0. Remove HTML tags if present
+    # 0. Convert HTML sub/sup markup before stripping remaining tags
+    val = re.sub(r'<sub(?:\s+[^>]*)?>(.*?)</sub>', r'_{\1}', val, flags=re.IGNORECASE | re.DOTALL)
+    val = re.sub(r'<sup(?:\s+[^>]*)?>(.*?)</sup>', r'^{\1}', val, flags=re.IGNORECASE | re.DOTALL)
     val = re.sub(r'<[^>]+>', ' ', val)
     val = re.sub(r'\\n', ' ', val)
     
@@ -265,14 +293,26 @@ def clean_latex_and_ocr(val, enable_chemical_typo_fix: bool = False):
     val = val.replace(r'\Delta', 'Δ').replace(r'\delta', 'δ').replace(r'\mu', 'μ').replace(r'\omega', 'ω').replace(r'\phi', 'φ').replace(r'\beta', 'β').replace(r'\gamma', 'γ')
     val = val.replace(r'\approx', '≈').replace(r'\leq', '≤').replace(r'\geq', '≥').replace(r'\neq', '≠')
     
-    # Superscripts / subscripts cleanup: ^{206} -> 206, _{...} -> ...
-    val = re.sub(r'\^\{+([0-9a-zA-Z\+\-\*\s]+)\}+', r'^\1', val)
-    val = re.sub(r'_\{+([0-9a-zA-Z\+\-\*\s]+)\}+', r'_\1', val)
+    # Superscripts / subscripts cleanup: ^{206} -> 206 or preserved as ^{206}
+    val = re.sub(r'\^\{+([0-9a-zA-Z\+\-\*\s]+)\}+', r'^{\1}' if preserve_scripts else r'^\1', val)
+    val = re.sub(r'_\{+([0-9a-zA-Z\+\-\*\s]+)\}+', r'_{\1}' if preserve_scripts else r'_\1', val)
     val = re.sub(r'(?<=\d)\s*times\s*(?=\d)', ' × ', val)
     
+    if preserve_scripts:
+        val = val.replace('^{', '\uE000').replace('_{', '\uE001')
+        val = re.sub('(\uE000|\uE001)([^\uE002{}]*)}', '\\1\\2\uE002', val)
+
     # Strip LaTeX $ delimiters and braces
     val = val.replace('$', '').replace('\\', '').replace('{', '').replace('}', '')
-    val = re.sub(r'([A-Za-z])_([0-9]+)', r'\1\2', val)
+    if preserve_scripts:
+        val = val.replace('\uE000', '^{').replace('\uE001', '_{').replace('\uE002', '}')
+    else:
+        def _strip_chem_sub(m):
+            prefix = val[:m.start()]
+            if re.search(r'(?:^|[^A-Za-z])[a-z]{2,}$', prefix + m.group(1)):
+                return m.group(0)
+            return f"{m.group(1)}{m.group(2)}"
+        val = re.sub(r'([A-Za-z])_([0-9]+)', _strip_chem_sub, val)
     val = re.sub(r'\s*±\s*', ' ± ', val)
     val = re.sub(r'\s*\^\s*([0-9+-]+)\s*', r'^\1', val)
     
@@ -542,8 +582,7 @@ def expand_squeezed_columns(df):
 
     from collections import Counter
 
-    new_cols = []
-    col_data = {}
+    col_entries = []
 
     def is_pure_number_token(t: str) -> bool:
         return bool(re.match(r'^[<>]?[-+]?\d+(?:\.\d+)?(?:[%‰]|×10[-+]?\d+)?$', t.strip()))
@@ -554,8 +593,7 @@ def expand_squeezed_columns(df):
 
         non_empty = [str(v).strip() for v in col_series if v is not None and str(v).strip() and str(v).strip().lower() not in ['nan', 'none', '']]
         if not non_empty:
-            new_cols.append(col_name)
-            col_data[col_name] = col_series
+            col_entries.append((col_name, col_series))
             continue
 
         # 仅统计纯数值/测量数据 token 的空格分隔计数（排除中文字符串、代码、公式段落）
@@ -598,13 +636,31 @@ def expand_squeezed_columns(df):
                         split_rows.append(parts[:modal_k-1] + [' '.join(parts[modal_k-1:])])
 
             for sub_i, sub_name in enumerate(sub_names):
-                new_cols.append(sub_name)
-                col_data[sub_name] = [r[sub_i] for r in split_rows]
+                col_entries.append((sub_name, [r[sub_i] for r in split_rows]))
         else:
-            new_cols.append(col_name)
-            col_data[col_name] = col_series
+            col_entries.append((col_name, col_series))
 
-    res_df = pd.DataFrame(col_data)
+    seen_cols = {}
+    unique_cols = []
+    data_dict = {}
+    for cname, series in col_entries:
+        base = str(cname)
+        if base not in seen_cols:
+            seen_cols[base] = 1
+            uname = base
+        else:
+            suffix = seen_cols[base]
+            uname = f"{base}_{suffix}"
+            while uname in seen_cols:
+                suffix += 1
+                uname = f"{base}_{suffix}"
+            seen_cols[base] = suffix + 1
+            seen_cols[uname] = 1
+        unique_cols.append(uname)
+        data_dict[uname] = series
+
+    res_df = pd.DataFrame(data_dict)
+    res_df.columns = unique_cols
     res_df.attrs = getattr(df, 'attrs', {}).copy()
     return res_df
 
@@ -671,6 +727,7 @@ def expand_multiline_subrows(df):
             
             for cp, extra_vals in subsequent_col_values.items():
                 col_splits[cp].extend(extra_vals)
+            max_splits = max((len(v) for v in col_splits), default=max_splits)
 
             for k in range(max_splits):
                 row_list = []
@@ -683,7 +740,7 @@ def expand_multiline_subrows(df):
                     elif k < len(lines):
                         row_list.append(lines[k])
                     else:
-                        row_list.append(lines[-1])
+                        row_list.append('')
                 new_rows.append(row_list)
         else:
             new_rows.append([row_iloc.iloc[cp] for cp in range(num_cols)])
@@ -949,19 +1006,19 @@ def should_promote_first_row(df: pd.DataFrame) -> bool:
     return False
 
 
-def _clean_vlm_dataframe(df: pd.DataFrame, original_attrs: dict) -> pd.DataFrame:
+def _clean_vlm_dataframe(df: pd.DataFrame, original_attrs: dict, preserve_scripts: bool = False) -> pd.DataFrame:
     """针对 PaddleOCR-VL-1.6 / MinerU 的零破坏直通管道 (Zero-Destructive Pass-Through)。"""
     # 0. 若表头为纯默认数字或系统占位符 (如 0, 1, 2 或 Col_1, Col_2)，检查首行是否应提升为表头
     is_default_cols = original_attrs.get('header_source') != 'explicit' and is_default_or_unnamed_columns(df.columns)
     if is_default_cols and should_promote_first_row(df):
-        first_row = [clean_latex_and_ocr(clean_text(str(x))).strip() for x in df.iloc[0]]
+        first_row = [clean_latex_and_ocr(clean_text(str(x)), preserve_scripts=preserve_scripts).strip() for x in df.iloc[0]]
         df = df.iloc[1:].reset_index(drop=True)
         df.columns = first_row
     elif is_default_cols:
         df.columns = [f"Col_{i+1}" for i in range(len(df.columns))]
 
     # 1. 规范化表头字符（保留 MultiIndex 展开的真实列名）
-    df.columns = [clean_latex_and_ocr(clean_text(str(c))) if c is not None else f"Col_{i+1}" for i, c in enumerate(df.columns)]
+    df.columns = [clean_latex_and_ocr(clean_text(str(c)), preserve_scripts=preserve_scripts) if c is not None else f"Col_{i+1}" for i, c in enumerate(df.columns)]
     
     # 确保列名唯一性
     if not df.columns.is_unique:
@@ -990,7 +1047,7 @@ def _clean_vlm_dataframe(df: pd.DataFrame, original_attrs: dict) -> pd.DataFrame
         if isinstance(x, float) and np.isnan(x):
             return ""
         s = str(x)
-        return clean_latex_and_ocr(clean_text(s))
+        return clean_latex_and_ocr(clean_text(s), preserve_scripts=preserve_scripts)
 
     df = df_map(df, _clean_cell)
 
@@ -1064,8 +1121,31 @@ def smart_flatten_headers(
     3. 语义冗余消解 (Deduplication): 当子列名已包含父列核心词时自动消解冗余前缀;
     4. 科学单位/计量括号保护: 将尾部单位规范化绑定至叶子节点 (如 '[wt%]' 或 '(g/t)')。
     """
-    if not header_rows:
+    if header_rows is None:
         return []
+    if isinstance(header_rows, pd.MultiIndex):
+        if len(header_rows) == 0:
+            return []
+        header_rows = [
+            [col[lvl] if isinstance(col, tuple) and lvl < len(col) else col for col in header_rows]
+            for lvl in range(header_rows.nlevels)
+        ]
+    elif isinstance(header_rows, pd.Index):
+        if len(header_rows) == 0:
+            return []
+        header_rows = [list(header_rows)]
+    elif isinstance(header_rows, pd.DataFrame):
+        if header_rows.empty:
+            return []
+        header_rows = header_rows.values.tolist()
+    elif isinstance(header_rows, np.ndarray):
+        if header_rows.size == 0:
+            return []
+        header_rows = [header_rows.tolist()] if header_rows.ndim == 1 else header_rows.tolist()
+    else:
+        header_rows = list(header_rows)
+        if not header_rows:
+            return []
     if len(header_rows) == 1:
         return [str(c).strip() if str(c).strip() and str(c).lower() != 'nan' else f"Col_{i+1}" for i, c in enumerate(header_rows[0])]
 
@@ -1372,14 +1452,14 @@ def is_paywall_table(df) -> bool:
     return bool(has_strong or weak_hits >= 2)
 
 
-def postprocess_dataframe(df, headers=None):
+def postprocess_dataframe(df, headers=None, preserve_scripts: bool = False):
     """Clean up and format the DataFrame safely and losslessly."""
     if df is None:
         return df
 
     # 领域模型向下解耦：若传入 ExtractedTable 统一对象，则处理其 underlying df 并同步属性
     if hasattr(df, 'df') and isinstance(df.df, pd.DataFrame):
-        df.df = postprocess_dataframe(df.df, headers=headers)
+        df.df = postprocess_dataframe(df.df, headers=headers, preserve_scripts=preserve_scripts)
         if hasattr(df, 'sync_attrs'):
             df.sync_attrs()
         return df
@@ -1411,7 +1491,7 @@ def postprocess_dataframe(df, headers=None):
 
     # 2. 针对 PaddleOCR-VL-1.6 / MinerU 官方高保真结构化表格的零破坏直通管道
     if is_vlm:
-        return _clean_vlm_dataframe(df, original_attrs)
+        return _clean_vlm_dataframe(df, original_attrs, preserve_scripts=preserve_scripts)
 
     # 3. 碎片化表检测：列数 >30 且填充率 <30% -> 丢弃
     if df.shape[1] > 30:
@@ -1428,14 +1508,18 @@ def postprocess_dataframe(df, headers=None):
 
     # 步骤 B: 表头覆盖与字符清洗
     if headers:
+        if isinstance(headers, str):
+            headers = [h.strip() for h in headers.split(',')]
+        else:
+            headers = list(headers)
         if len(headers) < len(df.columns):
             headers = headers + [f"Col{i}" for i in range(len(headers), len(df.columns))]
         else:
             headers = headers[:len(df.columns)]
         df.columns = headers
         
-    df.columns = [clean_latex_and_ocr(clean_text(c)) for c in df.columns]
-    df = df_map(df, lambda x: clean_latex_and_ocr(clean_text(x)) if isinstance(x, str) else x)
+    df.columns = [clean_latex_and_ocr(clean_text(c), preserve_scripts=preserve_scripts) for c in df.columns]
+    df = df_map(df, lambda x: clean_latex_and_ocr(clean_text(x), preserve_scripts=preserve_scripts) if isinstance(x, str) else x)
 
     # 保证列名唯一
     if not df.columns.is_unique:
@@ -2389,14 +2473,22 @@ def merge_continuation_tables(dfs):
         is_explicit_cont = bool(re.search(r'(?:续表|接上表|续上表|（续）|\(续\)|continued|cont\'?d|\(cont\b|cont\.)', combined_hint) or df.attrs.get('is_continuation')) and page_nearby
         
         # MinerU 跨页续表判定 1: 列名归一化与集合重合度 (Jaccard)
-        norm_curr_cols = set(_normalize_col_name(c) for c in df.columns if c and not str(c).startswith(('Unnamed', 'Col')))
-        norm_prev_cols = set(_normalize_col_name(c) for c in prev_df.columns if c and not str(c).startswith(('Unnamed', 'Col')))
+        def _is_placeholder_col(c_val) -> bool:
+            s_val = str(c_val).strip()
+            return (
+                not s_val
+                or bool(re.match(r'^(?:Unnamed(?:\s*[:_]\s*\d+)?|Col(?:umn)?[_\s]*\d+)$', s_val, re.IGNORECASE))
+            )
+
+        norm_curr_cols = set(_normalize_col_name(c) for c in df.columns if c is not None and not _is_placeholder_col(c))
+        norm_prev_cols = set(_normalize_col_name(c) for c in prev_df.columns if c is not None and not _is_placeholder_col(c))
         inter_cols = norm_curr_cols & norm_prev_cols
         union_cols = norm_curr_cols | norm_prev_cols
         col_jaccard = len(inter_cols) / max(1, len(union_cols)) if union_cols else 0.0
 
-        common_cols = set(_normalize_col_name(c) for c in df.columns) & set(_normalize_col_name(c) for c in prev_df.columns)
-        has_common_cols = len(common_cols - {'', 'unnamed', 'unnamed0', 'unnamed1', 'unnamed2', 'col1', 'col2', 'col3'}) >= 2
+        min_col_cnt = min(df.shape[1], prev_df.shape[1]) if df.shape[1] > 0 and prev_df.shape[1] > 0 else 0
+        common_col_thresh = 1 if min_col_cnt == 1 else 2
+        has_common_cols = len(inter_cols) >= common_col_thresh
 
         # 小表安全防护：若续表列名实质上是数据行（如检出限、误差、纯数值），则确系续表首行（保护 RangeIndex）
         is_seq_int = (
@@ -2417,20 +2509,23 @@ def merge_continuation_tables(dfs):
                 width_aligned = False
 
         # MinerU 跨页续表判定 3: 表头独立性与联合条件判定
-        has_distinct_header = (not cols_are_data) and any(not str(c).startswith(('Unnamed', 'Col')) for c in df.columns)
+        has_placeholder_or_seq_cols = is_seq_int or all(_is_placeholder_col(c) for c in df.columns)
+        has_distinct_header = (not cols_are_data) and (not is_seq_int) and any(not _is_placeholder_col(c) for c in df.columns)
         if has_distinct_header and not has_common_cols and not is_explicit_cont:
             cols_match = False
         else:
-            if is_explicit_cont or cols_are_data:
-                cols_match = has_common_cols or (abs(df.shape[1] - prev_df.shape[1]) <= 2 and width_aligned)
+            if is_explicit_cont or cols_are_data or has_placeholder_or_seq_cols:
+                cols_match = has_common_cols or (abs(df.shape[1] - prev_df.shape[1]) <= (1 if has_placeholder_or_seq_cols and not is_explicit_cont else 2) and width_aligned)
             else:
                 cols_match = (col_jaccard >= 0.35 or has_common_cols) and width_aligned and (abs(df.shape[1] - prev_df.shape[1]) <= 2)
 
-        # MinerU 跨页续表判定 4: 小表独立性保护——后表若只有 1~5 行且无明确续表标识、且非数据行列名且列集合差异大，坚决独立保留，杜绝前大后小误合并
+        # MinerU 跨页续表判定 4: 小表独立性保护——仅当后表带有独立真实表头且列集合与前表不重合时才独立保留；
+        # 若为无表头/占位列/重复同构表头的续表尾段（<6行），允许并入前表避免尾部数据丢失
         is_small_unlabeled_independent = (
-            df.shape[0] < 6 and 
-            not is_explicit_cont and 
-            not cols_are_data and 
+            df.shape[0] < 6 and
+            not is_explicit_cont and
+            not cols_are_data and
+            has_distinct_header and
             (col_jaccard < 0.40 or not has_common_cols)
         )
 

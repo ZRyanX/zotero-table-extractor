@@ -1048,23 +1048,49 @@ class DocLayoutEnsembleDetector:
             pp_bbox = pp_r.get("table_bbox", pp_r.get("crop_bbox", []))
             matched_idx = -1
             best_iou = 0.0
+            best_contain = 0.0
             for idx, y_r in enumerate(fused):
                 y_bbox = y_r.get("table_bbox", y_r.get("crop_bbox", []))
                 iou = DocLayoutYoloDetector._iou(pp_bbox, y_bbox)
-                if iou > best_iou:
+                contain = 0.0
+                if len(pp_bbox) >= 4 and len(y_bbox) >= 4:
+                    ix1 = max(pp_bbox[0], y_bbox[0])
+                    iy1 = max(pp_bbox[1], y_bbox[1])
+                    ix2 = min(pp_bbox[2], y_bbox[2])
+                    iy2 = min(pp_bbox[3], y_bbox[3])
+                    if ix2 > ix1 and iy2 > iy1:
+                        inter_a = (ix2 - ix1) * (iy2 - iy1)
+                        area_p = max(1e-6, (pp_bbox[2] - pp_bbox[0]) * (pp_bbox[3] - pp_bbox[1]))
+                        area_y = max(1e-6, (y_bbox[2] - y_bbox[0]) * (y_bbox[3] - y_bbox[1]))
+                        contain = inter_a / min(area_p, area_y)
+                if iou > best_iou or (iou == best_iou and contain > best_contain):
                     best_iou = iou
+                    best_contain = contain
                     matched_idx = idx
 
-            if best_iou >= 0.40 and matched_idx >= 0:
-                # 融合标记：补全缺失的 caption/footnote
+            if (best_iou >= 0.40 or (best_iou >= 0.25 and best_contain >= 0.70)) and matched_idx >= 0:
+                # 融合标记：补全缺失的 caption/footnote，并取更完整的联合边界框
                 matched_y = fused[matched_idx]
                 if pp_r.get("has_caption"):
                     matched_y["has_caption"] = True
                 if pp_r.get("has_footnote"):
                     matched_y["has_footnote"] = True
                 matched_y["score"] = max(matched_y.get("score", 0.0), pp_r.get("score", 0.0))
-            elif best_iou < 0.20:
-                # PP 检测到 YOLO 完全遗漏的表格主体，补全入选
+                if len(pp_bbox) >= 4 and len(matched_y.get("table_bbox", [])) >= 4:
+                    ym = matched_y["table_bbox"]
+                    matched_y["table_bbox"] = [
+                        min(ym[0], pp_bbox[0]), min(ym[1], pp_bbox[1]),
+                        max(ym[2], pp_bbox[2]), max(ym[3], pp_bbox[3])
+                    ]
+                pp_crop = pp_r.get("crop_bbox", [])
+                ym_crop = matched_y.get("crop_bbox", [])
+                if len(pp_crop) >= 4 and len(ym_crop) >= 4:
+                    matched_y["crop_bbox"] = [
+                        min(ym_crop[0], pp_crop[0]), min(ym_crop[1], pp_crop[1]),
+                        max(ym_crop[2], pp_crop[2]), max(ym_crop[3], pp_crop[3])
+                    ]
+            else:
+                # YOLO 遗漏或部分相邻/未充分重合的候选框（含 [0.20, 0.40) 区间）均予以保留补全
                 fused.append(pp_r)
 
         fused.sort(key=lambda r: (r.get("crop_bbox", [0, 0])[1], r.get("crop_bbox", [0, 0])[0]))

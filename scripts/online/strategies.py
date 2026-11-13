@@ -12,6 +12,14 @@ import io
 import pandas as pd
 
 try:
+    from .. import common
+except ImportError:
+    import common
+
+if hasattr(common, "ensure_macos_corefoundation"):
+    common.ensure_macos_corefoundation()
+
+try:
     from curl_cffi import requests as requests_impersonate
 except ImportError:
     requests_impersonate = None
@@ -23,11 +31,6 @@ except ImportError:
         from playwright_utils import find_playwright_chromium
     except ImportError:
         find_playwright_chromium = lambda: None
-
-try:
-    from .. import common
-except ImportError:
-    import common
 
 
 # Aliases to shared helpers (kept as bare names so call sites are unchanged)
@@ -332,10 +335,10 @@ def parse_tables_from_html(html_content, table_idx="all"):
         for idx, df in enumerate(dfs):
             if df.empty or len(df.columns) < 1 or len(df) < 1:
                 continue
-            # Basic cleanup of columns
+            # Basic cleanup of columns (index by iloc so duplicate column names never fail)
             df.columns = [clean_text(c) for c in df.columns]
-            for col in df.columns:
-                df[col] = df[col].astype(str).apply(clean_text)
+            for col_i in range(len(df.columns)):
+                df.iloc[:, col_i] = df.iloc[:, col_i].astype(str).apply(clean_text)
                 
             # Extract caption from preceding text block
             caption_text = ""
@@ -400,21 +403,40 @@ def parse_tables_from_markdown(md_content, table_idx="all"):
     current_table = []
     preceding_lines = []
     
+    def _is_markdown_sep_row(row_str, row_pos):
+        stripped = row_str.strip()
+        if not (stripped.startswith('|') and stripped.endswith('|')):
+            return False
+        cells = [p.strip() for p in stripped[1:-1].split('|')]
+        if not cells:
+            return False
+        if row_pos == 1:
+            return all(bool(re.match(r'^:?-{1,}:?$', c)) for c in cells)
+        return all(bool(re.match(r'^:?-{2,}:?$', c)) for c in cells)
+
     def process_table_and_add(t_lines, prec_lines):
         try:
-            processed_lines = []
-            for r in t_lines:
-                if '---' in r or '-|-' in r:
+            parsed_rows = []
+            for r_idx, r in enumerate(t_lines):
+                if _is_markdown_sep_row(r, r_idx):
                     continue
-                parts = [p.strip() for p in r.split('|')[1:-1]]
-                processed_lines.append('\t'.join(parts))
-                
-            csv_data = '\n'.join(processed_lines)
-            df = pd.read_csv(io.StringIO(csv_data), sep='\t')
-            if not df.empty and len(df.columns) >= 2:
-                df.columns = [clean_text(c) for c in df.columns]
-                for col in df.columns:
-                    df[col] = df[col].astype(str).apply(clean_text)
+                stripped = r.strip()
+                parts = [clean_text(p) for p in stripped[1:-1].split('|')]
+                parsed_rows.append(parts)
+
+            if len(parsed_rows) < 2:
+                return
+
+            max_cols = max(len(r) for r in parsed_rows)
+            if max_cols < 1:
+                return
+            norm_rows = [r + [''] * (max_cols - len(r)) for r in parsed_rows]
+            header_row = [clean_text(c) for c in norm_rows[0]]
+            data_rows = norm_rows[1:]
+            df = pd.DataFrame(data_rows, columns=header_row, dtype=str)
+            if not df.empty and len(df.columns) >= 1:
+                for col_i in range(len(df.columns)):
+                    df.iloc[:, col_i] = df.iloc[:, col_i].astype(str).apply(clean_text)
                     
                 caption_text = ""
                 label_text = ""
@@ -449,12 +471,12 @@ def parse_tables_from_markdown(md_content, table_idx="all"):
             current_table.append(line_strip)
         else:
             if current_table:
-                if len(current_table) >= 3:
+                if len(current_table) >= 2:
                     process_table_and_add(current_table, preceding_lines)
                 current_table = []
             preceding_lines.append(line)
             
-    if current_table and len(current_table) >= 3:
+    if current_table and len(current_table) >= 2:
         process_table_and_add(current_table, preceding_lines)
         
     if not tables_found:
@@ -671,10 +693,20 @@ def extract_elsevier_supplementary_tables(doi, api_key):
                     print(f"  -> Successfully opened PDF {filename} ({len(pdf_doc)} pages).")
                     for p_idx in range(len(pdf_doc)):
                         page = pdf_doc[p_idx]
-                        tbl_list = page.find_tables().tables
+                        try:
+                            finder = page.find_tables()
+                            tbl_list = list(finder.tables) if finder and finder.tables else []
+                        except Exception:
+                            tbl_list = []
+                        if not tbl_list:
+                            try:
+                                finder = page.find_tables(strategy="text")
+                                tbl_list = list(finder.tables) if finder and finder.tables else []
+                            except Exception:
+                                tbl_list = []
                         for t_idx, table in enumerate(tbl_list):
                             rows = table.extract()
-                            if rows and len(rows) >= 3 and len(rows[0]) >= 2:
+                            if rows and len(rows) >= 2 and len(rows[0]) >= 1:
                                 df = _rows_to_dataframe(rows)
                                 tbl_label = f"Supplementary Table {filename_no_ext}_P{p_idx+1}" if len(tbl_list) == 1 else f"Supplementary Table {filename_no_ext}_P{p_idx+1}_T{t_idx+1}"
                                 df.attrs['label'] = tbl_label
@@ -1733,16 +1765,93 @@ def extract_tables_via_firecrawl(url, api_key=None, table_idx="all", cancel_even
     return _finish([])
 
 
+def _scrapling_fetch_html(url, extra_kwargs=None):
+    """Fetch rendered HTML using Scrapling StealthyFetcher with macOS CoreFoundation pre-load."""
+    import inspect
+    if hasattr(common, "ensure_macos_corefoundation"):
+        common.ensure_macos_corefoundation()
+    try:
+        from scrapling.fetchers import StealthyFetcher
+    except ImportError:
+        from scrapling import StealthyFetcher
+    fetch_kwargs = {
+        "headless": True,
+        "network_idle": True,
+        "solve_cloudflare": True,
+        "hide_canvas": True,
+        "block_webrtc": True,
+        "wait": 1200,
+        "timeout": 45000,
+    }
+    if extra_kwargs:
+        fetch_kwargs.update(extra_kwargs)
+
+    # Filter kwargs by concrete signature or StealthSession schema when inspectable
+    allowed_keys = None
+    try:
+        sig = inspect.signature(StealthyFetcher.fetch)
+        has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+        if not has_varkw:
+            allowed_keys = set(sig.parameters.keys())
+        else:
+            try:
+                from scrapling.engines._browsers._types import StealthSession
+                ann = getattr(StealthSession, "__annotations__", None)
+                if isinstance(ann, dict) and ann:
+                    allowed_keys = set(ann.keys())
+            except Exception:
+                allowed_keys = None
+    except Exception:
+        allowed_keys = None
+
+    filtered_kwargs = (
+        {k: v for k, v in fetch_kwargs.items() if k in allowed_keys or (extra_kwargs and k in extra_kwargs)}
+        if allowed_keys is not None else dict(fetch_kwargs)
+    )
+
+    def _call_with_graceful_strip(fn, target_url, kwargs_dict):
+        cur = dict(kwargs_dict)
+        strip_order = ["hide_canvas", "block_webrtc", "solve_cloudflare", "wait", "timeout", "network_idle", "headless"]
+        while True:
+            try:
+                return fn(target_url, **cur)
+            except TypeError:
+                removed = False
+                for opt_k in strip_order:
+                    if opt_k in cur:
+                        cur.pop(opt_k)
+                        removed = True
+                        break
+                if not removed:
+                    raise
+
+    try:
+        res = _call_with_graceful_strip(StealthyFetcher.fetch, url, filtered_kwargs)
+    except TypeError:
+        try:
+            res = StealthyFetcher.fetch(url, **(extra_kwargs or {}))
+        except TypeError:
+            fetcher = StealthyFetcher()
+            res = _call_with_graceful_strip(fetcher.fetch, url, filtered_kwargs)
+    if res is None:
+        return ""
+    html = getattr(res, "html_content", None) or getattr(res, "text", None)
+    if not html:
+        body = getattr(res, "body", None)
+        if isinstance(body, bytes):
+            html = body.decode("utf-8", errors="replace")
+        elif isinstance(body, str):
+            html = body
+    return html or ""
+
+
 def extract_tables_via_scrapling(url, table_idx="all"):
     """
     Invokes Scrapling StealthyFetcher.
     """
     try:
-        from scrapling import StealthyFetcher
         print(f"Querying Scrapling StealthyFetcher for {url}...")
-        fetcher = StealthyFetcher()
-        res = fetcher.fetch(url)
-        html = res.html_content
+        html = _scrapling_fetch_html(url)
         if html:
             dfs = parse_tables_from_html(html, table_idx)
             if dfs:
@@ -1809,10 +1918,7 @@ def extract_cnki_tables_via_scrapling(url, table_idx="all", cookies_path=None):
     Fetches CNKI page using Scrapling StealthyFetcher with optional cookies.
     """
     try:
-        from scrapling import StealthyFetcher
         print(f"CNKI Scrapling: Loading {url}...")
-        fetcher = StealthyFetcher()
-        
         extra_kwargs = {}
         if cookies_path and os.path.exists(cookies_path):
             cookies = load_cookies_from_file(cookies_path)
@@ -1822,9 +1928,8 @@ def extract_cnki_tables_via_scrapling(url, table_idx="all", cookies_path=None):
                     print(f"CNKI Scrapling: Loaded {len(cookies)} cookies from {cookies_path}")
                 except Exception as e:
                     print(f"CNKI Scrapling: Failed to apply cookies: {e}")
-                    
-        res = fetcher.fetch(url, **extra_kwargs)
-        html = res.html_content
+
+        html = _scrapling_fetch_html(url, extra_kwargs=extra_kwargs)
         if html:
             if has_image_based_tables(html):
                 print("检测到知网网页表格为图片格式，无法直接抓取文本。自动跳转至本地 PDF 识别模式。")
@@ -2067,6 +2172,17 @@ def extract_tables_via_crawl4ai(url, table_idx="all", cancel_event=None):
                 # 表格出现立即返回；无表页面加载完成 3s 后也不再空等
                 "wait_for": "js:() => document.querySelectorAll('table').length > 0 || (document.readyState === 'complete' && performance.now() > 3000)",
             }
+            try:
+                from crawl4ai.table_extraction import DefaultTableExtraction
+                run_kwargs["table_extraction_strategy"] = DefaultTableExtraction()
+            except Exception:
+                try:
+                    import crawl4ai as _c4a
+                    _dte = getattr(_c4a, "DefaultTableExtraction", None)
+                    if _dte is not None:
+                        run_kwargs["table_extraction_strategy"] = _dte()
+                except Exception:
+                    pass
             run_config = CrawlerRunConfig(**_filter_kwargs(CrawlerRunConfig, run_kwargs))
 
             async with AsyncWebCrawler(config=browser_config) as crawler:
@@ -2075,14 +2191,14 @@ def extract_tables_via_crawl4ai(url, table_idx="all", cancel_event=None):
                     if cancel_event is not None and cancel_event.is_set():
                         task.cancel()
                         print("[Crawl4AI] 收到取消信号，已中止抓取。")
-                        return None, None, "cancel"
+                        return None, None, None, "cancel"
                     done, _pending = await asyncio.wait({task}, timeout=0.5)
                     if done:
                         break
                 try:
                     result = task.result()
                 except asyncio.CancelledError:
-                    return None, None, "cancel"
+                    return None, None, None, "cancel"
                 if result.success:
                     md_obj = result.markdown
                     if md_obj is not None and not isinstance(md_obj, str):
@@ -2090,9 +2206,10 @@ def extract_tables_via_crawl4ai(url, table_idx="all", cancel_event=None):
                         md_text = getattr(md_obj, "raw_markdown", None) or getattr(md_obj, "fit_markdown", None) or str(md_obj)
                     else:
                         md_text = md_obj
-                    return result.html, md_text, "ok"
+                    c4_tables = getattr(result, "tables", None)
+                    return result.html, md_text, c4_tables, "ok"
                 print(f"[Crawl4AI] Crawl failed: {result.error_message}")
-                return None, None, "fail"
+                return None, None, None, "fail"
 
         try:
             try:
@@ -2102,9 +2219,9 @@ def extract_tables_via_crawl4ai(url, table_idx="all", cancel_event=None):
             if running_loop is not None:
                 import nest_asyncio
                 nest_asyncio.apply()
-                html, markdown, status = running_loop.run_until_complete(_crawl())
+                html, markdown, c4_tables, status = running_loop.run_until_complete(_crawl())
             else:
-                html, markdown, status = asyncio.run(_crawl())
+                html, markdown, c4_tables, status = asyncio.run(_crawl())
         except Exception as e:
             print(f"[Crawl4AI Error] Exception during crawl: {e}")
             _crawl4ai_record(url, hard_failure=True)
@@ -2114,13 +2231,39 @@ def extract_tables_via_crawl4ai(url, table_idx="all", cancel_event=None):
             _crawl4ai_record(url, hard_failure=True)
             return []
 
-        if html:
+        if html or c4_tables:
             # 抓取成功（无论是否解析到表格）都清零该域失败计数
             _crawl4ai_record(url, hard_failure=False)
-            dfs = parse_tables_from_html(html, table_idx)
-            if dfs:
-                print(f"[Crawl4AI] Successfully extracted {len(dfs)} tables from HTML.")
-                return dfs
+            if html:
+                dfs = parse_tables_from_html(html, table_idx)
+                if dfs:
+                    print(f"[Crawl4AI] Successfully extracted {len(dfs)} tables from HTML.")
+                    return dfs
+
+            if c4_tables:
+                parsed_c4 = []
+                for idx_t, t_item in enumerate(c4_tables):
+                    if not isinstance(t_item, dict):
+                        continue
+                    headers = t_item.get("headers") or []
+                    rows = t_item.get("rows") or []
+                    if not rows:
+                        continue
+                    try:
+                        if headers:
+                            df_t = pd.DataFrame(rows, columns=[clean_text(h) for h in headers], dtype=str)
+                        else:
+                            df_t = _rows_to_dataframe(rows)
+                        if df_t is not None and not df_t.empty:
+                            if t_item.get("caption"):
+                                df_t.attrs["table_title"] = clean_text(t_item["caption"])
+                            df_t.attrs["extractor"] = "crawl4ai_table"
+                            parsed_c4.append(df_t)
+                    except Exception:
+                        pass
+                if parsed_c4:
+                    print(f"[Crawl4AI] Successfully extracted {len(parsed_c4)} tables via DefaultTableExtraction.")
+                    return parsed_c4
 
             if markdown:
                 dfs = parse_tables_from_markdown(markdown, table_idx)

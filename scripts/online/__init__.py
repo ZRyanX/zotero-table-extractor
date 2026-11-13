@@ -17,6 +17,14 @@ import requests
 import pandas as pd
 
 try:
+    from .. import common
+except ImportError:
+    import common
+
+if hasattr(common, "ensure_macos_corefoundation"):
+    common.ensure_macos_corefoundation()
+
+try:
     from curl_cffi import requests as requests_impersonate
 except ImportError:
     requests_impersonate = None
@@ -28,11 +36,6 @@ except ImportError:
         from playwright_utils import find_playwright_chromium
     except ImportError:
         find_playwright_chromium = lambda: None
-
-try:
-    from .. import common
-except ImportError:
-    import common
 
 load_config = common.load_config
 get_cnki_cookies_path = common.get_cnki_cookies_path

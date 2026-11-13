@@ -49,9 +49,18 @@ PENDING_DIR = os.path.join(BRIDGE_DIR, "pending")
 RESOLVED_DIR = os.path.join(BRIDGE_DIR, "resolved")
 CROPS_DIR = os.path.join(BRIDGE_DIR, "crops")
 
-def ensure_bridge_dirs():
+def ensure_bridge_dirs(bridge_dir: Optional[str] = None):
     """确保智能体通信目录存在。"""
-    for d in [BRIDGE_DIR, PENDING_DIR, RESOLVED_DIR, CROPS_DIR]:
+    if bridge_dir:
+        dirs = [
+            bridge_dir,
+            os.path.join(bridge_dir, "pending"),
+            os.path.join(bridge_dir, "resolved"),
+            os.path.join(bridge_dir, "crops"),
+        ]
+    else:
+        dirs = [BRIDGE_DIR, PENDING_DIR, RESOLVED_DIR, CROPS_DIR]
+    for d in dirs:
         os.makedirs(d, exist_ok=True)
 
 class AgentReasoningBridge:
@@ -63,7 +72,7 @@ class AgentReasoningBridge:
         self.pending_dir = os.path.join(self.bridge_dir, "pending")
         self.resolved_dir = os.path.join(self.bridge_dir, "resolved")
         self.crops_dir = os.path.join(self.bridge_dir, "crops")
-        ensure_bridge_dirs()
+        ensure_bridge_dirs(self.bridge_dir)
 
     def create_reasoning_task(
         self,

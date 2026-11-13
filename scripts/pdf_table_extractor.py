@@ -42,6 +42,7 @@ import os
 import re
 import io
 import time
+import shutil
 import tempfile
 import logging
 from pathlib import Path
@@ -306,10 +307,11 @@ def extract_via_structure_tree(pdf_path: str, pages: Optional[List[int]] = None)
             tbl_headers = []
             tbl_col_centers = []
             tbl_rows = []
+            has_auto_index = False
 
             for pan_idx, pan in enumerate(panels):
                 th_cells = [c for c in pan if c['role'] == 'TH']
-                if th_cells and pan_idx == 0:
+                if th_cells:
                     th_by_y = sorted(th_cells, key=lambda c: -c['y'])
                     th_rows_grouped = []
                     cur_r = []
@@ -342,32 +344,36 @@ def extract_via_structure_tree(pdf_path: str, pages: Optional[List[int]] = None)
 
                     col_th_cells = [c for r in col_header_rows for c in r] if col_header_rows else [c for c in th_cells if c['y'] >= max(c['y'] for c in pan) - 35.0]
 
+                    leaf_row = col_header_rows[-1] if col_header_rows else []
                     is_hierarchy = (
                         len(col_header_rows) >= 2 and
-                        len(col_header_rows[1]) >= 4 and
-                        len(col_header_rows[0]) <= len(col_header_rows[1]) * 0.75
+                        len(leaf_row) >= 4 and
+                        any(len(r) <= len(leaf_row) * 0.75 for r in col_header_rows[:-1])
                     )
 
                     if is_hierarchy:
-                        row0 = col_header_rows[0]
-                        row1 = col_header_rows[1]
                         headers = []
                         col_centers = []
-                        for sub in row1:
-                            matched_sup = None
-                            for i, sup in enumerate(row0):
-                                next_x = row0[i+1]['x'] if i+1 < len(row0) else 999999.0
-                                if sup['x'] - 15.0 <= sub['x'] < next_x - 15.0:
-                                    matched_sup = sup['text']
-                                    break
-                            if matched_sup and matched_sup != sub['text']:
-                                headers.append(f'{matched_sup} {sub["text"]}')
-                            else:
-                                headers.append(sub['text'])
+                        # 逐层向下映射所有上层表头（兼容 2 层及 3 层以上嵌套表头）
+                        for sub in leaf_row:
+                            path_parts = []
+                            for upper_row in col_header_rows[:-1]:
+                                matched_sup = None
+                                for i, sup in enumerate(upper_row):
+                                    next_x = upper_row[i+1]['x'] if i+1 < len(upper_row) else 999999.0
+                                    if sup['x'] - 15.0 <= sub['x'] < next_x - 15.0:
+                                        matched_sup = sup['text']
+                                        break
+                                if matched_sup and (not path_parts or matched_sup != path_parts[-1]):
+                                    path_parts.append(matched_sup)
+                            if not path_parts or sub['text'] != path_parts[-1]:
+                                path_parts.append(sub['text'])
+                            headers.append(' '.join(p for p in path_parts if p))
                             col_centers.append(sub['x'])
-                        if row0[0]['x'] < row1[0]['x'] - 20.0:
-                            headers.insert(0, row0[0]['text'])
-                            col_centers.insert(0, row0[0]['x'])
+                        top_row = col_header_rows[0]
+                        if top_row and leaf_row and top_row[0]['x'] < leaf_row[0]['x'] - 20.0:
+                            headers.insert(0, top_row[0]['text'])
+                            col_centers.insert(0, top_row[0]['x'])
                     else:
                         # 动态自适应列头聚类容差
                         all_th_x = sorted(c['x'] for c in col_th_cells)
@@ -392,23 +398,51 @@ def extract_via_structure_tree(pdf_path: str, pages: Optional[List[int]] = None)
                             headers.append(' '.join(x['text'] for x in clust_sorted if x['text']))
                             col_centers.append(sum(x['x'] for x in clust) / len(clust))
 
-                    tbl_headers = headers
-                    tbl_col_centers = col_centers
                     data_cells = [c for c in pan if c not in col_th_cells]
+                    if not tbl_headers:
+                        tbl_headers = headers
+                        tbl_col_centers = list(col_centers)
+                        panel_col_centers = list(col_centers)
+                    elif has_auto_index and len(col_centers) == len(tbl_headers) - 1:
+                        left_cells = [c for c in data_cells if c['x'] < min(col_centers) - 8.0] if col_centers else []
+                        if left_cells:
+                            left_x = sum(c['x'] for c in left_cells) / len(left_cells)
+                        elif len(tbl_col_centers) >= 2 and col_centers:
+                            left_x = col_centers[0] - (tbl_col_centers[1] - tbl_col_centers[0])
+                        elif tbl_col_centers:
+                            left_x = tbl_col_centers[0]
+                        else:
+                            left_x = col_centers[0] - 40.0 if col_centers else 0.0
+                        panel_col_centers = [left_x] + list(col_centers)
+                    elif len(col_centers) == len(tbl_headers):
+                        panel_col_centers = list(col_centers)
+                    else:
+                        panel_col_centers = list(tbl_col_centers)
+                        if data_cells and panel_col_centers and min(c['x'] for c in data_cells) > max(panel_col_centers) + 20.0:
+                            x_shift = min(c['x'] for c in data_cells) - min(panel_col_centers)
+                            panel_col_centers = [cx + x_shift for cx in panel_col_centers]
                 else:
                     data_cells = pan
+                    panel_col_centers = list(tbl_col_centers)
+                    if data_cells and panel_col_centers and min(c['x'] for c in data_cells) > max(panel_col_centers) + 20.0:
+                        x_shift = min(c['x'] for c in data_cells) - min(panel_col_centers)
+                        panel_col_centers = [cx + x_shift for cx in panel_col_centers]
 
                 # 若数据行在表头左侧存在独立数据列（即第 0 列为省略表头的行头，门限自适应）
-                if data_cells and tbl_col_centers:
-                    min_th_x = min(tbl_col_centers)
+                if not has_auto_index and data_cells and panel_col_centers:
+                    min_th_x = min(panel_col_centers)
                     leftmost_data_cells = [c for c in data_cells if c['x'] < min_th_x - 8.0]
-                    if leftmost_data_cells:
+                    if leftmost_data_cells and len(panel_col_centers) == len(tbl_headers):
                         left_x = sum(c['x'] for c in leftmost_data_cells) / len(leftmost_data_cells)
                         tbl_headers.insert(0, 'Index')
+                        panel_col_centers.insert(0, left_x)
                         tbl_col_centers.insert(0, left_x)
+                        has_auto_index = True
+                        for prev_r in tbl_rows:
+                            prev_r.insert(0, '')
 
                 n_cols = len(tbl_headers)
-                if n_cols == 0:
+                if n_cols == 0 or len(panel_col_centers) != n_cols:
                     continue
 
                 # 始终使用单元格顶行物理 y 坐标 (top_y) 行聚类 + 垂直区间重叠辅助 + x 轴物理列投影重建数据行，
@@ -419,8 +453,8 @@ def extract_via_structure_tree(pdf_path: str, pages: Optional[List[int]] = None)
                 curr_min_y = None
                 rows_grouped = []
                 for c in data_by_y:
-                    c_col = min(range(n_cols), key=lambda i: abs(tbl_col_centers[i] - c['x']))
-                    used_cols = {min(range(n_cols), key=lambda i: abs(tbl_col_centers[i] - x['x'])) for x in curr_r}
+                    c_col = min(range(n_cols), key=lambda i: abs(panel_col_centers[i] - c['x']))
+                    used_cols = {min(range(n_cols), key=lambda i: abs(panel_col_centers[i] - x['x'])) for x in curr_r}
                     vert_overlap = (curr_min_y is not None and c['y'] >= curr_min_y - 2.0 and c_col not in used_cols)
                     if curr_y is None or abs(c['y'] - curr_y) < 6.5 or vert_overlap:
                         curr_r.append(c)
@@ -438,7 +472,7 @@ def extract_via_structure_tree(pdf_path: str, pages: Optional[List[int]] = None)
                 for r in rows_grouped:
                     row_vals = [''] * n_cols
                     for c in r:
-                        best_idx = min(range(n_cols), key=lambda i: abs(tbl_col_centers[i] - c['x']))
+                        best_idx = min(range(n_cols), key=lambda i: abs(panel_col_centers[i] - c['x']))
                         if row_vals[best_idx]:
                             row_vals[best_idx] += ' ' + c['text']
                         else:
@@ -573,44 +607,58 @@ def classify_and_extract_via_inspector(pdf_path: str, caption_page_map: Optional
         except Exception as e_st:
             logger.debug(f"[pdf-inspector] extract_via_structure_tree notice: {e_st}")
 
-        # 2. 若非扫描件，优先使用 extract_pages_markdown 获取逐页 Markdown，精准绑定表格与页码
-        if result['pdf_type'] not in ('scanned', 'image_based') and not result['pages_needing_ocr']:
+        # 2. 若非纯扫描件，优先使用 extract_pages_markdown 对非 OCR 文本页获取逐页 Markdown，精准绑定表格与页码
+        if result['pdf_type'] not in ('scanned', 'image_based'):
             if hasattr(pdf_inspector, 'extract_pages_markdown'):
                 try:
-                    pages_res = pdf_inspector.extract_pages_markdown(pdf_path)
-                    if result['pdf_type'] in ('unknown', ''):
-                        result['pdf_type'] = 'text_based'
-                    result['confidence'] = max(result['confidence'], 0.85)
-                    result['pages_with_tables'] = list(getattr(pages_res, 'pages_with_tables', []))
-                    if not result['pages_needing_ocr']:
-                        result['pages_needing_ocr'] = list(getattr(pages_res, 'pages_needing_ocr', []))
-                    
-                    full_md_list = []
-                    for p_item in pages_res.pages:
-                        p_idx = p_item.page
-                        p_md = p_item.markdown or ""
-                        full_md_list.append(f"<!-- Page {p_idx+1} -->\n{p_md}")
-                        if p_md:
-                            p_tables = _parse_markdown_tables(p_md, caption_page_map, default_page=p_idx)
-                            for tbl_df, p_hint in p_tables:
-                                actual_page = p_hint if p_hint is not None else p_idx
-                                tbl_df.attrs['extractor'] = 'pdf_inspector'
-                                tbl_df.attrs['page_idx'] = actual_page
-                                if not tbl_df.attrs.get('label'):
-                                    tbl_df.attrs['label'] = f"Table {len(result['tables'])+1}"
-                                st_bbox = tbl_df.attrs.get('bbox')
-                                if st_bbox is None and result['structure_tables']:
-                                    same_p_st = [s for s in result['structure_tables'] if s.get('page_idx') == actual_page and s.get('bbox')]
-                                    if len(same_p_st) == 1 and len(p_tables) == 1:
-                                        st_bbox = same_p_st[0]['bbox']
-                                        tbl_df.attrs['bbox'] = st_bbox
-                                result['tables'].append({
-                                    'df': tbl_df,
-                                    'page_idx': actual_page,
-                                    'table_idx': len(result['tables']),
-                                    'bbox': st_bbox,
-                                })
-                    result['markdown'] = "\n\n".join(full_md_list)
+                    ocr_set = set(result.get('pages_needing_ocr') or [])
+                    page_cnt = int(result.get('page_count') or 0)
+                    non_ocr_pages = None
+                    if ocr_set and page_cnt > 0:
+                        non_ocr_pages = [p for p in range(page_cnt) if p not in ocr_set]
+                    if non_ocr_pages is None or len(non_ocr_pages) > 0:
+                        try:
+                            pages_res = (
+                                pdf_inspector.extract_pages_markdown(pdf_path, pages=non_ocr_pages)
+                                if non_ocr_pages is not None
+                                else pdf_inspector.extract_pages_markdown(pdf_path)
+                            )
+                        except TypeError:
+                            pages_res = pdf_inspector.extract_pages_markdown(pdf_path)
+                        if result['pdf_type'] in ('unknown', ''):
+                            result['pdf_type'] = 'text_based'
+                        result['confidence'] = max(result['confidence'], 0.85)
+                        result['pages_with_tables'] = list(getattr(pages_res, 'pages_with_tables', []))
+                        merged_ocr_pages = sorted(ocr_set | set(getattr(pages_res, 'pages_needing_ocr', [])))
+                        result['pages_needing_ocr'] = merged_ocr_pages
+                        
+                        full_md_list = []
+                        for p_item in pages_res.pages:
+                            p_idx = p_item.page
+                            p_md = p_item.markdown or ""
+                            full_md_list.append(f"<!-- Page {p_idx+1} -->\n{p_md}")
+                            if p_md:
+                                p_tables = _parse_markdown_tables(p_md, caption_page_map, default_page=p_idx)
+                                for tbl_df, p_hint in p_tables:
+                                    actual_page = p_hint if p_hint is not None else p_idx
+                                    tbl_df.attrs['extractor'] = 'pdf_inspector'
+                                    tbl_df.attrs['page_idx'] = actual_page
+                                    if not tbl_df.attrs.get('label'):
+                                        tbl_df.attrs['label'] = f"Table {len(result['tables'])+1}"
+                                        tbl_df.attrs['_label_is_fallback'] = True
+                                    st_bbox = tbl_df.attrs.get('bbox')
+                                    if st_bbox is None and result['structure_tables']:
+                                        same_p_st = [s for s in result['structure_tables'] if s.get('page_idx') == actual_page and s.get('bbox')]
+                                        if len(same_p_st) == 1 and len(p_tables) == 1:
+                                            st_bbox = same_p_st[0]['bbox']
+                                            tbl_df.attrs['bbox'] = st_bbox
+                                    result['tables'].append({
+                                        'df': tbl_df,
+                                        'page_idx': actual_page,
+                                        'table_idx': len(result['tables']),
+                                        'bbox': st_bbox,
+                                    })
+                        result['markdown'] = "\n\n".join(full_md_list)
                 except Exception as e_epm:
                     print(f"[pdf-inspector] extract_pages_markdown 提示: {e_epm}，回退到 process_pdf")
 
@@ -631,6 +679,7 @@ def classify_and_extract_via_inspector(pdf_path: str, caption_page_map: Optional
                         df.attrs['page_idx'] = page_hint
                     if not df.attrs.get('label'):
                         df.attrs['label'] = f"Table {i+1}"
+                        df.attrs['_label_is_fallback'] = True
                     st_bbox = df.attrs.get('bbox')
                     if st_bbox is None and result['structure_tables'] and page_hint is not None:
                         same_p_st = [s for s in result['structure_tables'] if s.get('page_idx') == page_hint and s.get('bbox')]
@@ -952,22 +1001,45 @@ def extract_via_find_tables(pdf_path: str, pages: Optional[List[int]] = None) ->
                     continue
                 page = doc[page_idx]
                 
-                # 先尝试默认 lines 策略（有边框线表格），再回退 text 策略（无线框表格）
-                finder = None
+                # 并行执行默认 lines 策略（有边框线表格）与 text 策略（无框三线表），补充合并同页不重叠的无线框表
+                combined_tables = []
+                seen_boxes = []
                 try:
-                    finder = page.find_tables()
-                    if not finder.tables:
-                        finder = page.find_tables(strategy="text")
+                    finder_lines = page.find_tables()
+                    if finder_lines and getattr(finder_lines, 'tables', None):
+                        for t in finder_lines.tables:
+                            combined_tables.append(t)
+                            if getattr(t, 'bbox', None):
+                                seen_boxes.append(list(t.bbox))
                 except Exception:
-                    try:
-                        finder = page.find_tables(strategy="text")
-                    except Exception:
-                        continue
-                
-                if not finder or not finder.tables:
+                    pass
+
+                try:
+                    finder_text = page.find_tables(strategy="text")
+                    if finder_text and getattr(finder_text, 'tables', None):
+                        for t_txt in finder_text.tables:
+                            t_box = list(t_txt.bbox) if getattr(t_txt, 'bbox', None) else None
+                            if t_box and seen_boxes:
+                                overlaps = False
+                                for eb in seen_boxes:
+                                    iou, iom = _compute_bbox_iou(t_box, eb)
+                                    if iou >= 0.25 or iom >= 0.45:
+                                        overlaps = True
+                                        break
+                                if overlaps:
+                                    continue
+                            elif not t_box and combined_tables:
+                                continue
+                            combined_tables.append(t_txt)
+                            if t_box:
+                                seen_boxes.append(t_box)
+                except Exception:
+                    pass
+
+                if not combined_tables:
                     continue
 
-                for tbl_idx, table in enumerate(finder.tables):
+                for tbl_idx, table in enumerate(combined_tables):
                     try:
                         rows = table.extract()
                     except Exception:
@@ -1079,21 +1151,64 @@ def extract_via_pdfplumber(pdf_path: str, pages: Optional[List[int]] = None) -> 
 
                 tables = page.find_tables()
                 page_parsed = _parse_plumber_tables(tables)
-                # 若默认 lines 策略未检出有效多列表格（如无竖线学术三线表），回退尝试 vertical_strategy="text"
+
+                def _add_plumber_complement(cand_list):
+                    for r in cand_list:
+                        rb = r.get('bbox')
+                        if rb:
+                            overlaps = False
+                            for ex in page_parsed:
+                                eb = ex.get('bbox')
+                                if eb:
+                                    iou, iom = _compute_bbox_iou(rb, eb)
+                                    if iou >= 0.25 or iom >= 0.45:
+                                        overlaps = True
+                                        break
+                            if overlaps:
+                                continue
+                        elif page_parsed:
+                            continue
+                        page_parsed.append(r)
+
+                # 混合页/三线表补全：无条件尝试 vertical_strategy="text" + horizontal_strategy="lines"，补充同页不重叠表格（含合法单列表）
+                try:
+                    fallback_tables = page.find_tables(
+                        table_settings={
+                            "vertical_strategy": "text",
+                            "horizontal_strategy": "lines",
+                            "intersection_y_tolerance": 5,
+                        }
+                    )
+                    fb_parsed = [
+                        r for r in _parse_plumber_tables(fallback_tables)
+                        if (r['df'].shape[1] >= 2 and r['df'].shape[0] >= 1)
+                        or (r['df'].shape[1] == 1 and r['df'].shape[0] >= 2)
+                    ]
+                    _add_plumber_complement(fb_parsed)
+                except Exception as e_fb:
+                    logger.debug(f"pdfplumber text-vertical fallback notice: {e_fb}")
+
+                # 纯无线框表补全：若当前页仍缺少多列表格，尝试 horizontal_strategy="text" 并严格以非低质/非元数据门禁过滤正文误检
                 if not any(r['df'].shape[1] >= 2 for r in page_parsed):
                     try:
-                        fallback_tables = page.find_tables(
+                        pure_text_tables = page.find_tables(
                             table_settings={
                                 "vertical_strategy": "text",
-                                "horizontal_strategy": "lines",
-                                "intersection_y_tolerance": 5,
+                                "horizontal_strategy": "text",
+                                "snap_tolerance": 3,
+                                "min_words_vertical": 3,
+                                "min_words_horizontal": 2,
                             }
                         )
-                        fb_parsed = [r for r in _parse_plumber_tables(fallback_tables) if r['df'].shape[1] >= 2 and r['df'].shape[0] >= 1]
-                        if fb_parsed:
-                            page_parsed = fb_parsed
-                    except Exception as e_fb:
-                        logger.debug(f"pdfplumber text-strategy fallback notice: {e_fb}")
+                        pt_parsed = [
+                            r for r in _parse_plumber_tables(pure_text_tables)
+                            if r['df'].shape[1] >= 2 and r['df'].shape[0] >= 2
+                            and not is_table_low_quality(r['df'])
+                            and not is_metadata_table(r['df'])
+                        ]
+                        _add_plumber_complement(pt_parsed)
+                    except Exception as e_pt:
+                        logger.debug(f"pdfplumber text-both fallback notice: {e_pt}")
 
                 results.extend(page_parsed)
         if doc_fitz:
@@ -1154,7 +1269,13 @@ def extract_via_camelot(pdf_path: str, pages: Optional[List[int]] = None) -> Lis
         pages_with_camelot = set()
         for flavor in ['lattice', 'stream']:
             try:
-                tables = camelot.read_pdf(pdf_path, flavor=flavor, pages=page_str)
+                if flavor == 'stream':
+                    try:
+                        tables = camelot.read_pdf(pdf_path, flavor=flavor, pages=page_str, edge_tol=150, row_tol=8)
+                    except TypeError:
+                        tables = camelot.read_pdf(pdf_path, flavor=flavor, pages=page_str)
+                else:
+                    tables = camelot.read_pdf(pdf_path, flavor=flavor, pages=page_str)
                 if tables and len(tables) > 0:
                     for tbl_idx, table in enumerate(tables):
                         report = getattr(table, 'parsing_report', None)
@@ -1174,11 +1295,6 @@ def extract_via_camelot(pdf_path: str, pages: Optional[List[int]] = None) -> Lis
                                 df = df.iloc[1:].reset_index(drop=True)
                                 df.columns = make_unique_columns(header_vals)
 
-                        if flavor == 'stream':
-                            existing_on_page = [r['df'] for r in results if r.get('page_idx') == page_idx]
-                            if any(_table_similarity(ex, df) >= 0.50 for ex in existing_on_page):
-                                continue
-
                         t_bbox = None
                         raw_bbox = getattr(table, '_bbox', None) or getattr(table, 'bbox', None)
                         if isinstance(raw_bbox, (list, tuple)) and len(raw_bbox) == 4:
@@ -1191,6 +1307,32 @@ def extract_via_camelot(pdf_path: str, pages: Optional[List[int]] = None) -> Lis
                                     t_bbox = [x0, y0_b, x1, y1_t]
                             except Exception:
                                 t_bbox = None
+
+                        if flavor == 'stream':
+                            existing_on_page = [r for r in results if r.get('page_idx') == page_idx]
+                            is_dup_stream = False
+                            for ex_item in existing_on_page:
+                                ex_df = ex_item['df']
+                                ex_box = ex_item.get('bbox')
+                                sim = _table_similarity(ex_df, df)
+                                if t_bbox and ex_box:
+                                    iou, iom = _compute_bbox_iou(t_bbox, ex_box)
+                                    if (iou >= 0.25 or iom >= 0.45) and sim >= 0.50:
+                                        is_dup_stream = True
+                                        break
+                                    if iom >= 0.80:
+                                        cov_ex, n_ex = _atomic_token_containment(ex_df, df, allow_reversed=False)
+                                        ex_ne = sum(1 for v in ex_df.values.flatten() if v is not None and str(v).strip() not in ('', 'nan', 'none'))
+                                        st_ne = sum(1 for v in df.values.flatten() if v is not None and str(v).strip() not in ('', 'nan', 'none'))
+                                        has_placeholder_cols = any(re.match(r'^Col_?\d+$', str(c).strip(), re.IGNORECASE) for c in df.columns)
+                                        if n_ex >= 4 and cov_ex >= 0.90 and (st_ne <= max(ex_ne * 1.6, ex_ne + 6) or (has_placeholder_cols and len(df) <= len(ex_df) + 2)):
+                                            is_dup_stream = True
+                                            break
+                                elif sim >= 0.85:
+                                    is_dup_stream = True
+                                    break
+                            if is_dup_stream:
+                                continue
 
                         df.attrs['extractor'] = f'camelot_{flavor}'
                         df.attrs['page_idx'] = page_idx
@@ -1297,16 +1439,25 @@ def extract_via_img2table(
         # img2table 接收 0-indexed 页码列表
         raw_pages = pages if pages is not None else candidate_pages
         target_pages = [int(p) for p in raw_pages] if raw_pages is not None else None
-        doc = PDF(src=pdf_path, pages=target_pages, detect_rotation=False, pdf_text_extraction=True)
+        try:
+            doc = PDF(src=pdf_path, pages=target_pages, detect_rotation=True, pdf_text_extraction=True)
+        except TypeError:
+            doc = PDF(src=pdf_path, pages=target_pages, detect_rotation=False, pdf_text_extraction=True)
 
         ocr_inst = _get_img2table_ocr()
         try:
             if ocr_inst is not None:
-                extracted = doc.extract_tables(ocr=ocr_inst, borderless_tables=True, implicit_rows=True)
+                extracted = doc.extract_tables(ocr=ocr_inst, borderless_tables=True, implicit_rows=True, implicit_columns=True)
             else:
-                extracted = doc.extract_tables(borderless_tables=True)
+                extracted = doc.extract_tables(borderless_tables=True, implicit_rows=True, implicit_columns=True)
         except TypeError:
-            extracted = doc.extract_tables(borderless_tables=True)
+            try:
+                if ocr_inst is not None:
+                    extracted = doc.extract_tables(ocr=ocr_inst, borderless_tables=True, implicit_rows=True)
+                else:
+                    extracted = doc.extract_tables(borderless_tables=True, implicit_rows=True)
+            except TypeError:
+                extracted = doc.extract_tables(borderless_tables=True)
 
         if extracted:
             for p_num, tbl_list in extracted.items():
@@ -1455,10 +1606,17 @@ def extract_via_gmft(pdf_path: str, pages: Optional[List[int]] = None) -> List[D
 
                     if isinstance(df.columns, pd.MultiIndex):
                         try:
-                            from table_postprocess import smart_flatten_headers
-                            df.columns = make_unique_columns(smart_flatten_headers(df.columns))
+                            try:
+                                from .table_postprocess import smart_flatten_headers
+                            except ImportError:
+                                from table_postprocess import smart_flatten_headers
+                            flattened = smart_flatten_headers(df.columns)
+                            if flattened and len(flattened) == len(df.columns):
+                                df.columns = make_unique_columns(flattened)
+                            else:
+                                raise ValueError("smart_flatten_headers length mismatch")
                         except Exception:
-                            df.columns = make_unique_columns([" ".join(str(x).strip() for x in col if str(x).strip()) for col in df.columns])
+                            df.columns = make_unique_columns([" ".join(str(x).strip() for x in col if str(x).strip() and str(x).strip().lower() != 'nan') for col in df.columns])
 
                     df = df_map(df, lambda x: str(x).strip() if x is not None else "")
                     df.attrs['extractor'] = 'gmft_tatr'
@@ -1789,9 +1947,241 @@ def _table_similarity(df1, df2) -> float:
 
 
 
+_NON_CTM_ROTATION_EXTRACTORS = frozenset({'find_tables', 'pdfplumber', 'text_alignment'})
+_CTM_AWARE_EXTRACTORS = frozenset({
+    'pdf_inspector_structure', 'pdf_inspector', 'pymupdf4llm', 'gmft',
+    'rapid_table', 'camelot', 'camelot_lattice', 'camelot_stream', 'mineru_api',
+})
+_REVERSED_COMMON_WORDS = frozenset({
+    'sample', 'table', 'total', 'mean', 'depth', 'element', 'elements',
+    'ratio', 'error', 'value', 'values', 'group', 'method', 'source',
+    'location', 'station', 'rock', 'mineral', 'isotope', 'grade', 'level',
+    'index', 'count', 'weight', 'mass', 'temp', 'time', 'date', 'year',
+    'area', 'type', 'unit', 'note', 'notes', 'age', 'ppm', 'ppb',
+})
+
+
+def _bbox_area_ratio(box1, box2) -> float:
+    if not box1 or not box2 or len(box1) < 4 or len(box2) < 4:
+        return float('inf')
+    try:
+        a1 = max(1e-6, abs(float(box1[2]) - float(box1[0])) * abs(float(box1[3]) - float(box1[1])))
+        a2 = max(1e-6, abs(float(box2[2]) - float(box2[0])) * abs(float(box2[3]) - float(box2[1])))
+        return max(a1, a2) / min(a1, a2)
+    except Exception:
+        return float('inf')
+
+
+def _is_reversed_sideways_garble(df) -> bool:
+    """Detect character-reversed or chopped sideways text typical of naive 90/270-degree PDF extraction."""
+    if df is None or getattr(df, 'empty', True):
+        return False
+
+
+    tokens = []
+    for c in getattr(df, 'columns', []):
+        s = str(c).strip()
+        if s and not re.match(r'^(?:Unnamed:\s*\d+|Col_?\d+|\d+)$', s, re.IGNORECASE):
+            tokens.extend(re.split(r'[\s\n\r/|,;]+', s))
+    for v in df.values.flatten():
+        if v is None:
+            continue
+        s = str(v).strip()
+        if s and s.lower() not in ('nan', 'none', 'null'):
+            tokens.extend(re.split(r'[\s\n\r/|,;]+', s))
+
+    if not tokens:
+        return False
+
+
+    reversed_hits = 0
+    non_num_tokens = 0
+    for tok in tokens:
+        if not tok or not re.search(r'[A-Za-z]', tok):
+            continue
+        non_num_tokens += 1
+        # Pattern 1: reversed capitalized Title-Case word, e.g. Sample -> elpmaS, Table -> elbaT
+        if re.match(r'^[a-z]{3,}[A-Z]$', tok):
+            reversed_hits += 1
+            continue
+        # Pattern 2: reversed unit/header word, e.g. mpp_U -> U_ppm, mpp_hT -> Th_ppm
+        tok_low = tok.lower()
+        rev_low = tok_low[::-1]
+        if tok_low != rev_low and len(tok_low) >= 4:
+            if tok_low.startswith(('mpp_', 'bpp_')):
+                reversed_hits += 1
+                continue
+            if tok_low not in _REVERSED_COMMON_WORDS:
+                if rev_low in _REVERSED_COMMON_WORDS:
+                    reversed_hits += 1
+                    continue
+                if any(part in _REVERSED_COMMON_WORDS for part in rev_low.split('_') if len(part) >= 3) and not any(
+                    part in _REVERSED_COMMON_WORDS for part in tok_low.split('_') if len(part) >= 3
+                ):
+                    reversed_hits += 1
+                    continue
+
+    if reversed_hits >= 2:
+        return True
+    if non_num_tokens > 0 and reversed_hits == 1 and non_num_tokens <= 3:
+        return True
+    return False
+
+
+
+def _atomic_table_tokens(df, include_reversed: bool = False) -> Set[str]:
+    if df is None or getattr(df, 'empty', True):
+        return set()
+    tokens: Set[str] = set()
+    for c in getattr(df, 'columns', []):
+        s = str(c).strip()
+        if s and not re.match(r'^(?:Unnamed:\s*\d+|Col_?\d+|\d+)$', s, re.IGNORECASE):
+            for tok in re.split(r'[\s\n\r/|,;]+', s.lower()):
+                tok = tok.strip()
+                if tok:
+                    tokens.add(tok)
+                    if include_reversed and len(tok) >= 2:
+                        tokens.add(tok[::-1])
+    for v in df.values.flatten():
+        if v is None:
+            continue
+        s = str(v).strip()
+        if not s or s.lower() in ('nan', 'none', 'null'):
+            continue
+        for tok in re.split(r'[\s\n\r/|,;]+', s.lower()):
+            tok = tok.strip()
+            if tok:
+                tokens.add(tok)
+                if include_reversed and len(tok) >= 2:
+                    tokens.add(tok[::-1])
+    return tokens
+
+
+def _atomic_token_containment(cand_df, ref_df, allow_reversed: bool = False) -> Tuple[float, int]:
+    """Fraction of cand_df's atomic tokens covered (exact or >=3-char substring) by ref_df."""
+    cand_norm = _atomic_table_tokens(cand_df, include_reversed=False)
+    if not cand_norm:
+        return 0.0, 0
+    ref_toks = _atomic_table_tokens(ref_df, include_reversed=False)
+    if not ref_toks:
+        return 0.0, len(cand_norm)
+
+    def _coverage(tokens_set: Set[str]) -> float:
+        matched = 0
+        for tok in tokens_set:
+            if tok in ref_toks:
+                matched += 1
+            elif len(tok) >= 3 and any((tok in rt or rt in tok) for rt in ref_toks if len(rt) >= 3):
+                matched += 1
+        return matched / len(tokens_set)
+
+    best = _coverage(cand_norm)
+    if allow_reversed:
+        cand_rev = {t[::-1] if len(t) >= 2 else t for t in cand_norm}
+        best = max(best, _coverage(cand_rev))
+    return best, len(cand_norm)
+
+
+def _get_bbox_dominant_angle(pdf_doc, page_idx: int, bbox) -> Tuple[int, float]:
+    if pdf_doc is None or not bbox or len(bbox) < 4:
+        return 0, 0.0
+    if not isinstance(page_idx, int) or page_idx < 0 or page_idx >= len(pdf_doc):
+        return 0, 0.0
+    try:
+        try:
+            from .doc_orientation_detector import detect_vector_text_details
+        except ImportError:
+            from doc_orientation_detector import detect_vector_text_details
+        import pymupdf as fitz
+        rect = fitz.Rect(float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
+        if rect.is_empty or rect.width <= 1 or rect.height <= 1:
+            return 0, 0.0
+        angle, total_len, ratio = detect_vector_text_details(pdf_doc[page_idx], rect=rect)
+        if total_len >= 6:
+            return int(angle), float(ratio)
+    except Exception:
+        pass
+    return 0, 0.0
+
+
+def _is_sideways_garbled_candidate(item_or_df: Any, src_name: Optional[str] = None, pdf_doc=None) -> bool:
+    is_dict = isinstance(item_or_df, dict)
+    df = item_or_df.get('df') if is_dict else item_or_df
+    if df is None or getattr(df, 'empty', True):
+        return False
+
+    if _is_reversed_sideways_garble(df):
+        return True
+    ext = (src_name or (item_or_df.get('extractor') if is_dict else None) or (df.attrs.get('extractor') if hasattr(df, 'attrs') else '') or '').strip().lower()
+    if ext in _NON_CTM_ROTATION_EXTRACTORS and pdf_doc is not None and is_dict:
+        bbox = item_or_df.get('pdf_bbox') or item_or_df.get('bbox') or df.attrs.get('pdf_bbox') or df.attrs.get('bbox')
+        p_idx = item_or_df.get('page_idx') if item_or_df.get('page_idx') is not None else df.attrs.get('page_idx')
+        if bbox is not None and isinstance(p_idx, int):
+            angle, ratio = _get_bbox_dominant_angle(pdf_doc, p_idx, bbox)
+            if angle in (90, 270) and ratio >= 0.60:
+                return True
+    return False
+
+
+def _is_upside_down_header_table(df) -> bool:
+    """Detect inverted/upside-down extractions where numeric data became headers and real headers landed in the last row."""
+    if df is None or getattr(df, 'empty', True) or len(df) < 2 or len(getattr(df, 'columns', [])) < 2:
+        return False
+
+    num_re = re.compile(r'^[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:[eE][-+]?\d+)?%?$')
+    summary_kw_re = re.compile(
+        r'^(?:total|mean|avg|average|sum|min|max|sd|std|median|n|count|note|notes|source|合计|总计|平均|均值|小计|注|备注)$',
+        re.IGNORECASE,
+    )
+    cols = [str(c).strip() for c in df.columns]
+    last_row = [str(v).strip() for v in df.iloc[-1].tolist()]
+
+    hdr_non_empty = [c for c in cols if c and not re.match(r'^(?:Unnamed:\s*\d+|Col_?\d+)$', c, re.IGNORECASE)]
+    last_non_empty = [v for v in last_row if v and v.lower() not in ('nan', 'none', '-', '—')]
+    if len(hdr_non_empty) < 2 or len(last_non_empty) < 2:
+        return False
+
+    hdr_nums = sum(1 for c in hdr_non_empty if num_re.match(c))
+    hdr_alpha = sum(1 for c in hdr_non_empty if not num_re.match(c) and re.search(r'[A-Za-z\u4e00-\u9fa5]', c))
+    last_nums = sum(1 for v in last_non_empty if num_re.match(v))
+    last_alpha_non_summary = sum(
+        1 for v in last_non_empty
+        if not num_re.match(v) and not summary_kw_re.match(v) and re.search(r'[A-Za-z\u4e00-\u9fa5]', v)
+    )
+
+    if hdr_nums >= 1 and last_nums == 0 and last_alpha_non_summary >= max(2, (len(last_non_empty) + 1) // 2):
+        if hdr_nums >= len(hdr_non_empty) / 2 or hdr_alpha == 0:
+            return True
+    return False
+
+
+def _degraded_matches_clean(
+    degraded_df,
+    clean_df,
+    same_verified_label: bool = False,
+    gc_thresh: float = 0.55,
+    cg_thresh: float = 0.65,
+    same_lbl_thresh: float = 0.50,
+) -> bool:
+    """
+    Check bidirectional atomic-token containment between a degraded (sideways-garbled
+    or upside-down) candidate and a clean candidate.
+    """
+    if degraded_df is None or clean_df is None:
+        return False
+    cov_gc, n_gc = _atomic_token_containment(degraded_df, clean_df, allow_reversed=True)
+    cov_cg, n_cg = _atomic_token_containment(clean_df, degraded_df, allow_reversed=True)
+    if (n_gc >= 3 and cov_gc >= gc_thresh) or (n_cg >= 3 and cov_cg >= cg_thresh):
+        return True
+    if same_verified_label and n_cg >= 3 and max(cov_gc, cov_cg) >= same_lbl_thresh:
+        return True
+    return False
+
+
 def _align_page_tables(
     page_tables: Dict[str, List[Dict[str, Any]]], 
-    priority: List[str]
+    priority: List[str],
+    pdf_doc=None,
 ) -> List[Dict[str, Dict[str, Any]]]:
     """
     将同一页面上由不同提取器提取的表格进行空间位置与内容对齐。
@@ -1809,7 +2199,7 @@ def _align_page_tables(
         for tbl in src_tbls:
             tbl_df = tbl.get('df')
             tbl_bbox = tbl.get('pdf_bbox') or tbl.get('bbox')
-            tbl_label = tbl_df.attrs.get('label') if tbl_df is not None else tbl.get('label')
+            tbl_label = (tbl_df.attrs.get('label') if tbl_df is not None and hasattr(tbl_df, 'attrs') else None) or tbl.get('label')
             best_cluster_idx = -1
             best_score = 0.0
 
@@ -1819,28 +2209,39 @@ def _align_page_tables(
 
                 cluster_scores = []
                 cluster_disqualified = False
+                has_strong_spatial = False
                 for existing_src, existing_tbl in cluster.items():
                     existing_df = existing_tbl.get('df')
                     existing_bbox = existing_tbl.get('pdf_bbox') or existing_tbl.get('bbox')
                     existing_label = (existing_df.attrs.get('label') if existing_df is not None and hasattr(existing_df, 'attrs') else None) or existing_tbl.get('label')
                     score = 0.0
 
-                    # 1. 显式表号标签冲突检查 (如 Table 1 vs Table 2，绝对严禁聚入同簇)
-                    if tbl_label and existing_label:
-                        fmt1 = format_table_label(tbl_label)
-                        fmt2 = format_table_label(existing_label)
-                        if fmt1 and fmt2 and fmt1 != fmt2:
-                            cluster_disqualified = True
-                            break
+                    # 1. 显式表号标签冲突检查 (如 Table 1 vs Table 2，绝对严禁聚入同簇；回退编号不参与硬冲突判定)
+                    tbl_is_fb = bool(tbl_df is not None and hasattr(tbl_df, 'attrs') and tbl_df.attrs.get('_label_is_fallback'))
+                    ex_is_fb = bool(existing_df is not None and hasattr(existing_df, 'attrs') and existing_df.attrs.get('_label_is_fallback'))
+                    fmt1 = format_table_label(tbl_label) if tbl_label else None
+                    fmt2 = format_table_label(existing_label) if existing_label else None
+                    vfmt1 = None if tbl_is_fb else fmt1
+                    vfmt2 = None if ex_is_fb else fmt2
+                    if vfmt1 and vfmt2 and vfmt1 != vfmt2:
+                        cluster_disqualified = True
+                        break
 
                     # 2. 空间二维重叠判定 (若两者均有有效 bbox)
                     has_both_bboxes = bool(tbl_bbox and existing_bbox and len(tbl_bbox) >= 4 and len(existing_bbox) >= 4)
                     spatial_matched = False
+                    strong_spatial_match = False
                     iom = 0.0
+                    iou = 0.0
                     if has_both_bboxes:
                         iou, iom_val = _compute_bbox_iou(tbl_bbox, existing_bbox)
                         iom = iom_val
-                        if iom >= 0.35 or iou >= 0.20:
+                        area_ratio = _bbox_area_ratio(tbl_bbox, existing_bbox)
+                        if iou >= 0.50 or (iom >= 0.75 and area_ratio <= 2.5):
+                            strong_spatial_match = True
+                            has_strong_spatial = True
+                            spatial_matched = True
+                        elif iom >= 0.35 or iou >= 0.20:
                             spatial_matched = True
                         elif iom == 0.0 and iou == 0.0:
                             # 明确在同一页面的不同空间区域（如一上一下或分栏左右），绝对严禁聚入同一簇
@@ -1855,22 +2256,48 @@ def _align_page_tables(
                         except Exception:
                             sim = 0.0
 
-                    # 空间匹配但内容无关时，禁止聚类（避免同页嵌套/相邻两表被合并覆盖误杀）
+                    # 空间匹配但内容无关时，禁止聚类（避免同页嵌套/相邻两表被合并覆盖误杀）；
+                    # 但强同位重叠 (iou >= 0.50 或 iom >= 0.75 且面积比 <= 2.5) 且无冲突显式表号时，允许聚类供投票择优
                     if spatial_matched:
                         has_same_fmt_label = bool(tbl_label and existing_label and format_table_label(tbl_label) == format_table_label(existing_label))
-                        if sim < 0.40 and not has_same_fmt_label:
+                        if sim < 0.40 and not has_same_fmt_label and not strong_spatial_match:
                             cluster_disqualified = True
                             break
-                        score = max(score, 0.40 * (0.50 + 0.50 * iom) + 0.60 * sim)
+                        base_score = 0.40 * (0.50 + 0.50 * iom) + 0.60 * sim
+                        if strong_spatial_match:
+                            base_score = max(base_score, 0.55 + 0.35 * max(iou, 0.5 * iom))
+                        score = max(score, base_score)
                     else:
-                        score = max(score, sim)
+                        if not has_both_bboxes and tbl_df is not None and existing_df is not None:
+                            c1, n1 = _atomic_token_containment(tbl_df, existing_df, allow_reversed=False)
+                            c2, n2 = _atomic_token_containment(existing_df, tbl_df, allow_reversed=False)
+                            min_toks = min(n1, n2)
+                            matched_unboxed = bool(min_toks >= 4 and max(c1, c2) >= 0.85)
+                            if not matched_unboxed:
+                                same_verified_lbl = bool(vfmt1 and vfmt2 and vfmt1 == vfmt2)
+                                tbl_bad = _is_sideways_garbled_candidate(tbl, src, pdf_doc=pdf_doc) or _is_upside_down_header_table(tbl_df)
+                                ex_bad = _is_sideways_garbled_candidate(existing_tbl, existing_src, pdf_doc=pdf_doc) or _is_upside_down_header_table(existing_df)
+                                if tbl_bad != ex_bad:
+                                    g_df, c_df = (tbl_df, existing_df) if tbl_bad else (existing_df, tbl_df)
+                                    matched_unboxed = _degraded_matches_clean(g_df, c_df, same_verified_label=same_verified_lbl)
+                                elif same_verified_lbl and n1 >= 3 and n2 >= 3 and max(c1, c2) >= 0.65:
+                                    matched_unboxed = True
+                            if matched_unboxed:
+                                score = max(score, 0.70, sim)
+                            else:
+                                score = max(score, sim)
+                        else:
+                            score = max(score, sim)
 
                     cluster_scores.append(score)
 
                 if cluster_disqualified:
                     continue
 
-                avg_score = sum(cluster_scores) / len(cluster_scores) if cluster_scores else 0.0
+                if has_strong_spatial and cluster_scores:
+                    avg_score = max(cluster_scores)
+                else:
+                    avg_score = sum(cluster_scores) / len(cluster_scores) if cluster_scores else 0.0
                 # 聚类阈值要求：无空间信息时需更严格的内容匹配 (>= 0.60)，避免同页小表误聚
                 threshold = 0.50 if any(tbl_bbox and (ex.get('pdf_bbox') or ex.get('bbox')) for ex in cluster.values()) else 0.60
                 if avg_score >= threshold and avg_score > best_score:
@@ -1897,6 +2324,7 @@ def three_way_vote(
     img2table_tables: Optional[List[Dict[str, Any]]] = None,
     pymupdf4llm_tables: Optional[List[Dict[str, Any]]] = None,
     rapid_table_tables: Optional[List[Dict[str, Any]]] = None,
+    pdf_path: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], List[str], Dict[str, Any]]:
     """
     多方投票融合: pdf-inspector-structure + pdf-inspector + pymupdf4llm + gmft + rapid_table + find_tables + img2table + text_alignment + pdfplumber + Camelot。
@@ -1941,13 +2369,22 @@ def three_way_vote(
     # 优先级排序：结构树绝对优先，pdf_inspector 与 pymupdf4llm/gmft 语义紧随其后，rapid_table 结构紧随其后，find_tables 与 img2table 矢量形态紧随其后
     priority = ['pdf_inspector_structure', 'pdf_inspector', 'pymupdf4llm', 'gmft', 'rapid_table', 'find_tables', 'img2table', 'text_alignment', 'pdfplumber', 'camelot']
 
-    for page in sorted(all_pages):
+    pdf_doc = None
+    if pdf_path and isinstance(pdf_path, str) and os.path.isfile(pdf_path):
+        try:
+            import pymupdf as fitz
+            pdf_doc = fitz.open(pdf_path)
+        except Exception:
+            pdf_doc = None
+
+    try:
+      for page in sorted(all_pages):
         page_tables = {}
         for src_name, src_tables in sources.items():
             page_tables[src_name] = [t for t in src_tables if t.get('page_idx', 0) == page]
 
         # 智能对齐该页上不同来源的表格簇，避免 raw zip 错位
-        aligned_clusters = _align_page_tables(page_tables, priority)
+        aligned_clusters = _align_page_tables(page_tables, priority, pdf_doc=pdf_doc)
         if not aligned_clusters:
             continue
 
@@ -1957,6 +2394,7 @@ def three_way_vote(
             logs.append(f"Page {page+1}: 主力引擎检测表数存在较大分歧 (counts={active_counts}) → 标记为低置信度页")
             low_confidence_pages.add(page)
 
+        page_fused = []
 
         # 逐个对齐表格簇进行投票
         for tbl_idx, candidates in enumerate(aligned_clusters):
@@ -1965,13 +2403,25 @@ def three_way_vote(
 
             # 两两比较（严格按照 priority 优先级顺序排列）
             src_names = [s for s in priority if s in candidates]
+            garbled_srcs = {
+                s for s in src_names
+                if _is_sideways_garbled_candidate(candidates[s], s, pdf_doc=pdf_doc)
+            }
+            inverted_srcs = {
+                s for s in src_names
+                if s not in garbled_srcs and _is_upside_down_header_table(candidates[s].get('df'))
+            }
+            clean_src_names = [s for s in src_names if s not in garbled_srcs]
+            clean_non_inv = [s for s in clean_src_names if s not in inverted_srcs]
+            vote_src_names = clean_non_inv if clean_non_inv else (clean_src_names if clean_src_names else src_names)
+
             best_result = None
             best_extractor = None
             agreement_found = False
 
-            for i in range(len(src_names)):
-                for j in range(i + 1, len(src_names)):
-                    s1, s2 = src_names[i], src_names[j]
+            for i in range(len(vote_src_names)):
+                for j in range(i + 1, len(vote_src_names)):
+                    s1, s2 = vote_src_names[i], vote_src_names[j]
                     sim = _table_similarity(candidates[s1]['df'], candidates[s2]['df'])
                     if sim >= similarity_threshold:
                         # 两个一致，取优先级更高的
@@ -1986,28 +2436,27 @@ def three_way_vote(
 
             if not agreement_found:
                 # 三方不一致或仅一方
-                if len(candidates) == 1:
-                    best_result = list(candidates.values())[0]
-                    best_extractor = list(candidates.keys())[0]
-                    logs.append(f"Page {page+1} Table {tbl_idx+1}: 仅 {best_extractor} 有结果 → 采用")
+                if len(vote_src_names) == 1:
+                    best_extractor = vote_src_names[0]
+                    best_result = candidates[best_extractor]
+                    logs.append(f"Page {page+1} Table {tbl_idx+1}: 仅 {best_extractor} 有有效候选 → 采用")
                 else:
                     # 取最高优先级候选 (pdf_inspector_structure / pdf_inspector)
-                    if 'pdf_inspector_structure' in candidates:
+                    if 'pdf_inspector_structure' in vote_src_names:
                         best_result = candidates['pdf_inspector_structure']
                         best_extractor = 'pdf_inspector_structure'
-                    elif 'pdf_inspector' in candidates:
+                    elif 'pdf_inspector' in vote_src_names:
                         best_result = candidates['pdf_inspector']
                         best_extractor = 'pdf_inspector'
                     else:
-                        # 取第一个（按优先级）
-                        best_result = list(candidates.values())[0]
-                        best_extractor = list(candidates.keys())[0]
+                        best_extractor = vote_src_names[0]
+                        best_result = candidates[best_extractor]
                     sims = []
                     max_sim = 0.0
-                    for i in range(len(src_names)):
-                        for j in range(i+1, len(src_names)):
-                            s = _table_similarity(candidates[src_names[i]]['df'], candidates[src_names[j]]['df'])
-                            sims.append(f"{src_names[i]}~{src_names[j]}={s:.2f}")
+                    for i in range(len(vote_src_names)):
+                        for j in range(i+1, len(vote_src_names)):
+                            s = _table_similarity(candidates[vote_src_names[i]]['df'], candidates[vote_src_names[j]]['df'])
+                            sims.append(f"{vote_src_names[i]}~{vote_src_names[j]}={s:.2f}")
                             max_sim = max(max_sim, s)
                     logs.append(f"Page {page+1} Table {tbl_idx+1}: 多方不一致 [{', '.join(sims)}] "
                                 f"→ 采用 {best_extractor} (最高优先级)")
@@ -2020,7 +2469,7 @@ def three_way_vote(
             # 若选出的候选表存在列挤压（如数值挤在同一单元格），且同页有未挤压的候选表，则自动切换为未挤压版本
             if best_result is not None and is_table_squeezed(best_result['df']):
                 for alt_name in ['pdf_inspector_structure', 'gmft', 'img2table', 'text_alignment', 'pdfplumber', 'camelot', 'pdf_inspector']:
-                    if alt_name in candidates and not is_table_squeezed(candidates[alt_name]['df']) and not _is_table_low_quality_after_clean(candidates[alt_name]):
+                    if alt_name in candidates and alt_name not in garbled_srcs and not is_table_squeezed(candidates[alt_name]['df']) and not _is_table_low_quality_after_clean(candidates[alt_name]):
                         logs.append(f"Page {page+1} Table {tbl_idx+1}: {best_extractor} 存在列挤压问题 → 自动切换为未挤压的 {alt_name}")
                         best_result = candidates[alt_name]
                         best_extractor = alt_name
@@ -2029,7 +2478,7 @@ def three_way_vote(
             # 低质量/损坏表格检查（先尝试 postprocess_dataframe 清洗修复表头/占位列/尾注后再判定）：
             # 若选出的候选表混入正文段落、章节标题或有效数据极度稀疏，检查是否有合格候选；若全不合格则剔除，留待 Step 3b PaddleOCR-VL 识别
             if best_result is not None and _is_table_low_quality_after_clean(best_result):
-                for alt_name in priority:
+                for alt_name in vote_src_names + [s for s in src_names if s in garbled_srcs]:
                     if alt_name in candidates and not _is_table_low_quality_after_clean(candidates[alt_name]):
                         logs.append(f"Page {page+1} Table {tbl_idx+1}: {best_extractor} 提取质量低劣 → 切换为 {alt_name}")
                         best_result = candidates[alt_name]
@@ -2048,23 +2497,310 @@ def three_way_vote(
                             best_result['df'].attrs['table_title'] = c['df'].attrs.get('table_title')
                             break
                 best_label = best_result['df'].attrs.get('label')
+                best_is_fb = bool(best_result['df'].attrs.get('_label_is_fallback'))
+                if not best_label or best_is_fb:
+                    for c in candidates.values():
+                        c_df_attrs = c['df'].attrs if hasattr(c['df'], 'attrs') else {}
+                        cand_label = c_df_attrs.get('label') or c.get('label')
+                        if cand_label and not c_df_attrs.get('_label_is_fallback'):
+                            best_result['df'].attrs['label'] = cand_label
+                            best_result['df'].attrs.pop('_label_is_fallback', None)
+                            if 'label' in best_result:
+                                best_result['label'] = cand_label
+                            best_label = cand_label
+                            best_is_fb = False
+                            break
                 if not best_label or best_label.startswith('Table '):
                     for c in candidates.values():
-                        cand_label = c['df'].attrs.get('label')
-                        if cand_label and not cand_label.startswith('Table '):
+                        c_df_attrs = c['df'].attrs if hasattr(c['df'], 'attrs') else {}
+                        cand_label = c_df_attrs.get('label')
+                        if cand_label and not cand_label.startswith('Table ') and not c_df_attrs.get('_label_is_fallback'):
                             best_result['df'].attrs['label'] = cand_label
+                            best_result['df'].attrs.pop('_label_is_fallback', None)
+                            if 'label' in best_result:
+                                best_result['label'] = cand_label
                             break
                 
                 best_result['df'].attrs['vote_extractor'] = best_extractor
                 best_result['df'].attrs['extractor'] = best_extractor
                 best_result['df'].attrs['cross_validated'] = agreement_found
-                fused.append(best_result)
+                is_degraded_cand = (best_extractor in garbled_srcs) or (best_extractor in inverted_srcs)
+                page_fused.append((best_result, is_degraded_cand, best_extractor))
+
+        # 抑制同页已经被清洁 CTM 感知引擎捕获的 90°/270° 旋转/倒序畸变孤立簇 (e.g. find_tables / pdfplumber / 倒置 pdf_inspector)
+        clean_ctm_items = [
+            it for (it, is_g, ext_n) in page_fused
+            if not is_g and ext_n in _CTM_AWARE_EXTRACTORS and not _is_table_low_quality_after_clean(it)
+        ]
+        for it, is_g, ext_n in page_fused:
+            if is_g and clean_ctm_items:
+                g_df = it.get('df')
+                g_lbl = it.get('label') or (g_df.attrs.get('label') if g_df is not None else None)
+                g_is_fb = bool(g_df.attrs.get('_label_is_fallback')) if g_df is not None and hasattr(g_df, 'attrs') else False
+                g_fmt = (format_table_label(g_lbl) if g_lbl else None) if not g_is_fb else None
+                shadowed_by = None
+                for c_it in clean_ctm_items:
+                    c_df = c_it.get('df')
+                    c_lbl = c_it.get('label') or (c_df.attrs.get('label') if c_df is not None else None)
+                    c_is_fb = bool(c_df.attrs.get('_label_is_fallback')) if c_df is not None and hasattr(c_df, 'attrs') else False
+                    c_fmt = (format_table_label(c_lbl) if c_lbl else None) if not c_is_fb else None
+                    if g_fmt and c_fmt and g_fmt != c_fmt:
+                        continue
+                    same_lbl = bool(g_fmt and c_fmt and g_fmt == c_fmt)
+                    if _degraded_matches_clean(g_df, c_df, same_verified_label=same_lbl):
+                        shadowed_by = c_it
+                        break
+                if shadowed_by is not None:
+                    logs.append(f"Page {page+1}: 过滤 90°/270° 旋转/倒序畸变重复表 ({ext_n})，已由 CTM 感知主表覆盖")
+                    c_df = shadowed_by.get('df')
+                    if c_df is not None and g_df is not None:
+                        c_is_fb = bool(c_df.attrs.get('_label_is_fallback'))
+                        g_lbl = g_df.attrs.get('label') or (it.get('label') if isinstance(it, dict) else None)
+                        g_fb = bool(
+                            g_is_fb
+                            or g_df.attrs.get('_label_is_fallback')
+                            or (it.get('_label_is_fallback') if isinstance(it, dict) else False)
+                        )
+                        if g_lbl and not g_fb and (not c_df.attrs.get('label') or c_is_fb):
+                            c_df.attrs['label'] = g_lbl
+                            c_df.attrs.pop('_label_is_fallback', None)
+                            if 'label' in shadowed_by:
+                                shadowed_by['label'] = g_lbl
+                            if '_label_is_fallback' in shadowed_by:
+                                shadowed_by.pop('_label_is_fallback', None)
+                            if g_df.attrs.get('table_title'):
+                                c_df.attrs['table_title'] = g_df.attrs.get('table_title')
+                            elif c_is_fb and c_df.attrs.get('table_title'):
+                                c_df.attrs['table_title'] = g_lbl
+                        else:
+                            if not c_df.attrs.get('label') and g_lbl:
+                                c_df.attrs['label'] = g_lbl
+                                if g_fb:
+                                    c_df.attrs['_label_is_fallback'] = True
+                            if not c_df.attrs.get('table_title') and g_df.attrs.get('table_title'):
+                                c_df.attrs['table_title'] = g_df.attrs.get('table_title')
+                    continue
+            fused.append(it)
+    finally:
+        if pdf_doc is not None:
+            try:
+                pdf_doc.close()
+            except Exception:
+                pass
 
     vote_summary = {
         'low_confidence_pages': low_confidence_pages,
         'page_scores': page_scores,
     }
     return fused, logs, vote_summary
+
+
+def _extractor_rank_for_dedup(item: Dict[str, Any]) -> int:
+    df = item.get('df')
+    ext = (
+        item.get('extractor')
+        or (df.attrs.get('vote_extractor') if df is not None and hasattr(df, 'attrs') else None)
+        or (df.attrs.get('extractor') if df is not None and hasattr(df, 'attrs') else '')
+        or ''
+    ).lower()
+    order = {
+        'pdf_inspector_structure': 110,
+        'mineru_api': 105,
+        'pdf_inspector': 100,
+        'pymupdf4llm': 90,
+        'gmft': 85,
+        'rapid_table': 80,
+        'paddleocr_vl': 78,
+        'pp_structure': 75,
+        'docling': 72,
+        'camelot_lattice': 68,
+        'camelot_stream': 66,
+        'camelot': 65,
+        'img2table': 55,
+        'find_tables': 40,
+        'text_alignment': 30,
+        'pdfplumber': 20,
+    }
+    return order.get(ext, 50)
+
+
+def _dedup_same_page_tables(
+    results: List[Dict[str, Any]],
+    pdf_path: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Conservative same-page deduplication guard:
+    Eliminates duplicate extractions on the same page sharing strong spatial overlap
+    (iou >= 0.55 or iom >= 0.80 with area_ratio <= 2.5), sideways-garbled duplicates
+    covered by a clean CTM-aware table, or unboxed token-identical duplicates, whenever
+    items do NOT carry distinct verified (non-fallback) caption labels.
+    """
+    if not results or len(results) <= 1:
+        return results
+
+    pdf_doc = None
+    if pdf_path and isinstance(pdf_path, str) and os.path.isfile(pdf_path):
+        try:
+            import pymupdf as fitz
+            pdf_doc = fitz.open(pdf_path)
+        except Exception:
+            pdf_doc = None
+
+    def _verified_fmt_label(item: Dict[str, Any]) -> Optional[str]:
+        df = item.get('df')
+        is_fb = bool(df.attrs.get('_label_is_fallback')) if df is not None and hasattr(df, 'attrs') else False
+        if is_fb:
+            return None
+        lbl = item.get('label') or (df.attrs.get('label') if df is not None and hasattr(df, 'attrs') else None)
+        if not lbl:
+            return None
+        return format_table_label(str(lbl))
+
+    def _quality_key(item: Dict[str, Any]) -> Tuple[int, int, int, int, int, int, int, int]:
+        df = item.get('df')
+        is_empty = 1 if (df is None or getattr(df, 'empty', True)) else 0
+        is_g = 1 if _is_sideways_garbled_candidate(item, pdf_doc=pdf_doc) else 0
+        is_inv = 1 if (df is not None and not is_empty and _is_upside_down_header_table(df)) else 0
+        is_sq = 1 if (df is not None and not is_empty and is_table_squeezed(df)) else 0
+        is_low = 1 if _is_table_low_quality_after_clean(item) else 0
+        has_verified_lbl = 1 if _verified_fmt_label(item) else 0
+        rank = _extractor_rank_for_dedup(item)
+        cells = int(df.size) if (df is not None and hasattr(df, 'size')) else 0
+        return (-is_empty, -is_low, -is_g, -is_inv, -is_sq, rank, has_verified_lbl, cells)
+
+    try:
+        indexed = list(enumerate(results))
+        indexed.sort(key=lambda pair: _quality_key(pair[1]), reverse=True)
+
+        kept_indices: List[Tuple[int, Dict[str, Any]]] = []
+        for orig_idx, cand in indexed:
+            cand_df = cand.get('df')
+            cand_p = cand.get('page_idx')
+            if cand_p is None and cand_df is not None and hasattr(cand_df, 'attrs'):
+                cand_p = cand_df.attrs.get('page_idx')
+            cand_box = (
+                cand.get('pdf_bbox')
+                or (cand_df.attrs.get('pdf_bbox') if cand_df is not None and hasattr(cand_df, 'attrs') else None)
+                or cand.get('bbox')
+                or (cand_df.attrs.get('bbox') if cand_df is not None and hasattr(cand_df, 'attrs') else None)
+            )
+            cand_fmt_type = (
+                'points'
+                if (cand.get('pdf_bbox') or (cand_df is not None and hasattr(cand_df, 'attrs') and cand_df.attrs.get('pdf_bbox')))
+                else (cand_df.attrs.get('bbox_format') if cand_df is not None and hasattr(cand_df, 'attrs') else None)
+            )
+            cand_fmt_lbl = _verified_fmt_label(cand)
+            cand_garbled = _is_sideways_garbled_candidate(cand, pdf_doc=pdf_doc)
+            cand_inverted = bool(cand_df is not None and not getattr(cand_df, 'empty', True) and _is_upside_down_header_table(cand_df))
+            cand_bad = cand_garbled or cand_inverted
+
+            matched_winner = None
+            for _, kept in kept_indices:
+                kept_df = kept.get('df')
+                kept_p = kept.get('page_idx')
+                if kept_p is None and kept_df is not None and hasattr(kept_df, 'attrs'):
+                    kept_p = kept_df.attrs.get('page_idx')
+                if cand_p != kept_p:
+                    continue
+
+                kept_fmt_lbl = _verified_fmt_label(kept)
+                if cand_fmt_lbl and kept_fmt_lbl and cand_fmt_lbl != kept_fmt_lbl:
+                    continue
+                same_verified_lbl = bool(cand_fmt_lbl and kept_fmt_lbl and cand_fmt_lbl == kept_fmt_lbl)
+                kept_garbled = _is_sideways_garbled_candidate(kept, pdf_doc=pdf_doc)
+                kept_inverted = bool(kept_df is not None and not getattr(kept_df, 'empty', True) and _is_upside_down_header_table(kept_df))
+                kept_bad = kept_garbled or kept_inverted
+
+                kept_box = (
+                    kept.get('pdf_bbox')
+                    or (kept_df.attrs.get('pdf_bbox') if kept_df is not None and hasattr(kept_df, 'attrs') else None)
+                    or kept.get('bbox')
+                    or (kept_df.attrs.get('bbox') if kept_df is not None and hasattr(kept_df, 'attrs') else None)
+                )
+                kept_fmt_type = (
+                    'points'
+                    if (kept.get('pdf_bbox') or (kept_df is not None and hasattr(kept_df, 'attrs') and kept_df.attrs.get('pdf_bbox')))
+                    else (kept_df.attrs.get('bbox_format') if kept_df is not None and hasattr(kept_df, 'attrs') else None)
+                )
+
+                is_dup = False
+                if cand_box and kept_box and cand_fmt_type == kept_fmt_type and len(cand_box) >= 4 and len(kept_box) >= 4:
+                    iou, iom = _compute_bbox_iou(cand_box, kept_box)
+                    area_ratio = _bbox_area_ratio(cand_box, kept_box)
+                    if iou >= 0.55 or (iom >= 0.80 and area_ratio <= 2.5):
+                        is_dup = True
+                    elif iom >= 0.80 and cand_df is not None and kept_df is not None:
+                        cov_kc, n_kc = _atomic_token_containment(kept_df, cand_df, allow_reversed=False)
+                        kept_ne = sum(1 for v in kept_df.values.flatten() if v is not None and str(v).strip() not in ('', 'nan', 'none'))
+                        cand_ne = sum(1 for v in cand_df.values.flatten() if v is not None and str(v).strip() not in ('', 'nan', 'none'))
+                        if n_kc >= 4 and cov_kc >= 0.90 and cand_ne <= max(kept_ne * 1.6, kept_ne + 6):
+                            is_dup = True
+                    elif iou == 0.0 and iom == 0.0:
+                        if cand_bad and cand_df is not None and kept_df is not None:
+                            if not kept_bad:
+                                if _degraded_matches_clean(
+                                    cand_df, kept_df, same_verified_label=same_verified_lbl,
+                                    gc_thresh=0.70, cg_thresh=0.75, same_lbl_thresh=0.50,
+                                ):
+                                    is_dup = True
+                            else:
+                                cov, n_tok = _atomic_token_containment(cand_df, kept_df, allow_reversed=True)
+                                if n_tok >= 3 and cov >= 0.70:
+                                    is_dup = True
+                        elif cand_df is not None and kept_df is not None:
+                            if _table_similarity(cand_df, kept_df) >= 0.90:
+                                is_dup = True
+                        if not is_dup:
+                            continue
+
+                if not is_dup and cand_df is not None and kept_df is not None:
+                    if cand_bad:
+                        if not kept_bad:
+                            if _degraded_matches_clean(cand_df, kept_df, same_verified_label=same_verified_lbl):
+                                is_dup = True
+                        else:
+                            cov, n_tok = _atomic_token_containment(cand_df, kept_df, allow_reversed=True)
+                            if n_tok >= 3 and cov >= 0.55:
+                                is_dup = True
+                    elif not cand_box or not kept_box or cand_fmt_type != kept_fmt_type:
+                        sim = _table_similarity(cand_df, kept_df)
+                        cov1, n1 = _atomic_token_containment(cand_df, kept_df, allow_reversed=False)
+                        cov2, n2 = _atomic_token_containment(kept_df, cand_df, allow_reversed=False)
+                        if (
+                            sim >= 0.80
+                            or (min(n1, n2) >= 4 and max(cov1, cov2) >= 0.85)
+                            or (same_verified_lbl and min(n1, n2) >= 3 and max(cov1, cov2) >= 0.65)
+                        ):
+                            is_dup = True
+                    else:
+                        if _table_similarity(cand_df, kept_df) >= 0.85:
+                            is_dup = True
+
+                if is_dup:
+                    matched_winner = kept
+                    break
+
+            if matched_winner is not None:
+                w_df = matched_winner.get('df')
+                if w_df is not None and cand_df is not None and hasattr(w_df, 'attrs') and hasattr(cand_df, 'attrs'):
+                    if not _verified_fmt_label(matched_winner) and _verified_fmt_label(cand):
+                        w_df.attrs['label'] = cand_df.attrs.get('label') or cand.get('label')
+                        matched_winner['label'] = w_df.attrs['label']
+                        w_df.attrs.pop('_label_is_fallback', None)
+                    if (not w_df.attrs.get('table_title') or w_df.attrs.get('table_title') == w_df.attrs.get('label')) and cand_df.attrs.get('table_title'):
+                        w_df.attrs['table_title'] = cand_df.attrs.get('table_title')
+                continue
+
+            kept_indices.append((orig_idx, cand))
+
+        kept_indices.sort(key=lambda pair: pair[0])
+        return [cand for _, cand in kept_indices]
+    finally:
+        if pdf_doc is not None:
+            try:
+                pdf_doc.close()
+            except Exception:
+                pass
 
 
 def _is_table_low_quality_after_clean(item_or_df: Any) -> bool:
@@ -2079,6 +2815,7 @@ def _is_table_low_quality_after_clean(item_or_df: Any) -> bool:
         return True
     if not is_table_low_quality(df) and not is_metadata_table(df):
         return False
+
     try:
         try:
             from .table_postprocess import postprocess_dataframe
@@ -2089,6 +2826,7 @@ def _is_table_low_quality_after_clean(item_or_df: Any) -> bool:
             if is_dict:
                 item_or_df['df'] = cleaned
             return False
+
     except Exception:
         pass
     return True
@@ -2235,6 +2973,7 @@ def extract_via_ocr(pdf_path: str, pages: Optional[List[int]] = None) -> List[Di
                     df.attrs['extractor'] = 'ppstructure_vlm'
                     if not df.attrs.get('label'):
                         df.attrs['label'] = f"Table {i+1}"
+                        df.attrs['_label_is_fallback'] = True
                     p_idx = _resolve_ocr_table_page(df, i, len(dfs), pages, pdf_path, caption_page_map)
                     df.attrs['page_idx'] = p_idx
                     results.append({
@@ -2403,6 +3142,7 @@ def has_text_layer(pdf_path: str, min_chars: int = 100, max_bad_char_ratio: floa
             if has_full_images == 0 and total_chars >= 20 and (valid_chars / max(1, total_chars)) >= 0.70:
                 return True
             return False
+
             
         bad_ratio = bad_chars / total_chars
         valid_ratio = valid_chars / total_chars
@@ -2410,10 +3150,12 @@ def has_text_layer(pdf_path: str, min_chars: int = 100, max_bad_char_ratio: floa
         if bad_ratio > max_bad_char_ratio or (valid_ratio < 0.65 and has_full_images >= 2):
             print(f"[PDF] 检测到劣质乱码假文本层 (控制符={bad_ratio:.1%}, 有效文字={valid_ratio:.1%}) → 判定为扫描版 PDF (scanned)")
             return False
+
             
         return True
     except Exception:
         return False
+
 
 
 def is_valid_caption_line(line: str) -> Tuple[bool, Optional[str], Optional[str]]:
@@ -2431,15 +3173,28 @@ def is_valid_caption_line(line: str) -> Tuple[bool, Optional[str], Optional[str]
         return False, None, None
     raw_lbl = m.group(1).strip()
     title = m.group(2).strip()
-    # 去除括号内部内容后再检查是否有正文标点（仅过滤明显的中文正文逗号、句号、感叹号，保留英文正常词间逗号）
+    # 去除括号内部内容后再检查是否有正文标点（保留仅以句号结尾或后接表注/单位的中文表标题，过滤正文长句）
     title_no_brackets = re.sub(r'（.*?）|\(.*?\)', '', title)
-    if any(p in title_no_brackets for p in ['。', '！', '？', '!']):
+    if any(p in title_no_brackets for p in ['！', '？', '!', '?']):
         return False, None, None
+    if '。' in title_no_brackets:
+        before_dot, after_dot = title_no_brackets.split('。', 1)
+        after_clean = re.sub(r'[；;,\s]+', '', after_dot)
+        if after_clean and not re.match(
+            r'^(?:注|备注|说明|其中|单位|数据来源|资料来源|Note|Notes|\*)\s*[:：]?',
+            after_dot.strip(),
+            re.IGNORECASE,
+        ):
+            return False, None, None
+        if re.search(r'(?:所示|可知|可见|看出|表明|显示|如下|为此|因此|列出了|给出了|汇总了)$', before_dot.strip()):
+            return False, None, None
     # 排除正文常用引导词/代词/动词开头或结尾（正文引用行）
-    if any(title.startswith(p) for p in [')', '）', '中', '可以', '所示', '可知', '看出', '见', '综合表达', '显示', '表明', '为', '是', '由', '在中', '对于', '根据', 'shown', 'listed', 'summarized']):
+    if any(title.startswith(p) for p in [')', '）', '中', '可以', '所示', '可知', '看出', '见', '综合表达', '显示', '表明', '为', '是', '由', '在中', '对于', '根据', '列出了', '给出了', '汇总了', '统计了', '总结了', '展示了', '反映了', '提供了', '对比了', '分析了', 'shown', 'listed', 'summarized']):
         return False, None, None
     if any(title.endswith(p) for p in ['所示', '可以看出', '表明', '可知', '见表', '来自表', '列入表', 'shown in', 'listed in']):
         return False, None, None
+    if title.endswith('。'):
+        title = title.rstrip('。 ')
     if len(title) > 160:
         return False, None, None
     return True, raw_lbl, title
@@ -2524,15 +3279,18 @@ def reconcile_table_captions(all_results: List[Dict[str, Any]], pdf_path: str) -
 
             curr_label = df.attrs.get('label', '')
             curr_title = df.attrs.get('table_title', '')
+            curr_is_fb = bool(df.attrs.get('_label_is_fallback'))
 
             assigned_label = None
             assigned_title = None
 
             # 1. 如果表格自带由 OCR/VLM 精准解析出的真实独立表号（如 表1, 表2, 附表1, Table 1 等），优先采信
-            if curr_label and TABLE_LABEL_RE.match(curr_label.strip()):
+            is_fallback_label = False
+            if curr_label and not curr_is_fb and TABLE_LABEL_RE.match(curr_label.strip()):
                 assigned_label = format_table_label(curr_label)
                 assigned_title = curr_title or assigned_label
                 used_captions.add(assigned_label)
+                df.attrs.pop('_label_is_fallback', None)
             # 2. 否则从本页精确绑定原生 text 层检测到的 caption
             elif p_idx in caption_map and caption_map[p_idx]:
                 caps = caption_map[p_idx]
@@ -2541,14 +3299,16 @@ def reconcile_table_captions(all_results: List[Dict[str, Any]], pdf_path: str) -
                     assigned_label = cap['label']
                     assigned_title = cap['title']
                     used_captions.add(assigned_label)
+                    df.attrs.pop('_label_is_fallback', None)
                 else:
                     for cap in caps:
                         if cap['label'] not in used_captions:
                             assigned_label = cap['label']
                             assigned_title = cap['title']
                             used_captions.add(assigned_label)
+                            df.attrs.pop('_label_is_fallback', None)
                             break
-            elif curr_label:
+            elif curr_label and not curr_is_fb:
                 assigned_label = format_table_label(curr_label)
                 assigned_title = curr_title or assigned_label
                 used_captions.add(assigned_label)
@@ -2569,6 +3329,7 @@ def reconcile_table_captions(all_results: List[Dict[str, Any]], pdf_path: str) -
                         if (p_idx - prev_p <= 3) and cols_ok and not is_small_pair:
                             assigned_label = prev_lbl
                             assigned_title = f"{prev_lbl} (续)"
+                            is_fallback_label = False
                             break
 
             # 3. 语种感知规范回退（中文文献用 表N，英文文献用 Table N）
@@ -2583,9 +3344,14 @@ def reconcile_table_captions(all_results: List[Dict[str, Any]], pdf_path: str) -
                 assigned_label = candidate_lbl
                 assigned_title = curr_title or assigned_label
                 used_captions.add(assigned_label)
+                is_fallback_label = True
 
             df.attrs['label'] = assigned_label
             df.attrs['table_title'] = assigned_title
+            if is_fallback_label:
+                df.attrs['_label_is_fallback'] = True
+            else:
+                df.attrs.pop('_label_is_fallback', None)
             r['label'] = assigned_label
 
     except Exception as e:
@@ -2636,15 +3402,18 @@ def _check_sparse_continuation_table(prev_page, next_page) -> bool:
         if not next_words or len(next_words) < 4:
             return False
 
+
         # 过滤页眉 (一般位于顶部 30pt 以内或 < 5% 页高)
         top_words = [w for w in next_words if 30.0 <= w[1] <= next_h * 0.48 and w[3] <= next_h * 0.52]
         if len(top_words) < 4:
             return False
 
+
         top_y0 = min(w[1] for w in top_words)
         # 若顶部文字起点离页顶过远（超过页高 35%），则并非紧密承接前页顶部的续表
         if top_y0 > next_h * 0.35:
             return False
+
 
         # 将 top_words 按纵向坐标分行 (容差 5pt)
         sorted_words = sorted(top_words, key=lambda w: (round(w[1] / 6.0) * 6.0, w[0]))
@@ -2662,12 +3431,15 @@ def _check_sparse_continuation_table(prev_page, next_page) -> bool:
         if len(lines) < 2:
             return False
 
+
         # 终止条件校验：若首行属于新章节标题、新图题或新独立表题，直接拒绝
         first_line_text = " ".join(w[4] for w in lines[0] if len(w) > 4 and w[4]).strip()
         if re.match(r'^(?:\d+[\.\s]|[A-Z][\.\s]|Chapter|Section|第[一二三四五六七八九十\d]+[章节篇]|Conclusion|References|Acknowledgements|参考文献|致谢|图|Fig)', first_line_text, re.IGNORECASE):
             return False
+
         if re.match(r'^(?:附表|附录表|补充表|表|Table|Tab\.)\s*\d+', first_line_text, re.IGNORECASE) and not re.search(r'(?:续|cont)', first_line_text, re.IGNORECASE):
             return False
+
 
         # 正文停用词密度过滤：若包含高比例常见叙述性停用词，说明为正文自然语言段落而非表格元胞
         prose_stopwords = {'the', 'of', 'and', 'in', 'to', 'a', 'is', 'that', 'for', 'it', 'as', 'was', 'with', 'be', 'by', 'on', 'not', 'this', 'are', 'or', 'an', 'they', 'which', 'from', 'at', 'we', 'were', 'has', 'have', 'had', 'been', 'their', 'which', 'its', 'also', 'between', 'these', 'those'}
@@ -2676,6 +3448,7 @@ def _check_sparse_continuation_table(prev_page, next_page) -> bool:
             sw_ratio = sum(1 for t in tokens if t in prose_stopwords) / len(tokens)
             if sw_ratio >= 0.22:
                 return False
+
 
         # 多列对齐特征与列间隙探测 (Column Alignment)
         line_col_starts = []
@@ -2707,6 +3480,7 @@ def _check_sparse_continuation_table(prev_page, next_page) -> bool:
         has_multi_col = any(len(starts) >= 2 for starts in line_col_starts)
         if aligned_col_count < 2 or not has_multi_col:
             return False
+
 
         # 2. 探查前一页底部表格的水平区间与底部位置（必须存在触底表格，杜绝普通正文误判）
         prev_span = None
@@ -2794,6 +3568,7 @@ def _check_sparse_continuation_table(prev_page, next_page) -> bool:
         if prev_span is None:
             return False
 
+
         # 3. 水平跨度一致性检查 (Horizontal Span Consistency)
         next_x0 = min(w[0] for w in top_words)
         next_x1 = max(w[2] for w in top_words)
@@ -2804,6 +3579,7 @@ def _check_sparse_continuation_table(prev_page, next_page) -> bool:
         if prev_w < 50.0 or next_w < 50.0:
             return False
 
+
         x_overlap = max(0.0, min(prev_x1, next_x1) - max(prev_x0, next_x0))
         min_w = min(prev_w, next_w)
         overlap_ratio = x_overlap / min_w
@@ -2813,9 +3589,11 @@ def _check_sparse_continuation_table(prev_page, next_page) -> bool:
         if overlap_ratio < 0.60 or width_ratio < 0.45:
             return False
 
+
         return True
     except Exception:
         return False
+
 
 
 def group_continuation_atomic_blocks(pdf_path: str, pages: List[int]) -> List[List[int]]:
@@ -2883,9 +3661,11 @@ def group_continuation_atomic_blocks(pdf_path: str, pages: List[int]) -> List[Li
                             if ln.endswith('.') and len(ln.split()) >= 10:
                                 if re.search(r'(?:et\s+al\.|fig\.|tab\.|no\.|vol\.|pp?\.|wt\.|ca\.|\d+\.)$', ln, re.IGNORECASE):
                                     return False
+
                                 num_w = sum(1 for w in ln.split() if re.search(r'\d', w))
                                 return (num_w / max(1, len(ln.split()))) < 0.20
                             return False
+
 
                         sentence_count = sum(1 for l in lines if _is_true_prose_sentence(l))
                         if sentence_count >= 3 and len(next_text) >= 350 and not is_sparse_cont:
@@ -3296,6 +4076,7 @@ def _get_table_garbage_row_indices(df: Any) -> set:
         except ValueError:
             return False
 
+
     for r in range(df.shape[0]):
         row_vals = [str(df.iat[r, c]).strip() for c in range(df.shape[1]) if str(df.iat[r, c]).strip() not in ("", "nan", "none")]
         if not row_vals:
@@ -3332,6 +4113,7 @@ def _should_replace_with_ocr(nat_item, ocr_item) -> bool:
     if df_o is None or df_o.empty:
         return False
 
+
     # 若原生表格退化为无意义残表（空表、单单元格），允许合格 OCR 替换
     is_n_degenerate = (
         df_n is None or
@@ -3344,6 +4126,7 @@ def _should_replace_with_ocr(nat_item, ocr_item) -> bool:
 
     if is_table_low_quality(df_o) and not is_table_low_quality(df_n):
         return False
+
 
     # 识别原生表格中是否存在明确的污染、表头重复、元数据混入或低质量判定
     is_n_low_quality = is_table_low_quality(df_n)
@@ -3523,9 +4306,11 @@ def _should_replace_with_ocr(nat_item, ocr_item) -> bool:
     # 严格门禁：无论原生表是否受污染，都绝不允许 OCR 丢失独立样本或通过重复假造行记录！
     if has_missing_distinct_samples:
         return False
+
     min_retention = 0.90 if clean_n_is_low_quality else 0.95
     if record_retention_ratio < min_retention:
         return False
+
 
     # 若原生表格存在缺陷/污染/低质：只要 OCR 本身合格且通过样本核查，允许剔除垃圾行替换
     if is_n_low_quality or is_n_contaminated:
@@ -3534,19 +4319,24 @@ def _should_replace_with_ocr(nat_item, ocr_item) -> bool:
                 o_valid_cells >= (0.85 * n_clean_valid_cells)):
                 return True
             return False
+
         else:
             if o_valid_cells >= (0.75 * n_clean_valid_cells):
                 if df_o.shape[0] >= int(0.9 * len(clean_n)) or ocr_cols >= clean_n_cols:
                     return True
             return False
 
+
     # 原生表格为清洁高质表格：严格保护其已有行列结构与数据量
     if df_o.shape[0] < df_n.shape[0]:
         return False
+
     if df_o.shape[1] < df_n.shape[1]:
         return False
+
     if o_valid_cells < n_clean_valid_cells and not clean_n_is_low_quality:
         return False
+
 
     # 填充率对比：如果 OCR 极度稀疏而原生填充良好，保留原生
     n_cells = df_n.size
@@ -3555,6 +4345,7 @@ def _should_replace_with_ocr(nat_item, ocr_item) -> bool:
     o_fill = o_valid_cells / max(1, o_cells)
     if o_fill < 0.20 and n_fill >= 0.50:
         return False
+
 
     return True
 
@@ -4347,7 +5138,7 @@ def _do_extract_tables_from_pdf(
             import ocr_client
 
         primary_succeeded = False
-        pages_requiring_ocr = set()
+        pages_requiring_ocr = set(p for p in (target_pages or []) if p in pure_image_pages)
         original_native_results = []
         valid_fused = []
         valid_struct_tables = []
@@ -4428,10 +5219,14 @@ def _do_extract_tables_from_pdf(
                 cache_zip = pdf_p.parent / "mineru_cache" / f"{pdf_p.stem}.zip"
                 cache_dir = pdf_p.parent / "mineru_cache" / pdf_p.stem
                 mineru_dfs = []
+                mineru_pages = target_pages if target_pages is not None else native_target_pages
+                mineru_from_cache = False
                 if cache_dir.exists() and cache_dir.is_dir():
                     logs.append(f"  发现本地 MinerU 结构化缓存目录: {cache_dir.name}")
                     try:
                         mineru_dfs = ocr_client.extract_mineru_structured_archive(str(cache_dir))
+                        if mineru_dfs:
+                            mineru_from_cache = True
                     except Exception as e_c:
                         logs.append(f"  读取 MinerU 缓存目录异常: {e_c}")
                         mineru_dfs = []
@@ -4445,6 +5240,8 @@ def _do_extract_tables_from_pdf(
                     logs.append(f"  发现本地 MinerU 结构化缓存包: {cache_zip.name}")
                     try:
                         mineru_dfs = ocr_client.extract_mineru_structured_archive(str(cache_zip))
+                        if mineru_dfs:
+                            mineru_from_cache = True
                     except Exception as e_c:
                         logs.append(f"  读取 MinerU 缓存异常: {e_c}")
                         mineru_dfs = []
@@ -4456,30 +5253,63 @@ def _do_extract_tables_from_pdf(
                             pass
                 if not mineru_dfs:
                     try:
-                        mineru_ok = ocr_client.is_mineru_available(config=_cfg, file_path=pdf_path, pages=native_target_pages)
+                        mineru_ok = ocr_client.is_mineru_available(config=_cfg, file_path=pdf_path, pages=mineru_pages)
                     except TypeError:
                         mineru_ok = ocr_client.is_mineru_available(config=_cfg, file_path=pdf_path)
                     if mineru_ok:
-                        page_desc = [p + 1 for p in native_target_pages] if native_target_pages else "all"
+                        page_desc = [p + 1 for p in mineru_pages] if mineru_pages else "all"
                         logs.append(f"  调用 MinerU 官方高保真结构化主抽取 (页码: {page_desc})")
                         try:
-                            mineru_dfs = ocr_client.call_mineru_structured_api(pdf_path, config=_cfg, page_ranges=native_target_pages)
+                            mineru_dfs = ocr_client.call_mineru_structured_api(pdf_path, config=_cfg, page_ranges=mineru_pages)
+                            mineru_from_cache = False
                         except Exception as e_mineru:
                             logs.append(f"  MinerU 结构化主抽取异常: {e_mineru}")
                             mineru_dfs = []
 
                 if mineru_dfs:
+                    if not mineru_from_cache and mineru_pages and hasattr(ocr_client, '_remap_mineru_subset_dfs'):
+                        try:
+                            mineru_dfs = ocr_client._remap_mineru_subset_dfs(mineru_dfs, mineru_pages, file_path=pdf_path)
+                        except Exception:
+                            pass
+                    valid_m_pages = sorted(set(mineru_pages)) if mineru_pages else None
                     logs.append(f"  MinerU 结构化主抽取解析出 {len(mineru_dfs)} 个表格，启动本地数值一致性门禁核验...")
                     accepted_mineru = []
                     unverified_mineru = []
                     for i_m, m_df in enumerate(mineru_dfs):
                         p_idx = m_df.attrs.get('page_idx') if hasattr(m_df, 'attrs') else None
-                        if p_idx is None:
-                            p_idx = _resolve_ocr_table_page(m_df, i_m, len(mineru_dfs), native_target_pages, pdf_path, caption_page_map)
+                        if p_idx is None or (valid_m_pages and p_idx not in valid_m_pages):
+                            resolved_p = _resolve_ocr_table_page(
+                                m_df, i_m, len(mineru_dfs), valid_m_pages or target_pages, pdf_path, caption_page_map
+                            )
+                            if valid_m_pages and resolved_p not in valid_m_pages and isinstance(p_idx, int) and 0 <= p_idx < len(valid_m_pages):
+                                resolved_p = valid_m_pages[p_idx]
+                            p_idx = resolved_p
                         bbox = m_df.attrs.get('bbox') if hasattr(m_df, 'attrs') else None
                         is_valid, info = table_validator.verify_table_numeric_integrity(
                             df=m_df, pdf_path=pdf_path, page_idx=p_idx, bbox=bbox, min_match_ratio=0.7
                         )
+                        if (
+                            not is_valid
+                            and info.get('match_ratio', 0.0) == 0.0
+                            and not mineru_from_cache
+                            and valid_m_pages
+                            and len(valid_m_pages) > 1
+                            and not (m_df.attrs.get('label') if hasattr(m_df, 'attrs') else None)
+                        ):
+                            passing_alts = []
+                            for alt_p in valid_m_pages:
+                                if alt_p == p_idx:
+                                    continue
+                                alt_ok, alt_info = table_validator.verify_table_numeric_integrity(
+                                    df=m_df, pdf_path=pdf_path, page_idx=alt_p, bbox=None, min_match_ratio=0.7
+                                )
+                                if alt_ok:
+                                    passing_alts.append((alt_p, alt_info))
+                            if len(passing_alts) == 1:
+                                p_idx, info = passing_alts[0]
+                                is_valid = True
+                                bbox = None
                         converted_bbox = info.get("converted_bbox") or bbox
                         if hasattr(m_df, 'attrs'):
                             m_df.attrs['page_idx'] = p_idx
@@ -4519,7 +5349,15 @@ def _do_extract_tables_from_pdf(
                         except Exception:
                             pass
 
-                    for cand in supp_candidates:
+                    supp_pdf_doc = None
+                    if supp_candidates and accepted_mineru and pdf_path and isinstance(pdf_path, str) and os.path.isfile(pdf_path):
+                        try:
+                            supp_pdf_doc = fitz.open(pdf_path)
+                        except Exception:
+                            supp_pdf_doc = None
+
+                    try:
+                      for cand in supp_candidates:
                         c_df = cand.get('df')
                         c_p = cand.get('page_idx')
                         if c_p is None and c_df is not None and hasattr(c_df, 'attrs'):
@@ -4528,27 +5366,86 @@ def _do_extract_tables_from_pdf(
                             continue
                         c_box = cand.get('bbox') or (c_df.attrs.get('bbox') if c_df is not None and hasattr(c_df, 'attrs') else None)
                         c_lbl = cand.get('label') or (c_df.attrs.get('label') if c_df is not None and hasattr(c_df, 'attrs') else None)
+                        c_title = cand.get('table_title') or (c_df.attrs.get('table_title') if c_df is not None and hasattr(c_df, 'attrs') else None)
                         c_fmt = format_table_label(c_lbl) if c_lbl else None
+                        c_is_fb = bool(c_df.attrs.get('_label_is_fallback')) if c_df is not None and hasattr(c_df, 'attrs') else False
+                        c_fmt_v = None if c_is_fb else c_fmt
+                        cand_bad = (
+                            _is_sideways_garbled_candidate(cand, pdf_doc=supp_pdf_doc)
+                            or (c_df is not None and not getattr(c_df, 'empty', True) and _is_upside_down_header_table(c_df))
+                        )
 
                         is_covered = False
                         for m_item in accepted_mineru:
-                            if m_item.get('page_idx') != c_p:
-                                continue
+                            m_p = m_item.get('page_idx')
                             m_df = m_item.get('df')
                             m_box = m_item.get('bbox') or (m_df.attrs.get('bbox') if m_df is not None and hasattr(m_df, 'attrs') else None)
-                            m_lbl = m_df.attrs.get('label') if m_df is not None and hasattr(m_df, 'attrs') else None
+                            m_lbl = m_item.get('label') or (m_df.attrs.get('label') if m_df is not None and hasattr(m_df, 'attrs') else None)
                             m_fmt = format_table_label(m_lbl) if m_lbl else None
+                            m_is_fb = bool(m_df.attrs.get('_label_is_fallback')) if m_df is not None and hasattr(m_df, 'attrs') else False
+                            m_fmt_v = None if m_is_fb else m_fmt
 
-                            if c_fmt and m_fmt and c_fmt == m_fmt:
-                                is_covered = True
-                                break
-                            if c_box and m_box:
-                                iou, iom = _compute_bbox_iou(c_box, m_box)
-                                if iou >= 0.20 or iom >= 0.35:
+                            sim_cm = 0.0
+                            if c_df is not None and m_df is not None:
+                                try:
+                                    sim_cm = _table_similarity(c_df, m_df)
+                                except Exception:
+                                    sim_cm = 0.0
+
+                            if m_p == c_p:
+                                if c_fmt_v and m_fmt_v and c_fmt_v != m_fmt_v:
+                                    continue
+                                same_lbl = bool(c_fmt_v and m_fmt_v and c_fmt_v == m_fmt_v)
+                                if same_lbl:
                                     is_covered = True
-                                    break
-                            if c_df is not None and m_df is not None and _table_similarity(c_df, m_df) >= 0.65:
-                                is_covered = True
+                                elif c_box and m_box:
+                                    iou, iom = _compute_bbox_iou(c_box, m_box)
+                                    if iou >= 0.20 or iom >= 0.35:
+                                        is_covered = True
+                                if not is_covered and sim_cm >= 0.65:
+                                    is_covered = True
+                                if not is_covered and c_df is not None and m_df is not None:
+                                    m_bad = (
+                                        _is_sideways_garbled_candidate(m_item, pdf_doc=supp_pdf_doc)
+                                        or (not getattr(m_df, 'empty', True) and _is_upside_down_header_table(m_df))
+                                    )
+                                    cov_cm, n_cm = _atomic_token_containment(c_df, m_df, allow_reversed=True)
+                                    if n_cm >= 3 and cov_cm >= 0.85:
+                                        is_covered = True
+                                    elif cand_bad and not m_bad and _degraded_matches_clean(c_df, m_df, same_verified_label=same_lbl):
+                                        is_covered = True
+                            else:
+                                # Cross-page duplicate guard for subset mineru_pages mis-indexing when MinerU lacked an explicit caption label
+                                if sim_cm >= 0.90 and (
+                                    (not mineru_from_cache and mineru_pages and not m_fmt)
+                                    or (c_fmt and m_fmt and c_fmt == m_fmt)
+                                ):
+                                    is_covered = True
+                                    if (
+                                        mineru_pages
+                                        and not m_fmt
+                                        and m_p not in mineru_pages
+                                        and c_p in mineru_pages
+                                    ):
+                                        m_item['page_idx'] = c_p
+                                        if m_df is not None and hasattr(m_df, 'attrs'):
+                                            m_df.attrs['page_idx'] = c_p
+
+                            if is_covered:
+                                if m_df is not None and hasattr(m_df, 'attrs'):
+                                    if c_lbl and not c_is_fb and (not m_df.attrs.get('label') or m_is_fb):
+                                        m_df.attrs['label'] = c_lbl
+                                        m_df.attrs.pop('_label_is_fallback', None)
+                                        m_item['label'] = c_lbl
+                                    elif not m_df.attrs.get('label') and c_lbl:
+                                        m_df.attrs['label'] = c_lbl
+                                        m_item['label'] = c_lbl
+                                        if c_is_fb:
+                                            m_df.attrs['_label_is_fallback'] = True
+                                    if (not m_df.attrs.get('table_title') or m_is_fb) and c_title and not c_is_fb:
+                                        m_df.attrs['table_title'] = c_title
+                                    elif not m_df.attrs.get('table_title') and c_title:
+                                        m_df.attrs['table_title'] = c_title
                                 break
                         if not is_covered:
                             pages_requiring_ocr.add(c_p)
@@ -4570,6 +5467,12 @@ def _do_extract_tables_from_pdf(
                                         if not c_df.attrs.get('extractor'):
                                             c_df.attrs['extractor'] = 'pdf_inspector'
                                     accepted_mineru.append(cand_copy)
+                    finally:
+                      if supp_pdf_doc is not None:
+                          try:
+                              supp_pdf_doc.close()
+                          except Exception:
+                              pass
 
                     # 交叉核对全文声明漏表与扫描页覆盖未知
                     try:
@@ -4587,7 +5490,7 @@ def _do_extract_tables_from_pdf(
                         logger.debug(f"Cross check error: {e_cc}")
 
                     covered_m_pages = set(t['page_idx'] for t in accepted_mineru)
-                    for p_req in (native_target_pages or []):
+                    for p_req in (target_pages or []):
                         if p_req not in covered_m_pages:
                             pages_requiring_ocr.add(p_req)
                         else:
@@ -4614,45 +5517,69 @@ def _do_extract_tables_from_pdf(
                         else:
                             logs.append("  MinerU 提取的所有表格均未通过数值门禁，平滑降级进入原生多方投票备用管线")
 
-        # 3. 若未启用主抽取或主抽取未产出有效表格，平滑降级进入原生多方投票备用管线 (Legacy Fallback)
-        if not primary_succeeded:
-            logs.append("→ Step 2: 进入原生多方投票备用管线 (pdf-inspector + PyMuPDF4LLM + GMFT + Camelot/img2table + pdfplumber + find_tables)")
-            structure_results = valid_struct_tables if valid_struct_tables else _get_structure_tree_tables(native_target_pages)
+        # 3. 若未启用主抽取或主抽取未产出/仅部分覆盖有效表格，平滑降级进入原生多方投票备用管线 (Legacy Fallback)
+        step3_uncovered_pages = (
+            sorted(
+                p for p in (native_target_pages or [])
+                if p not in {t.get('page_idx') for t in all_results if t.get('page_idx') is not None}
+            )
+            if primary_succeeded else []
+        )
+        if not primary_succeeded or step3_uncovered_pages:
+            is_partial_step3 = bool(primary_succeeded and step3_uncovered_pages)
+            step3_pages = step3_uncovered_pages if is_partial_step3 else native_target_pages
+            step3_page_set = set(step3_pages) if step3_pages is not None else None
+            inspector_step3 = (
+                [t for t in inspector_tables if t.get('page_idx') in step3_page_set]
+                if (is_partial_step3 and step3_page_set is not None) else inspector_tables
+            )
+            struct_step3 = (
+                [t for t in valid_struct_tables if t.get('page_idx') in step3_page_set]
+                if (is_partial_step3 and step3_page_set is not None) else valid_struct_tables
+            )
+            if is_partial_step3:
+                logs.append(f"→ Step 2: 主抽取未覆盖 {[p+1 for p in step3_uncovered_pages]} 页，定向进入原生多方投票备用管线")
+            else:
+                logs.append("→ Step 2: 进入原生多方投票备用管线 (pdf-inspector + PyMuPDF4LLM + GMFT + Camelot/img2table + pdfplumber + find_tables)")
+            structure_results = struct_step3 if struct_step3 else _get_structure_tree_tables(step3_pages)
             if structure_results:
                 logs.append(f"  Tagged PDF 结构树提取到 {len(structure_results)} 个语义表格 (pdf_inspector_structure)")
 
-            ft_results = extract_via_find_tables(pdf_path, pages=native_target_pages)
-            plumber_results = extract_via_pdfplumber(pdf_path, pages=native_target_pages)
-            camelot_results = extract_via_camelot(pdf_path, pages=native_target_pages)
-            img2table_results = extract_via_img2table(pdf_path, pages=native_target_pages)
-            gmft_results = extract_via_gmft(pdf_path, pages=native_target_pages)
-            pymupdf4llm_results = extract_via_pymupdf4llm(pdf_path, pages=native_target_pages)
+            ft_results = extract_via_find_tables(pdf_path, pages=step3_pages)
+            plumber_results = extract_via_pdfplumber(pdf_path, pages=step3_pages)
+            camelot_results = extract_via_camelot(pdf_path, pages=step3_pages)
+            img2table_results = extract_via_img2table(pdf_path, pages=step3_pages)
+            gmft_results = extract_via_gmft(pdf_path, pages=step3_pages)
+            pymupdf4llm_results = extract_via_pymupdf4llm(pdf_path, pages=step3_pages)
             if pymupdf4llm_results:
                 logs.append(f"  PyMuPDF4LLM 提取到 {len(pymupdf4llm_results)} 个表格 (LLM-ready Markdown)")
-            rapid_table_results = extract_via_rapid_table(pdf_path, pages=native_target_pages) if is_rapid_table_available() else []
+            rapid_table_results = extract_via_rapid_table(pdf_path, pages=step3_pages) if is_rapid_table_available() else []
             if rapid_table_results:
                 logs.append(f"  RapidTable 提取到 {len(rapid_table_results)} 个表格 (ONNX 结构识别)")
-            align_results = extract_via_text_alignment(pdf_path, pages=native_target_pages)
+            align_results = extract_via_text_alignment(pdf_path, pages=step3_pages)
 
             # 多方投票融合
             logs.append("→ Step 3: 多方投票融合")
             fused, vote_logs, vote_summary = three_way_vote(
-                inspector_tables, ft_results, plumber_results, camelot_results,
+                inspector_step3, ft_results, plumber_results, camelot_results,
                 align_tables=align_results,
                 structure_tables=structure_results,
                 gmft_tables=gmft_results,
                 img2table_tables=img2table_results,
                 pymupdf4llm_tables=pymupdf4llm_results,
                 rapid_table_tables=rapid_table_results,
+                pdf_path=pdf_path,
             )
             logs.extend(vote_logs)
 
             if fused:
-                for f_item in fused:
-                    if not any(id(a.get('df')) == id(f_item.get('df')) for a in all_results):
-                        all_results.append(f_item)
-                extractors = set(r['df'].attrs.get('vote_extractor', r['df'].attrs.get('extractor', '?')) for r in all_results)
-                logs.append(f"  投票完成: {len(all_results)} 个表格 (extractors: {extractors})")
+                fused = _dedup_same_page_tables(fused, pdf_path=pdf_path)
+                if not is_partial_step3:
+                    for f_item in fused:
+                        if not any(id(a.get('df')) == id(f_item.get('df')) for a in all_results):
+                            all_results.append(f_item)
+                extractors = set(r['df'].attrs.get('vote_extractor', r['df'].attrs.get('extractor', '?')) for r in (fused if is_partial_step3 else all_results))
+                logs.append(f"  投票完成: {len(fused if is_partial_step3 else all_results)} 个表格 (extractors: {extractors})")
             else:
                 logs.append("  多方投票未获得表格")
 
@@ -4661,20 +5588,37 @@ def _do_extract_tables_from_pdf(
                 from .table_validator import validate_native_extraction_pipeline
             except ImportError:
                 from table_validator import validate_native_extraction_pipeline
-            original_native_results = list(all_results)
-            if 'unverified_mineru' in locals() and unverified_mineru:
-                for u_item in unverified_mineru:
-                    if not any(id(r.get('df')) == id(u_item.get('df')) for r in original_native_results):
-                        original_native_results.append(u_item)
-                    if not any(id(r.get('df')) == id(u_item.get('df')) for r in all_results):
-                        all_results.append(u_item)
-                    pages_requiring_ocr.add(u_item.get('page_idx'))
-            valid_fused, pages_req, val_logs = validate_native_extraction_pipeline(
-                all_results, pdf_path, target_pages, vote_summary
-            )
-            logs.extend(val_logs)
-            all_results = valid_fused
-            pages_requiring_ocr.update(pages_req)
+            if is_partial_step3:
+                partial_raw = list(fused or [])
+                for item_p in partial_raw:
+                    if not any(id(r.get('df')) == id(item_p.get('df')) for r in original_native_results):
+                        original_native_results.append(item_p)
+                if partial_raw:
+                    valid_partial, pages_req, val_logs = validate_native_extraction_pipeline(
+                        partial_raw, pdf_path, step3_pages, vote_summary
+                    )
+                    logs.extend(val_logs)
+                    for vp in valid_partial:
+                        if not any(id(r.get('df')) == id(vp.get('df')) for r in all_results):
+                            all_results.append(vp)
+                    all_results = _dedup_same_page_tables(all_results, pdf_path=pdf_path)
+                    valid_fused = list(all_results)
+                    pages_requiring_ocr.update(pages_req)
+            else:
+                original_native_results = list(all_results)
+                if 'unverified_mineru' in locals() and unverified_mineru:
+                    for u_item in unverified_mineru:
+                        if not any(id(r.get('df')) == id(u_item.get('df')) for r in original_native_results):
+                            original_native_results.append(u_item)
+                        if not any(id(r.get('df')) == id(u_item.get('df')) for r in all_results):
+                            all_results.append(u_item)
+                        pages_requiring_ocr.add(u_item.get('page_idx'))
+                valid_fused, pages_req, val_logs = validate_native_extraction_pipeline(
+                    all_results, pdf_path, target_pages, vote_summary
+                )
+                logs.extend(val_logs)
+                all_results = valid_fused
+                pages_requiring_ocr.update(pages_req)
 
         def _unique_valid_page_tables(p, results):
             unique = []
@@ -4711,10 +5655,18 @@ def _do_extract_tables_from_pdf(
             expected = max(len(decls), len([t for t in inspector_tables if t.get('page_idx') == p]), 1)
             if len(unique) < expected:
                 return False
+
             labels = {label for _, label, _, _ in unique if label}
-            # Named but different tables cannot satisfy a declared missing table.
-            if len(labels) == len(unique):
-                return all(not d.get('label') or (format_table_label(str(d['label'])) or str(d['label'])).strip().lower() in labels for d in decls)
+            unlabeled_cnt = sum(1 for _, label, _, _ in unique if not label)
+            declared_labels = [
+                (format_table_label(str(d['label'])) or str(d['label'])).strip().lower()
+                for d in decls if d.get('label')
+            ]
+            missing_declared = [dl for dl in declared_labels if dl not in labels]
+            # 每个无标签的合法表最多只允许匹配 1 个未具名缺失表；绝不可因混入 1 个无标签表而整页跳过缺表检测
+            if len(missing_declared) > unlabeled_cnt:
+                return False
+
             return True
 
         # 若检验发现任何问题、缺陷或低置信度页面，优先通过 DocLayout-YOLO 目标切图送入 PaddleOCR-VL 独立接管提取
@@ -4812,6 +5764,7 @@ def _do_extract_tables_from_pdf(
     # Step 4: 预对齐真实表号 + 跨页续表合并
     if all_results:
         all_results = reconcile_table_captions(all_results, pdf_path)
+        all_results = _dedup_same_page_tables(all_results, pdf_path=pdf_path)
         logs.append("→ Step 4: 跨页续表合并")
         try:
             from table_postprocess import merge_continuation_tables
@@ -4828,21 +5781,72 @@ def _do_extract_tables_from_pdf(
                         'bbox': None,
                     })
                 all_results = reconcile_table_captions(all_results, pdf_path)
+                all_results = _dedup_same_page_tables(all_results, pdf_path=pdf_path)
         except Exception as e:
             logs.append(f"  跨页合并跳过: {e}")
 
     total_declared_count = sum(1 for decls in page_decls.values() for d in decls if not d.get('is_continuation'))
     total_cand_count = len(inspector_tables)
     total_expected_tables = max(total_declared_count, total_cand_count)
-    if all_results and (total_expected_tables == 0 or len(all_results) >= total_expected_tables or not use_ocr_fallback):
+    extracted_pages_all = set()
+    for _r in all_results:
+        if _r.get('page_idx') is not None:
+            extracted_pages_all.add(_r.get('page_idx'))
+        for _cp in (_r.get('covered_pages') or []):
+            if _cp is not None:
+                extracted_pages_all.add(_cp)
+        _rdf = _r.get('df')
+        if _rdf is not None and hasattr(_rdf, 'attrs'):
+            for _cp in (_rdf.attrs.get('covered_pages') or []):
+                if _cp is not None:
+                    extracted_pages_all.add(_cp)
+
+    _strong_table_cues = {
+        'vector_find_tables',
+        'text_find_tables',
+        'probe_disjoint_native',
+        'structure_tree',
+        'image_scan',
+        'caption',
+        'pdf_inspector',
+        'inspector_table',
+        'caller_candidate',
+    }
+    uncovered_must_pages = [
+        p for p in (target_pages or [])
+        if p not in extracted_pages_all and (
+            p in pure_image_pages
+            or p in image_table_pages
+            or p in page_decls
+            or p in inspector_table_pages
+            or bool(candidate_sources.get(p, set()) & _strong_table_cues)
+        )
+    ]
+    remaining_unresolved = set(locals().get('unresolved_ocr_pages', set())) - extracted_pages_all
+    can_early_exit = bool(all_results) and (
+        not use_ocr_fallback
+        or (
+            len(all_results) >= total_expected_tables
+            and not uncovered_must_pages
+            and not remaining_unresolved
+        )
+    )
+    if can_early_exit:
+        for _r in all_results:
+            if _r.get('df') is not None and hasattr(_r['df'], 'attrs'):
+                _r['df'].attrs.pop('_label_is_fallback', None)
         extractors = set(r['df'].attrs.get('extractor', '?') for r in all_results)
         logs.append(f"  最终: {len(all_results)} 个表格 (extractors: {extractors})")
         return all_results, logs
 
-    # Step 5: 全局 OCR 兜底 (结构化提取未获得有效表格，或已提取表数少于声明表数)
-    logs.append(f"→ Step 5: 结构化提取表数 ({len(all_results)}) 少于声明表数 ({total_expected_tables}) 或为空，回退到全局 OCR")
+    # Step 5: 全局/缺页 OCR 兜底 (结构化提取未获得有效表格、已提取表数少于声明表数、或强线索候选页尚未覆盖)
+    logs.append(f"→ Step 5: 结构化提取表数 ({len(all_results)}) 少于声明表数 ({total_expected_tables})、为空或存在未覆盖候选页 ({len(uncovered_must_pages) + len(remaining_unresolved)} 页)，回退到 OCR")
     if use_ocr_fallback:
-        ocr_results = extract_via_ocr(pdf_path)
+        targeted_missing = sorted(set(uncovered_must_pages) | set(remaining_unresolved))
+        if all_results and len(all_results) >= total_expected_tables and targeted_missing:
+            ocr_results = extract_via_ocr(pdf_path, pages=targeted_missing)
+        else:
+            ocr_results = extract_via_ocr(pdf_path)
         if ocr_results:
             pages_to_reconcile = sorted(list(set(
                 [r.get('page_idx', 0) for r in ocr_results] +
@@ -4851,8 +5855,12 @@ def _do_extract_tables_from_pdf(
             )))
             all_results = reconcile_native_and_ocr_tables(all_results, ocr_results, pages_to_reconcile, logs)
             all_results = reconcile_table_captions(all_results, pdf_path)
+            all_results = _dedup_same_page_tables(all_results, pdf_path=pdf_path)
             logs.append(f"  全局 OCR 补漏后共获得 {len(all_results)} 个表格")
 
+    for _r in all_results:
+        if _r.get('df') is not None and hasattr(_r['df'], 'attrs'):
+            _r['df'].attrs.pop('_label_is_fallback', None)
     return all_results, logs
 
 
@@ -5433,6 +6441,29 @@ def _extract_page_via_text_alignment(doc, page_idx: int, pdf_path: str) -> List[
         except Exception as e_pos:
             logger.debug(f"[text_alignment] _align_table_with_positions notice: {e_pos}")
 
+        def _compute_rot_vis_bounds():
+            vis_rect_start = _search_for_visual(page, cap.get('label') or page_label or '')
+            v_start = (vis_rect_start[-1].y1 + 5) if vis_rect_start else page_h * 0.05
+            v_end = page_h * 0.96
+            if ci + 1 < len(captions_on_page):
+                next_cap = captions_on_page[ci + 1]
+                next_query = next_cap.get('label') or next_cap.get('title') or ''
+                if next_query:
+                    next_rects = _search_for_visual(page, next_query)
+                    below_next = [r for r in (next_rects or []) if r.y0 > v_start + 10.0]
+                    if below_next:
+                        v_end = min(v_end, below_next[0].y0 - 5.0)
+            after_pos_rot = cap.get('text_pos', 0) + len(cap.get('title', ''))
+            for sec_m in re.finditer(r'^[ \t]*([1-9]\d*(?:\.[1-9]\d*){1,2}[ \t]+[\u4e00-\u9fa5A-Za-z]{2,})', text[after_pos_rot:], re.MULTILINE):
+                sec_rects = _search_for_visual(page, sec_m.group(1).strip()[:12])
+                below_sec = [r for r in (sec_rects or []) if r.y0 > v_start + 15.0]
+                if below_sec:
+                    v_end = min(v_end, below_sec[0].y0 - 2.0)
+                    break
+            if v_end <= v_start + 8.0:
+                v_end = page_h * 0.96
+            return v_start, v_end
+
         if pos_df is not None and not pos_df.empty and pos_df.shape[0] >= 1 and pos_df.shape[1] >= 1:
             pos_df.attrs['extractor'] = 'text_alignment'
             pos_df.attrs['label'] = cap['label']
@@ -5441,9 +6472,7 @@ def _extract_page_via_text_alignment(doc, page_idx: int, pdf_path: str) -> List[
             pos_df.attrs['page_idx'] = page_idx
             
             if rot != 0:
-                vis_rect = _search_for_visual(page, cap.get('label') or page_label or '')
-                vis_y_start = (vis_rect[-1].y1 + 5) if vis_rect else page_h * 0.05
-                vis_y_end = page_h * 0.92
+                vis_y_start, vis_y_end = _compute_rot_vis_bounds()
                 bbox = [0.0, vis_y_start, page_w, vis_y_end]
             else:
                 bbox = [0.0, table_y_start, page_w, table_y_end]
@@ -5461,10 +6490,8 @@ def _extract_page_via_text_alignment(doc, page_idx: int, pdf_path: str) -> List[
         # 回退至基于 words 的视觉分列分行对齐
         if rot != 0:
             vis_words = _get_words_visual(page)
-            vis_rect = _search_for_visual(page, cap.get('label') or page_label or '')
-            vis_y_start = (vis_rect[-1].y1 + 5) if vis_rect else page_h * 0.05
-            vis_y_end = page_h * 0.92
-            table_words = [w for w in vis_words if w[1] >= vis_y_start and w[1] < vis_y_end and not (w[1] > page_h * 0.90 and w[4].isdigit())]
+            vis_y_start, vis_y_end = _compute_rot_vis_bounds()
+            table_words = [w for w in vis_words if w[1] >= vis_y_start and w[1] < vis_y_end and not (w[1] > page_h * 0.94 and w[4].isdigit())]
             cur_bbox = [0.0, vis_y_start, page_w, vis_y_end]
         else:
             table_words = [w for w in words if w[1] >= table_y_start and w[1] < table_y_end and not (w[1] > page_h * 0.90 and w[4].isdigit())]

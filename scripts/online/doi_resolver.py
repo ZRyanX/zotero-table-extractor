@@ -9,6 +9,14 @@ import uuid
 import requests
 
 try:
+    from .. import common
+except ImportError:
+    import common
+
+if hasattr(common, "ensure_macos_corefoundation"):
+    common.ensure_macos_corefoundation()
+
+try:
     from curl_cffi import requests as requests_impersonate
 except ImportError:
     requests_impersonate = None
@@ -20,11 +28,6 @@ except ImportError:
         from playwright_utils import find_playwright_chromium
     except ImportError:
         find_playwright_chromium = lambda: None
-
-try:
-    from .. import common
-except ImportError:
-    import common
 
 
 # Aliases to shared helpers (kept as bare names so call sites are unchanged)
@@ -52,18 +55,26 @@ def get_doi_from_zotero_db(pdf_path, db_path=None):
         
     temp_db_path = None
     conn = None
-    try:
-        # 优先使用 SQLite URI 只读不可变模式（mode=ro&immutable=1）：零磁盘拷贝、零文件锁冲突
-        abs_db = os.path.abspath(db_path)
-        uri = f"file:{urllib.request.pathname2url(abs_db)}?mode=ro&immutable=1"
-        conn = sqlite3.connect(uri, uri=True)
-    except Exception:
-        # 回退至临时文件拷贝只读连接
-        import shutil
+    wal_exists = os.path.exists(db_path + "-wal") and os.path.getsize(db_path + "-wal") > 0
+    if not wal_exists:
+        try:
+            abs_db = os.path.abspath(db_path)
+            uri = f"file:{urllib.request.pathname2url(abs_db)}?mode=ro"
+            conn = sqlite3.connect(uri, uri=True, timeout=2.0)
+            conn.execute("SELECT 1 FROM sqlite_master LIMIT 1")
+        except Exception:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                conn = None
+
+    if conn is None:
         import tempfile
         temp_db_path = os.path.join(tempfile.gettempdir(), f'zotero_extractor_{os.getpid()}_{uuid.uuid4().hex[:6]}.sqlite')
         try:
-            shutil.copy2(db_path, temp_db_path)
+            common.copy_sqlite_snapshot(db_path, temp_db_path)
             conn = sqlite3.connect(temp_db_path)
         except Exception as e:
             print(f"Warning: Failed to copy Zotero DB: {e}")
@@ -136,11 +147,8 @@ def get_doi_from_zotero_db(pdf_path, db_path=None):
                 conn.close()
             except Exception:
                 pass
-        if temp_db_path and temp_db_path != db_path and os.path.exists(temp_db_path):
-            try:
-                os.remove(temp_db_path)
-            except Exception:
-                pass
+        if temp_db_path and temp_db_path != db_path:
+            common.cleanup_sqlite_snapshot(temp_db_path)
 
     if doi or title or url:
         return doi, title, url

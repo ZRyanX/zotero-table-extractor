@@ -20,6 +20,7 @@ import tempfile
 import zipfile
 import subprocess
 import collections
+from contextlib import contextmanager
 from typing import List, Dict, Any, Optional, Union, Tuple, Set
 
 import logging
@@ -817,6 +818,8 @@ def extract_mineru_structured_archive(archive_input: Any) -> List[pd.DataFrame]:
                         for df in dfs:
                             if df is not None and not df.empty:
                                 df.attrs['extractor'] = 'mineru_api'
+                                if isinstance(table_body, str) and '<table' in table_body.lower():
+                                    df.attrs['raw_html'] = table_body
                                 df.attrs['page_idx'] = page_idx
                                 df.attrs['bbox'] = box
                                 if page_idx in known_page_sizes:
@@ -999,6 +1002,91 @@ def extract_mineru_structured_archive(archive_input: Any) -> List[pd.DataFrame]:
                 pass
 
 
+def _detect_pdf_needs_ocr(
+    file_path: str,
+    page_ranges: Optional[Union[str, List[int]]] = None,
+) -> bool:
+    """Detect whether a local image or target PDF pages require OCR (scanned/low-text/large raster table)."""
+    if not file_path or not isinstance(file_path, str):
+        return False
+    low = file_path.lower()
+    if low.endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp")):
+        return True
+    if not low.endswith(".pdf") or not os.path.exists(file_path) or fitz is None:
+        return False
+    try:
+        with fitz.open(file_path) as doc:
+            n_pages = len(doc)
+            if n_pages == 0:
+                return False
+            target_pages: List[int] = []
+            if page_ranges is not None:
+                parsed_ranges = _parse_page_ranges_zero_based(page_ranges)
+                if parsed_ranges:
+                    target_pages = [p for p in parsed_ranges if 0 <= p < n_pages]
+                elif isinstance(page_ranges, (list, tuple, set)):
+                    for p in page_ranges:
+                        if isinstance(p, int) and 0 <= p < n_pages:
+                            target_pages.append(p)
+            if not target_pages:
+                target_pages = list(range(min(n_pages, 20)))
+            for p_idx in target_pages:
+                pg = doc[p_idx]
+                txt = (pg.get_text("text") or "").strip()
+                if len(txt) < 40:
+                    return True
+                page_area = max(1.0, float(pg.rect.width * pg.rect.height))
+                try:
+                    img_infos = pg.get_images(full=True)
+                except Exception:
+                    img_infos = []
+                if img_infos:
+                    max_img_ratio = 0.0
+                    for info in img_infos:
+                        xref = info[0]
+                        try:
+                            for r in pg.get_image_rects(xref):
+                                ratio = (r.width * r.height) / page_area
+                                if ratio > max_img_ratio:
+                                    max_img_ratio = ratio
+                        except Exception:
+                            pass
+                    if max_img_ratio >= 0.25 and len(txt) < 250:
+                        return True
+    except Exception:
+        return False
+    return False
+
+
+def _has_structured_tables_in_md(md_text: Optional[str]) -> bool:
+    """Return True if Markdown/HTML output contains at least one structured table."""
+    if not md_text or not isinstance(md_text, str):
+        return False
+    if re.search(r'<table\b', md_text, re.IGNORECASE):
+        return True
+    if re.search(r'\|[^\n]+\|\s*\r?\n\s*\|[\s:\-|]+\|', md_text):
+        return True
+    return False
+
+
+def _split_markdown_by_pages(mineru_md: str) -> List[Dict[str, Any]]:
+    """Split combined Markdown by <!-- Page N --> markers so multi-page failover keeps real page_idx."""
+    if not mineru_md:
+        return [{"page_idx": 0, "markdown": "", "images": {}}]
+    matches = list(re.finditer(r'<!--\s*Page\s*(\d+)\s*-->', mineru_md, re.IGNORECASE))
+    if not matches:
+        return [{"page_idx": 0, "markdown": mineru_md, "images": {}}]
+    pages: List[Dict[str, Any]] = []
+    for idx, m in enumerate(matches):
+        page_num = max(0, int(m.group(1)) - 1)
+        start = m.end()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(mineru_md)
+        chunk = mineru_md[start:end].strip()
+        if chunk:
+            pages.append({"page_idx": page_num, "markdown": chunk, "images": {}})
+    return pages or [{"page_idx": 0, "markdown": mineru_md, "images": {}}]
+
+
 class MinerUClient:
     """
     MinerU 官方云端 API 客户端 (mineru.net)。
@@ -1014,11 +1102,12 @@ class MinerUClient:
     def submit_task(
         self,
         file_path: str,
-        is_ocr: bool = True,
+        is_ocr: Optional[bool] = None,
         enable_table: bool = True,
         enable_formula: bool = True,
         page_ranges: Optional[Union[str, List[int]]] = None,
         pages: Optional[Union[str, List[int]]] = None,
+        model_version: Optional[str] = None,
     ) -> Optional[str]:
         """
         提交解析任务至 MinerU API，返回 batch_id 或 task_id。
@@ -1028,6 +1117,19 @@ class MinerUClient:
         if page_ranges is None and pages is not None:
             page_ranges = pages
         page_ranges_str = format_page_ranges(page_ranges)
+        if is_ocr is None:
+            if isinstance(file_path, str) and file_path.startswith(("http://", "https://")):
+                is_ocr = True
+            else:
+                is_ocr = _detect_pdf_needs_ocr(file_path, page_ranges)
+        resolved_model = model_version or os.getenv("MINERU_MODEL")
+        if not resolved_model:
+            try:
+                resolved_model = (load_config() or {}).get("MINERU_MODEL")
+            except Exception:
+                resolved_model = None
+        if not resolved_model or str(resolved_model).lower() == "auto":
+            resolved_model = "vlm"
 
         if not self.api_key:
             # 零 Token Agent 备用 API 触发检查 (文件大小 <= 10MB 且请求目标页数 <= 20)
@@ -1048,7 +1150,7 @@ class MinerUClient:
 
             if is_eligible:
                 print(f"[MinerU Agent API] 未配置 MINERU_API_KEY，且文件满足免费额度限制 (大小: {file_size_bytes / (1024*1024):.2f}MB <= 10MB, 请求页数: {_count_requested_pages(page_ranges, page_count)} <= 20)，触发零 Token Agent 备用 API 提交...")
-                return self._submit_agent_task(file_path, page_ranges=page_ranges_str)
+                return self._submit_agent_task(file_path, page_ranges=page_ranges_str, backend=resolved_model)
             else:
                 print("[MinerU] 提示: 未配置 MINERU_API_KEY，无法提交任务")
                 return None
@@ -1063,11 +1165,11 @@ class MinerUClient:
             url = f"{self.api_base}/api/v4/extract/task"
             payload = {
                 "url": file_path,
-                "is_ocr": is_ocr,
+                "is_ocr": bool(is_ocr),
                 "enable_table": enable_table,
                 "enable_formula": enable_formula,
-                "model": "vlm",
-                "model_version": "vlm"
+                "model": resolved_model,
+                "model_version": resolved_model
             }
             if page_ranges_str:
                 payload["page_ranges"] = page_ranges_str
@@ -1098,10 +1200,10 @@ class MinerUClient:
             file_item["page_ranges"] = page_ranges_str
         payload = {
             "files": [file_item],
-            "model_version": "vlm",
+            "model_version": resolved_model,
             "enable_formula": enable_formula,
             "enable_table": enable_table,
-            "is_ocr": is_ocr
+            "is_ocr": bool(is_ocr)
         }
         if page_ranges_str:
             payload["page_ranges"] = page_ranges_str
@@ -1141,24 +1243,37 @@ class MinerUClient:
             print(f"[MinerU] 提交任务异常: {e}")
             return None
 
-    def _submit_agent_task(self, file_path: str, page_ranges: Optional[str] = None) -> Optional[str]:
+    def _submit_agent_task(
+        self,
+        file_path: str,
+        page_ranges: Optional[str] = None,
+        backend: Optional[str] = None,
+    ) -> Optional[str]:
         """向 MinerU 零 Token Agent 备用 API (/api/v1/agent/parse/file) 提交轻量任务。
         按照官方协议：POST JSON 获取预签名上传 URL -> PUT 二进制上传 -> 返回 task_id。
         """
         agent_url = f"{self.api_base}/api/v1/agent/parse/file"
         try:
             filename = os.path.basename(file_path)
-            payload = {
-                "filename": filename,
-                "file_name": filename,
-                "backend": "pipeline",
-                "return_md": True,
-            }
-            if page_ranges:
-                payload["page_range"] = page_ranges
+            pref_backend = backend or os.getenv("MINERU_AGENT_BACKEND") or os.getenv("MINERU_MODEL") or "vlm"
+            if str(pref_backend).lower() == "auto":
+                pref_backend = "vlm"
             headers = {"Content-Type": "application/json"}
-            resp = requests.post(agent_url, json=payload, headers=headers, timeout=120)
-            if resp.status_code == 200:
+            backends_to_try = [pref_backend] if pref_backend == "pipeline" else [pref_backend, "pipeline"]
+            resp = None
+            for b_name in backends_to_try:
+                payload = {
+                    "filename": filename,
+                    "file_name": filename,
+                    "backend": b_name,
+                    "return_md": True,
+                }
+                if page_ranges:
+                    payload["page_range"] = page_ranges
+                resp = requests.post(agent_url, json=payload, headers=headers, timeout=120)
+                if resp.status_code == 200 or resp.status_code not in (400, 422):
+                    break
+            if resp is not None and resp.status_code == 200:
                 res_json = resp.json()
                 data = res_json.get("data")
                 task_id = None
@@ -1678,7 +1793,9 @@ class MinerUCLIClient:
             cmd.extend(["--base-url", self.api_base])
         if is_ocr:
             cmd.append("--ocr")
-        if not enable_table:
+        if enable_table:
+            cmd.append("--table")
+        else:
             cmd.append("--table=false")
         if not enable_formula:
             cmd.append("--formula=false")
@@ -1753,8 +1870,10 @@ class MinerUCLIClient:
                 if df is not None and hasattr(df, "attrs"):
                     df.attrs.setdefault("extractor", "mineru_api")
                     df.attrs["mineru_source"] = "cli"
+            dfs = _remap_mineru_subset_dfs(dfs, page_ranges, file_path=file_path)
 
             md_text = self._read_markdown_from_dir(target_out) or stdout
+            md_text = _remap_mineru_subset_markdown(md_text, page_ranges)
 
             return {
                 "success": True,
@@ -1819,7 +1938,9 @@ class MinerUCLIClient:
             cmd.extend(["--timeout", str(int(timeout))])
         if is_ocr:
             cmd.append("--ocr")
-        if not enable_table:
+        if enable_table:
+            cmd.append("--table")
+        else:
             cmd.append("--table=false")
         if not enable_formula:
             cmd.append("--formula=false")
@@ -1896,7 +2017,7 @@ class MinerUCLIClient:
                 if not recovered:
                     return {"success": False, "error": err_msg, "dfs": [], "markdown": ""}
 
-            md_text = self._read_markdown_from_dir(target_out) or stdout
+            md_text = _remap_mineru_subset_markdown(self._read_markdown_from_dir(target_out) or stdout, page_ranges)
             dfs = []
             if parse_structured_vlm_content is not None and md_text:
                 try:
@@ -1905,6 +2026,7 @@ class MinerUCLIClient:
                         if df is not None and hasattr(df, "attrs"):
                             df.attrs["extractor"] = "mineru_api"
                             df.attrs["mineru_source"] = "cli_flash"
+                    dfs = _remap_mineru_subset_dfs(dfs, page_ranges, file_path=file_path)
                 except Exception:
                     dfs = []
 
@@ -1949,6 +2071,7 @@ def call_mineru_api(
     cancel_event=None,
     page_ranges: Optional[Union[str, List[int]]] = None,
     pages: Optional[Union[str, List[int]]] = None,
+    is_ocr: Optional[bool] = None,
 ) -> str:
     """
     通过 MinerU 进行高保真多模态解析并返回 Markdown 表格字符串。
@@ -1956,6 +2079,7 @@ def call_mineru_api(
     """
     if page_ranges is None and pages is not None:
         page_ranges = pages
+    explicit_config = config if isinstance(config, dict) else None
     if config is None:
         config = load_config()
 
@@ -1963,6 +2087,11 @@ def call_mineru_api(
     api_base = config.get("MINERU_API_BASE", "https://mineru.net") or "https://mineru.net"
     cli_mode = str(config.get("MINERU_USE_CLI", os.getenv("MINERU_USE_CLI", "auto"))).lower().strip()
     should_try_cli = cli_mode in ("auto", "cli", "true", "1") and is_mineru_cli_available(config)
+    need_ocr = _detect_pdf_needs_ocr(file_path, page_ranges) if is_ocr is None else bool(is_ocr)
+    cfg_model = config.get("MINERU_MODEL") or "vlm"
+    if str(cfg_model).lower() == "auto":
+        cfg_model = "vlm"
+    allow_flash = bool(config.get("MINERU_ENABLE_FLASH_EXTRACT", True))
 
     if should_try_cli:
         cli_client = MinerUCLIClient(
@@ -1972,27 +2101,46 @@ def call_mineru_api(
         )
         try:
             print("[MinerU] 检测到 mineru-open-api CLI，通过官方 CLI 抽取 Markdown...")
-            if not token and isinstance(file_path, str) and os.path.exists(file_path) and os.path.getsize(file_path) <= 10 * 1024 * 1024:
+            used_flash = False
+            if not token and allow_flash and isinstance(file_path, str) and os.path.exists(file_path) and os.path.getsize(file_path) <= 10 * 1024 * 1024:
+                used_flash = True
                 cli_res = cli_client.flash_extract(
                     file_path=file_path,
                     page_ranges=page_ranges,
                     timeout=timeout,
-                    cancel_event=cancel_event
+                    cancel_event=cancel_event,
+                    is_ocr=need_ocr,
                 )
             else:
                 cli_res = cli_client.extract(
                     file_path=file_path,
-                    formats="md",
+                    formats="json,md",
                     page_ranges=page_ranges,
-                    model=config.get("MINERU_MODEL") or None,
+                    model=cfg_model,
                     timeout=timeout,
-                    cancel_event=cancel_event
+                    cancel_event=cancel_event,
+                    is_ocr=need_ocr,
                 )
             if cli_res.get("success"):
-                md = cli_res.get("markdown") or ""
-                if md:
-                    print("[MinerU CLI] Markdown 抽取成功！")
-                return md
+                md = _remap_mineru_subset_markdown(cli_res.get("markdown") or "", page_ranges)
+                cli_dfs = _remap_mineru_subset_dfs(cli_res.get("dfs") or [], page_ranges, file_path=file_path)
+                has_tables = _has_structured_tables_in_md(md) or bool(cli_dfs)
+                if used_flash and not has_tables and cli_mode == "auto":
+                    print("[MinerU CLI] flash-extract 未返回结构化表格（可能仅输出占位符），继续回退至 REST Agent API...")
+                else:
+                    if cli_dfs and (
+                        not _has_structured_tables_in_md(md)
+                        or (
+                            not re.search(r'<!--\s*Page\s*\d+\s*-->', md, re.IGNORECASE)
+                            and any(isinstance(d.attrs.get("page_idx"), int) and d.attrs.get("raw_html") for d in cli_dfs if d is not None)
+                        )
+                    ):
+                        rendered_md = _dfs_to_page_markdown(cli_dfs)
+                        if rendered_md:
+                            md = rendered_md
+                    if md:
+                        print("[MinerU CLI] Markdown 抽取成功！")
+                    return md
             elif cli_res.get("error") == "cancelled" or (cancel_event is not None and cancel_event.is_set()):
                 print("[MinerU CLI] 任务已取消，终止执行")
                 return ""
@@ -2012,13 +2160,33 @@ def call_mineru_api(
         return ""
 
     client = MinerUClient(api_key=token, api_base=api_base)
-    task_id = client.submit_task(file_path, page_ranges=page_ranges)
+    submit_kwargs: Dict[str, Any] = {"page_ranges": page_ranges}
+    if is_ocr is not None:
+        submit_kwargs["is_ocr"] = bool(is_ocr)
+    if explicit_config and explicit_config.get("MINERU_MODEL") and str(explicit_config.get("MINERU_MODEL")).lower() != "auto":
+        submit_kwargs["model_version"] = cfg_model
+    task_id = client.submit_task(file_path, **submit_kwargs)
     if not task_id:
         return ""
     poll_res = client.poll_task(task_id, timeout=timeout, cancel_event=cancel_event)
     if not poll_res.get("success"):
         return ""
-    return client.parse_mineru_table_result(poll_res.get("data", {}))
+    poll_data = poll_res.get("data", {})
+    md = client.parse_mineru_table_result(poll_data)
+    if not _has_structured_tables_in_md(md) or not re.search(r'<!--\s*Page\s*\d+\s*-->', md or "", re.IGNORECASE):
+        struct_dfs = _remap_mineru_subset_dfs(
+            client.parse_mineru_structured_result(poll_data),
+            page_ranges,
+            file_path=file_path,
+        )
+        if struct_dfs and (
+            not _has_structured_tables_in_md(md)
+            or any(isinstance(d.attrs.get("page_idx"), int) and d.attrs.get("raw_html") for d in struct_dfs if d is not None)
+        ):
+            rendered_md = _dfs_to_page_markdown(struct_dfs)
+            if rendered_md:
+                return rendered_md
+    return _remap_mineru_subset_markdown(md, page_ranges)
 
 
 def call_mineru_structured_api(
@@ -2028,6 +2196,7 @@ def call_mineru_structured_api(
     cancel_event=None,
     page_ranges: Optional[Union[str, List[int]]] = None,
     pages: Optional[Union[str, List[int]]] = None,
+    is_ocr: Optional[bool] = None,
 ) -> List[pd.DataFrame]:
     """
     通过 MinerU 进行高保真多模态解析，直接返回高质量结构化 DataFrame 列表。
@@ -2035,6 +2204,7 @@ def call_mineru_structured_api(
     """
     if page_ranges is None and pages is not None:
         page_ranges = pages
+    explicit_config = config if isinstance(config, dict) else None
     if config is None:
         config = load_config()
 
@@ -2042,6 +2212,11 @@ def call_mineru_structured_api(
     api_base = config.get("MINERU_API_BASE", "https://mineru.net") or "https://mineru.net"
     cli_mode = str(config.get("MINERU_USE_CLI", os.getenv("MINERU_USE_CLI", "auto"))).lower().strip()
     should_try_cli = cli_mode in ("auto", "cli", "true", "1") and is_mineru_cli_available(config)
+    need_ocr = _detect_pdf_needs_ocr(file_path, page_ranges) if is_ocr is None else bool(is_ocr)
+    cfg_model = config.get("MINERU_MODEL") or "vlm"
+    if str(cfg_model).lower() == "auto":
+        cfg_model = "vlm"
+    allow_flash = bool(config.get("MINERU_ENABLE_FLASH_EXTRACT", True))
 
     if should_try_cli:
         cli_client = MinerUCLIClient(
@@ -2051,29 +2226,36 @@ def call_mineru_structured_api(
         )
         try:
             print("[MinerU] 检测到 mineru-open-api CLI，通过官方 CLI 执行结构化抽取（免去手动上传、轮询与解压）...")
-            if not token and isinstance(file_path, str) and os.path.exists(file_path) and os.path.getsize(file_path) <= 10 * 1024 * 1024:
+            used_flash = False
+            if not token and allow_flash and isinstance(file_path, str) and os.path.exists(file_path) and os.path.getsize(file_path) <= 10 * 1024 * 1024:
+                used_flash = True
                 cli_res = cli_client.flash_extract(
                     file_path=file_path,
                     page_ranges=page_ranges,
                     timeout=timeout,
-                    cancel_event=cancel_event
+                    cancel_event=cancel_event,
+                    is_ocr=need_ocr,
                 )
             else:
                 cli_res = cli_client.extract(
                     file_path=file_path,
                     formats="json,md",
                     page_ranges=page_ranges,
-                    model=config.get("MINERU_MODEL") or None,
+                    model=cfg_model,
                     timeout=timeout,
-                    cancel_event=cancel_event
+                    cancel_event=cancel_event,
+                    is_ocr=need_ocr,
                 )
             if cli_res.get("success"):
-                extracted_dfs = cli_res.get("dfs", [])
-                if extracted_dfs:
-                    print(f"[MinerU CLI] 抽取成功，获得 {len(extracted_dfs)} 个结构化表格")
+                extracted_dfs = _remap_mineru_subset_dfs(cli_res.get("dfs", []), page_ranges, file_path=file_path)
+                if used_flash and not extracted_dfs and cli_mode == "auto":
+                    print("[MinerU CLI] flash-extract 未产生活性结构化表格（仅 Markdown 占位符），继续回退至 REST Agent API...")
                 else:
-                    print("[MinerU CLI] 抽取完成，文档未包含结构化表格")
-                return extracted_dfs
+                    if extracted_dfs:
+                        print(f"[MinerU CLI] 抽取成功，获得 {len(extracted_dfs)} 个结构化表格")
+                    else:
+                        print("[MinerU CLI] 抽取完成，文档未包含结构化表格")
+                    return extracted_dfs
             elif cli_res.get("error") == "cancelled" or (cancel_event is not None and cancel_event.is_set()):
                 print("[MinerU CLI] 任务已取消，终止执行")
                 return []
@@ -2093,17 +2275,255 @@ def call_mineru_structured_api(
         return []
 
     client = MinerUClient(api_key=token, api_base=api_base)
-    task_id = client.submit_task(file_path, page_ranges=page_ranges)
+    submit_kwargs: Dict[str, Any] = {"page_ranges": page_ranges}
+    if is_ocr is not None:
+        submit_kwargs["is_ocr"] = bool(is_ocr)
+    if explicit_config and explicit_config.get("MINERU_MODEL") and str(explicit_config.get("MINERU_MODEL")).lower() != "auto":
+        submit_kwargs["model_version"] = cfg_model
+    task_id = client.submit_task(file_path, **submit_kwargs)
     if not task_id:
         return []
     poll_res = client.poll_task(task_id, timeout=timeout, cancel_event=cancel_event)
     if not poll_res.get("success"):
         return []
-    return client.parse_mineru_structured_result(poll_res.get("data", {}))
+    return _remap_mineru_subset_dfs(
+        client.parse_mineru_structured_result(poll_res.get("data", {})),
+        page_ranges,
+        file_path=file_path,
+    )
 
 
 # 全局默认 MinerU 客户端实例
 mineru_client = MinerUClient()
+
+
+def _has_cached_hf_repo(hub_cache: str, repo_folder: str) -> bool:
+    snap_root = os.path.join(hub_cache, repo_folder, "snapshots")
+    if not os.path.isdir(snap_root):
+        return False
+    try:
+        for rev in os.listdir(snap_root):
+            rev_dir = os.path.join(snap_root, rev)
+            if os.path.isdir(rev_dir) and os.listdir(rev_dir):
+                return True
+    except OSError:
+        return False
+    return False
+
+
+@contextmanager
+def _docling_hf_offline_if_cached():
+    """Avoid network stalls in huggingface_hub when Docling HF models are already cached locally."""
+    env_flag = os.environ.get("HF_HUB_OFFLINE", "").strip().lower()
+    if env_flag in ("0", "false", "no"):
+        yield
+        return
+
+    hc = None
+    prev_attr = None
+    prev_env = os.environ.get("HF_HUB_OFFLINE")
+    activated = False
+    try:
+        import huggingface_hub.constants as hc_mod
+        hc = hc_mod
+        hub_cache = str(getattr(hc, "HF_HUB_CACHE", os.path.expanduser("~/.cache/huggingface/hub")))
+        required = (
+            "models--docling-project--docling-layout-heron",
+            "models--docling-project--docling-models",
+        )
+        if all(_has_cached_hf_repo(hub_cache, repo) for repo in required):
+            prev_attr = getattr(hc, "HF_HUB_OFFLINE", False)
+            hc.HF_HUB_OFFLINE = True
+            os.environ["HF_HUB_OFFLINE"] = "1"
+            activated = True
+    except Exception:
+        hc = None
+    try:
+        yield
+    finally:
+        if activated and hc is not None:
+            try:
+                hc.HF_HUB_OFFLINE = prev_attr
+            except Exception:
+                pass
+            if prev_env is None:
+                os.environ.pop("HF_HUB_OFFLINE", None)
+            else:
+                os.environ["HF_HUB_OFFLINE"] = prev_env
+
+
+def _parse_page_ranges_zero_based(
+    page_ranges: Optional[Union[str, List[int], Tuple[int, ...], set]]
+) -> List[int]:
+    """Parse 0-based int collections or 1-based MinerU page_ranges strings (e.g. '2,4-5') into sorted 0-based indices."""
+    if not page_ranges:
+        return []
+    pages_set: Set[int] = set()
+    if isinstance(page_ranges, (list, tuple, set)):
+        for p in page_ranges:
+            try:
+                pi = int(p)
+                if pi >= 0:
+                    pages_set.add(pi)
+            except Exception:
+                pass
+    elif isinstance(page_ranges, str):
+        for part in page_ranges.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "-" in part:
+                try:
+                    s_p, e_p = part.split("-", 1)
+                    s_i, e_i = int(s_p.strip()), int(e_p.strip())
+                    if e_i >= s_i > 0:
+                        pages_set.update(p - 1 for p in range(s_i, e_i + 1))
+                except Exception:
+                    pass
+            elif part.isdigit():
+                val = int(part)
+                if val > 0:
+                    pages_set.add(val - 1)
+    return sorted(pages_set)
+
+
+def _should_remap_subset_indices(found_zero_based: List[int], req_pages: List[int]) -> bool:
+    """Return True only when extracted 0-based page indices appear subset-relative rather than document-relative."""
+    if not req_pages or not found_zero_based:
+        return False
+    req_set = set(req_pages)
+    if len(req_pages) == 1:
+        return all(p == 0 for p in found_zero_based) and req_pages[0] != 0
+    return (
+        all(0 <= p < len(req_pages) for p in found_zero_based)
+        and any(p not in req_set for p in found_zero_based)
+        and max(found_zero_based) < max(req_pages)
+    )
+
+
+def _remap_mineru_subset_markdown(
+    md: Optional[str],
+    page_ranges: Optional[Union[str, List[int], Tuple[int, ...], set]],
+) -> str:
+    if not md or not isinstance(md, str):
+        return md or ""
+    req_pages = _parse_page_ranges_zero_based(page_ranges)
+    if not req_pages:
+        return md
+    marker_re = re.compile(r'<!--\s*Page\s*(\d+)\s*-->', re.IGNORECASE)
+    matches = marker_re.findall(md)
+    if not matches:
+        if len(req_pages) == 1:
+            return f"<!-- Page {req_pages[0] + 1} -->\n{md}"
+        return md
+    found_zero = [max(0, int(m) - 1) for m in matches]
+    if not _should_remap_subset_indices(found_zero, req_pages):
+        return md
+    return _remap_subset_page_markers(md, req_pages)
+
+
+def _remap_mineru_subset_dfs(
+    dfs: Optional[List[pd.DataFrame]],
+    page_ranges: Optional[Union[str, List[int], Tuple[int, ...], set]],
+    file_path: Optional[str] = None,
+) -> List[pd.DataFrame]:
+    """
+    Remap subset-relative df.attrs['page_idx'] (and update page_size from original PDF)
+    when MinerU extracts a proper subset via page_ranges and returns 0..len(req)-1 indices.
+    """
+    if not dfs:
+        return dfs if dfs is not None else []
+    req_pages = _parse_page_ranges_zero_based(page_ranges)
+    if not req_pages:
+        return dfs
+
+    found_indices: List[int] = []
+    for df in dfs:
+        if df is None or not hasattr(df, "attrs"):
+            continue
+        p_idx = df.attrs.get("page_idx")
+        if isinstance(p_idx, bool):
+            continue
+        if isinstance(p_idx, int):
+            found_indices.append(p_idx)
+
+    remap_needed = _should_remap_subset_indices(found_indices, req_pages)
+    single_missing = (len(req_pages) == 1)
+
+    page_sizes: Dict[int, List[float]] = {}
+    if (remap_needed or single_missing) and isinstance(file_path, str) and os.path.isfile(file_path):
+        try:
+            doc = fitz.open(file_path)
+            try:
+                for p_target in req_pages:
+                    if 0 <= p_target < len(doc):
+                        rect = doc[p_target].rect
+                        page_sizes[p_target] = [float(rect.width), float(rect.height)]
+            finally:
+                doc.close()
+        except Exception:
+            pass
+
+    for df in dfs:
+        if df is None or not hasattr(df, "attrs"):
+            continue
+        p_idx = df.attrs.get("page_idx")
+        new_p = None
+        if p_idx is None and single_missing:
+            new_p = req_pages[0]
+        elif remap_needed and isinstance(p_idx, int) and not isinstance(p_idx, bool) and 0 <= p_idx < len(req_pages):
+            new_p = req_pages[p_idx]
+
+        if new_p is not None:
+            df.attrs["page_idx"] = new_p
+            if new_p in page_sizes:
+                df.attrs["page_size"] = list(page_sizes[new_p])
+
+    return dfs
+
+
+def _remap_subset_page_markers(md: Optional[str], subset_pages: Optional[List[int]]) -> str:
+    """Remap subset 1-based <!-- Page K --> markers (or unmarked subset text) back to original 0-based PDF pages."""
+    if not md or not isinstance(md, str) or not subset_pages:
+        return md or ""
+    marker_re = re.compile(r'<!--\s*Page\s*(\d+)\s*-->', re.IGNORECASE)
+    if marker_re.search(md):
+        def _repl(match):
+            sub_idx = max(0, int(match.group(1)) - 1)
+            orig_idx = subset_pages[sub_idx] if sub_idx < len(subset_pages) else sub_idx
+            return f"<!-- Page {orig_idx + 1} -->"
+        return marker_re.sub(_repl, md)
+    return f"<!-- Page {subset_pages[0] + 1} -->\n{md}"
+
+
+def _dfs_to_page_markdown(dfs: List[pd.DataFrame]) -> str:
+    """Render structured MinerU DataFrames back into page-marked HTML/Markdown preserving titles & footnotes."""
+    if not dfs:
+        return ""
+    chunks = []
+    last_page = None
+    for df in dfs:
+        if df is None or df.empty:
+            continue
+        p_idx = df.attrs.get("page_idx")
+        parts = []
+        if isinstance(p_idx, int) and p_idx >= 0 and p_idx != last_page:
+            parts.append(f"<!-- Page {p_idx + 1} -->")
+            last_page = p_idx
+        title = str(df.attrs.get("table_title") or "").strip()
+        if title:
+            parts.append(title)
+        raw_html = df.attrs.get("raw_html") or df.attrs.get("html")
+        if isinstance(raw_html, str) and "<table" in raw_html.lower():
+            parts.append(raw_html.strip())
+        else:
+            parts.append(df.to_html(index=False))
+        footnote = str(df.attrs.get("table_footnote") or "").strip()
+        if footnote:
+            parts.append(footnote)
+        if parts:
+            chunks.append("\n".join(parts))
+    return "\n\n".join(chunks)
 
 
 def is_mineru_available(
@@ -2161,7 +2581,9 @@ def call_paddleocr_job(
     model: str,
     config: Optional[dict] = None,
     timeout: int = 600,
-    cancel_event=None
+    cancel_event=None,
+    pages: Optional[Union[str, List[int]]] = None,
+    page_ranges: Optional[Union[str, List[int]]] = None,
 ) -> Dict[str, Any]:
     """
     通用 AIStudio 作业调用底层函数。支持 PP-StructureV3 / PaddleOCR-VL-1.6 等任意模型。
@@ -2197,16 +2619,30 @@ def call_paddleocr_job(
             "model": "mineru",
             "jsonl_url": "",
             "combined_markdown": mineru_md,
-            "pages": [{"page_idx": 0, "markdown": mineru_md, "images": {}}],
+            "pages": _split_markdown_by_pages(mineru_md),
             "error": None,
             "failover": True
         }
 
+    target_ranges = page_ranges if page_ranges is not None else pages
+
+    def _call_mineru_failover() -> str:
+        if target_ranges is not None:
+            return call_mineru_api(
+                file_path, config=config, timeout=timeout, cancel_event=cancel_event, page_ranges=target_ranges
+            )
+        return call_mineru_api(file_path, config=config, timeout=timeout, cancel_event=cancel_event)
+
+    def _can_mineru_for_target() -> bool:
+        if target_ranges is not None:
+            return is_mineru_available(config, file_path, page_ranges=target_ranges)
+        return is_mineru_available(config, file_path)
+
     if not token:
         # 若未配置百度 Token 但 MinerU 可用（配置了 key 或符合 Agent 免费额度），直接平滑切换
-        if is_mineru_available(config, file_path):
+        if _can_mineru_for_target():
             print(f"[{model}] 提示: 未配置百度 AIStudio Token，自动切换至 MinerU API 解析...")
-            mineru_md = call_mineru_api(file_path, config=config, timeout=timeout, cancel_event=cancel_event)
+            mineru_md = _call_mineru_failover()
             if mineru_md:
                 return _make_failover_result(mineru_md)
         print(f"[{model}] 错误: 未配置 Token (PADDLEOCR_ACCESS_TOKEN 环境变量或 config.json)")
@@ -2225,7 +2661,7 @@ def call_paddleocr_job(
         return {"success": False, "model": model, "error": "file_not_found", "combined_markdown": "", "pages": []}
 
     engine_pref = (config.get("OCR_ENGINE") or os.environ.get("OCR_ENGINE") or "auto").lower()
-    can_mineru_failover = is_mineru_available(config, file_path) and engine_pref in ("auto", "mineru")
+    can_mineru_failover = _can_mineru_for_target() and engine_pref in ("auto", "mineru")
 
     # 提交作业（支持指数退避与满队列重试，并在队列爆满或超时时无缝熔断至 MinerU）
     retry_waits = [5, 15, 30, 60, 90]
@@ -2257,7 +2693,7 @@ def call_paddleocr_job(
             is_net_err = isinstance(e, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)) or "timeout" in str(e).lower() or "connection" in str(e).lower()
             if is_net_err and can_mineru_failover:
                 print(f"[{model}] 百度 AIStudio 提交网络异常/超时，触发多云熔断，自动切换至 MinerU API...")
-                mineru_md = call_mineru_api(file_path, config=config, timeout=timeout, cancel_event=cancel_event)
+                mineru_md = _call_mineru_failover()
                 if mineru_md:
                     return _make_failover_result(mineru_md)
             return {"success": False, "model": model, "error": str(e), "combined_markdown": "", "pages": []}
@@ -2269,7 +2705,7 @@ def call_paddleocr_job(
         elif job_response.status_code == 400 and "队列已满" in job_response.text:
             if can_mineru_failover:
                 print(f"[{model}] 遇到百度 AIStudio 队列已满 (status=400 队列已满)，立即触发多云双活熔断，无缝切换至 MinerU API...")
-                mineru_md = call_mineru_api(file_path, config=config, timeout=timeout, cancel_event=cancel_event)
+                mineru_md = _call_mineru_failover()
                 if mineru_md:
                     return _make_failover_result(mineru_md)
             print(f"[{model}] 队列已满, 等待 {wait_time}s 后重试 ({attempt+1}/{len(retry_waits)})...")
@@ -2280,7 +2716,7 @@ def call_paddleocr_job(
             print(f"[{model}] 提交作业失败, status={job_response.status_code}: {job_response.text[:200]}")
             if job_response.status_code in (500, 502, 503, 504) and can_mineru_failover:
                 print(f"[{model}] 百度 AIStudio 服务端异常 (status={job_response.status_code})，触发多云熔断，自动切换至 MinerU API...")
-                mineru_md = call_mineru_api(file_path, config=config, timeout=timeout, cancel_event=cancel_event)
+                mineru_md = _call_mineru_failover()
                 if mineru_md:
                     return _make_failover_result(mineru_md)
             return {"success": False, "model": model, "error": f"status_{job_response.status_code}", "combined_markdown": "", "pages": []}
@@ -2288,7 +2724,7 @@ def call_paddleocr_job(
         print(f"[{model}] 提交作业重试 {len(retry_waits)} 次后仍失败")
         if can_mineru_failover:
             print(f"[{model}] 百度 AIStudio 多次重试未成功，无缝切换至 MinerU API...")
-            mineru_md = call_mineru_api(file_path, config=config, timeout=timeout, cancel_event=cancel_event)
+            mineru_md = _call_mineru_failover()
             if mineru_md:
                 return _make_failover_result(mineru_md)
         return {"success": False, "model": model, "error": "max_retries_exceeded", "combined_markdown": "", "pages": []}
@@ -2308,7 +2744,7 @@ def call_paddleocr_job(
             print(f"[{model}] 轮询超时 ({timeout}s)，跳过")
             if can_mineru_failover:
                 print(f"[{model}] 百度 AIStudio 轮询超时，无缝切换至 MinerU API...")
-                mineru_md = call_mineru_api(file_path, config=config, timeout=timeout, cancel_event=cancel_event)
+                mineru_md = _call_mineru_failover()
                 if mineru_md:
                     return _make_failover_result(mineru_md)
             return {"success": False, "model": model, "error": "timeout", "combined_markdown": "", "pages": []}
@@ -2352,7 +2788,7 @@ def call_paddleocr_job(
             print(f"[{model}] 作业失败: {error_msg}")
             if can_mineru_failover:
                 print(f"[{model}] 百度 AIStudio 任务失败 ({error_msg})，无缝切换至 MinerU API...")
-                mineru_md = call_mineru_api(file_path, config=config, timeout=timeout, cancel_event=cancel_event)
+                mineru_md = _call_mineru_failover()
                 if mineru_md:
                     return _make_failover_result(mineru_md)
             return {"success": False, "model": model, "error": error_msg, "combined_markdown": "", "pages": []}
@@ -2555,7 +2991,11 @@ def call_paddleocr_vl_online_api(
         return call_docling_table_extractor(file_path, config=config, cancel_event=cancel_event, pages=pages)
 
     model = config.get("PADDLEOCR_MCP_MODEL", "PaddleOCR-VL-1.6")
-    res = call_paddleocr_job(file_path, model=model, config=config, timeout=timeout, cancel_event=cancel_event)
+    job_kwargs: Dict[str, Any] = {}
+    if pages is not None or page_ranges is not None:
+        job_kwargs["pages"] = pages
+        job_kwargs["page_ranges"] = page_ranges
+    res = call_paddleocr_job(file_path, model=model, config=config, timeout=timeout, cancel_event=cancel_event, **job_kwargs)
     md = res.get("combined_markdown", "")
     if not md and is_mineru_available(config, file_path) and not res.get("failover") and engine in ("auto", "mineru"):
         print("[Dual-Cloud Failover] AIStudio 未返回有效解析结果，尝试 MinerU API 进行视觉兜底...")
@@ -2590,22 +3030,29 @@ def run_ppstructure_vlm_pipeline(
     print(f"[PP-StructureV3 -> VLM] 阶段 1: 正在使用 PP-StructureV3 进行版面分析与表格定位...")
     target_file = pdf_path
     temp_subset = None
+    subset_pages = None
     if pages and os.path.exists(pdf_path) and pdf_path.lower().endswith(".pdf"):
         try:
             import fitz
             import tempfile as _tmp
             doc_full = fitz.open(pdf_path)
-            if len(pages) < len(doc_full):
+            valid_pages = []
+            seen_pages = set()
+            for p in pages:
+                if isinstance(p, int) and 0 <= p < len(doc_full) and p not in seen_pages:
+                    seen_pages.add(p)
+                    valid_pages.append(p)
+            if valid_pages and len(valid_pages) < len(doc_full):
                 doc_sub = fitz.open()
-                for p in pages:
-                    if 0 <= p < len(doc_full):
-                        doc_sub.insert_pdf(doc_full, from_page=p, to_page=p)
+                for p in valid_pages:
+                    doc_sub.insert_pdf(doc_full, from_page=p, to_page=p)
                 doc_full.close()
                 fd, temp_subset = _tmp.mkstemp(prefix="ppstruct_subset_", suffix=".pdf")
                 os.close(fd)
                 doc_sub.save(temp_subset)
                 doc_sub.close()
                 target_file = temp_subset
+                subset_pages = valid_pages
             else:
                 doc_full.close()
         except Exception as e:
@@ -2621,6 +3068,8 @@ def run_ppstructure_vlm_pipeline(
                 pass
 
     pp_md = pp_res.get("combined_markdown", "")
+    if subset_pages and pp_md:
+        pp_md = _remap_subset_page_markers(pp_md, subset_pages)
     pages_data = pp_res.get("pages", [])
 
     # 若阶段 1 发生 MinerU 双活故障转移且已获得解析结果，直接产出结果，避免重复冗余请求
@@ -2631,17 +3080,34 @@ def run_ppstructure_vlm_pipeline(
     # 收集包含表格的页面与切图 URL
     table_pages = set()
     table_crop_images = []
+    pp_page_mds: Dict[int, str] = {}
     for p_info in pages_data:
         sub_p_idx = p_info["page_idx"]
-        orig_p_idx = pages[sub_p_idx] if (pages and sub_p_idx < len(pages)) else sub_p_idx
+        orig_p_idx = subset_pages[sub_p_idx] if (subset_pages and 0 <= sub_p_idx < len(subset_pages)) else sub_p_idx
         md = p_info.get("markdown", "")
         images = p_info.get("images", {})
         has_table = bool(re.search(r'(?:<table|\|[^\n]+\|[^\n]+\||\|[\s:\-|]+\||(?:表|Table)\s*\d+)', md, re.IGNORECASE))
+        if has_table and md:
+            pp_page_mds[orig_p_idx] = md
         if has_table or images:
             table_pages.add(orig_p_idx)
-            for img_name, img_url in images.items():
-                if "table" in img_name.lower() or "tab" in img_name.lower() or len(images) == 1:
+            explicit_table_crops = [
+                (img_name, img_url)
+                for img_name, img_url in images.items()
+                if "table" in img_name.lower() or "tab" in img_name.lower()
+            ]
+            if explicit_table_crops:
+                for img_name, img_url in explicit_table_crops:
                     table_crop_images.append((orig_p_idx, img_name, img_url))
+            elif images:
+                # 当仅有一个切图或有多张切图但命名泛化 (如 img_0.png) 时，排除明显非表格图示，避免遗漏多切图页
+                for img_name, img_url in images.items():
+                    if len(images) == 1 or not re.search(
+                        r'(?:^|[_-])(?:fig|figure|chart|formula|equation|logo|icon|seal|stamp)(?:[_.\-]|$)',
+                        img_name,
+                        re.IGNORECASE,
+                    ):
+                        table_crop_images.append((orig_p_idx, img_name, img_url))
 
     if pages:
         for p in pages:
@@ -2653,10 +3119,11 @@ def run_ppstructure_vlm_pipeline(
     if cancel_event is not None and cancel_event.is_set():
         return pp_md
 
-    # 2. 后置解析：优先将切图提交给 PaddleOCR-VL-1.6 进行针对性 VLM 解析
+    # 2. 后置解析：优先将切图提交给 PaddleOCR-VL-1.6 进行针对性 VLM 解析，未覆盖页补全扫描
+    vlm_mds = []
+    crop_covered_pages = set()
     if table_crop_images:
         print(f"[PP-StructureV3 -> VLM] 阶段 2: 正在将 {len(table_crop_images)} 个表格切图提交 PaddleOCR-VL-1.6 精细解析...")
-        vlm_mds = []
         for orig_p_idx, img_name, img_url in table_crop_images:
             if cancel_event is not None and cancel_event.is_set():
                 break
@@ -2664,21 +3131,31 @@ def run_ppstructure_vlm_pipeline(
                 crop_job = call_paddleocr_job(img_url, model="PaddleOCR-VL-1.6", config=config, timeout=120, cancel_event=cancel_event)
                 c_md = crop_job.get("combined_markdown", "")
                 if c_md:
+                    if not re.search(r'<!--\s*Page\s*\d+\s*-->', c_md, re.IGNORECASE):
+                        c_md = f"<!-- Page {orig_p_idx + 1} -->\n{c_md}"
                     vlm_mds.append(c_md)
+                    crop_covered_pages.add(orig_p_idx)
             except Exception as e:
                 print(f"[PP-StructureV3 -> VLM] 切图 {img_name} VLM 解析异常: {e}")
 
-        if vlm_mds:
-            combined_vlm_md = "\n\n".join(vlm_mds)
-            print(f"[PP-StructureV3 -> VLM] PaddleOCR-VL-1.6 成功完成切图精细解析！")
-            return combined_vlm_md
+    remaining_pages = [p for p in sorted_pages if p not in crop_covered_pages]
+    if remaining_pages and not (cancel_event is not None and cancel_event.is_set()):
+        print(f"[PP-StructureV3 -> VLM] 阶段 2: 针对剩余 {len(remaining_pages)} 个目标页面提交 PaddleOCR-VL-1.6 识别...")
+        rem_md = run_paddleocr_vl(pdf_path, pages=remaining_pages, config=config, cancel_event=cancel_event)
+        if rem_md:
+            vlm_mds.append(rem_md)
+        else:
+            for orig_p_idx in remaining_pages:
+                if orig_p_idx in pp_page_mds:
+                    p_md_seg = pp_page_mds[orig_p_idx]
+                    if not re.search(r'<!--\s*Page\s*\d+\s*-->', p_md_seg, re.IGNORECASE):
+                        p_md_seg = f"<!-- Page {orig_p_idx + 1} -->\n{p_md_seg}"
+                    vlm_mds.append(p_md_seg)
 
-    # 若无独立切图或切图解析为空，针对候选页面执行 PaddleOCR-VL 识别
-    if sorted_pages:
-        print(f"[PP-StructureV3 -> VLM] 阶段 2: 针对 {len(sorted_pages)} 个目标页面提交 PaddleOCR-VL-1.6 识别...")
-        vlm_md = run_paddleocr_vl(pdf_path, pages=sorted_pages, cancel_event=cancel_event)
-        if vlm_md:
-            return vlm_md
+    if vlm_mds:
+        combined_vlm_md = "\n\n".join(vlm_mds)
+        print(f"[PP-StructureV3 -> VLM] PaddleOCR-VL-1.6 成功完成精细解析！")
+        return combined_vlm_md
 
     # 兜底返回 PP-StructureV3 自身的 Markdown
     return pp_md or ""
@@ -2710,13 +3187,20 @@ def crops_to_temp_images(crop_items: list) -> list:
     return image_paths
 
 
-def run_paddleocr_vl(pdf_path: str, pages=None, cancel_event=None, enable_doclayout: bool = True) -> str:
+def run_paddleocr_vl(
+    pdf_path: str,
+    pages=None,
+    cancel_event=None,
+    enable_doclayout: bool = True,
+    config: Optional[dict] = None,
+) -> str:
     """
     PaddleOCR-VL 识别入口。
     - 若指定 pages，逐页渲染为图片提交在线 API
     - 否则传整个 PDF 给在线 API
     """
-    config = load_config()
+    if config is None:
+        config = load_config()
     engine = (config.get("OCR_ENGINE") or os.environ.get("OCR_ENGINE") or "auto").lower()
     if engine == "docling":
         return call_docling_table_extractor(pdf_path, pages=pages, config=config, cancel_event=cancel_event)
@@ -2760,7 +3244,7 @@ def run_paddleocr_vl(pdf_path: str, pages=None, cancel_event=None, enable_doclay
                     try:
                         b_md = call_paddleocr_vl_online_api(temp_sub_pdf, config=config, timeout=240, cancel_event=cancel_event)
                         if b_md:
-                            block_mds.append(b_md)
+                            block_mds.append(_remap_subset_page_markers(b_md, block))
                     finally:
                         if os.path.exists(temp_sub_pdf):
                             try:
@@ -2769,14 +3253,17 @@ def run_paddleocr_vl(pdf_path: str, pages=None, cancel_event=None, enable_doclay
                                 pass
                 doc_full.close()
                 if block_mds:
-                    return "\n\n".join(block_mds)
-            doc_full.close()
+                    joined_blocks = "\n\n".join(block_mds)
+                    if _has_structured_tables_in_md(joined_blocks):
+                        return joined_blocks
+            else:
+                doc_full.close()
         except Exception as e:
             print(f"[OCR Notice] 连续块 PaddleOCR-VL 识别异常: {e}")
 
     # 1. 传整个 PDF 给在线 API
     print(f"[OCR] 正在将整个 PDF 提交 PaddleOCR-VL-1.6 在线 API 识别: {pdf_path}")
-    full_md = call_paddleocr_vl_online_api(pdf_path, config=config, timeout=600, cancel_event=cancel_event)
+    full_md = call_paddleocr_vl_online_api(pdf_path, config=config, timeout=600, cancel_event=cancel_event, pages=pages)
 
     if full_md and parse_structured_vlm_content is not None:
         try:
@@ -2786,19 +3273,26 @@ def run_paddleocr_vl(pdf_path: str, pages=None, cancel_event=None, enable_doclay
                 return full_md
         except Exception:
             pass
+    if full_md and _has_structured_tables_in_md(full_md):
+        return full_md
 
-    # 补充保障：逐页将包含图表关键词的 PDF 页面渲染为图像调用
+    # 补充保障：逐页将包含图表关键词的 PDF 页面（支持单页 PDF 与显式 pages 过滤）渲染为图像调用
+    page_mds = []
     try:
         doc = fitz.open(pdf_path)
-        if len(doc) > 1:
+        iter_pages = (
+            sorted(set(p for p in pages if 0 <= p < len(doc)))
+            if pages is not None
+            else list(range(len(doc)))
+        )
+        if len(doc) >= 1 and iter_pages:
             print(f"[OCR] 正在尝试对 PDF 候选页面逐页进行 PaddleOCR-VL 图像识别...")
-            page_mds = []
-            for page_idx in range(len(doc)):
+            for page_idx in iter_pages:
                 if cancel_event is not None and cancel_event.is_set():
                     break
                 page = doc[page_idx]
                 page_text = page.get_text("text")
-                if page_may_contain_tables and not page_may_contain_tables(page_text):
+                if pages is None and page_may_contain_tables and not page_may_contain_tables(page_text):
                     continue
 
                 mat = fitz.Matrix(200 / 72.0, 200 / 72.0)
@@ -2810,6 +3304,8 @@ def run_paddleocr_vl(pdf_path: str, pages=None, cancel_event=None, enable_doclay
                     print(f"[OCR] 正在对 PDF 第 {page_idx+1} 页执行 PaddleOCR-VL 识别...")
                     p_md = call_paddleocr_vl_online_api(temp_page_img, config=config, timeout=120, cancel_event=cancel_event)
                     if p_md:
+                        if not re.search(r'<!--\s*Page\s*\d+\s*-->', p_md, re.IGNORECASE):
+                            p_md = f"<!-- Page {page_idx + 1} -->\n{p_md}"
                         page_mds.append(p_md)
                 finally:
                     if os.path.exists(temp_page_img):
@@ -2818,16 +3314,17 @@ def run_paddleocr_vl(pdf_path: str, pages=None, cancel_event=None, enable_doclay
                         except Exception:
                             pass
 
-            doc.close()
-            if page_mds:
-                return "\n\n".join(page_mds)
-        else:
-            doc.close()
+        doc.close()
+        if page_mds:
+            joined_pages = "\n\n".join(page_mds)
+            if _has_structured_tables_in_md(joined_pages):
+                return joined_pages
     except Exception as e:
         print(f"[OCR Notice] 逐页 PaddleOCR-VL 识别提示: {e}")
 
-    # 离线备用降级：当 PaddleOCR 在线服务无结果且配置了 Docling 备用时，启动 Docling TableFormer 兜底
-    if not full_md and config and config.get("DOCLING_OFFLINE_FALLBACK", True):
+    # 离线备用降级：当 PaddleOCR 在线服务无结果或仅返回纯文本无表格且配置了 Docling 备用时，启动 Docling TableFormer 兜底
+    best_md_so_far = full_md or ("\n\n".join(page_mds) if page_mds else "")
+    if not _has_structured_tables_in_md(best_md_so_far) and (config is None or config.get("DOCLING_OFFLINE_FALLBACK", True)):
         try:
             print("[OCR Fallback] PaddleOCR 未返回表格，尝试启动 IBM Docling (TableFormer) 离线备用提取...")
             docling_md = call_docling_table_extractor(pdf_path, pages=pages, config=config, cancel_event=cancel_event)
@@ -2837,7 +3334,7 @@ def run_paddleocr_vl(pdf_path: str, pages=None, cancel_event=None, enable_doclay
         except Exception as e_d:
             print(f"[OCR Fallback Notice] Docling 备用提取异常: {e_d}")
 
-    return full_md or ""
+    return best_md_so_far or ""
 
 
 # ===========================================================================
@@ -2949,12 +3446,12 @@ def extract_via_docling(
                     if text_len <= 50:
                         needs_ocr = True
                         break
-                    # 正文虽可搜索，但若页面内嵌入栅格图像 (图片表格/扫描插图)，亦须启用 OCR
+                    # 正文虽可搜索，但若页面内嵌入较大栅格图像 (图片表格/扫描插图)，亦须启用 OCR；跳过微小图标/期刊 Logo
                     images = p_check.get_images(full=True)
                     if images:
                         for img_info in images:
                             img_w, img_h = img_info[2], img_info[3]
-                            if (img_w >= 80 and img_h >= 40) or (img_w * img_h >= 4000):
+                            if (img_w >= 160 and img_h >= 80) or (img_w * img_h >= 16000):
                                 needs_ocr = True
                                 break
                     if needs_ocr:
@@ -2965,12 +3462,24 @@ def extract_via_docling(
         if config and ("do_ocr" in config or "DO_OCR" in config):
             needs_ocr = bool(config.get("do_ocr", config.get("DO_OCR", needs_ocr)))
 
-        cache_key = (bool(needs_ocr), id(DocumentConverter))
+        images_scale = float(config.get("DOCLING_IMAGES_SCALE", 2.0)) if config else 2.0
+        cache_key = (bool(needs_ocr), round(images_scale, 2), id(DocumentConverter))
         converter = _DOCLING_CONVERTER_CACHE.get(cache_key)
         if converter is None:
             pipeline_options = PdfPipelineOptions()
             pipeline_options.do_table_structure = True
             pipeline_options.do_ocr = needs_ocr
+            if hasattr(pipeline_options, "images_scale"):
+                pipeline_options.images_scale = images_scale
+            try:
+                from docling.datamodel.pipeline_options import AcceleratorOptions, AcceleratorDevice
+                if hasattr(pipeline_options, "accelerator_options"):
+                    pipeline_options.accelerator_options = AcceleratorOptions(
+                        num_threads=int((config or {}).get("DOCLING_NUM_THREADS", 4)),
+                        device=AcceleratorDevice.AUTO,
+                    )
+            except Exception:
+                pass
             try:
                 from docling.datamodel.pipeline_options import TableFormerMode
                 if hasattr(pipeline_options, "table_structure_options") and pipeline_options.table_structure_options is not None:
@@ -2990,10 +3499,12 @@ def extract_via_docling(
                 except Exception:
                     pass
 
-            converter = DocumentConverter(format_options=format_opts)
+            with _docling_hf_offline_if_cached():
+                converter = DocumentConverter(format_options=format_opts)
             _DOCLING_CONVERTER_CACHE[cache_key] = converter
 
-        conv_res = converter.convert(effective_pdf)
+        with _docling_hf_offline_if_cached():
+            conv_res = converter.convert(effective_pdf)
         if not conv_res or not conv_res.document:
             return []
 
@@ -3006,7 +3517,10 @@ def extract_via_docling(
             if cancel_event is not None and cancel_event.is_set():
                 break
 
-            df = tbl.export_to_dataframe()
+            try:
+                df = tbl.export_to_dataframe(doc=doc_item)
+            except TypeError:
+                df = tbl.export_to_dataframe()
             if df is None or df.empty or len(df) < 1:
                 continue
 
@@ -3129,8 +3643,9 @@ def call_docling_table_extractor(
                 for _, r_data in df.iterrows():
                     lines.append("| " + " | ".join(str(v).replace("\n", " ").strip() for v in r_data.values) + " |")
                 table_md = "\n".join(lines)
+        page_marker = f"<!-- Page {p+1} -->\n" if p is not None else ""
         page_str = f"Page {p+1}" if p is not None else "Page unknown"
-        block = f"### Table {idx+1} ({page_str}): {title}\n\n{table_md}\n"
+        block = f"{page_marker}### Table {idx+1} ({page_str}): {title}\n\n{table_md}\n"
         md_blocks.append(block)
 
     return "\n\n".join(md_blocks)
@@ -3166,13 +3681,20 @@ class PaddleOCRVLBackend(OCRBackend):
         return {"tables": True, "formulas": True, "autorotate": True, "crops": True}
 
     def probe_health(self) -> Dict[str, Any]:
-        token = os.getenv("PADDLEOCR_MCP_AISTUDIO_ACCESS_TOKEN", "")
-        if not token:
-            try:
-                cfg = load_config()
-                token = cfg.get("PADDLEOCR_MCP_AISTUDIO_ACCESS_TOKEN", "")
-            except Exception:
-                pass
+        try:
+            cfg = load_config() or {}
+        except Exception:
+            cfg = {}
+        token = (
+            os.getenv("PADDLEOCR_ACCESS_TOKEN")
+            or os.getenv("PADDLEOCR_MCP_AISTUDIO_ACCESS_TOKEN")
+            or cfg.get("PADDLEOCR_ACCESS_TOKEN")
+            or cfg.get("PADDLEOCR_MCP_AISTUDIO_ACCESS_TOKEN")
+            or cfg.get("PADDLEOCR_VL_TOKEN")
+            or ""
+        )
+        if str(token).strip().lower() in ("", "your-aistudio-access-token"):
+            token = ""
         healthy = bool(token)
         return {
             "status": "healthy" if healthy else "unauthenticated",

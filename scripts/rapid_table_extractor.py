@@ -17,6 +17,7 @@ rapid_table_extractor.py — RapidAI / TableStructureRec + RapidTable 本地双�
 
 import os
 import sys
+import importlib.util
 import logging
 from typing import List, Dict, Any, Optional, Tuple, Union
 
@@ -192,9 +193,15 @@ class RapidTableExtractor:
             self._wired_engine = wired
 
             # UniTable 使用 PyTorch，作为独立可选依赖；
-            # 仅当已在环境引入 torch 或无任何可用引擎时进行尝试，避免在轻量 ONNX 推理或沙箱 mock 中意外引入重度依赖
+            # 仅当 rapid_table 实际具备 ModelType/RapidTableInput 接口，且 PyTorch 已加载或可用时按需初始化
             wireless = None
-            if "torch" in sys.modules or (wired is None and self._wired_tsr_engine is None and self._lineless_tsr_engine is None):
+            rapid_table_mod = sys.modules.get("rapid_table")
+            has_unitable_api = bool(
+                rapid_table_mod is not None
+                and (hasattr(rapid_table_mod, "ModelType") or hasattr(rapid_table_mod, "RapidTableInput"))
+            )
+            has_torch_spec = ("torch" in sys.modules) or (importlib.util.find_spec("torch") is not None)
+            if has_unitable_api and os.environ.get("RAPID_TABLE_UNITABLE", "1") != "0" and has_torch_spec:
                 try:
                     import torch
                     wireless = _instantiate_engine("unitable", self.model_dir)

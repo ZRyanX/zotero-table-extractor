@@ -37,19 +37,48 @@ except ImportError:
 logger = logging.getLogger("omnidocbench")
 
 
-def compute_iou(box_a: List[float], box_b: List[float]) -> float:
-    """计算两个 2D 矩形框的 IoU [x0, y0, x1, y1]。"""
-    xA = max(box_a[0], box_b[0])
-    yA = max(box_a[1], box_b[1])
-    xB = min(box_a[2], box_b[2])
-    yB = min(box_a[3], box_b[3])
+def _normalize_box_xyxy(box: Any) -> Optional[List[float]]:
+    """Convert list/tuple/dict box representations to [x0, y0, x1, y1]."""
+    if box is None:
+        return None
+    if isinstance(box, dict):
+        for key in ("bbox", "box", "rect", "xyxy"):
+            if key in box and isinstance(box[key], (list, tuple)) and len(box[key]) >= 4:
+                return [float(v) for v in box[key][:4]]
+        if all(k in box for k in ("x0", "y0", "x1", "y1")):
+            return [float(box["x0"]), float(box["y0"]), float(box["x1"]), float(box["y1"])]
+        if all(k in box for k in ("left", "top", "right", "bottom")):
+            return [float(box["left"]), float(box["top"]), float(box["right"]), float(box["bottom"])]
+        if all(k in box for k in ("x", "y")) and ("w" in box or "width" in box) and ("h" in box or "height" in box):
+            x = float(box["x"])
+            y = float(box["y"])
+            w = float(box.get("w", box.get("width", 0.0)))
+            h = float(box.get("h", box.get("height", 0.0)))
+            return [x, y, x + w, y + h]
+        return None
+    if isinstance(box, (list, tuple)) and len(box) >= 4:
+        return [float(v) for v in box[:4]]
+    return None
+
+
+def compute_iou(box_a: Any, box_b: Any) -> float:
+    """计算两个 2D 矩形框的 IoU [x0, y0, x1, y1]（兼容 list/tuple 与 dict 框）。"""
+    coords_a = _normalize_box_xyxy(box_a)
+    coords_b = _normalize_box_xyxy(box_b)
+    if coords_a is None or coords_b is None:
+        return 0.0
+
+    xA = max(coords_a[0], coords_b[0])
+    yA = max(coords_a[1], coords_b[1])
+    xB = min(coords_a[2], coords_b[2])
+    yB = min(coords_a[3], coords_b[3])
 
     inter_w = max(0.0, xB - xA)
     inter_h = max(0.0, yB - yA)
     inter_area = inter_w * inter_h
 
-    area_a = max(0.0, box_a[2] - box_a[0]) * max(0.0, box_a[3] - box_a[1])
-    area_b = max(0.0, box_b[2] - box_b[0]) * max(0.0, box_b[3] - box_b[1])
+    area_a = max(0.0, coords_a[2] - coords_a[0]) * max(0.0, coords_a[3] - coords_a[1])
+    area_b = max(0.0, coords_b[2] - coords_b[0]) * max(0.0, coords_b[3] - coords_b[1])
 
     union_area = area_a + area_b - inter_area
     if union_area <= 0:

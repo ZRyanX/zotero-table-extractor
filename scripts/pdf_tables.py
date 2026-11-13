@@ -1098,13 +1098,16 @@ def crop_to_dataframe(pdf_path: str, crop_info: Dict[str, Any], dpi: int = 200) 
     force_visual_ocr = bool(crop_info.get("needs_ocr"))
 
     if not force_visual_ocr:
-        # --- 优先: PyMuPDF find_tables() 结构化提取 ---
+        # --- 优先: PyMuPDF find_tables() 矢量线框结构化提取 ---
         try:
-            finder = page.find_tables()
+            try:
+                finder = page.find_tables(clip=crop_rect)
+            except TypeError:
+                finder = page.find_tables()
             best_table = None
             best_overlap = 0.0
             crop_area = crop_rect.width * crop_rect.height
-            for t in finder.tables:
+            for t in (finder.tables if finder else []):
                 t_rect = fitz.Rect(t.bbox)
                 inter = crop_rect & t_rect
                 if inter.is_empty or inter.width <= 0 or inter.height <= 0:
@@ -1157,6 +1160,47 @@ def crop_to_dataframe(pdf_path: str, crop_info: Dict[str, Any], dpi: int = 200) 
             if words:
                 df, caption, footnote = _rebuild_df_from_words(words, crop_rect)
 
+        # --- 无线框文本策略兜底 2b: 仅在样式感知与 word-level 均未产出有效表格时启用 ---
+        if df is None or df.empty:
+            try:
+                try:
+                    finder_txt = page.find_tables(clip=crop_rect, strategy="text")
+                except TypeError:
+                    finder_txt = page.find_tables(strategy="text")
+                best_txt_table = None
+                best_txt_overlap = 0.0
+                crop_area = crop_rect.width * crop_rect.height
+                for t in (finder_txt.tables if finder_txt else []):
+                    t_rect = fitz.Rect(t.bbox)
+                    inter = crop_rect & t_rect
+                    if inter.is_empty or inter.width <= 0 or inter.height <= 0:
+                        continue
+                    overlap = (inter.width * inter.height) / crop_area if crop_area > 0 else 0
+                    if overlap > best_txt_overlap:
+                        best_txt_overlap = overlap
+                        best_txt_table = t
+                if best_txt_table is not None and best_txt_overlap > 0.3:
+                    rows = best_txt_table.extract()
+                    clean_rows = []
+                    for row in rows:
+                        clean_row = [("" if cell is None else str(cell).strip()) for cell in row]
+                        if any(c for c in clean_row):
+                            clean_rows.append(clean_row)
+                    if len(clean_rows) >= 2:
+                        cand_df = pd.DataFrame(clean_rows[1:], columns=clean_rows[0])
+                        try:
+                            from common import is_table_squeezed, is_table_low_quality
+                            if is_table_squeezed(cand_df) or is_table_low_quality(cand_df) or cand_df.shape[1] < 2:
+                                cand_df = None
+                        except Exception:
+                            pass
+                        if cand_df is not None and not cand_df.empty:
+                            df = cand_df
+                            df.attrs['label'] = crop_info.get('label', '')
+                            df.attrs['table_title'] = crop_info.get('caption', '')
+            except Exception as e_txt:
+                logger.debug(f"[PDF-Tables] find_tables(strategy='text') 回退跳过: {e_txt}")
+
     # --- 视觉/OCR 兜底 3: 当 needs_ocr 为真或矢量/word 重建均为空时，调用 RapidTable / Docling / VLM ---
     if df is None or df.empty:
         crop_img = crop_info.get("image")
@@ -1186,8 +1230,8 @@ def crop_to_dataframe(pdf_path: str, crop_info: Dict[str, Any], dpi: int = 200) 
         p_idx = int(crop_info.get("page_index", 0))
         t_idx = int(crop_info.get("table_index", 0))
 
-        # 3b. IBM Docling (TableFormer) 离线高精度提取兜底
-        if (df is None or df.empty) and crop_info.get("needs_ocr", True):
+        # 3b. IBM Docling (TableFormer) 离线高精度提取兜底（原生与 RapidTable 失败时无条件放行）
+        if df is None or df.empty:
             try:
                 try:
                     from . import ocr_client as _ocr_mod
@@ -1221,8 +1265,8 @@ def crop_to_dataframe(pdf_path: str, crop_info: Dict[str, Any], dpi: int = 200) 
             except Exception as e_doc:
                 logger.debug(f"[PDF-Tables] Docling 切图兜底提示: {e_doc}")
 
-        # 3c. OCR / VLM 云端与多引擎回退
-        if (df is None or df.empty) and crop_info.get("needs_ocr", True):
+        # 3c. OCR / VLM 云端与多引擎回退（前置结构化引擎均失败时放行兜底）
+        if df is None or df.empty:
             try:
                 try:
                     from . import ocr_client as _ocr_mod

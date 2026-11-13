@@ -20,6 +20,14 @@ import concurrent.futures
 import requests
 
 try:
+    from .. import common
+except ImportError:
+    import common
+
+if hasattr(common, "ensure_macos_corefoundation"):
+    common.ensure_macos_corefoundation()
+
+try:
     from curl_cffi import requests as requests_impersonate
 except ImportError:
     requests_impersonate = None
@@ -31,11 +39,6 @@ except ImportError:
         from playwright_utils import find_playwright_chromium
     except ImportError:
         find_playwright_chromium = lambda: None
-
-try:
-    from .. import common
-except ImportError:
-    import common
 
 
 # Aliases to shared helpers (kept as bare names so call sites are unchanged)
@@ -741,29 +744,41 @@ class Crawl4AICNKINode(ExtractionNode):
 # 并行竞速管线（race pipeline）
 # ---------------------------------------------------------------------------
 
-def _race_candidates(candidates, cancel_event=None):
+def _race_candidates(candidates, cancel_event=None, authoritative_names=None, grace_timeout=6.0):
     """
-    并发执行一组候选抓取渠道，首个返回非空表格列表的渠道获胜。
+    并发执行一组候选抓取渠道，优先权威 XML/LaTeXML 全文数据源并取表格更完整的结果。
 
     candidates: [(name, callable -> list[DataFrame]), ...]
-    返回 (dfs, winner_name)。失败者线程不阻塞返回（shutdown(wait=False)，
-    各渠道自身均有网络超时兜底）。
+    authoritative_names: 若非权威渠道 (如 DirectHTTP 网页片段) 先返回，而权威全文通道
+        (ElsevierXML / NCBIPMC / ArxivHTML) 仍在执行，等待短窗口 grace_timeout，防止
+        网页摘要/单表片段提前中断完整 XML/补充材料抽取。
     """
+    import time as _t
     if not candidates:
         return [], None
     if cancel_event is not None and cancel_event.is_set():
         return [], None
 
+    auth_set = set(authoritative_names or ())
     ex = concurrent.futures.ThreadPoolExecutor(max_workers=len(candidates))
     try:
         fut_map = {ex.submit(fn): name for name, fn in candidates}
         pending = set(fut_map)
+        best_fast = None  # (dfs, name)
+        grace_deadline = None
+
         while pending:
             if cancel_event is not None and cancel_event.is_set():
                 print("[Race] 收到取消信号，放弃剩余竞速渠道。")
                 break
+            wait_step = 0.5
+            if grace_deadline is not None:
+                rem = grace_deadline - _t.monotonic()
+                if rem <= 0:
+                    break
+                wait_step = min(0.5, rem)
             done, pending = concurrent.futures.wait(
-                pending, timeout=0.5, return_when=concurrent.futures.FIRST_COMPLETED
+                pending, timeout=wait_step, return_when=concurrent.futures.FIRST_COMPLETED
             )
             for fut in done:
                 name = fut_map[fut]
@@ -772,9 +787,28 @@ def _race_candidates(candidates, cancel_event=None):
                 except Exception as e:
                     print(f"[Race] 渠道 {name} 异常: {e}")
                     dfs = []
-                if dfs:
+                if not dfs:
+                    continue
+                if name in auth_set or not any(fut_map[p] in auth_set for p in pending):
+                    if best_fast is not None and len(best_fast[0]) > len(dfs) and name not in auth_set:
+                        print(f"[Race] 渠道 {best_fast[1]} 保留更多表格 ({len(best_fast[0])} >= {len(dfs)})。")
+                        return best_fast
                     print(f"[Race] 渠道 {name} 竞速获胜，提取到 {len(dfs)} 个表格。")
                     return dfs, name
+                # 非权威渠道先到达且权威渠道仍在请求，记录兜底并短暂等待权威渠道完成
+                if best_fast is None or len(dfs) > len(best_fast[0]):
+                    best_fast = (dfs, name)
+                if grace_deadline is None:
+                    import time as _t
+                    grace_deadline = _t.monotonic() + float(grace_timeout)
+            if grace_deadline is not None:
+                import time as _t
+                if _t.monotonic() >= grace_deadline or not any(fut_map[p] in auth_set for p in pending):
+                    break
+
+        if best_fast is not None:
+            print(f"[Race] 渠道 {best_fast[1]} 竞速获胜，提取到 {len(best_fast[0])} 个表格。")
+            return best_fast
         return [], None
     finally:
         try:
@@ -934,13 +968,31 @@ def _race_extract(state, cancel_event=None):
         tier1.append(("ElsevierXML", _elsevier_xml))
     if doi:
         tier1.append(("Unpaywall", lambda: extract_tables_via_unpaywall(doi, table_idx, cancel_event=cancel_event)))
-    dfs, winner = _race_candidates(tier1, cancel_event)
+    dfs, winner = _race_candidates(
+        tier1,
+        cancel_event,
+        authoritative_names={"ArxivHTML", "NCBIPMC", "ElsevierXML"},
+    )
 
     history.append(f"general-tier1:{winner or 'none'}")
-    if dfs:
+    # 若仅靠非权威 DirectHTTP 在动态出版社页面拿到单个极小表 (可能漏掉折叠/补充表)，继续让浏览器渠道尝试补全
+    _tier1_incomplete_hint = (
+        dfs
+        and table_idx == "all"
+        and winner not in ("ArxivHTML", "NCBIPMC", "ElsevierXML", "Unpaywall")
+        and len(dfs) == 1
+        and len(dfs[0]) <= 2
+        and bool(url and any(dom in url.lower() for dom in (
+            "sciencedirect.com", "springer.com", "nature.com", "wiley.com",
+            "tandfonline.com", "oup.com", "geoscienceworld.org", "lyellcollection.org",
+            "acs.org", "rsc.org", "degruyter.com"
+        )))
+    )
+    if dfs and not _tier1_incomplete_hint:
         return dfs, history
+    best_partial = dfs if _tier1_incomplete_hint else []
     if cancelled():
-        return [], history
+        return best_partial, history
 
     # Tier-2: 独立浏览器 / 云抓取渠道并发竞速
     tier2 = []
@@ -950,22 +1002,25 @@ def _race_extract(state, cancel_event=None):
         tier2.append(("Scrapling", lambda: extract_tables_via_scrapling(url, table_idx)))
     dfs, winner = _race_candidates(tier2, cancel_event)
     history.append(f"general-tier2:{winner or 'none'}")
-    if dfs:
+    if dfs and len(dfs) > len(best_partial):
         return dfs, history
     if cancelled():
-        return [], history
+        return best_partial, history
 
     # Tier-3: 共享浏览器 Playwright（锁内串行，含补充材料下载）
     if url:
         print("[Race] General Tier-3: PlaywrightGeneral（浏览器锁内）")
         s, _n = _run_node_locked(PlaywrightGeneralNode(), state)
         history.append("general-tier3:playwright")
-        if s.get("dfs"):
+        if s.get("dfs") and len(s["dfs"]) > len(best_partial):
             return s["dfs"], history
         if s.get("title") and not state.get("title"):
             state["title"] = s["title"]
         if cancelled():
-            return [], history
+            return best_partial, history
+
+    if best_partial:
+        return best_partial, history
 
     # Tier-4: 学术搜索尾流 + BrowserAct
     dfs, winner = _tail_race()

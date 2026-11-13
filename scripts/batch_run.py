@@ -128,16 +128,17 @@ def get_similarity_score(folder, title, filename):
         sim_fi = SequenceMatcher(None, folder_clean, file_clean).ratio()
         return max(score_t, score_fi, sim_t, sim_fi)
 
-def run_task(idx, total, folder, pdf_path, plan=None, online=False, sequential=False, timeout=300, db_path=None):
+def run_task(idx, total, folder, pdf_path, plan=None, online=False, sequential=False, timeout=300, db_path=None, skip_supplementary=False):
     """Runs a single extraction subprocess. Returns (folder, success, elapsed, detail)."""
     script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "extract_zotero_table.py")
 
     cmd = [
         sys.executable, script_path,
         "--pdf", pdf_path,
-        "--skip-supplementary",
         "--output", paper_tables
     ]
+    if skip_supplementary:
+        cmd.append("--skip-supplementary")
     if db_path:
         cmd += ["--db-path", db_path]
     # 预分析结果（doi/url/title）注入子进程，跳过其内部重复的元数据解析
@@ -244,9 +245,20 @@ def generate_batch_tasks(paper_tables_dir, pdf_records, resume=False, recheck=Fa
                             from common import format_table_label
                         except ImportError:
                             try:
-                                from .common import format_table_label
+                                from .common import format_table_label, TABLE_LABEL_RE
                             except ImportError:
                                 format_table_label = lambda x: x.strip()
+                                TABLE_LABEL_RE = None
+
+                        try:
+                            from common import TABLE_LABEL_RE as _TBL_LBL_RE
+                        except ImportError:
+                            _TBL_LBL_RE = TABLE_LABEL_RE if 'TABLE_LABEL_RE' in locals() else None
+
+                        _fallback_lbl_re = _TBL_LBL_RE or re.compile(
+                            r'(?:Extended\s+Data\s+Table|Appendix\s+Table|Supplementary\s+Table|附\s*表|附录表|补充表|Table|表)\s*[A-Za-z]?\d+(?:[\.\-–—]\d+)*',
+                            re.IGNORECASE,
+                        )
 
                         exp_labels, exp_count = scan_pdf_table_expected_labels(pdf_p)
                         if exp_count > 0 and exp_labels:
@@ -256,8 +268,8 @@ def generate_batch_tasks(paper_tables_dir, pdf_records, resume=False, recheck=Fa
                                     fpath = os.path.join(folder_path, fn)
                                     file_labels = set()
                                     stem = os.path.splitext(fn)[0]
-                                    m_fn = re.match(r'^(?:(Table|表|Supplementary\s+Table)\s*([A-Za-z0-9\.\-]+))', stem.strip(), re.IGNORECASE)
-                                    fn_label = format_table_label(f"{m_fn.group(1)} {m_fn.group(2)}") if m_fn else format_table_label(stem)
+                                    m_fn = _fallback_lbl_re.search(stem.strip())
+                                    fn_label = format_table_label(m_fn.group(0)) if m_fn else format_table_label(stem)
 
                                     try:
                                         import openpyxl
@@ -278,9 +290,9 @@ def generate_batch_tasks(paper_tables_dir, pdf_records, resume=False, recheck=Fa
                                                 if fn_label:
                                                     file_labels.add(fn_label)
                                                 for sname in wb.sheetnames:
-                                                    m_sn = re.match(r'^(?:(Table|表|Supplementary\s+Table)\s*([A-Za-z0-9\.\-]+))', sname.strip(), re.IGNORECASE)
+                                                    m_sn = _fallback_lbl_re.search(sname.strip())
                                                     if m_sn:
-                                                        file_labels.add(format_table_label(f"{m_sn.group(1)} {m_sn.group(2)}"))
+                                                        file_labels.add(format_table_label(m_sn.group(0)))
                                                     else:
                                                         lbl = format_table_label(sname)
                                                         if lbl:
@@ -314,6 +326,39 @@ def generate_batch_tasks(paper_tables_dir, pdf_records, resume=False, recheck=Fa
 get_paper_tasks = generate_batch_tasks
 
 
+def resolve_zotero_attachment_path(raw_path, key, storage_dir, attachments_base_dir=None):
+    """Resolve both Zotero managed storage: attachments and Linked PDF attachment paths."""
+    if not raw_path:
+        return None
+    p = str(raw_path).strip()
+    if p.startswith("storage:"):
+        rel = p[len("storage:"):].lstrip("/\\")
+        cand = os.path.join(storage_dir, key, rel)
+        return cand if os.path.exists(cand) else None
+    if p.startswith("attachments:"):
+        rel = p[len("attachments:"):].lstrip("/\\")
+        if attachments_base_dir:
+            cand = os.path.join(os.path.expanduser(attachments_base_dir), rel)
+            if os.path.exists(cand):
+                return cand
+        cand_exp = os.path.expanduser(rel)
+        if os.path.exists(cand_exp):
+            return cand_exp
+        cand_db_parent = os.path.join(os.path.dirname(storage_dir), rel)
+        if os.path.exists(cand_db_parent):
+            return cand_db_parent
+        return None
+    if p.startswith("file://"):
+        from urllib.parse import unquote
+        p = unquote(p[len("file://"):])
+    expanded = os.path.expanduser(p)
+    if os.path.exists(expanded):
+        return expanded
+    # Fallback to Zotero storage/key/basename if only a bare filename was stored
+    cand_storage = os.path.join(storage_dir, key, os.path.basename(p))
+    return cand_storage if os.path.exists(cand_storage) else None
+
+
 def main():
     parser = argparse.ArgumentParser(description="Batch extraction of Zotero library tables (parallel).")
     parser.add_argument("--workers", type=int, default=4,
@@ -328,6 +373,8 @@ def main():
                             help="禁用在线提取")
     parser.add_argument("--pdf-only", action="store_true", default=False,
                         help="禁用在线提取，仅用 PaddleOCR 本地识别")
+    parser.add_argument("--skip-supplementary", action="store_true", default=False,
+                        help="跳过补充材料与附录表格（默认不跳过）")
     parser.add_argument("--sequential", action="store_true",
                         help="传递给提取脚本：禁用竞速，走旧版串行管线")
     parser.add_argument("--resume", action="store_true", default=False,
@@ -349,14 +396,18 @@ def main():
     log(f"=== STARTING BATCH EXTRACTION PROCESS === (workers={args.workers}, online={args.online}, sequential={args.sequential})")
     log(f"[Paths] paper_tables={paper_tables} | zotero_db={zotero_db}")
 
-    # 1. Query Zotero database for PDFs
+    # 1. Query Zotero database for PDFs (WAL-safe snapshot + Linked PDF resolution)
     import shutil
+    import sqlite3
     try:
-        shutil.copy2(zotero_db, temp_db)
-        conn = sqlite3.connect(temp_db) if 'sqlite3' in sys.modules else None
-        if not conn:
-            import sqlite3
-            conn = sqlite3.connect(temp_db)
+        if common and hasattr(common, "copy_sqlite_snapshot"):
+            common.copy_sqlite_snapshot(zotero_db, temp_db)
+        else:
+            shutil.copy2(zotero_db, temp_db)
+            for _sfx in ("-wal", "-shm"):
+                if os.path.exists(zotero_db + _sfx):
+                    shutil.copy2(zotero_db + _sfx, temp_db + _sfx)
+        conn = sqlite3.connect(temp_db)
         cursor = conn.cursor()
         
         cursor.execute("SELECT fieldID, fieldName FROM fields WHERE fieldName IN ('title', 'DOI');")
@@ -381,30 +432,32 @@ def main():
             """, (title_fid,))
             parent_titles = {item_id: val for item_id, val in cursor.fetchall()}
             
+        cfg = common.load_config() if common and hasattr(common, "load_config") else {}
+        attachments_base_dir = cfg.get("ZOTERO_ATTACHMENTS_BASE_DIR")
         pdf_records = []
         for item_id, parent_id, path, key in attachments:
-            filename = None
-            if path:
-                if path.startswith("storage:"):
-                    filename = path[len("storage:"):]
-                else:
-                    filename = os.path.basename(path)
-            if filename:
-                actual_path = os.path.join(zotero_storage_dir, key, filename)
-                if os.path.exists(actual_path):
-                    pdf_records.append({
-                        "pdf_path": actual_path,
-                        "parent_title": parent_titles.get(parent_id, ""),
-                        "key": key,
-                        "filename": filename
-                    })
+            actual_path = resolve_zotero_attachment_path(path, key, zotero_storage_dir, attachments_base_dir)
+            if actual_path and os.path.exists(actual_path):
+                pdf_records.append({
+                    "pdf_path": actual_path,
+                    "parent_title": parent_titles.get(parent_id, ""),
+                    "key": key,
+                    "filename": os.path.basename(actual_path)
+                })
         conn.close()
     except Exception as e:
         log(f"Error querying Zotero database: {e}")
         sys.exit(1)
     finally:
-        if os.path.exists(temp_db):
-            os.remove(temp_db)
+        if common and hasattr(common, "cleanup_sqlite_snapshot"):
+            common.cleanup_sqlite_snapshot(temp_db)
+        else:
+            for _sfx in ("", "-wal", "-shm"):
+                if os.path.exists(temp_db + _sfx):
+                    try:
+                        os.remove(temp_db + _sfx)
+                    except Exception:
+                        pass
             
     log(f"Found {len(pdf_records)} PDFs in Zotero library.")
     
@@ -452,7 +505,8 @@ def main():
         fut_map = {
             ex.submit(run_task, idx + 1, total, folder, pdf_path,
                       plan=plans.get(pdf_path), online=args.online, sequential=args.sequential,
-                      timeout=args.timeout, db_path=args.db_path): folder
+                      timeout=args.timeout, db_path=args.db_path,
+                      skip_supplementary=args.skip_supplementary): folder
             for idx, (folder, pdf_path) in enumerate(tasks)
         }
         for fut in concurrent.futures.as_completed(fut_map):

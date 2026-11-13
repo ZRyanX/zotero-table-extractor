@@ -802,9 +802,6 @@ def remediate_pdf_pages_lossless(
 
     for p_idx in sorted_pages:
         page = doc[p_idx]
-        # 仅针对未经旋转定义 (page.rotation == 0) 的页面进行检测；已设 rotation 的页面已在视口层声明过旋转
-        if getattr(page, "rotation", 0) != 0:
-            continue
 
         res = detect_page_orientation(
             page,
