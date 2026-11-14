@@ -443,9 +443,26 @@ def call_journal_supp_downloader(doi_or_url: str, output_dir: str) -> bool:
 
     import subprocess
     cmd = [sys.executable, supp_downloader_script, doi_or_url, "-o", output_dir]
+    sub_env = os.environ.copy()
+    try:
+        cfg = load_config() if callable(load_config) else {}
+        for _k in (
+            "ELSEVIER_API_KEY",
+            "ELSEVIER_INSTTOKEN",
+            "UNPAYWALL_EMAIL",
+            "CROSSREF_EMAIL",
+            "OPENALEX_API_KEY",
+            "CORE_API_KEY",
+        ):
+            if cfg.get(_k) and not sub_env.get(_k):
+                sub_env[_k] = str(cfg[_k])
+        if cfg.get("IS_CAMPUS_NETWORK") and not sub_env.get("IS_CAMPUS_NETWORK"):
+            sub_env["IS_CAMPUS_NETWORK"] = "true"
+    except Exception:
+        pass
     try:
         print(f"[Supp Downloader] 正在调用 journal-supp-downloader 技能抓取附表...")
-        ret = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        ret = subprocess.run(cmd, capture_output=True, text=True, timeout=300, env=sub_env)
         if ret.returncode == 0:
             print(f"[Supp Downloader] 附表下载成功完成！")
             return True

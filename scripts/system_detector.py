@@ -127,15 +127,32 @@ def _read_config_dict() -> Dict[str, Any]:
     return {}
 
 
-def _get_path_setting(key: str, default: Optional[str] = None) -> Optional[str]:
-    """获取自定义路径设置，优先环境变量，其次 config.json，最后默认值。"""
-    env_val = os.environ.get(key)
-    if env_val:
-        return os.path.normpath(os.path.expanduser(env_val))
+def _is_foreign_nonexistent_path(raw_val: str) -> bool:
+    """Return True if a configured path belongs to another OS."""
+    expanded = os.path.expanduser(raw_val.strip())
+    if not IS_MACOS and expanded.startswith(("/Users/", "/Volumes/")):
+        return True
+    if not IS_WINDOWS and len(expanded) >= 3 and expanded[1] == ":" and expanded[2] in ("\\", "/"):
+        return True
+    return False
+
+
+def _get_path_setting(key: str, default: Optional[str] = None, require_exists: bool = False) -> Optional[str]:
+    """获取自定义路径设置，优先 OS 专属键，其次环境变量与 config.json，最后默认值。"""
+    os_suffixes = ["_WINDOWS"] if IS_WINDOWS else (["_MAC", "_MACOS"] if IS_MACOS else ["_LINUX"])
+    candidate_keys = [f"{key}{sfx}" for sfx in os_suffixes] + [key]
     cfg = _read_config_dict()
-    val = cfg.get(key)
-    if val and isinstance(val, str) and val.strip():
-        return os.path.normpath(os.path.expanduser(val.strip()))
+
+    for ckey in candidate_keys:
+        for source in (os.environ.get(ckey), cfg.get(ckey)):
+            if source and isinstance(source, str) and source.strip():
+                raw = source.strip()
+                if _is_foreign_nonexistent_path(raw):
+                    continue
+                norm = os.path.normpath(os.path.expanduser(raw))
+                if require_exists and not os.path.exists(norm):
+                    continue
+                return norm
     return default
 
 
@@ -167,7 +184,7 @@ def get_paper_tables_dir() -> str:
 
 def get_zotero_dir() -> str:
     """获取 Zotero 数据主目录。优先级：config.json > 默认 ~/Zotero"""
-    custom = _get_path_setting("ZOTERO_DIR")
+    custom = _get_path_setting("ZOTERO_DIR", require_exists=True)
     if custom:
         return custom
     if IS_MACOS and os.path.isdir(_MACOS_ZOTERO_DIR):
@@ -177,7 +194,7 @@ def get_zotero_dir() -> str:
 
 def get_zotero_db_path() -> str:
     """获取 zotero.sqlite 路径。优先级：config.json > <zotero_dir>/zotero.sqlite"""
-    custom = _get_path_setting("ZOTERO_DB_PATH")
+    custom = _get_path_setting("ZOTERO_DB_PATH", require_exists=True)
     if custom:
         return custom
     cand = os.path.join(get_zotero_dir(), "zotero.sqlite")
@@ -190,7 +207,7 @@ def get_zotero_db_path() -> str:
 
 def get_zotero_storage_dir() -> str:
     """获取 Zotero storage 目录。优先级：config.json > <zotero_dir>/storage"""
-    custom = _get_path_setting("ZOTERO_STORAGE_DIR")
+    custom = _get_path_setting("ZOTERO_STORAGE_DIR", require_exists=True)
     if custom:
         return custom
     cand = os.path.join(get_zotero_dir(), "storage")
@@ -277,10 +294,11 @@ def adapt_path(path: str) -> str:
     if not path or not isinstance(path, str):
         return path
 
-    if os.path.exists(path):
-        return path
-
     norm = path.replace("\\", "/")
+    is_foreign_posix = not IS_MACOS and norm.startswith(("/Users/", "/Volumes/"))
+
+    if not is_foreign_posix and os.path.exists(path):
+        return path
 
     # 1. /Volumes/ExFat/AIHub/paper_tables/...
     if norm.startswith("/Volumes/ExFat/AIHub/paper_tables"):

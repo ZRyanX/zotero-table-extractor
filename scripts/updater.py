@@ -1123,6 +1123,9 @@ class SkillUpdater:
         priority_keys = [
             "FIRECRAWL_API_KEY",
             "ELSEVIER_API_KEY",
+            "ELSEVIER_INSTTOKEN",
+            "OPENALEX_API_KEY",
+            "CORE_API_KEY",
             "PADDLEOCR_MCP_AISTUDIO_ACCESS_TOKEN",
             "MINERU_TOKEN",
             "MINERU_API_KEY",

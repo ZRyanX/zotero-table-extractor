@@ -1096,13 +1096,17 @@ def _clean_vlm_dataframe(df: pd.DataFrame, original_attrs: dict, preserve_script
 
     if hasattr(df, 'attrs'):
         current_fn = df.attrs.get('footnotes', [])
+        if isinstance(current_fn, str):
+            current_fn = [current_fn]
         df.attrs.update(original_attrs)
         if current_fn:
             existing_fn = df.attrs.get('footnotes', [])
+            if isinstance(existing_fn, str):
+                existing_fn = [existing_fn]
             if not existing_fn:
-                df.attrs['footnotes'] = current_fn
+                df.attrs['footnotes'] = list(current_fn) if isinstance(current_fn, (list, tuple)) else [str(current_fn)]
             elif isinstance(existing_fn, list) and current_fn != existing_fn:
-                df.attrs['footnotes'] = list(dict.fromkeys(existing_fn + current_fn))
+                df.attrs['footnotes'] = list(dict.fromkeys(list(existing_fn) + list(current_fn)))
     return df
 
 

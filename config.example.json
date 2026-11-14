@@ -1,6 +1,12 @@
 {
   "FIRECRAWL_API_KEY": "your-firecrawl-api-key",
   "ELSEVIER_API_KEY": "your-elsevier-api-key",
+  "ELSEVIER_INSTTOKEN": "",
+  "IS_CAMPUS_NETWORK": false,
+  "UNPAYWALL_EMAIL": "",
+  "CROSSREF_EMAIL": "",
+  "OPENALEX_API_KEY": "",
+  "CORE_API_KEY": "",
   "CNKI_STRATEGY": "auto",
   "PLAYWRIGHT_HEADED": false,
   "PAPER_TABLES_DIR": "",

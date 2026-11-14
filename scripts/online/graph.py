@@ -44,6 +44,7 @@ except ImportError:
 # Aliases to shared helpers (kept as bare names so call sites are unchanged)
 get_cnki_cookies_path = common.get_cnki_cookies_path
 load_config = common.load_config
+get_polite_email = getattr(common, "get_polite_email", lambda config=None, service="crossref": "supp_downloader@academic-research.org")
 browser_extraction_lock = common.browser_extraction_lock
 
 
@@ -162,6 +163,22 @@ class ExtractionGraph:
         return state
 
 
+def _normalize_publisher_url(url: str) -> str:
+    """Normalize bare DOI host typos and upgrade Atypon Literatum /doi/abs/ URLs to /doi/full/."""
+    if not url:
+        return url
+    m_bare = re.match(r"^https?://(10\.\d{4,9})/([^\s]+)$", url.strip(), re.IGNORECASE)
+    if m_bare:
+        url = f"https://doi.org/{m_bare.group(1)}/{m_bare.group(2)}"
+    if "/doi/abs/" in url and any(dom in url.lower() for dom in (
+        "onlinelibrary.wiley.com", "tandfonline.com", "sagepub.com",
+        "geoscienceworld.org", "lyellcollection.org", "agu.onlinelibrary.wiley.com",
+        "pubs.acs.org",
+    )):
+        return url.replace("/doi/abs/", "/doi/full/", 1)
+    return url
+
+
 class ResolveMetadataNode(ExtractionNode):
     def __init__(self, fallback_node=None):
         super().__init__("ResolveMetadataNode", fallback_node)
@@ -173,7 +190,7 @@ class ResolveMetadataNode(ExtractionNode):
         
         # 0. Check if pdf_path is already a URL
         if isinstance(pdf_path, str) and (pdf_path.startswith("http://") or pdf_path.startswith("https://")):
-            url = pdf_path
+            url = _normalize_publisher_url(pdf_path)
             is_cnki = "cnki.net" in url or "cnki.com.cn" in url
             doi = None
             if "doi.org/" in url:
@@ -206,11 +223,14 @@ class ResolveMetadataNode(ExtractionNode):
             state["doi"] = doi
             state["title"] = title
             
-            url = None
+            url = state.get("url")
             is_cnki = False
             
             # Prioritize direct Zotero URL if available (saves redirect timeouts)
-            if zotero_url and zotero_url.startswith("http"):
+            if url and isinstance(url, str) and url.startswith("http"):
+                if "cnki.net" in url or "cnki.com.cn" in url:
+                    is_cnki = True
+            elif zotero_url and zotero_url.startswith("http"):
                 url = zotero_url
                 if "cnki.net" in url or "cnki.com.cn" in url:
                     is_cnki = True
@@ -264,8 +284,8 @@ class ResolveMetadataNode(ExtractionNode):
             if not url:
                 print(f"[Graph] Could not resolve DOI or URL for PDF: {pdf_path}")
                 return state, self.fallback_node
-                
-            state["url"] = url
+
+            state["url"] = _normalize_publisher_url(url)
             state["is_cnki"] = is_cnki
 
         # 检查 arXiv 与 PMC
@@ -338,7 +358,7 @@ class ImpersonatedHTTPNode(ExtractionNode):
             r = requests_impersonate.get(url, impersonate="chrome", timeout=15)
             if r.status_code == 200:
                 html = r.text
-                if html:
+                if html and not (hasattr(common, "is_anti_bot_blocked") and common.is_anti_bot_blocked("", html)):
                     dfs = parse_tables_from_html(html, table_idx)
                     if dfs:
                         print(f"[ImpersonatedHTTPNode] Successfully extracted {len(dfs)} tables via TLS impersonation.")
@@ -512,6 +532,7 @@ class PlaywrightGeneralNode(ExtractionNode):
                 "access denied", "are you a robot", "sciencedirect", "just a moment",
                 "performing security verification", "error", "403", "page not found",
                 "cloudflare", "your privacy, your choice", "there was a problem",
+                "请稍候", "radware", "安全验证", "attention required",
             }
             if resolved_title and dfs:
                 title_lower = resolved_title.lower().strip()
@@ -642,8 +663,16 @@ class AcademicSearchGraphNode(ExtractionNode):
         if title:
             print(f"[AcademicSearchGraph] Searching alternative open-access repositories by title: {title}")
             try:
-                crossref_url = f"https://api.crossref.org/works?query.title={urllib.parse.quote(title)}&rows=3"
-                r = requests.get(crossref_url, timeout=10)
+                polite_email = get_polite_email(load_config(), service="crossref")
+                crossref_url = (
+                    f"https://api.crossref.org/works?query.title={urllib.parse.quote(title)}"
+                    f"&rows=3&mailto={urllib.parse.quote(polite_email)}"
+                )
+                r = requests.get(
+                    crossref_url,
+                    headers={"User-Agent": f"ZoteroTableExtractor/1.0 (mailto:{polite_email})"},
+                    timeout=10,
+                )
                 if r.status_code == 200:
                     data = r.json()
                     items = data.get("message", {}).get("items", [])
@@ -985,7 +1014,8 @@ def _race_extract(state, cancel_event=None):
         and bool(url and any(dom in url.lower() for dom in (
             "sciencedirect.com", "springer.com", "nature.com", "wiley.com",
             "tandfonline.com", "oup.com", "geoscienceworld.org", "lyellcollection.org",
-            "acs.org", "rsc.org", "degruyter.com"
+            "acs.org", "rsc.org", "degruyter.com", "mdpi.com", "iopscience.iop.org",
+            "frontiersin.org", "science.org", "copernicus.org",
         )))
     )
     if dfs and not _tier1_incomplete_hint:

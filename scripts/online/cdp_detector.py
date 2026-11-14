@@ -20,12 +20,15 @@ import sys
 import re
 import json
 import time
+import shutil
+import subprocess
 import platform
 import tempfile
 import threading
 import contextlib
+import urllib.parse
 import urllib.request
-from typing import Optional, Dict, Any, List, Set, Union
+from typing import Optional, Dict, Any, List, Set, Union, Tuple
 
 _CDP_TAB_SEMAPHORE = None
 _CDP_TAB_MAX_COUNT = 6
@@ -448,3 +451,355 @@ def install_cdp_port_guard(target: Any, cdp_port: Optional[Union[int, str]] = No
         pass
 
     return route_installed
+
+
+# ---------------------------------------------------------------------------
+# 出版社页面加载增强：Tab 复用、瞬态挑战壳等待、慢速第三方脚本拦截、系统 Chrome / BrowserSkill
+# ---------------------------------------------------------------------------
+
+DEFAULT_SLOW_THIRD_PARTY_DOMAINS = frozenset({
+    "ajax.googleapis.com",
+    "fonts.googleapis.com",
+    "scholar.google.com",
+    "www.googletagmanager.com",
+    "googletagmanager.com",
+    "www.google-analytics.com",
+    "google-analytics.com",
+    "cookie-cdn.cookiepro.com",
+    "cdn.cookielaw.org",
+    "geolocation.onetrust.com",
+    "js.trendmd.com",
+})
+
+
+def merge_blocked_domains(url: str, existing_domains=None, proxy: str = "") -> Set[str]:
+    """合并拖慢首屏加载的第三方跟踪/同意弹窗域名（始终豁免目标站点自身主机）。"""
+    target_host = (urllib.parse.urlparse(url or "").hostname or "").lower()
+    extra = set(DEFAULT_SLOW_THIRD_PARTY_DOMAINS)
+    if proxy:
+        extra -= {"ajax.googleapis.com", "fonts.googleapis.com"}
+    merged = set(existing_domains or ())
+    for dom in extra:
+        if target_host and (target_host == dom or target_host.endswith("." + dom)):
+            continue
+        merged.add(dom)
+    return merged
+
+
+def install_slow_tracker_route_blocker(target: Any, target_url: str, proxy: str = "") -> bool:
+    """在 Playwright Page 或 Context 上拦截会卡住页面 load 的第三方跟踪/弹窗域。"""
+    if target is None or not hasattr(target, "route"):
+        return False
+    blocked = merge_blocked_domains(target_url, proxy=proxy)
+    if not blocked:
+        return False
+
+    def _should_abort(req_url: str) -> bool:
+        try:
+            host = (urllib.parse.urlparse(req_url).hostname or "").lower()
+            if not host:
+                return False
+            return any(host == dom or host.endswith("." + dom) for dom in blocked)
+        except Exception:
+            return False
+
+    try:
+        target.route(lambda u: _should_abort(u), lambda route: route.abort())
+        return True
+    except Exception:
+        return False
+
+
+def has_system_chrome() -> bool:
+    """检测本机是否安装了独立的桌面版 Google Chrome（用于 real_chrome 有头回退）。"""
+    for env_var in ("CHROME_PATH", "GOOGLE_CHROME_BIN"):
+        candidate = os.environ.get(env_var, "").strip()
+        if candidate and os.path.exists(candidate):
+            return True
+    if sys.platform == "darwin":
+        mac_paths = (
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            os.path.expanduser("~/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+        )
+        return any(os.path.exists(p) for p in mac_paths)
+    if sys.platform.startswith("win"):
+        win_paths = (
+            os.path.join(os.environ.get("PROGRAMFILES", r"C:\Program Files"), "Google", "Chrome", "Application", "chrome.exe"),
+            os.path.join(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"), "Google", "Chrome", "Application", "chrome.exe"),
+            os.path.join(os.environ.get("LOCALAPPDATA", ""), "Google", "Chrome", "Application", "chrome.exe"),
+        )
+        return any(p and os.path.exists(p) for p in win_paths)
+    return any(shutil.which(name) for name in ("google-chrome", "google-chrome-stable", "chromium", "chrome"))
+
+
+def get_publisher_table_wait_selector(url: str) -> str:
+    """按出版社域返回更精准的表格/容器等待选择器。"""
+    low = (url or "").lower()
+    if "sciencedirect.com" in low or "cell.com" in low:
+        return "table, .tables, [id^='t0'], [id^='tbl']"
+    if "onlinelibrary.wiley.com" in low:
+        return "table, .article-table-content"
+    if "springer.com" in low or "nature.com" in low:
+        return "table, .c-article-table-container, .c-article-table"
+    if any(k in low for k in ("geoscienceworld.org", "lyellcollection.org", "academic.oup.com", "silverchair")):
+        return "table, .table-wrap, .table-modal"
+    if "pubs.acs.org" in low:
+        return "table, .NLM_table-wrap"
+    if "pubs.rsc.org" in low:
+        return "table, .rtable__wrapper, .table_caption"
+    if "iopscience.iop.org" in low:
+        return "table, .table-wrapper"
+    if "mdpi.com" in low:
+        return "table, .html-table_show"
+    if "tandfonline.com" in low:
+        return "table, .tableView"
+    if "frontiersin.org" in low:
+        return "table, .TableWrap"
+    return "table"
+
+
+def find_matching_cdp_page(browser: Any, target_url: str):
+    """
+    在已通过 CDP 连接的浏览器上下文中查找匹配标签页（零重复请求直接复用）：
+    依次匹配完整 URL、DOI token（10.xxxx/...）、Elsevier PII（S...），以及页内 meta DOI。
+    """
+    if not browser or not target_url:
+        return None
+    target_norm = target_url.lower().rstrip("/")
+    m_doi = re.search(r"10\.\d{4,9}/[-._;()/:A-Za-z0-9]+", target_url)
+    doi_token = m_doi.group(0).lower() if m_doi else ""
+    m_pii = re.search(r"[sS]\d{16}[0-9a-zA-Z]", target_url)
+    pii_token = m_pii.group(0).lower() if m_pii else ""
+
+    for ctx in getattr(browser, "contexts", []) or []:
+        for pg in getattr(ctx, "pages", []) or []:
+            try:
+                pg_url = (pg.url or "").lower().rstrip("/")
+                if not pg_url or pg_url == "about:blank" or pg_url.startswith(("chrome://", "edge://")):
+                    continue
+                if pg_url == target_norm or (len(target_norm) > 20 and (target_norm in pg_url or pg_url in target_norm)):
+                    return pg
+                if doi_token and doi_token in pg_url:
+                    return pg
+                if pii_token and pii_token in pg_url:
+                    return pg
+                if doi_token:
+                    try:
+                        meta_doi = pg.evaluate(
+                            """() => document.querySelector('meta[name*="doi" i], meta[name="citation_doi" i]')?.content || ''"""
+                        )
+                        if meta_doi and doi_token in str(meta_doi).lower():
+                            return pg
+                    except Exception:
+                        pass
+            except Exception:
+                continue
+    return None
+
+
+def looks_like_transient_challenge_shell(html_content: Optional[str], current_url: str = "") -> bool:
+    """识别值得短时等待的瞬态风控/跳转壳（Turnstile、F5 /tspd/、Elsevier crasolve、AIP loading 等）。"""
+    low_url = (current_url or "").lower()
+    if "crasolve=1" in low_url or "linkinghub.elsevier.com" in low_url:
+        return True
+    if not html_content or not isinstance(html_content, str):
+        return True
+    low = html_content.lower()
+    has_body = bool(re.search(r"<body\b", low))
+    if not has_body and ("<html" in low or "<head" in low or "<!doctype" in low):
+        return True
+    if "crasolve" in low[:3000] and "sciencedirect" in (low_url + low[:3000]):
+        return True
+    if ("/tspd/" in low or "apm_do_not_touch" in low) and len(re.sub(r"<[^>]+>", " ", low).strip()) < 1500:
+        return True
+    cleaned = re.sub(r"<(script|style|noscript|svg)\b[^>]*>.*?</\1>", " ", html_content, flags=re.IGNORECASE | re.DOTALL)
+    vis = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", cleaned)).strip().lower()
+    if len(vis) < 1500 and any(
+        m in vis for m in (
+            "just a moment",
+            "checking your browser",
+            "verify you are human",
+            "attention required",
+            "enable javascript and cookies to continue",
+        )
+    ):
+        return True
+    if ("cf-turnstile" in low or "challenges.cloudflare.com" in low) and len(vis) < 1500:
+        return True
+    if "pubs.aip.org" in low_url and "loading" in vis and len(vis) < 600:
+        return True
+    return False
+
+
+def wait_through_transient_challenge(page: Any, max_wait_s: float = 8.0) -> bool:
+    """
+    在 Playwright 页面刚加载后检测 Elsevier linkinghub meta-refresh、crasolve、
+    Turnstile / F5 /tspd/ 等瞬态挑战壳，执行有界等待并在需要时主动跟踪 meta-refresh。
+    返回 True 表示等待期间页面已稳定脱离瞬态壳。
+    """
+    if page is None:
+        return False
+    try:
+        cur_url = getattr(page, "url", "") or ""
+        # 1. Elsevier linkinghub / retrieve/pii meta-refresh 等待与兜底跳转
+        if "linkinghub.elsevier.com" in cur_url.lower() or "retrieve/pii" in cur_url.lower():
+            for _ in range(5):
+                try:
+                    page.wait_for_timeout(1500)
+                    new_url = getattr(page, "url", "") or ""
+                    if new_url and "linkinghub.elsevier.com" not in new_url.lower() and "retrieve/pii" not in new_url.lower():
+                        cur_url = new_url
+                        break
+                except Exception:
+                    break
+            else:
+                try:
+                    redir = page.evaluate("""() => {
+                        const m = document.querySelector('meta[http-equiv="REFRESH"], meta[http-equiv="refresh"]');
+                        if (!m) return null;
+                        const match = (m.getAttribute('content') || '').match(/url\\s*=\\s*['"]?([^'";\\s]+)/i);
+                        if (!match) return null;
+                        let target = match[1];
+                        if (target.startsWith('/')) target = window.location.origin + target;
+                        return target;
+                    }""")
+                    if redir and isinstance(redir, str) and redir.startswith("http"):
+                        page.goto(redir, wait_until="domcontentloaded", timeout=30000)
+                        page.wait_for_timeout(2000)
+                except Exception:
+                    pass
+
+        # 2. 有界轮询瞬态风控壳，等待 JS/XHR 就地替换为真实文章 DOM
+        probe_html = page.content()
+        cur_url = getattr(page, "url", "") or cur_url
+        if not looks_like_transient_challenge_shell(probe_html, cur_url):
+            return True
+
+        deadline = time.monotonic() + float(max_wait_s)
+        while time.monotonic() < deadline:
+            try:
+                page.wait_for_timeout(500)
+                cur_html = page.content()
+                cur_url = getattr(page, "url", "") or cur_url
+            except Exception:
+                break
+            if not looks_like_transient_challenge_shell(cur_html, cur_url):
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def find_bsk_executable() -> Optional[str]:
+    """探测腾讯 BrowserSkill CLI (`bsk`) 可执行文件路径（未安装时 <1ms 返回 None）。"""
+    for env_key in ("BSK_BIN", "BSK_PATH"):
+        val = (os.environ.get(env_key) or "").strip()
+        if val and os.path.isfile(val):
+            return val
+    found = shutil.which("bsk")
+    if found:
+        return found
+    home = os.path.expanduser("~")
+    for d in [
+        os.environ.get("BSK_INSTALL_DIR", ""),
+        os.path.join(os.environ.get("BSK_HOME", ""), "bin") if os.environ.get("BSK_HOME") else "",
+        os.path.join(home, ".browserskill", "bin"),
+        os.path.join(home, ".local", "bin"),
+    ]:
+        if not d:
+            continue
+        for name in ("bsk.exe", "bsk"):
+            cand = os.path.join(d, name)
+            if os.path.isfile(cand):
+                return cand
+    return None
+
+
+def try_fetch_html_via_browserskill(
+    url: str,
+    wait_selector: Optional[str] = None,
+    timeout: float = 30.0,
+) -> Tuple[str, Optional[int], str]:
+    """
+    可选集成 Tencent BrowserSkill (`bsk`) 复用用户日常 Chrome/Edge 已连接会话抓取页面。
+    未安装或 daemon 未就绪时静默返回 ("", None, url)。
+    """
+    exe = find_bsk_executable()
+    if not exe or not url:
+        return "", None, url
+    try:
+        st_proc = subprocess.run(
+            [exe, "status", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+        if st_proc.returncode != 0:
+            return "", None, url
+        st_data = json.loads(st_proc.stdout or "{}")
+        if not (st_data.get("ready") or (st_data.get("daemon_running") and st_data.get("browsers"))):
+            return "", None, url
+    except Exception:
+        return "", None, url
+
+    sess_id = None
+    try:
+        start_proc = subprocess.run(
+            [exe, "start", "--no-focus", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=min(10.0, timeout),
+        )
+        start_data = json.loads(start_proc.stdout or "{}")
+        sess_id = start_data.get("session_id") or start_data.get("id")
+        if not sess_id:
+            return "", None, url
+
+        subprocess.run(
+            [exe, "navigate", url, "--session", str(sess_id)],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=True,
+        )
+        if wait_selector:
+            deadline = time.monotonic() + min(10.0, timeout * 0.4)
+            while time.monotonic() < deadline:
+                ev = subprocess.run(
+                    [exe, "evaluate", f"!!document.querySelector({json.dumps(wait_selector)})", "--session", str(sess_id), "--json"],
+                    capture_output=True,
+                    text=True,
+                    timeout=3.0,
+                )
+                if "true" in (ev.stdout or "").lower():
+                    break
+                time.sleep(0.5)
+
+        ev_dom = subprocess.run(
+            [
+                exe,
+                "evaluate",
+                "JSON.stringify({html: document.documentElement ? document.documentElement.outerHTML : '', url: window.location.href})",
+                "--session",
+                str(sess_id),
+                "--json",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+        )
+        raw_out = json.loads(ev_dom.stdout or "{}")
+        payload = raw_out.get("result", raw_out) if isinstance(raw_out, dict) else {}
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        if isinstance(payload, dict) and payload.get("html"):
+            return str(payload["html"]), None, str(payload.get("url") or url)
+    except Exception:
+        pass
+    finally:
+        if sess_id:
+            try:
+                subprocess.run([exe, "stop", "--session", str(sess_id)], capture_output=True, timeout=3.0)
+            except Exception:
+                pass
+    return "", None, url

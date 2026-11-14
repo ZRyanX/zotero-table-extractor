@@ -82,12 +82,158 @@ def get_config_path():
     return os.path.join(get_skill_root(), 'config.json')
 
 
-def load_config():
-    """Loads config.json from the skill root, applying OS-specific profile overrides.
+_COMPANION_KEY_MAP = {
+    "ELSEVIER_API_KEY": "ELSEVIER_API_KEY",
+    "elsevier_api_key": "ELSEVIER_API_KEY",
+    "ELSEVIER_INSTTOKEN": "ELSEVIER_INSTTOKEN",
+    "elsevier_insttoken": "ELSEVIER_INSTTOKEN",
+    "IS_CAMPUS_NETWORK": "IS_CAMPUS_NETWORK",
+    "is_campus_network": "IS_CAMPUS_NETWORK",
+    "UNPAYWALL_EMAIL": "UNPAYWALL_EMAIL",
+    "unpaywall_email": "UNPAYWALL_EMAIL",
+    "CROSSREF_EMAIL": "CROSSREF_EMAIL",
+    "crossref_email": "CROSSREF_EMAIL",
+    "email": "UNPAYWALL_EMAIL",
+    "OPENALEX_API_KEY": "OPENALEX_API_KEY",
+    "openalex_api_key": "OPENALEX_API_KEY",
+    "CORE_API_KEY": "CORE_API_KEY",
+    "core_api_key": "CORE_API_KEY",
+    "ZOTERO_API_KEY": "ZOTERO_API_KEY",
+    "zotero_api_key": "ZOTERO_API_KEY",
+    "ZOTERO_USER_ID": "ZOTERO_USER_ID",
+    "zotero_library_id": "ZOTERO_USER_ID",
+    "ZOTERO_LIBRARY_TYPE": "ZOTERO_LIBRARY_TYPE",
+    "zotero_library_type": "ZOTERO_LIBRARY_TYPE",
+}
 
-    敏感配置支持环境变量覆盖：
+
+def _parse_bool_flag(val):
+    if isinstance(val, bool):
+        return val
+    return str(val).strip().lower() in ("1", "true", "yes", "y")
+
+
+def _parse_dotenv_file(env_path):
+    """Parse a .env file into a dict without mutating os.environ."""
+    parsed = {}
+    if not env_path or not os.path.isfile(env_path):
+        return parsed
+    try:
+        with open(env_path, "r", encoding="utf-8") as fh:
+            for raw_line in fh:
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("export "):
+                    line = line[7:].strip()
+                if "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                key = key.strip()
+                val = val.strip()
+                if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+                    val = val[1:-1]
+                elif " #" in val:
+                    val = val.split(" #", 1)[0].rstrip()
+                if key:
+                    parsed[key] = val
+    except Exception:
+        pass
+    return parsed
+
+
+def _discover_companion_downloader_roots():
+    """Return candidate journal-supp-downloader root directories that exist locally."""
+    roots = []
+    seen = set()
+
+    def _add(path):
+        if path:
+            norm = os.path.abspath(path)
+            if os.path.isdir(norm) and norm not in seen:
+                seen.add(norm)
+                roots.append(norm)
+
+    try:
+        if callable(globals().get("get_journal_downloader_script")):
+            script_path = get_journal_downloader_script()
+            if script_path and os.path.isfile(script_path):
+                _add(os.path.dirname(os.path.dirname(script_path)))
+    except Exception:
+        pass
+
+    skill_parent = os.path.dirname(get_skill_root())
+    _add(os.path.join(skill_parent, "journal-supp-downloader"))
+    home = os.path.expanduser("~")
+    _add(os.path.join(home, ".gemini", "antigravity-cli", "skills", "journal-supp-downloader"))
+    _add(os.path.join(home, ".gemini", "config", "skills", "journal-supp-downloader"))
+    return roots
+
+
+def _load_companion_academic_credentials():
+    """
+    从 companion 生态（~/.scansci-pdf、~/.journal_supp_downloader_profile、
+    journal-supp-downloader/.env & config*.json）读取未在主配置中设定的凭据与网络标记。
+    返回映射后的标准大写键字典；任何读取异常均静默忽略，且永不打印密钥值。
+    """
+    if os.getenv("ZTE_DISABLE_COMPANION_CREDS") == "1":
+        return {}
+
+    merged = {}
+    home = os.path.expanduser("~")
+    json_candidates = [
+        os.path.join(home, ".scansci-pdf", "config.json"),
+        os.path.join(home, ".journal_supp_downloader_profile", "config.json"),
+    ]
+    roots = _discover_companion_downloader_roots()
+    for root in roots:
+        json_candidates.append(os.path.join(root, "config.json"))
+        json_candidates.append(os.path.join(root, "config.local.json"))
+
+    def _absorb(raw_key, raw_val):
+        if raw_val in (None, ""):
+            return
+        mapped = _COMPANION_KEY_MAP.get(raw_key)
+        if not mapped:
+            return
+        if mapped == "IS_CAMPUS_NETWORK":
+            merged[mapped] = _parse_bool_flag(raw_val)
+        else:
+            val_str = str(raw_val).strip()
+            if val_str:
+                merged[mapped] = val_str
+                if raw_key == "email" and not merged.get("CROSSREF_EMAIL"):
+                    merged["CROSSREF_EMAIL"] = val_str
+
+    for jpath in json_candidates:
+        if not os.path.isfile(jpath):
+            continue
+        try:
+            with open(jpath, "r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+            if isinstance(payload, dict):
+                for k, v in payload.items():
+                    _absorb(k, v)
+        except Exception:
+            pass
+
+    for root in roots:
+        for env_name in (".env", ".env.local"):
+            env_map = _parse_dotenv_file(os.path.join(root, env_name))
+            for k, v in env_map.items():
+                _absorb(k, v)
+
+    return merged
+
+
+def load_config():
+    """Loads config.json from the skill root, applying companion & env overrides.
+
+    敏感配置支持环境变量覆盖，并在主配置留空时回退读取同生态工具
+    （journal-supp-downloader .env / ~/.scansci-pdf/config.json）的凭据：
     - FIRECRAWL_API_KEY ← $FIRECRAWL_API_KEY
     - ELSEVIER_API_KEY ← $ELSEVIER_API_KEY
+    - ELSEVIER_INSTTOKEN ← $ELSEVIER_INSTTOKEN
     - PADDLEOCR_MCP_AISTUDIO_ACCESS_TOKEN ← $PADDLEOCR_ACCESS_TOKEN
     """
     config_path = get_config_path()
@@ -106,11 +252,28 @@ def load_config():
         except Exception as e:
             print(f"Warning: Failed to load config from {config_path}: {e}")
 
-    # 跨平台路径回退（macOS, Linux, Windows 统一生效）
+    # 跨平台路径适配与回退（macOS, Linux, Windows 统一生效）
+    for _path_key in (
+        "PAPER_TABLES_DIR",
+        "ZOTERO_DIR",
+        "ZOTERO_DB_PATH",
+        "ZOTERO_STORAGE_DIR",
+        "PLAYWRIGHT_USER_DATA_DIR",
+        "SUPP_DOWNLOADER_SCRIPT",
+    ):
+        if data.get(_path_key) and isinstance(data[_path_key], str):
+            data[_path_key] = adapt_path(data[_path_key])
+
     if not data.get("PAPER_TABLES_DIR"):
         data["PAPER_TABLES_DIR"] = get_paper_tables_dir()
     if not data.get("ZOTERO_DB_PATH"):
         data["ZOTERO_DB_PATH"] = get_zotero_db_path()
+
+    # 同生态凭据与网络标志低优先级回退（仅填补主配置未设置或为空的项）
+    companion_creds = _load_companion_academic_credentials()
+    for c_key, c_val in companion_creds.items():
+        if data.get(c_key) in (None, "") and c_val not in (None, ""):
+            data[c_key] = c_val
 
     # 默认多云与引擎配置
     if "MINERU_API_KEY" not in data:
@@ -135,6 +298,18 @@ def load_config():
         data["GMFT_ENABLED"] = True
     if "IMG2TABLE_ENABLED" not in data:
         data["IMG2TABLE_ENABLED"] = True
+    if "ELSEVIER_INSTTOKEN" not in data:
+        data["ELSEVIER_INSTTOKEN"] = ""
+    if "IS_CAMPUS_NETWORK" not in data:
+        data["IS_CAMPUS_NETWORK"] = False
+    if "UNPAYWALL_EMAIL" not in data:
+        data["UNPAYWALL_EMAIL"] = ""
+    if "CROSSREF_EMAIL" not in data:
+        data["CROSSREF_EMAIL"] = ""
+    if "OPENALEX_API_KEY" not in data:
+        data["OPENALEX_API_KEY"] = ""
+    if "CORE_API_KEY" not in data:
+        data["CORE_API_KEY"] = ""
     if "ZOTERO_SYNC_ENABLED" not in data:
         data["ZOTERO_SYNC_ENABLED"] = False
     if "ZOTERO_BETTER_NOTES_ENABLED" not in data:
@@ -152,6 +327,12 @@ def load_config():
     env_overrides = {
         'FIRECRAWL_API_KEY': 'FIRECRAWL_API_KEY',
         'ELSEVIER_API_KEY': 'ELSEVIER_API_KEY',
+        'ELSEVIER_INSTTOKEN': 'ELSEVIER_INSTTOKEN',
+        'IS_CAMPUS_NETWORK': 'IS_CAMPUS_NETWORK',
+        'UNPAYWALL_EMAIL': 'UNPAYWALL_EMAIL',
+        'CROSSREF_EMAIL': 'CROSSREF_EMAIL',
+        'OPENALEX_API_KEY': 'OPENALEX_API_KEY',
+        'CORE_API_KEY': 'CORE_API_KEY',
         'PADDLEOCR_MCP_AISTUDIO_ACCESS_TOKEN': 'PADDLEOCR_ACCESS_TOKEN',
         'MINERU_API_KEY': 'MINERU_API_KEY',
         'MINERU_API_BASE': 'MINERU_API_BASE',
@@ -188,6 +369,33 @@ def load_config():
         data["MINERU_TOKEN"] = data["MINERU_API_KEY"]
 
     return data
+
+
+def build_elsevier_headers(config=None, accept="application/json"):
+    """构造 Elsevier API 请求头，自动附带 X-ELS-APIKey 与可选 X-ELS-InstToken。"""
+    cfg = config if isinstance(config, dict) else load_config()
+    api_key = str(cfg.get("ELSEVIER_API_KEY") or os.getenv("ELSEVIER_API_KEY") or "").strip()
+    if not api_key:
+        return {}
+    headers = {"X-ELS-APIKey": api_key}
+    if accept:
+        headers["Accept"] = accept
+    insttoken = str(cfg.get("ELSEVIER_INSTTOKEN") or os.getenv("ELSEVIER_INSTTOKEN") or "").strip()
+    if insttoken:
+        headers["X-ELS-InstToken"] = insttoken
+    return headers
+
+
+def get_polite_email(config=None, service="unpaywall"):
+    """返回 Unpaywall/Crossref/OpenAlex 礼貌池（Polite Pool）邮箱标识。"""
+    cfg = config if isinstance(config, dict) else load_config()
+    svc = (service or "").strip().lower()
+    if svc == "crossref":
+        email = cfg.get("CROSSREF_EMAIL") or cfg.get("UNPAYWALL_EMAIL")
+    else:
+        email = cfg.get("UNPAYWALL_EMAIL") or cfg.get("CROSSREF_EMAIL")
+    email = str(email or os.getenv("UNPAYWALL_EMAIL") or os.getenv("CROSSREF_EMAIL") or "").strip()
+    return email or "supp_downloader@academic-research.org"
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +476,28 @@ def get_crawl4ai_cookies_path():
     return os.path.join(home, ".zotero_crawl4ai_cookies.json")
 
 
+def get_companion_cookie_paths():
+    """Return existing publisher/institutional cookie files shared with companion tools."""
+    home = os.path.expanduser("~")
+    candidates = [
+        get_crawl4ai_cookies_path(),
+        os.path.join(home, ".journal_supp_downloader_profile", "cookies.json"),
+        os.path.join(home, ".scansci-pdf", "cache", "vpnsci-cookies.json"),
+        os.path.join(home, ".scansci-pdf", "cache", "vpnsci_cookies.json"),
+        os.path.join(home, ".scansci-pdf", "cache", "ezproxy_cookies.json"),
+    ]
+    for root in _discover_companion_downloader_roots():
+        candidates.append(os.path.join(root, "cookies.json"))
+    seen = set()
+    existing = []
+    for p in candidates:
+        norm = os.path.abspath(p)
+        if norm not in seen and os.path.isfile(norm):
+            seen.add(norm)
+            existing.append(norm)
+    return existing
+
+
 def load_cookies_from_file(file_path):
     """
     Parses cookies from a Netscape cookie file or JSON cookie file.
@@ -283,6 +513,8 @@ def load_cookies_from_file(file_path):
         # Try JSON first
         try:
             data = json.loads(content)
+            if isinstance(data, dict) and isinstance(data.get("cookies"), list):
+                data = data["cookies"]
             if isinstance(data, list):
                 for c in data:
                     cookie = {
@@ -1068,3 +1300,33 @@ def is_metadata_table(df):
         # 无数字且全部短文本 -> 仍可能是分类列表，保留
 
     return False
+
+
+_ANTI_BOT_MARKERS = (
+    "just a moment",
+    "请稍候",
+    "performing security verification",
+    "attention required",
+    "cf-browser-verification",
+    "cf-challenge",
+    "challenge-platform",
+    "cf_styles",
+    "access denied",
+    "are you a robot",
+    "there was a problem",
+    "enable javascript and cookies to continue",
+    "radware bot manager",
+    "validate.perfdrive.com",
+    "bm-verify=",
+    "安全验证",
+    "your privacy, your choice",
+)
+
+
+def is_anti_bot_blocked(title: str = "", html_or_text: str = "") -> bool:
+    """Return True if a fetched page title or HTML/text indicates an anti-bot or challenge block."""
+    t_low = (title or "").strip().lower()
+    if t_low in ("sciencedirect", "cloudflare", "error", "403", "page not found", "security verification"):
+        return True
+    sample = f"{t_low}\n{(html_or_text or '')[:12000].lower()}"
+    return any(marker in sample for marker in _ANTI_BOT_MARKERS)

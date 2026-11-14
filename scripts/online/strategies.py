@@ -38,6 +38,18 @@ get_cnki_cookies_path = common.get_cnki_cookies_path
 get_crawl4ai_cookies_path = common.get_crawl4ai_cookies_path
 load_config = common.load_config
 load_cookies_from_file = common.load_cookies_from_file
+build_elsevier_headers = getattr(
+    common,
+    "build_elsevier_headers",
+    lambda config=None, accept="application/json": (
+        {"X-ELS-APIKey": (config or {}).get("ELSEVIER_API_KEY", ""), **({"Accept": accept} if accept else {})}
+        if (config or {}).get("ELSEVIER_API_KEY")
+        else {}
+    ),
+)
+get_polite_email = getattr(common, "get_polite_email", lambda config=None, service="unpaywall": "supp_downloader@academic-research.org")
+is_metadata_table = getattr(common, "is_metadata_table", lambda _df: False)
+is_anti_bot_blocked = getattr(common, "is_anti_bot_blocked", lambda _t="", _h="": False)
 
 
 _SUP_UNICODE = {'0':'⁰','1':'¹','2':'²','3':'³','4':'⁴','5':'⁵','6':'⁶','7':'⁷','8':'⁸','9':'⁹','+':'⁺','-':'⁻','−':'⁻','=':'⁼','(':'⁽',')':'⁾','n':'ⁿ','i':'ⁱ'}
@@ -310,13 +322,156 @@ def clean_text(val):
     return val.strip()
 
 
+_DOM_WRAPPER_SELECTORS = (
+    "div.tables", ".c-article-table-container", ".html-table_show",
+    "div[id*='-tbl-'].article-table-content", ".article-table-content",
+    "div.ArticleTable", "figure.table", "div.article-fulltext-table-wrap",
+    "div.boxout.boxout-bdr-grey",
+    ".table-wrap", ".NLM_table-wrap", "figure.c-article-table__wrapper",
+    "div.c-article-table", ".html-table-container", "section.article-section__table",
+    "div[data-widget-def='tableWidget']", "div.entry-table", "div.table-item",
+    ".table-wrap-content", ".table-box",
+)
+_DOM_CAPTION_SELECTORS = (
+    "span.captions", "div.captions", "header.u-mb-16", ".c-article-table__figcaption",
+    ".html-caption", "header.article-table-caption", "header.article-fulltext-label-header",
+    "figcaption", "caption", ".table-caption", ".c-article-table__caption",
+    ".caption", ".table-wrap-title", ".table-title", ".table-header", ".html-table-title",
+)
+_DOM_FOOTNOTE_SELECTORS = (
+    "div.c-article-table-footer", ".html-table_foot", "div.article-section__table-footnotes",
+    ".ArticleTable__foot", "div.notes", "dl.footnotes", ".legend", ".tbl-foot",
+    ".table-wrap-foot", ".table-footnotes", ".c-article-table__notes",
+    ".table-foot", ".table-footnote", ".table-note", ".html-table-footnote", "tfoot",
+)
+
+
+def _extract_caption_and_label_from_wrapper(wrapper):
+    """Extract caption text and normalized Table label from a BeautifulSoup table wrapper."""
+    caption_text = ""
+    ft_hdr = wrapper.select_one(".ArticleTable__header")
+    ft_desc = wrapper.select_one(".ArticleTable__description")
+    if ft_hdr or ft_desc:
+        caption_text = ". ".join(
+            s for s in (
+                ft_hdr.get_text(" ", strip=True) if ft_hdr else "",
+                ft_desc.get_text(" ", strip=True) if ft_desc else "",
+            ) if s
+        )
+    if not caption_text:
+        aps_hdr = wrapper.select_one("header.article-fulltext-label-header")
+        aps_p = wrapper.select_one("p.article-fulltext-paragraph")
+        if aps_hdr and aps_p:
+            caption_text = clean_text(f"{aps_hdr.get_text(' ', strip=True)} {aps_p.get_text(' ', strip=True)}")
+    if not caption_text:
+        for sel in _DOM_CAPTION_SELECTORS:
+            el = wrapper.select_one(sel)
+            if el:
+                txt = clean_text(el.get_text(" ", strip=True))
+                if txt:
+                    caption_text = txt
+                    break
+    label_text = ""
+    if caption_text:
+        m = re.match(
+            r'^(T\s*A\s*B\s*L\s*E\s*A\s*U\s*X?|T\s*A\s*B\s*L\s*E|T\s*A\s*B\s*\.|表)(?:\s*S\s*)?\s*(\d+|[ivxlcdm]+|S\d+|[a-z])',
+            caption_text,
+            re.IGNORECASE,
+        )
+        if m:
+            label_text = f"表 {m.group(2)}" if "表" in m.group(1) else f"Table {m.group(2)}"
+    return caption_text, label_text
+
+
+def _is_dom_noise_table(table_el) -> bool:
+    """Skip publisher boilerplate, disclaimer, supporting-info, and duplicate modal tables."""
+    if table_el.find_parent("section", class_="html-fn_group") or table_el.find_parent(class_="html-fn_group"):
+        return True
+    cls = table_el.get("class") or []
+    if "support-info__table" in cls or table_el.find_parent(class_="support-info__table-wrapper") or table_el.find_parent("section", class_="article-section__supporting"):
+        return True
+    modal = table_el.find_parent(class_="table-modal") or table_el.find_parent(class_="reveal-modal")
+    if modal:
+        wrap = modal.find_parent(class_="table-wrap") or modal.find_parent(class_="figure-table-wrapper")
+        if wrap and wrap.select_one(".table-overflow table"):
+            return True
+    if "body" in cls:
+        trs = table_el.find_all("tr")
+        first_cols = len(trs[0].find_all(["th", "td"])) if trs else 0
+        if len(trs) <= 2 and first_cols <= 1:
+            return True
+    return False
+
+
+def _parse_dom_wrappers_bs4(html_content, read_html_fn):
+    """Use BeautifulSoup to extract tables with publisher-aware captions, footnotes, and noise filtering."""
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        return []
+    parser = "lxml"
+    try:
+        soup = BeautifulSoup(html_content, parser)
+    except Exception:
+        soup = BeautifulSoup(html_content, "html.parser")
+
+    wrappers = []
+    seen_wrappers = set()
+    for sel in _DOM_WRAPPER_SELECTORS:
+        for el in soup.select(sel):
+            if id(el) not in seen_wrappers:
+                seen_wrappers.add(id(el))
+                wrappers.append(el)
+    if not wrappers:
+        return []
+
+    seen_tables = set()
+    valid_dfs = []
+    for wrapper in wrappers:
+        table_els = [wrapper] if wrapper.name == "table" else wrapper.find_all("table")
+        if not table_els:
+            continue
+        caption_text, label_text = _extract_caption_and_label_from_wrapper(wrapper)
+        footnote_text = ""
+        for fsel in _DOM_FOOTNOTE_SELECTORS:
+            fel = wrapper.select_one(fsel)
+            if fel:
+                footnote_text = clean_text(fel.get_text(" ", strip=True))
+                if footnote_text:
+                    break
+        for tbl in table_els:
+            if id(tbl) in seen_tables or _is_dom_noise_table(tbl):
+                continue
+            seen_tables.add(id(tbl))
+            tbl_copy = BeautifulSoup(str(tbl), "html.parser")
+            for tf in tbl_copy.find_all("tfoot"):
+                if not footnote_text:
+                    footnote_text = clean_text(tf.get_text(" ", strip=True))
+                tf.decompose()
+            sub_dfs = read_html_fn(str(tbl_copy))
+            for df in sub_dfs:
+                if df.empty or len(df.columns) < 1 or len(df) < 1:
+                    continue
+                df.columns = [clean_text(c) for c in df.columns]
+                for col_i in range(len(df.columns)):
+                    df.iloc[:, col_i] = df.iloc[:, col_i].astype(str).apply(clean_text)
+                if label_text:
+                    df.attrs['label'] = label_text
+                if caption_text:
+                    df.attrs['table_title'] = caption_text
+                if footnote_text:
+                    df.attrs['footnotes'] = [footnote_text]
+                if is_metadata_table(df):
+                    continue
+                valid_dfs.append(df)
+    return valid_dfs
+
+
 def parse_tables_from_html(html_content, table_idx="all"):
     """
-    Parses tables from raw HTML using pandas.read_html and extracts captions directly preceding them.
-
-    修复：不再因检测到摘要页就整体跳过——有些期刊摘要页确实嵌入了数据表。
-    改为逐表过滤：依赖 is_metadata_table() 过滤文献信息框/摘要版权框/目录大纲/参考文献列表等非数据表，
-    仅当所有表都被过滤掉时才返回空。
+    Parses tables from raw HTML using publisher-aware BeautifulSoup wrappers when present,
+    falling back to pandas.read_html and line-based caption matching.
+    Applies is_metadata_table() filtering per table.
     """
     try:
         # Wrap literal HTML in StringIO to avoid deprecation warnings
@@ -324,70 +479,64 @@ def parse_tables_from_html(html_content, table_idx="all"):
             from ..table_postprocess import read_html_preserving_text
         except ImportError:
             from table_postprocess import read_html_preserving_text
-        dfs = read_html_preserving_text(html_content)
-        if not dfs:
-            return []
-            
-        # Split html_content by <table to find preceding text blocks
-        parts = html_content.split('<table')
-        
-        valid_dfs = []
-        for idx, df in enumerate(dfs):
-            if df.empty or len(df.columns) < 1 or len(df) < 1:
-                continue
-            # Basic cleanup of columns (index by iloc so duplicate column names never fail)
-            df.columns = [clean_text(c) for c in df.columns]
-            for col_i in range(len(df.columns)):
-                df.iloc[:, col_i] = df.iloc[:, col_i].astype(str).apply(clean_text)
-                
-            # Extract caption from preceding text block
-            caption_text = ""
-            label_text = ""
-            if idx < len(parts):
-                preceding_text = parts[idx]
-                lines = preceding_text.split('\n')
-                for line in reversed(lines[-15:]):
-                    line_clean = clean_text(line).strip()
-                    # Strip HTML tags
-                    line_no_html = re.sub(r'<[^>]+>', '', line_clean).strip()
-                    # Strip leading markdown/formatting chars
-                    line_stripped = re.sub(r'^[#*_\-\s\(\)\:\.\,\»]+', '', line_no_html).strip()
-                    # Robust pattern matching for spaced spelling like T A B L E
-                    pattern = r'^(T\s*A\s*B\s*L\s*E\s*A\s*U\s*X?|T\s*A\s*B\s*L\s*E|T\s*A\s*B\s*\.|表)(?:\s*S\s*)?\s*(\d+|[ivxlcdm]+|ni|rn|[a-z])'
-                    match = re.match(pattern, line_stripped, re.IGNORECASE)
-                    if match:
-                        caption_text = line_stripped
-                        tbl_word = match.group(1).upper()
-                        tbl_num = match.group(2)
-                        if "表" in tbl_word:
-                            label_text = f"表 {tbl_num}"
-                        else:
-                            label_text = f"Table {tbl_num}"
-                        break
-                        
-            if label_text:
-                df.attrs['label'] = label_text
-            if caption_text:
-                df.attrs['table_title'] = caption_text
-                
-            valid_dfs.append(df)
-            
+
+        valid_dfs = _parse_dom_wrappers_bs4(html_content, read_html_preserving_text)
+
+        if not valid_dfs:
+            dfs = read_html_preserving_text(html_content)
+            if not dfs:
+                return []
+
+            # Split html_content by <table to find preceding text blocks
+            parts = html_content.split('<table')
+
+            valid_dfs = []
+            for idx, df in enumerate(dfs):
+                if df.empty or len(df.columns) < 1 or len(df) < 1:
+                    continue
+                # Basic cleanup of columns (index by iloc so duplicate column names never fail)
+                df.columns = [clean_text(c) for c in df.columns]
+                for col_i in range(len(df.columns)):
+                    df.iloc[:, col_i] = df.iloc[:, col_i].astype(str).apply(clean_text)
+
+                # Extract caption from preceding text block
+                caption_text = ""
+                label_text = ""
+                if idx < len(parts):
+                    preceding_text = parts[idx]
+                    lines = preceding_text.split('\n')
+                    for line in reversed(lines[-15:]):
+                        line_clean = clean_text(line).strip()
+                        # Strip HTML tags
+                        line_no_html = re.sub(r'<[^>]+>', '', line_clean).strip()
+                        # Strip leading markdown/formatting chars
+                        line_stripped = re.sub(r'^[#*_\-\s\(\)\:\.\,\»]+', '', line_no_html).strip()
+                        # Robust pattern matching for spaced spelling like T A B L E
+                        pattern = r'^(T\s*A\s*B\s*L\s*E\s*A\s*U\s*X?|T\s*A\s*B\s*L\s*E|T\s*A\s*B\s*\.|表)(?:\s*S\s*)?\s*(\d+|[ivxlcdm]+|ni|rn|[a-z])'
+                        match = re.match(pattern, line_stripped, re.IGNORECASE)
+                        if match:
+                            caption_text = line_stripped
+                            tbl_word = match.group(1).upper()
+                            tbl_num = match.group(2)
+                            if "表" in tbl_word:
+                                label_text = f"表 {tbl_num}"
+                            else:
+                                label_text = f"Table {tbl_num}"
+                            break
+
+                if label_text:
+                    df.attrs['label'] = label_text
+                if caption_text:
+                    df.attrs['table_title'] = caption_text
+                if is_metadata_table(df):
+                    continue
+
+                valid_dfs.append(df)
+
         if not valid_dfs:
             return []
-            
-        if table_idx == "all":
-            return valid_dfs
-        elif table_idx == "first":
-            return [valid_dfs[0]]
-        else:
-            try:
-                idx = int(table_idx)
-                if idx < len(valid_dfs):
-                    return [valid_dfs[idx]]
-                else:
-                    return valid_dfs
-            except ValueError:
-                return valid_dfs
+
+        return _select_tables(valid_dfs, table_idx) or []
     except Exception as e:
         print(f"Warning: Failed to parse HTML tables: {e}")
         return []
@@ -501,11 +650,14 @@ def extract_tables_via_paper_fetch(doi_or_url, table_idx="all", cancel_event=Non
     if cancel_event is not None and cancel_event.is_set():
         return []
     try:
-        # Load Elsevier Key dynamically and inject into environment for paper-fetch-skill
+        # Load Elsevier & polite-pool credentials dynamically and inject into environment for paper-fetch-skill
         config = load_config()
-        els_key = config.get("ELSEVIER_API_KEY")
-        if els_key:
-            os.environ["ELSEVIER_API_KEY"] = els_key
+        for _env_k in ("ELSEVIER_API_KEY", "ELSEVIER_INSTTOKEN", "UNPAYWALL_EMAIL", "CROSSREF_EMAIL", "OPENALEX_API_KEY"):
+            _v = config.get(_env_k)
+            if _v:
+                os.environ[_env_k] = str(_v)
+        if config.get("IS_CAMPUS_NETWORK"):
+            os.environ["IS_CAMPUS_NETWORK"] = "true"
             
         import sys
         # Add paper-fetch-skill src to path
@@ -547,16 +699,18 @@ def extract_tables_via_elsevier_api(doi, table_idx="all"):
     Extracts tables from Elsevier articles using the Elsevier Full-Text Retrieval API.
     Always uses the DOI endpoint (/content/article/doi/{DOI}) which has proper auth.
     Returns XOCS XML containing <ce:table> elements — no browser needed.
-    Requires ELSEVIER_API_KEY in config.json or environment.
+    Requires ELSEVIER_API_KEY in config.json, companion config, or environment.
+    Automatically attaches X-ELS-InstToken when ELSEVIER_INSTTOKEN is configured.
     """
     try:
         config = load_config()
-        els_key = config.get("ELSEVIER_API_KEY") or os.environ.get("ELSEVIER_API_KEY", "")
-        if not els_key:
+        headers = build_elsevier_headers(config, accept="text/xml")
+        if not headers:
             return []
+        els_key = headers["X-ELS-APIKey"]
+        insttoken = headers.get("X-ELS-InstToken", "")
 
         api_url = f"https://api.elsevier.com/content/article/doi/{doi}"
-        headers = {"X-ELS-APIKey": els_key, "Accept": "text/xml"}
         print(f"[Elsevier API] \u6b63\u5728\u83b7\u53d6 XOCS XML: {doi}")
         resp = requests.get(api_url, headers=headers, timeout=20)
         if resp.status_code != 200:
@@ -564,14 +718,14 @@ def extract_tables_via_elsevier_api(doi, table_idx="all"):
             return []
         
         tables = _parse_elsevier_xocs_tables(resp.text, table_idx)
-        tables.extend(extract_elsevier_supplementary_tables(doi, els_key))
+        tables.extend(extract_elsevier_supplementary_tables(doi, els_key, insttoken=insttoken))
         return tables
     except Exception as e:
         print(f"[Elsevier API] \u63d0\u53d6\u5931\u8d25: {e}")
         return []
 
 
-def extract_elsevier_supplementary_tables(doi, api_key):
+def extract_elsevier_supplementary_tables(doi, api_key, insttoken=""):
     """
     Finds and extracts tables from all non-image supplementary attachments
     associated with an Elsevier article using the Elsevier Object API.
@@ -588,6 +742,11 @@ def extract_elsevier_supplementary_tables(doi, api_key):
     supplementary_dfs = []
     if not api_key:
         return supplementary_dfs
+    if not insttoken:
+        try:
+            insttoken = str((load_config() or {}).get("ELSEVIER_INSTTOKEN") or os.environ.get("ELSEVIER_INSTTOKEN") or "").strip()
+        except Exception:
+            insttoken = str(os.environ.get("ELSEVIER_INSTTOKEN") or "").strip()
 
     try:
         # Step 1: Fetch attachment metadata using DOI
@@ -596,6 +755,8 @@ def extract_elsevier_supplementary_tables(doi, api_key):
             "X-ELS-APIKey": api_key,
             "Accept": "application/json"
         }
+        if insttoken:
+            headers["X-ELS-InstToken"] = insttoken
         params = {
             "view": "META"
         }
@@ -634,7 +795,10 @@ def extract_elsevier_supplementary_tables(doi, api_key):
             
             # Step 2: Download the attachment bytes
             dl_url = f"https://api.elsevier.com/content/object/eid/{eid}"
-            dl_resp = requests.get(dl_url, headers={"X-ELS-APIKey": api_key}, timeout=30)
+            dl_headers = {"X-ELS-APIKey": api_key}
+            if insttoken:
+                dl_headers["X-ELS-InstToken"] = insttoken
+            dl_resp = requests.get(dl_url, headers=dl_headers, timeout=30)
             if dl_resp.status_code != 200:
                 print(f"[Elsevier API] Failed to download {filename}: HTTP {dl_resp.status_code}")
                 continue
@@ -1412,6 +1576,49 @@ def extract_tables_via_arxiv_html(arxiv_id_or_url, table_idx="all"):
             return tables_found
 
 
+def _extract_table_subpage_urls(base_url, html_text, limit=12):
+    """Extract unique Springer/Nature-style /tables/<N> subpage URLs from article HTML."""
+    urls = []
+    seen = set()
+    for m in re.finditer(r'href=["\']([^"\']*?/tables/\d+[^"\']*)["\']', html_text or "", re.IGNORECASE):
+        abs_u = urllib.parse.urljoin(base_url, m.group(1).split("#")[0])
+        if abs_u != base_url and abs_u not in seen:
+            seen.add(abs_u)
+            urls.append(abs_u)
+            if len(urls) >= limit:
+                break
+    return urls
+
+
+def _follow_table_subpages(base_url, html_text, fetch_html_fn, table_idx="all"):
+    """Follow /tables/N subpage links or Copernicus JATS XML links using fetch_html_fn."""
+    # Copernicus & open-access JATS XML link (e.g. se-9-373-2018.xml)
+    if "copernicus.org" in (base_url or "").lower():
+        xml_m = re.search(r'(?:href|content)=["\']([^"\']+?\.xml)["\']', html_text or "", re.IGNORECASE)
+        if xml_m:
+            xml_url = urllib.parse.urljoin(base_url, xml_m.group(1))
+            xml_text = fetch_html_fn(xml_url)
+            if xml_text and "<table-wrap" in xml_text:
+                xml_dfs = _parse_jats_xml_tables(xml_text, table_idx=table_idx)
+                if xml_dfs:
+                    return xml_dfs
+
+    sub_urls = _extract_table_subpage_urls(base_url, html_text)
+    if not sub_urls:
+        return []
+    all_dfs = []
+    for sub_u in sub_urls:
+        sub_html = fetch_html_fn(sub_u)
+        if not sub_html or is_anti_bot_blocked("", sub_html):
+            continue
+        sub_dfs = parse_tables_from_html(sub_html, "all")
+        if sub_dfs:
+            all_dfs.extend(sub_dfs)
+    if not all_dfs:
+        return []
+    return _select_tables(all_dfs, table_idx) or []
+
+
 def extract_tables_via_direct_http(url, table_idx="all", cancel_event=None):
 
     """
@@ -1424,39 +1631,39 @@ def extract_tables_via_direct_http(url, table_idx="all", cancel_event=None):
     if cancel_event is not None and cancel_event.is_set():
         return []
     try:
-        text = None
-        status_code = None
-        
-        # Try curl_cffi first to mimic real Chrome browser TLS signatures
-        try:
-            from curl_cffi import requests as crequests
-            print(f"尝试本地直接 HTTP 请求网页 (机构 IP 直连 + TLS Chrome 模拟): {url} ...")
-            resp = crequests.get(url, impersonate="chrome110", timeout=12, allow_redirects=True)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Cache-Control": "max-age=0",
+            "Upgrade-Insecure-Requests": "1"
+        }
+
+        def _fetch_one(target_url):
             if cancel_event is not None and cancel_event.is_set():
-                return []
-            text = resp.text
-            status_code = resp.status_code
-        except ImportError:
-            # Fallback to standard requests with realistic browser headers
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
-                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-                "Cache-Control": "max-age=0",
-                "Upgrade-Insecure-Requests": "1"
-            }
+                return None, ""
+            if requests_impersonate is not None:
+                resp = requests_impersonate.get(target_url, impersonate="chrome110", timeout=12, allow_redirects=True)
+                return resp.status_code, resp.text
+            resp = requests.get(target_url, headers=headers, timeout=12, allow_redirects=True)
+            return resp.status_code, resp.text
+
+        if requests_impersonate is not None:
+            print(f"尝试本地直接 HTTP 请求网页 (机构 IP 直连 + TLS Chrome 模拟): {url} ...")
+        else:
             print(f"尝试本地直接 HTTP 请求网页 (机构 IP 直连 + 标头伪装): {url} ...")
-            resp = requests.get(url, headers=headers, timeout=12, allow_redirects=True)
-            text = resp.text
-            status_code = resp.status_code
-            
+        status_code, text = _fetch_one(url)
+        if cancel_event is not None and cancel_event.is_set():
+            return []
+
         if status_code == 200 and text:
-            # Basic check for Cloudflare or access errors
-            if "cf-browser-verification" in text or "cf_styles" in text or "Access Denied" in text or "Access denied" in text or "Forbidden" in text:
-                print("本地直接 HTTP 请求被 Cloudflare 或 Access Denied 阻止。")
+            if is_anti_bot_blocked("", text):
+                print("本地直接 HTTP 请求被反爬拦截 (Cloudflare / Access Denied / Radware)。")
                 return []
-                
+
             dfs = parse_tables_from_html(text, table_idx)
+            if not dfs:
+                dfs = _follow_table_subpages(url, text, lambda su: (_fetch_one(su)[1] if _fetch_one(su)[0] == 200 else ""), table_idx)
             if dfs:
                 print(f"本地直接 HTTP 提取成功，解析到 {len(dfs)} 个表格。")
                 return dfs
@@ -1765,8 +1972,179 @@ def extract_tables_via_firecrawl(url, api_key=None, table_idx="all", cancel_even
     return _finish([])
 
 
+def _normalize_cookies_for_scrapling(cookies, default_url=None):
+    """规范化 Cookie 列表使其满足 Playwright / Scrapling 的结构要求。"""
+    if not cookies:
+        return []
+    normalized = []
+    for item in cookies:
+        if not isinstance(item, dict) or not item.get("name") or item.get("value") is None:
+            continue
+        c = dict(item)
+        c["name"] = str(c["name"])
+        c["value"] = str(c["value"])
+        if not c.get("domain") and not c.get("url"):
+            if default_url:
+                host = urllib.parse.urlsplit(default_url).hostname
+                if host:
+                    c["domain"] = host
+                    c["path"] = c.get("path") or "/"
+                else:
+                    c["url"] = default_url
+            else:
+                continue
+        if c.get("url"):
+            c.pop("domain", None)
+            c.pop("path", None)
+        elif not c.get("path"):
+            c["path"] = "/"
+        ss = c.get("sameSite")
+        if isinstance(ss, str):
+            ss_low = ss.strip().lower()
+            if ss_low == "strict":
+                c["sameSite"] = "Strict"
+            elif ss_low == "lax":
+                c["sameSite"] = "Lax"
+            elif ss_low in ("none", "no_restriction"):
+                c["sameSite"] = "None"
+            else:
+                c.pop("sameSite", None)
+        elif "sameSite" in c:
+            c.pop("sameSite", None)
+        normalized.append(c)
+    return normalized
+
+
+def _scrapling_bounded_session_fetch(url, filtered_kwargs):
+    """
+    借鉴 journal-supp-downloader 的 stealthy_fetch_bounded 机制：
+    通过 StealthySession 执行抓取并注入 page_setup 超时夹紧（规避 solve_cloudflare=True
+    将超时强制拉回 60s），拦截第三方卡死域，并在导航竞态异常时自动重试一次。
+    """
+    import time as _time
+    from scrapling.engines._browsers._types import StealthSession
+    from scrapling.engines.toolbelt.custom import Response as _Resp  # noqa: F401
+    from scrapling.fetchers import StealthySession
+
+    try:
+        from .cdp_detector import merge_blocked_domains
+    except ImportError:
+        try:
+            from cdp_detector import merge_blocked_domains
+        except ImportError:
+            merge_blocked_domains = None
+
+    ann = getattr(StealthSession, "__annotations__", {}) or {}
+    req_ms = max(1000, int(filtered_kwargs.get("timeout") or 35000))
+    deadline_t = _time.monotonic() + (req_ms / 1000.0)
+
+    session_kwargs = {k: v for k, v in filtered_kwargs.items() if not ann or k in ann}
+    session_kwargs.setdefault("retries", 1)
+    session_kwargs.setdefault("block_ads", True)
+    if merge_blocked_domains and "blocked_domains" in ann:
+        proxy_val = str(session_kwargs.get("proxy") or "")
+        session_kwargs["blocked_domains"] = merge_blocked_domains(
+            url, session_kwargs.get("blocked_domains"), proxy=proxy_val
+        )
+
+    orig_setup = session_kwargs.pop("page_setup", None)
+    orig_action = session_kwargs.pop("page_action", None)
+    wait_ms = session_kwargs.pop("wait", None)
+    session_kwargs.pop("timeout", None)
+
+    def _wrapped_setup(page):
+        def _clamp_post_load(_p=None):
+            rem_ms = max(1000, int((deadline_t - _time.monotonic()) * 1000))
+            capped_ms = min(req_ms, rem_ms)
+            try:
+                page.set_default_timeout(capped_ms)
+            except Exception:
+                pass
+            try:
+                page.set_default_navigation_timeout(capped_ms)
+            except Exception:
+                pass
+
+        _clamp_post_load()
+        orig_wfls = getattr(page, "wait_for_load_state", None)
+        if callable(orig_wfls):
+            def _bounded_wait_for_load_state(state="load", *w_args, **w_kwargs):
+                if state in ("networkidle", "load", "domcontentloaded"):
+                    rem_ms = int((deadline_t - _time.monotonic()) * 1000)
+                    if rem_ms <= 0:
+                        return None
+                    max_wait = 4000 if state == "networkidle" else 8000
+                    cap_ms = min(max_wait, max(500, rem_ms))
+                    if "timeout" in w_kwargs and w_kwargs["timeout"] is not None:
+                        w_kwargs["timeout"] = min(int(w_kwargs["timeout"]), cap_ms)
+                    elif w_args:
+                        w_args = (min(int(w_args[0]), cap_ms),) + w_args[1:]
+                    else:
+                        w_kwargs["timeout"] = cap_ms
+                    try:
+                        return orig_wfls(state, *w_args, **w_kwargs)
+                    except Exception:
+                        if state in ("load", "domcontentloaded"):
+                            return None
+                        raise
+                return orig_wfls(state, *w_args, **w_kwargs)
+
+            try:
+                page.wait_for_load_state = _bounded_wait_for_load_state
+            except Exception:
+                pass
+
+        try:
+            page.on("domcontentloaded", _clamp_post_load)
+            page.on("load", _clamp_post_load)
+        except Exception:
+            pass
+        if orig_setup is not None:
+            orig_setup(page)
+
+    def _wrapped_action(page):
+        if _time.monotonic() >= deadline_t:
+            return
+        rem_ms = max(1000, int((deadline_t - _time.monotonic()) * 1000))
+        capped_ms = min(req_ms, rem_ms)
+        try:
+            page.set_default_timeout(capped_ms)
+        except Exception:
+            pass
+        try:
+            page.set_default_navigation_timeout(capped_ms)
+        except Exception:
+            pass
+        if orig_action is not None:
+            return orig_action(page)
+
+    fetch_kwargs = {"timeout": req_ms}
+    if "page_setup" in ann:
+        fetch_kwargs["page_setup"] = _wrapped_setup
+    if orig_action is not None:
+        fetch_kwargs["page_action"] = _wrapped_action
+    if wait_ms is not None:
+        fetch_kwargs["wait"] = min(int(wait_ms), max(0, req_ms // 3))
+
+    with StealthySession(**session_kwargs) as engine:
+        try:
+            return engine.fetch(url, **fetch_kwargs)
+        except Exception as exc:
+            err_l = str(exc).lower()
+            is_nav_race = (
+                "navigating and changing the content" in err_l
+                or "execution context was destroyed" in err_l
+            )
+            rem_s = deadline_t - _time.monotonic()
+            if not is_nav_race or rem_s <= 4.0:
+                raise
+            retry_kwargs = dict(fetch_kwargs)
+            retry_kwargs["timeout"] = max(1000, min(req_ms, int(rem_s * 1000)))
+            return engine.fetch(url, **retry_kwargs)
+
+
 def _scrapling_fetch_html(url, extra_kwargs=None):
-    """Fetch rendered HTML using Scrapling StealthyFetcher with macOS CoreFoundation pre-load."""
+    """Fetch rendered HTML using Scrapling StealthyFetcher / bounded StealthySession."""
     import inspect
     if hasattr(common, "ensure_macos_corefoundation"):
         common.ensure_macos_corefoundation()
@@ -1776,7 +2154,7 @@ def _scrapling_fetch_html(url, extra_kwargs=None):
         from scrapling import StealthyFetcher
     fetch_kwargs = {
         "headless": True,
-        "network_idle": True,
+        "network_idle": False,
         "solve_cloudflare": True,
         "hide_canvas": True,
         "block_webrtc": True,
@@ -1809,9 +2187,25 @@ def _scrapling_fetch_html(url, extra_kwargs=None):
         if allowed_keys is not None else dict(fetch_kwargs)
     )
 
+    # 真实 Scrapling 环境下优先走有界 StealthySession（支持 blocked_domains 与超时夹紧）
+    is_real_stealth = (
+        getattr(StealthyFetcher, "__module__", "") == "scrapling.fetchers.stealth_chrome"
+        and getattr(getattr(StealthyFetcher, "fetch", None), "__module__", "") == "scrapling.engines.toolbelt.custom"
+        or "scrapling" in getattr(StealthyFetcher, "__module__", "")
+    )
+    if is_real_stealth and os.environ.get("ZTE_DISABLE_SCRAPLING_BOUNDED") != "1":
+        try:
+            res = _scrapling_bounded_session_fetch(url, filtered_kwargs)
+        except Exception:
+            res = None
+        if res is not None:
+            html = getattr(res, "html_content", None) or getattr(res, "text", None)
+            if html:
+                return html
+
     def _call_with_graceful_strip(fn, target_url, kwargs_dict):
         cur = dict(kwargs_dict)
-        strip_order = ["hide_canvas", "block_webrtc", "solve_cloudflare", "wait", "timeout", "network_idle", "headless"]
+        strip_order = ["real_chrome", "blocked_domains", "cookies", "hide_canvas", "block_webrtc", "solve_cloudflare", "wait", "timeout", "network_idle", "headless"]
         while True:
             try:
                 return fn(target_url, **cur)
@@ -1845,15 +2239,214 @@ def _scrapling_fetch_html(url, extra_kwargs=None):
     return html or ""
 
 
-def extract_tables_via_scrapling(url, table_idx="all"):
+def _scrapling_page_action(page):
+    """Wait out Akamai/Elsevier/Turnstile shells, accept cookie banners, and expand lazy tables/accordions."""
+    try:
+        from .cdp_detector import wait_through_transient_challenge
+    except ImportError:
+        try:
+            from cdp_detector import wait_through_transient_challenge
+        except ImportError:
+            wait_through_transient_challenge = None
+
+    try:
+        has_bm = page.evaluate("""() => {
+            const m = document.querySelector('meta[http-equiv="refresh" i]');
+            return Boolean(m && (m.getAttribute('content') || '').includes('bm-verify'));
+        }""")
+        if has_bm:
+            try:
+                page.wait_for_url(lambda u: "bm-verify=" in u, timeout=9000)
+                page.wait_for_load_state("domcontentloaded", timeout=15000)
+                page.wait_for_timeout(1500)
+            except Exception:
+                page.wait_for_timeout(6500)
+    except Exception:
+        pass
+
+    if wait_through_transient_challenge:
+        wait_through_transient_challenge(page, max_wait_s=6.0)
+
+    for sel in (
+        "#onetrust-accept-btn-handler",
+        "button[data-cc-action='accept']",
+        "button[data-test='accept-cookie']",
+        ".c-button--primary[data-test='accept-cookie']",
+        "button:has-text('Accept all cookies')",
+    ):
+        try:
+            btn = page.locator(sel).first
+            if btn.is_visible(timeout=400):
+                btn.click()
+                page.wait_for_timeout(400)
+                break
+        except Exception:
+            pass
+    try:
+        clicked = page.evaluate("""
+            () => {
+                let n = 0;
+                document.querySelectorAll("details:not([open])").forEach(d => {
+                    d.open = true;
+                    n++;
+                });
+                document.querySelectorAll('.link-reveal.link-table, .tableDownloadOption a, a.showTable').forEach(el => {
+                    const txt = (el.innerText || '').toLowerCase();
+                    if (el.matches('.link-reveal.link-table, a.showTable') || txt.includes('display table')) {
+                        try { el.click(); n++; } catch(e) {}
+                    }
+                });
+                const accSelectors = [
+                    "button[aria-expanded='false']",
+                    "a[aria-expanded='false']",
+                    "[role='button'][aria-expanded='false']",
+                    ".accordion-button.collapsed",
+                    ".accordion-button[aria-expanded='false']"
+                ].join(", ");
+                const kw = ["table", "supp", "appendi", "extended", "additional", "data", "material", "esm", "附", "补充", "表"];
+                document.querySelectorAll(accSelectors).forEach(el => {
+                    const txt = (el.innerText || el.textContent || el.getAttribute("aria-label") || el.getAttribute("title") || "").toLowerCase();
+                    if (/delete|remove|edit|upload|publish|purchase|删除|移除|编辑|上传|发布|购买/i.test(txt)) return;
+                    if (kw.some(k => txt.includes(k))) {
+                        try { el.click(); n++; } catch(e) {}
+                    }
+                });
+                return n;
+            }
+        """)
+        if clicked:
+            page.wait_for_timeout(1200)
+    except Exception:
+        pass
+
+
+def _extract_tf_csvs_from_scrapling_html(base_url, html_text, headless=False):
+    """When T&F HTML has downloadTable links, fetch them in a single authenticated StealthyFetcher session."""
+    dl_matches = re.findall(r'href=["\']([^"\']*?/action/downloadTable\?[^"\']+)["\']', html_text or "", re.IGNORECASE)
+    if not dl_matches:
+        return []
+    seen = []
+    for raw in dl_matches:
+        u = urllib.parse.urljoin(base_url, raw.replace("&amp;", "&"))
+        if u not in seen:
+            seen.append(u)
+    collected = []
+    def _fetch_all(page):
+        _scrapling_page_action(page)
+        for idx, dl_u in enumerate(seen, 1):
+            try:
+                resp = page.request.get(dl_u, timeout=15000)
+                if resp.status == 200:
+                    txt = resp.text()
+                    if txt and not txt.lstrip().startswith(("<!DOCTYPE", "<html")) and not is_anti_bot_blocked("", txt):
+                        collected.append((idx, txt))
+            except Exception:
+                pass
+    _scrapling_fetch_html(base_url, {"headless": headless, "solve_cloudflare": True, "network_idle": False, "wait": 2000, "page_action": _fetch_all})
+    dfs = []
+    for idx, csv_txt in collected:
+        try:
+            df = pd.read_csv(io.StringIO(csv_txt), dtype=str, keep_default_na=False)
+            if not df.empty:
+                df.columns = [clean_text(c) for c in df.columns]
+                for ci in range(len(df.columns)):
+                    df.iloc[:, ci] = df.iloc[:, ci].astype(str).apply(clean_text)
+                df.attrs["table_title"] = f"Table {idx}"
+                dfs.append(df)
+        except Exception:
+            pass
+    return dfs
+
+
+def _collect_domain_cookies_for_scrapling(url):
+    """收集并归一化与目标域匹配的共享 Cookie，供 Scrapling 无头/有头浏览器注入。"""
+    paths = []
+    primary = get_crawl4ai_cookies_path()
+    if primary and os.path.exists(primary):
+        paths.append(primary)
+    get_companion_cp = getattr(common, "get_companion_cookie_paths", None)
+    if callable(get_companion_cp):
+        for cp in get_companion_cp():
+            if cp not in paths:
+                paths.append(cp)
+    raw = []
+    for cp in paths:
+        try:
+            raw.extend(load_cookies_from_file(cp) or [])
+        except Exception:
+            pass
+    if not raw:
+        return []
+    matched = _cookies_for_domain(raw, url)
+    return _normalize_cookies_for_scrapling(matched, default_url=url)
+
+
+def extract_tables_via_scrapling(url, table_idx="all", force_headed=False):
     """
-    Invokes Scrapling StealthyFetcher.
+    Invokes Scrapling StealthyFetcher, auto-retrying in headed mode (real Chrome when installed)
+    when headless is blocked by Cloudflare Turnstile, Radware Bot Manager, or Access Denied,
+    and optionally escalating to Tencent BrowserSkill if installed and ready.
     """
     try:
-        print(f"Querying Scrapling StealthyFetcher for {url}...")
-        html = _scrapling_fetch_html(url)
-        if html:
+        from .cdp_detector import has_system_chrome, try_fetch_html_via_browserskill
+    except ImportError:
+        try:
+            from cdp_detector import has_system_chrome, try_fetch_html_via_browserskill
+        except ImportError:
+            has_system_chrome = lambda: False
+            try_fetch_html_via_browserskill = None
+
+    try:
+        print(f"Querying Scrapling StealthyFetcher for {url} (force_headed={force_headed})...")
+        used_headless = not force_headed
+        domain_cookies = _collect_domain_cookies_for_scrapling(url)
+        first_kwargs = {
+            "headless": used_headless,
+            "solve_cloudflare": True,
+            "network_idle": False,
+            "wait": 2500 if used_headless else 3000,
+            "page_action": _scrapling_page_action,
+        }
+        if not used_headless and has_system_chrome():
+            first_kwargs["real_chrome"] = True
+        if domain_cookies:
+            first_kwargs["cookies"] = domain_cookies
+
+        html = _scrapling_fetch_html(url, first_kwargs)
+        if not force_headed and (not html or is_anti_bot_blocked("", html)):
+            print("Scrapling 无头模式受阻，自动切换有头浏览器模式重试...")
+            used_headless = False
+            headed_kwargs = {
+                "headless": False,
+                "solve_cloudflare": True,
+                "network_idle": False,
+                "wait": 3000,
+                "page_action": _scrapling_page_action,
+            }
+            if has_system_chrome():
+                headed_kwargs["real_chrome"] = True
+            if domain_cookies:
+                headed_kwargs["cookies"] = domain_cookies
+            html = _scrapling_fetch_html(url, headed_kwargs)
+
+        if (not html or is_anti_bot_blocked("", html)) and try_fetch_html_via_browserskill:
+            bsk_html, _bsk_status, _bsk_final = try_fetch_html_via_browserskill(url, timeout=30.0)
+            if bsk_html and not is_anti_bot_blocked("", bsk_html):
+                html = bsk_html
+
+        if html and not is_anti_bot_blocked("", html):
             dfs = parse_tables_from_html(html, table_idx)
+            if not dfs and "tandfonline.com" in url.lower():
+                dfs = _extract_tf_csvs_from_scrapling_html(url, html, headless=used_headless)
+                if dfs:
+                    dfs = _select_tables(dfs, table_idx) or []
+            if not dfs:
+                dfs = _follow_table_subpages(
+                    url,
+                    html,
+                    lambda su: _scrapling_fetch_html(su, {"headless": used_headless, "solve_cloudflare": not used_headless, "network_idle": False}),
+                    table_idx,
+                )
             if dfs:
                 return dfs
     except Exception as e:
@@ -1863,26 +2456,84 @@ def extract_tables_via_scrapling(url, table_idx="all"):
 
 def extract_tables_via_playwright(url, table_idx="all"):
     """
-    Invokes Playwright directly.
+    Invokes Playwright directly, reusing an active CDP browser tab when available,
+    blocking hanging third-party trackers, and waiting out transient anti-bot shells.
     """
     try:
         from playwright.sync_api import sync_playwright
+        try:
+            from .cdp_detector import (
+                find_active_cdp_endpoint,
+                find_matching_cdp_page,
+                get_publisher_table_wait_selector,
+                install_cdp_port_guard,
+                install_slow_tracker_route_blocker,
+                wait_through_transient_challenge,
+            )
+        except ImportError:
+            from cdp_detector import (
+                find_active_cdp_endpoint,
+                find_matching_cdp_page,
+                get_publisher_table_wait_selector,
+                install_cdp_port_guard,
+                install_slow_tracker_route_blocker,
+                wait_through_transient_challenge,
+            )
+
         print(f"Querying Playwright browser for {url}...")
         with sync_playwright() as p:
-            exec_path = find_playwright_chromium()
-            if exec_path:
-                print(f"[Playwright] 使用自动识别的 Chromium 路径: {exec_path}")
-            browser = p.chromium.launch(headless=True, executable_path=exec_path)
-            page = browser.new_page(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-            )
-            page.goto(url, wait_until="networkidle", timeout=30000)
+            cdp_ep = find_active_cdp_endpoint(timeout=1.0)
+            browser = None
+            page = None
+            connected_cdp = False
+            reused_tab = False
+
+            if cdp_ep:
+                try:
+                    browser = p.chromium.connect_over_cdp(cdp_ep["cdp_url"], timeout=8000)
+                    connected_cdp = True
+                    matched = find_matching_cdp_page(browser, url)
+                    if matched is not None:
+                        page = matched
+                        reused_tab = True
+                    elif browser.contexts:
+                        page = browser.contexts[0].new_page()
+                    if page is not None:
+                        install_cdp_port_guard(page, cdp_port=cdp_ep.get("port"))
+                except Exception:
+                    connected_cdp = False
+                    page = None
+
+            if page is None:
+                exec_path = find_playwright_chromium()
+                if exec_path:
+                    print(f"[Playwright] 使用自动识别的 Chromium 路径: {exec_path}")
+                browser = p.chromium.launch(headless=True, executable_path=exec_path)
+                page = browser.new_page(
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+                )
+                install_cdp_port_guard(page)
+
+            install_slow_tracker_route_blocker(page, url)
+            if not reused_tab:
+                page.goto(url, wait_until="domcontentloaded", timeout=35000)
+                wait_through_transient_challenge(page, max_wait_s=8.0)
+
             try:
-                page.wait_for_selector("table", timeout=5000)
+                page.wait_for_selector(get_publisher_table_wait_selector(url), timeout=6000)
             except Exception:
                 pass
             html = page.content()
-            browser.close()
+
+            if connected_cdp:
+                if not reused_tab and page:
+                    try:
+                        page.close()
+                    except Exception:
+                        pass
+            elif browser:
+                browser.close()
+
             if html:
                 return parse_tables_from_html(html, table_idx)
     except Exception as e:
@@ -2128,25 +2779,38 @@ def extract_tables_via_crawl4ai(url, table_idx="all", cancel_event=None):
             return []
 
         # CDP 模式复用真实浏览器（自带登录态），无需注入 Cookie；
-        # 自启浏览器模式按目标域名过滤注入已保存的 Cookie。
+        # 自启浏览器模式按目标域名过滤注入已保存的 Cookie（含 journal-supp-downloader 共享 cookie）。
         cookies_list = None
         if not cdp_url:
-            cookies_path = get_crawl4ai_cookies_path()
-            if os.path.exists(cookies_path):
+            cookie_paths = []
+            primary_cp = get_crawl4ai_cookies_path()
+            if os.path.exists(primary_cp):
+                cookie_paths.append(primary_cp)
+            get_companion_cp = getattr(common, "get_companion_cookie_paths", None)
+            if callable(get_companion_cp):
+                for cp in get_companion_cp():
+                    if cp not in cookie_paths:
+                        cookie_paths.append(cp)
+
+            valid_keys = {"name", "value", "url", "domain", "path", "expires", "httpOnly", "secure", "sameSite"}
+            merged_cookies = []
+            for cp in cookie_paths:
                 try:
-                    with open(cookies_path, "r", encoding="utf-8") as f:
-                        raw_cookies = json.load(f)
+                    raw_cookies = load_cookies_from_file(cp)
+                    if not raw_cookies:
+                        with open(cp, "r", encoding="utf-8") as f:
+                            loaded = json.load(f)
+                        if isinstance(loaded, dict) and isinstance(loaded.get("cookies"), list):
+                            raw_cookies = loaded["cookies"]
                     if isinstance(raw_cookies, list):
-                        valid_keys = {"name", "value", "url", "domain", "path", "expires", "httpOnly", "secure", "sameSite"}
-                        cookies_list = []
                         for c in raw_cookies:
-                            if isinstance(c, dict):
-                                cleaned_c = {k: c[k] for k in valid_keys if k in c}
-                                cookies_list.append(cleaned_c)
-                        cookies_list = _cookies_for_domain(cookies_list, url)
-                    print(f"[Crawl4AI] Loaded {len(cookies_list or [])} domain-matched cookies from: {cookies_path}")
+                            if isinstance(c, dict) and c.get("name"):
+                                merged_cookies.append({k: c[k] for k in valid_keys if k in c})
                 except Exception as e:
-                    print(f"[Crawl4AI Warning] Failed to load cookies: {e}")
+                    print(f"[Crawl4AI Warning] Failed to load cookies from {cp}: {e}")
+            if merged_cookies:
+                cookies_list = _cookies_for_domain(merged_cookies, url)
+                print(f"[Crawl4AI] Loaded {len(cookies_list or [])} domain-matched cookies from {len(cookie_paths)} store(s)")
 
         async def _crawl():
             from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
@@ -2292,8 +2956,14 @@ def extract_tables_via_unpaywall(doi, table_idx="all", cancel_event=None):
     if cancel_event is not None and cancel_event.is_set():
         return []
     try:
-        oa_api = f"https://api.unpaywall.org/v2/{doi}?email=zotero-table-extractor@local"
-        resp = requests.get(oa_api, timeout=10)
+        config = load_config()
+        polite_email = get_polite_email(config, service="unpaywall")
+        oa_api = f"https://api.unpaywall.org/v2/{urllib.parse.quote(doi, safe='')}?email={urllib.parse.quote(polite_email)}"
+        resp = requests.get(
+            oa_api,
+            headers={"User-Agent": f"ZoteroTableExtractor/1.0 (mailto:{polite_email})"},
+            timeout=10,
+        )
         if resp.status_code != 200:
             return []
         data = resp.json()

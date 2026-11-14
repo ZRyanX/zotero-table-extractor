@@ -111,7 +111,10 @@ def autofit_excel_columns(file_path, title=None, footnotes=None, sheet_footnotes
                 elif "*default*" in sheet_footnotes and (len(wb.worksheets) == 1 or not any(s in sheet_footnotes for s in wb.sheetnames)):
                     notes_to_add = sheet_footnotes["*default*"]
             elif footnotes:
-                notes_to_add = footnotes if isinstance(footnotes, list) else [str(footnotes)]
+                notes_to_add = footnotes if isinstance(footnotes, (list, tuple)) else [str(footnotes)]
+
+            if isinstance(notes_to_add, str):
+                notes_to_add = [notes_to_add]
 
             if notes_to_add:
                 existing_first_col = {str(row[0].value).strip() for row in sheet.iter_rows() if row and row[0].value is not None}

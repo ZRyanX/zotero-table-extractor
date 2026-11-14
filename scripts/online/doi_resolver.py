@@ -32,6 +32,16 @@ except ImportError:
 
 # Aliases to shared helpers (kept as bare names so call sites are unchanged)
 load_config = common.load_config
+build_elsevier_headers = getattr(
+    common,
+    "build_elsevier_headers",
+    lambda config=None, accept="application/json": (
+        {"X-ELS-APIKey": (config or {}).get("ELSEVIER_API_KEY", ""), **({"Accept": accept} if accept else {})}
+        if (config or {}).get("ELSEVIER_API_KEY")
+        else {}
+    ),
+)
+get_polite_email = getattr(common, "get_polite_email", lambda config=None, service="crossref": "supp_downloader@academic-research.org")
 
 def get_doi_from_zotero_db(pdf_path, db_path=None):
     """
@@ -204,9 +214,14 @@ def get_doi_by_title(title):
     """
     if not title or len(title) < 10:
         return None
-    url = f"https://api.crossref.org/works?query.title={urllib.parse.quote(title)}&rows=1"
+    polite_email = get_polite_email(load_config(), service="crossref")
+    url = f"https://api.crossref.org/works?query.title={urllib.parse.quote(title)}&rows=1&mailto={urllib.parse.quote(polite_email)}"
     try:
-        response = requests.get(url, timeout=10)
+        response = requests.get(
+            url,
+            headers={"User-Agent": f"ZoteroTableExtractor/1.0 (mailto:{polite_email})"},
+            timeout=10,
+        )
         if response.status_code == 200:
             data = response.json()
             items = data.get("message", {}).get("items", [])
@@ -326,11 +341,11 @@ def _resolve_pii_to_doi(pii):
     """
     try:
         config = load_config()
-        els_key = config.get("ELSEVIER_API_KEY") or os.environ.get("ELSEVIER_API_KEY", "")
-        if els_key:
+        headers = build_elsevier_headers(config, accept="application/json")
+        if headers:
             # Use Elsevier abstract/metadata endpoint with field=doi
             url = f"https://api.elsevier.com/content/abstract/pii/{pii}?field=doi&httpAccept=application/json"
-            r = requests.get(url, headers={"X-ELS-APIKey": els_key}, timeout=10)
+            r = requests.get(url, headers=headers, timeout=10)
             if r.status_code == 200:
                 data = r.json()
                 doi_val = (data.get("abstracts-retrieval-response", {})
