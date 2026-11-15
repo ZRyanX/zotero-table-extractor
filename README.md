@@ -1,675 +1,604 @@
 # 📊 Zotero Table Extractor
 
 <p align="center">
-  <img src="figures/zotero_table_extractor_architecture.svg" alt="Zotero Table Extractor Architecture" width="100%" />
+  <a href="README.md"><b>English</b></a> | <a href="README.zh-CN.md">简体中文</a>
 </p>
 
 <p align="center">
-  <b>一站式学术文献结构化表格智能提取系统</b><br/>
-  从 Zotero 选中条目、本地 PDF、期刊网页或 DOI 中自动定位、识别、核验并提取复杂科学表格，导出为出版级 Excel (<code>.xlsx</code>)。
+  <b>End-to-End Intelligent Scientific Table Extraction System for Zotero, PDFs, and Academic Publishers</b><br/>
+  Automatically locate, extract, verify, reconstruct, and export complex scientific tables from Zotero items, local or remote PDFs, journal web pages, and DOIs into publication-grade Excel (<code>.xlsx</code>) workbooks.
 </p>
 
 <p align="center">
-  <a href="#-核心能力"><img src="https://img.shields.io/badge/Pipeline-Dual_Track_(Online+PDF)-blue.svg" alt="Pipeline"></a>
-  <a href="#-核心能力"><img src="https://img.shields.io/badge/Pipeline-Dual_Track_(Online+PDF)-blue.svg" alt="Pipeline"></a>
-  <a href="#-多方投票仲裁"><img src="https://img.shields.io/badge/Voting-9_Engine_Consensus-orange.svg" alt="Voting"></a>
-  <a href="#-两阶段视觉-ai-接管"><img src="https://img.shields.io/badge/Visual_AI-PP--DocLayoutV3_%2B_DocLayout--YOLO_%2B_TeleOCR-purple.svg" alt="Visual AI"></a>
-  <a href="#-环境要求"><img src="https://img.shields.io/badge/Python-3.9%2B-brightgreen.svg" alt="Python Version"></a>
-  <a href="#-环境要求"><img src="https://img.shields.io/badge/Platform-macOS_%7C_Linux_%7C_Windows-lightgrey.svg" alt="Platform"></a>
+  <a href="#-core-capabilities"><img src="https://img.shields.io/badge/Pipeline-Dual_Track_(Online+PDF)-blue.svg" alt="Pipeline"></a>
+  <a href="#2-native-pdf-primary-pipeline-9-engine-consensus--ibm-teds-arbitration"><img src="https://img.shields.io/badge/Consensus-9_Engine_%2B_MinerU_%2B_TEDS-orange.svg" alt="Voting"></a>
+  <a href="#3-two-track-rotation-remediation--3-stage-visual-ai-takeover"><img src="https://img.shields.io/badge/Visual_AI-YOLO_%2B_PP--DocLayoutV3_%2B_PaddleOCR--VL_%2B_Docling-purple.svg" alt="Visual AI"></a>
+  <a href="#-requirements--installation"><img src="https://img.shields.io/badge/Python-3.9%2B-brightgreen.svg" alt="Python Version"></a>
+  <a href="#-requirements--installation"><img src="https://img.shields.io/badge/Platform-macOS_%7C_Linux_%7C_Windows-lightgrey.svg" alt="Platform"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-teal.svg" alt="License"></a>
 </p>
 
 ---
 
-## 📑 目录
+## 📑 Table of Contents
 
-- [💡 项目简介](#-项目简介)
-- [✨ 核心能力](#-核心能力)
-  - [1. 优先在线 HTML/XML 高保真提取](#1-优先在线-htmlxml-高保真提取)
-  - [2. 本地原生 PDF 9 引擎投票与 IBM TEDS 拓扑共识 (含 RapidTable)](#2-本地原生-pdf-9-引擎投票与-ibm-teds-拓扑共识)
-  - [3. 复杂扫描件/无框表两阶段视觉 AI 接管（PP-DocLayoutV3 双检与 TeleOCR 网关）](#3-复杂扫描件无框表两阶段视觉-ai-接管)
-  - [4. 7 阶轻量安全后处理与 SMART 语义表头展平](#4-7-阶轻量安全后处理流水线)
-  - [5. 跨页续表 4-Way 联合判定与断裂单元格合并 (MinerU 规则体系)](#5-跨页续表与横向分块自适应拼接)
-  - [6. OmniDocBench 标准化评测与 LLM 语义等价门禁](#6-omnidocbench-标准化评测与-llm-语义等价门禁)
-  - [7. 出版级规范 Excel 导出](#7-出版级规范-excel-导出)
-  - [8. 全库批量并发与工业级鲁棒性](#8-全库批量并发与工业级鲁棒性)
-  - [9. PyZotero 与 Zotero-Better-Notes 生态闭环联动 (可选)](#9-pyzotero-与-zotero-better-notes-生态闭环联动-可选)
-- [🏗 架构设计与数据流转图](#-架构设计与数据流转图)
-- [💻 环境要求与安装](#-环境要求与安装)
-- [⚙️ 配置指南](#️-配置指南)
-  - [1. 跨平台路径与环境交互式配置向导 (setup_paths.py)](#1-跨平台路径与环境交互式配置向导强烈推荐)
-  - [2. 配置文件手动初始化 (config.json)](#2-配置文件手动初始化-configjson)
-  - [3. 环境变量优先支持](#3-环境变量优先支持)
-  - [4. 详细配置项说明](#4-详细配置项说明)
-  - [5. 技能在线更新与配置防护机制 (update.py)](#5-技能在线更新与配置防护机制-updatepy)
-  - [6. 各种 API 获取方式](#6-各种-api-获取方式)
-  - [7. 期刊与知网登录向导 (login.py)](#7-期刊与知网登录向导-loginpy)
-- [🚀 使用方法](#-使用方法)
-  - [单篇 PDF 表格提取](#单篇-pdf-表格提取)
-  - [在线文献 URL / DOI 提取](#在线文献-url--doi-提取)
-  - [目录批量与路径清单批量提取](#目录批量与路径清单批量提取)
-  - [Zotero 全库一键批量提取](#zotero-全库一键批量提取)
-  - [结合 AI Agent / MCP 编排调用](#结合-ai-agent--mcp-编排调用)
-  - [表格提取质量核验与清理](#表格提取质量核验与清理)
-- [📂 文件结构](#-文件结构)
-- [🙏 鸣谢与参考开源项目](#-鸣谢与参考开源项目)
-- [📄 开源协议与免责声明](#-开源协议与免责声明)
-
----
-
-## 💡 项目简介
-
-学术文献（尤其是地学、材料、化学、生物、医学等自然科学领域）中的表格往往存在**无边框/三线表、跨行跨列单元格、多数值挤压排版、上下标与正负公差、多级复合表头以及跨页续表（Continued tables）**等极为复杂的排版特征。传统的单一工具（如纯 Camelot 或单纯 OCR）在面对上述排版时极易发生串行、漏列、公式错乱或数据缺失。
-
-**Zotero Table Extractor** 是一套端到端的学术表格智能提取与重构引擎：
-1. **双轨驱动**：优先走官方直连 API / 原生 HTML / JATS XML 提取（涵盖 arXiv 官方 HTML、NCBI PMC Open Access JATS XML 与 Elsevier XOCS XML，100% 零 OCR 误差），若缺失或受阻则无缝降级到本地 PDF 深度流水线；
-2. **多方验证与 TEDS 拓扑度量**：原生文本 PDF 采用 **9 引擎多方投票与 IBM TEDS (树编辑距离) 拓扑度量交叉仲裁**（包含 RapidTable 本地 ONNX 双模型、PyMuPDF4LLM、GMFT 与 img2table）；
-3. **视觉多模态大模型双轨接管与双检融合**：采用 **PP-DocLayoutV3 (25类细粒度) 与 DocLayout-YOLO** 并列双检投票切图，首选 **PaddleOCR-VL-1.6 / TeleOCR (vLLM)** 在线大模型重构，同时支持 **IBM Docling (TableFormer)** 与 **RapidTable** 作为本地离线备用接管引擎；
-4. **精细后处理与 MinerU 跨页续表联合判定**：内置 7 阶轻量安全清洗流水线与 **SMART 语义表头展平**，移植 MinerU 4-Way 跨页续表联合判定（列名 Jaccard 重合度 + 页宽比对齐 + 续表词法 + 小表保护）与跨页断裂单元格合并；
-5. **严密质量闭环与度量**：集成 **OmniDocBench (CVPR 2025)** 表格与版面标准化基准评估体系，构建 **LLM 语义化表格评测门禁 (arXiv 2603.18652)**，杜绝“修复了结构但破坏了语义”；
-6. **Excel 富文本原生保真导出**：集成 openpyxl `CellRichText` 原生导出学术上下标（`10^{-3}`, `CaCO_3`, `H_2O`, `Fe^{3+}`）并严密保护数值单元格计算属性；
-7. **生态闭环联动 (可选)**：可选集成 PyZotero 与 Zotero-Better-Notes，自动将提取出的 `.xlsx` 挂载回文献条目并生成富文本表格预览笔记。
+- [💡 Overview](#-overview)
+- [✨ Core Capabilities](#-core-capabilities)
+  - [1. Online HTML/XML High-Fidelity Extraction (Tiered Concurrent Racing)](#1-online-htmlxml-high-fidelity-extraction-tiered-concurrent-racing)
+  - [2. Native PDF Primary Pipeline, 9-Engine Consensus & IBM TEDS Arbitration](#2-native-pdf-primary-pipeline-9-engine-consensus--ibm-teds-arbitration)
+  - [3. Two-Track Rotation Remediation & 3-Stage Visual AI Takeover](#3-two-track-rotation-remediation--3-stage-visual-ai-takeover)
+  - [4. 7-Stage Safe Post-Processing & SMART Semantic Header Flattening](#4-7-stage-safe-post-processing--smart-semantic-header-flattening)
+  - [5. Multi-Page Continuation Merging (MinerU 4-Way & DeepDoc Monotone DP)](#5-multi-page-continuation-merging-mineru-4-way--deepdoc-monotone-dp)
+  - [6. OmniDocBench Standardization & LLM Semantic Equivalence Gate](#6-omnidocbench-standardization--llm-semantic-equivalence-gate)
+  - [7. Publication-Grade Excel Export (CellRichText Sub/Superscripts)](#7-publication-grade-excel-export-cellrichtext-subsuperscripts)
+  - [8. Full-Library Batch Concurrency & Industrial Robustness](#8-full-library-batch-concurrency--industrial-robustness)
+  - [9. Optional PyZotero & Zotero-Better-Notes Ecosystem Sync](#9-optional-pyzotero--zotero-better-notes-ecosystem-sync)
+- [🏗 Architecture & Data Flow](#-architecture--data-flow)
+- [💻 Requirements & Installation](#-requirements--installation)
+- [🔧 Configuration Guide](#-configuration-guide)
+  - [1. Cross-Platform Interactive Setup Wizard (`setup_paths.py`)](#1-cross-platform-interactive-setup-wizard-setup_pathspy)
+  - [2. Manual Configuration (`config.json`)](#2-manual-configuration-configjson)
+  - [3. Environment Variables & Companion Credential Discovery](#3-environment-variables--companion-credential-discovery)
+  - [4. Configuration Reference](#4-configuration-reference)
+  - [5. Obtaining API Keys & CLI Tools](#5-obtaining-api-keys--cli-tools)
+  - [6. Safe Self-Updating & Config Protection (`update.py`)](#6-safe-self-updating--config-protection-updatepy)
+  - [7. Publisher & CNKI Login Wizard (`login.py`)](#7-publisher--cnki-login-wizard-loginpy)
+- [🚀 Usage](#-usage)
+  - [Single PDF Extraction](#single-pdf-extraction)
+  - [Online Article URL / DOI Extraction](#online-article-url--doi-extraction)
+  - [Directory & Path-List Batch Extraction](#directory--path-list-batch-extraction)
+  - [Full Zotero Library Batch Extraction](#full-zotero-library-batch-extraction)
+  - [AI Agent / MCP Orchestration](#ai-agent--mcp-orchestration)
+  - [Output Verification & Cleanup](#output-verification--cleanup)
+- [📂 Repository Structure](#-repository-structure)
+- [🧪 Regression Testing & Benchmark Scope](#-regression-testing--benchmark-scope)
+- [🙏 Acknowledgements & Referenced Projects](#-acknowledgements--referenced-projects)
+- [📄 License & Disclaimer](#-license--disclaimer)
 
 ---
 
-## ✨ 核心能力
+## 💡 Overview
 
-### 1. 优先在线 HTML/XML 高保真提取
-- **arXiv 官方 HTML 与 ar5iv (LaTeXML) 原生直取**：针对 arXiv 论文直取官方 HTML / ar5iv 结构化表格，100% 保真免除 OCR 误差。
-- **NCBI PMC (PubMed Central) Open Access JATS XML 直连**：针对医学与生命科学论文，通过 NCBI API 直接获取标准 NISO JATS XML 正文字段，原生解析行列、合并单元格与尾注。
-- **Elsevier 官方 XOCS XML 直连**：通过官方 API 直取原生 XML 数据节点，数学符号与行列结构保真度达 100%。
-- **多出版商自适应分流**：原生覆盖 Elsevier / ScienceDirect、Springer Link、Wiley、Nature、IEEE Xplore、Taylor & Francis、MDPI、ACS、RSC、GeoSciWorld 等。
-- **中国知网 (CNKI) 专属适配**：内置 Scrapling 极速爬取与 Playwright 动态渲染引擎，支持滑块验证码绕过、地质特殊符号还原及文献 HTML 阅读页表格提取。
-- **附表 (Supplementary Tables) 自动探测**：自动嗅探并提取论文正文及关联的在线附表。
-- **CDP 动态端口自愈与 Port Guard 防反爬**：打破 9222 端口硬编码，自动探测 Chromium 家族 `DevToolsActivePort` 动态端口直连，免重启内存复用校园网/CARSI 学术认证，根除 SQLite 锁死；通过 CDP Port Guard 拦截前端针对本地调试端口的反爬嗅探并伪装 `ConnectionRefused`；结合跨进程槽位文件锁实现多 Tab 隔离高并发抽取。
-- **完备性门禁**：若在线提取得到的表数量低于 PDF 文本层扫描出的表格 caption 数量，系统自动触发增量补偿，防止在线版本漏表。
+Scientific tables—especially in earth sciences, geochemistry, materials science, chemistry, biology, and medicine—routinely feature **borderless three-line layouts, nested `rowspan`/`colspan` spanning headers, squeezed numeric cells, chemical formulas, sub/superscripts, $\pm$ tolerances, and multi-page continuation segments**. Single-tool extractors (e.g., standalone Camelot or raw OCR) frequently suffer from shifted columns, truncated bottom rows, dropped tables, or corrupted scientific notation.
 
-### 2. 本地原生 PDF 8 引擎投票与 IBM TEDS 拓扑共识
-对于含有完整矢量文本层的 Native PDF，启动多算法交叉核验，兼顾极速与极高准确率（单页约 0.1s）：
-- **[`pdf-inspector`](https://github.com/firecrawl/pdf-inspector)**：Rust 编写的高性能检测器，快速判定 PDF 类型并解析 Tagged PDF / PDF/UA 语义结构树与 Markdown 表格；
-- **[`PyMuPDF4LLM`](https://github.com/pymupdf/PyMuPDF4LLM)**：Artifex 出品，原生将 PDF 转化为 LLM-ready Markdown 表格参与共识投票；
-- **`PyMuPDF find_tables()`**：极速矢量线框表格识别；
-- **[`GMFT`](https://github.com/conjuncts/gmft)**：基于 TATR (Table Transformer) 的深度视觉结构解析，专精学术多层复合表头与跨列单元格对齐；
-- **[`img2table`](https://github.com/xavctn/img2table)**：纯 Python + OpenCV 形态学轮廓方案，**彻底摆脱系统级 Ghostscript 依赖**，稳健支持有框与无框表；
-- **`text_alignment`**：基于文字坐标聚类分列的无线框对齐引擎；
-- **`pdfplumber`**：基于字符空间矩形与相交线框的结构提取；
-- **`Camelot`**：Lattice 网格法与 Stream 文本流双策略识别；
-- **IBM TEDS 拓扑度量与多方仲裁**：集成纯 Python IBM TEDS (Tree-Edit-Distance) 树编辑距离算法，综合 DOM 树拓扑、单元格跨度与矩阵内容相似度计算综合得分，任意两方相似度 $\ge 0.75$ 则判定一致并采纳最佳版本；相似度 $< 0.90$ 标记为低置信度并触发视觉 AI 介入。
+**Zotero Table Extractor** solves this with a resilient, dual-track architecture:
 
-
-### 3. 复杂扫描件/无框表两阶段视觉 AI 接管（双轨弹性保障）
-针对扫描版 PDF、混合排版以及低置信度复杂页：
-- **前置表格定位与切图**：
-  - 在线模式：调用百度 **PP-StructureV3** 版面分析模型，毫秒级定位页面内表格 Bounding Box 并高精度裁切；
-  - 离线/兜底模式：内置 **DocLayout-YOLO**（DocStructBench 1280x1280 高分辨率 ONNX 权重，内置端到端 NMS，约 73MB），无网环境下本地完成目标检测。
-- **高精度多模态重构（在线首选 + 离线备用）**：
-  - **首选主引擎（在线）**：将表格定位区域或全页送入百度 **PaddleOCR-VL-1.6** 多模态大模型，输出高精度 HTML `<table>` 与 Markdown 结构，轻松应对跨行跨列合并单元格、旋转表格与倾斜扫描件；
-  - **备用兜底（离线）**：集成 **[IBM Docling (TableFormer)](https://github.com/DS4SD/docling)** 作为离线备用引擎。在无网络、无 Token 或配置纯离线模式时，本地纯 CPU/Metal 运行 TableFormer 还原多行列跨度拓扑，提供永不掉线的离线保障。
-- **严格边界防污染截断**：
-  - 提取算法严格隔离相邻表格的 Caption 范围，彻底消除连续表跨表重叠与串表污染；中英文双语表题优先保留真实 Caption。
-
-### 4. 7 阶轻量安全后处理流水线
-提取出的原始表格在导出前经过严格的 7 阶清洗与规范化：
-1. **阶段 A（VLM 直通保护）**：保护高精度 MultiIndex 表头，不盲目切片，仅执行 LaTeX 语法与 OCR 乱码清洗（如 `\pm`, `\times` 规范化、零宽字符过滤）；
-2. **阶段 B（碎片表门禁）**：列数 $> 30$ 且填充率 $< 30\%$ 的低质量碎片表直接拦截剔除；
-3. **阶段 C（表头探测与复合重构）**：扫描前 80 行寻找真实科学关键词（如样品号、含量、参数等），剥离误卷入的正文段落与页眉，展平并合并两级复合表头（`Parent_Child`）；
-4. **阶段 D（单元格挤压展开）**：
-   - `expand_squeezed_columns`：智能拆分因 OCR 粘连而挤在单个单元格内的多个连续数值；
-   - `expand_multiline_subrows`：展开单元格内多行子项；
-   - `populate_section_categories`：向下填充继承地质层位、样品组别等区域分组头；
-5. **阶段 E（公式注入防御与数值类型推断）**：
-   - 自动推断整型、浮点型，保留地学有效数字；
-   - **Excel 公式注入防御**：检测以 `=`, `+`, `-`, `@` 开头的单元格内容，自动前置单引号 `'` 转义，杜绝 Excel 打开时的恶性宏执行或公式报错；
-6. **阶段 F（噪声与付费墙过滤）**：清除 `Unnamed` 占位符、移除页底版权声明、水印与付费墙截断提示；
-7. **阶段 G（表号与表题规范化）**：统一抽取标准表号（`Table 1`、`表2` 等），并在元数据中保留中英文完整标题。
-
-### 5. 跨页续表与横向分块自适应拼接 (DeepDoc / MinerU 列对齐)
-- **DeepDoc & MinerU 启发式三向单调动态规划 (DP) 列对齐**：
-  - 重构跨页长表格合并算法，引入包含 `(i-1, j-1)`（投影匹配）、`(i, j-1)`（基准列缺失填空）与 `(i-1, j)`（续表冗余列跳过）的三向状态转移，彻底解决续表列数大于目标列数（`n_curr > n_target`）或存在无头续表时的列错位问题；
-- **纵向跨页续表合并**：自动识别 `Table 1 (continued)`、`表1 (续)`、`Table 2 Continued` 或紧随其后的同列构型无头表格，自适应剥离重复表头，合并为单一完整连续大表；
-- **横向分块表格合并**：自动识别因页面宽度受限而被横向拆分为两部分的数据表（如 `Table 4 Part 1` 与 `Table 4 Part 2`），按行索引精准水平拼接；
-- **对齐与边缘保护**：自适应对齐列名，对于行数 $< 3$ 的小型表开启边缘保护，杜绝误判误删。
-
-### 6. 出版级规范 Excel 导出
-- **视觉主题定制**：深色表头底色、清晰加粗白字、交替行斑马纹浅灰底、精细灰色线框；
-- **动态列宽自适应**：智能采样前 200 行文本长度，自动计算最佳列宽并限制上下边界，告别 `###` 遮挡；
-- **元数据完美注入**：写入 Dublin Core 与 Office 标准核心属性，在 macOS Finder QuickLook（按空格键即时预览）以及 Windows 资源管理器中均能获得原生级预览；
-- **双轨导出模式**：
-  - **分表独立输出**：以 `Table 1.xlsx`、`Table 2.xlsx` 独立存放于专属论文目录，附带 `table_captions.txt` 目录索引清单；
-  - **单文件多 Sheet 输出**：将整篇论文所有表格汇聚于单个 `.xlsx` 文件中的多个 Sheet。
-
-### 7. 全库批量并发与工业级鲁棒性
-- **只读 SQLite 快照克隆**：在扫描 Zotero 数据库时自动克隆临时副本，彻底消除 SQLite `database is locked` 读写冲突；
-- **子进程完全隔离**：全库遍历采用独立的 Python 子进程并发执行，单篇文献的解析超时（内置熔断机制）或异常绝不波及主进程与其他文献；
-- **断点续传与执行计划**：内置 `batch_planner.py` 预分析文献年份与元数据（自动区分知网老文献直通本地管线），支持断点跳过已提取文献。
-
-### 8. PyZotero 与 Zotero-Better-Notes 生态闭环联动 (可选)
-为了实现科研文献“提取-整理-沉淀”的一站式工作流闭环，系统原生支持与 Zotero 深度联动：
-- **安全开关控制（默认关闭）**：默认配置 `"ZOTERO_SYNC_ENABLED": false`，保持轻量纯本地运行；可通过配置或 `--sync-zotero` 参数一键启用；
-- **自动挂载 Excel 子附件**：提取成功后，自动反向推导 Zotero 条目 ID 并将生成的 `.xlsx` 文件挂载为对应条目的子附件，支持随 Zotero 跨设备同步；
-- **自动生成 Better-Notes 规范富文本笔记**：在对应文献条目下生成名为 `📊 Extracted Tables (N tables)` 的笔记，内置各表格的 HTML 预览与格式化表格，无需打开 Excel 即可在 Zotero 阅读器内即时对比科学数据。
+1. **Online-First High-Fidelity Track**: Runs tiered concurrent racing across native structured sources (**arXiv HTML / ar5iv LaTeXML, NCBI PMC JATS XML, Elsevier XOCS XML**), publisher DOM adapters, **CNKI** (with `chndoi.org` dynamic rerouting), OA-gated **Firecrawl**, **Scrapling**, **Crawl4AI**, and **CDP-aware Playwright** (with `DevToolsActivePort` dynamic discovery and anti-bot Port Guard). Any missing or truncated tables are seamlessly supplemented by the local PDF pipeline and losslessly merged.
+2. **Lossless Orientation & Structured PDF Primary Track**: Combines 0-latency vector text orientation checks with **TurboOCR (`doc_ori.onnx`)** for lossless `/Rotate` remediation on native PDFs (preserving vector text and structure trees). Routes native PDFs through **Tagged PDF / PDF/UA Structure Tree** fast-path → **MinerU Open API (CLI + REST dual-mode, `flash-extract`, DoH CDN self-healing)** → **Local Numeric Integrity Gate** → targeted **9-Engine Consensus Voting & IBM TEDS** topology arbitration.
+3. **3-Stage Visual AI & Offline Takeover**: Recovers unresolved, scanned, or low-confidence pages via **RapidTable (ONNX)** → **DocLayout-YOLO + PP-DocLayoutV3** layout ensemble / **PP-StructureV3** cropping into **PaddleOCR-VL-1.6** or **TeleOCR (vLLM)** → **IBM Docling (TableFormer)** pure CPU/Metal offline fallback, strictly guarded by anti-regression quality checks.
+4. **7-Stage Post-Processing, SMART Headers & Monotone DP Stitching**: Preserves MultiIndex hierarchies, flattens multi-level headers via **SMART** (`Category > Subcategory > Field [Unit]`), isolates **olmOCR 2-style footnotes**, escapes Excel formula injection, and stitches multi-page continuation tables via **MinerU 4-Way** criteria and **DeepDoc/MinerU 3-Way Monotone DP** column alignment.
+5. **Semantic Gate, Rich-Text Excel & Zotero Sync**: Validates LLM table repairs via **LLM Semantic Equivalence (`arXiv 2603.18652`)**, renders native academic sub/superscripts (`10^{-3}`, `CaCO_3`, `Fe^{3+}`) via `openpyxl` `CellRichText`, and optionally attaches `.xlsx` files plus **Zotero-Better-Notes** HTML preview cards back to Zotero.
 
 ---
 
-## 🏗 架构设计与数据流转图
+## ✨ Core Capabilities
+
+### 1. Online HTML/XML High-Fidelity Extraction (Tiered Concurrent Racing)
+
+*Default `race=True` executes tiered parallel racing; pass `--sequential` to use the sequential DAG.*
+
+- **Authoritative Full-Text XML/LaTeXML Priority**:
+  - **arXiv HTML / ar5iv (LaTeXML)**: Native structured HTML table extraction with zero OCR error.
+  - **NCBI PMC Open Access JATS XML**: Direct NISO JATS XML parsing preserving full `rowspan`/`colspan`, nested sections, and footnotes.
+  - **Elsevier XOCS XML**: Direct API access (`X-ELS-APIKey` + optional `X-ELS-InstToken`) with automatic PII-to-DOI resolution.
+  - **Grace Window**: When non-authoritative HTTP channels return early while `ArxivHTML`, `NCBIPMC`, or `ElsevierXML` is still running, the race controller grants a bounded grace window so complete XML tables are never preempted by partial page snippets.
+- **Broad Publisher DOM Coverage**: Tailored selectors and modal expansion for **Wiley, Springer/Nature** (including `idp.springer.com` institutional redirect recovery), **Taylor & Francis** (with CSV download support), **ACS, GeoSciWorld / Silverchair** (modal table expansion & deduplication), **MDPI, Copernicus XML, Frontiers, APS, IOP, OUP, Sage, De Gruyter, and Science**.
+- **CNKI (China National Knowledge Infrastructure) Pipeline**: Races `Scrapling` and `Crawl4AI` before falling back to `PlaywrightCNKI` (automated human-like slider drag, persistent cookies, and dynamic `chndoi.org` / `chinadoi.cn` rerouting). Automatically skips web scraping for pre-2020 Chinese PDFs (`is_pre_2020_chinese_paper`) that lack HTML full text.
+- **CDP Dynamic Port Discovery, Port Guard & Tab Concurrency (`cdp_detector.py`)**:
+  - Scans `DevToolsActivePort` across Chrome, Edge, Brave, Chromium, Arc, and Vivaldi by most-recent activity—eliminating hardcoded `9222` conflicts and reusing existing campus/CARSI authenticated sessions in memory.
+  - **CDP Port Guard** intercepts frontend probes targeting loopback debugging ports and spoofs `ConnectionRefused` against anti-bot fingerprinting (Cloudflare Turnstile, DataDome, Akamai).
+  - **6-Slot Cross-Process Tab Guard** (`cdp_tab_slot_guard`) allows safe concurrent background-tab extraction across `batch_run.py` worker processes.
+- **Resilient Fallbacks & Completeness Gate**:
+  - **Unpaywall** (`DirectHTTP`-first, skipping PDF links in online HTML mode), **Europe PMC**, **Crossref** preprint search, **Firecrawl** (strictly gated to confirmed OA papers via `is_open_access_paper`, `html`→`markdown` fallback, 403 circuit breaker, and local cache), **BrowserSkill (`bsk`)**, and bounded supplementary table extraction (`journal-supp-downloader` integration).
+  - Cross-checks online table labels and counts against the PDF's **Declaration Ledger** and scanned-page checks; if anything is missing or truncated, verified online tables are kept and losslessly merged with local PDF recovery results in a single atomic export.
+
+### 2. Native PDF Primary Pipeline, 9-Engine Consensus & IBM TEDS Arbitration
+
+- **Multi-Signal Candidate Page Mining (`Declaration Ledger`)**: Full-document scan (no artificial page-count cutoff) combining table caption/continuation declarations, `pdf-inspector` (~5–80ms Rust pre-classifier & Markdown extractor), Tagged PDF/UA structure tree, image-page detection, chunked adaptive `find_tables()` + `find_tables(strategy="text")` + `probe_disjoint_native_tables()`, and 5-cue continuation tracing.
+- **Native PDF Primary Architecture (`v1.9.0`+)**:
+  1. **Tagged PDF / PDF/UA Structure Tree Fast-Path**: Directly extracts publisher `Table`/`TH`/`TD` semantic elements when complete and numerically verified.
+  2. **MinerU Official Structured Extraction (`ocr_client.py`)**: Supports **MinerU Open API CLI (`mineru-open-api`)** and Python REST API (`auto` / `cli` / `api`), zero-Token `flash-extract` / Agent API fallback, AliDNS/Tencent DoH IP-bypass TLS self-healing (`HostHeaderSSLAdapter`), local `mineru_cache` ZIP/directory loading, and `page_ranges` subset page remapping.
+  3. **Local Bidirectional Numeric Integrity Gate (`table_validator.py`)**: Normalizes `content_list` (0–1000) and `middle.json` (PDF point) coordinates and verifies extracted numeric tokens against the PDF text layer (`verify_table_numeric_integrity`, `cross_check_missed_tables`).
+- **9-Engine Consensus Voting Fallback (`three_way_vote`, or `USE_LEGACY_VOTING=true`)**:
+  - Arbitrates across **`pdf-inspector`** (Markdown + Structure Tree), **`PyMuPDF4LLM`**, **`PyMuPDF find_tables()`**, **`GMFT` (TATR)**, **`img2table`** (pure Python + OpenCV, Ghostscript-free), **`Camelot`** (Lattice/Stream), **`pdfplumber`**, **`RapidTable`**, and **`text_alignment`** (with PDF-Extract-Kit K-Means column alignment).
+  - Uses 2D bbox spatial overlap (IoU/IoM), label-conflict-free clustering, and pure-Python **IBM TEDS (`teds.py`)** Zhang-Shasha tree-edit distance ($\ge 0.75$ consensus; $< 0.90$ flagged for visual AI verification).
+
+### 3. Two-Track Rotation Remediation & 3-Stage Visual AI Takeover
+
+- **Tier-1 Lossless Orientation Remediation (`doc_orientation_detector.py`)**:
+  - Combines 0-latency PDF vector text direction (`span["dir"]`/`line["dir"]`) with **TurboOCR (`doc_ori.onnx`, PP-LCNet_x1_0, ~6.47 MB)** using strict page-level confidence/margin thresholds ($\ge 0.80$ / $\ge 0.35$) and mixed-orientation guards (skips whole-page rotation when prose is 0° and an embedded table is 90°).
+  - Rewrites `/Rotate` losslessly on rotated native PDFs (preserving vector text and structure trees); rasterizes rotation at 150 DPI only for rotated scanned PDFs.
+- **3-Stage Targeted Visual AI & Offline Takeover** (triggered on scanned PDFs or unresolved/low-confidence pages):
+  1. **Stage 1 — RapidTable Fast Rescue**: Local ONNX `SLANet-Plus` / `TableStructureRec` (`TableCls` wired vs. lineless routing) or optional PyTorch `UniTable`.
+  2. **Stage 2 — Layout Ensemble + Online VLM**: **DocLayout-YOLO** (1280×1280 ONNX with CoreML/CUDA/DirectML/CPU EP) + **PP-DocLayoutV3** (25-class polygon-fitting segmentation) ensemble (`DOCLAYOUT_ENGINE=ensemble`) or **PP-StructureV3** crops → **PaddleOCR-VL-1.6** or **TeleOCR (vLLM)** via unified `OCRBackendRegistry`, with **Tier-2 upright crop rotation** and strict inter-table boundary isolation.
+  3. **Stage 3 — IBM Docling (TableFormer) Offline Fallback**: Runs locally on CPU/Metal (`DOCLING_OFFLINE_FALLBACK=true`) with cached HuggingFace repo detection when cloud VLM APIs are unavailable.
+- **Anti-Regression Guard (`_should_replace_with_ocr`)**: Refuses to replace non-degenerate native tables with OCR outputs that have fewer rows, lower fill density, or missing sample identities.
+
+### 4. 7-Stage Safe Post-Processing & SMART Semantic Header Flattening
+
+Every extracted table passes through a 7-stage pipeline (`table_postprocess.py`):
+1. **Stage A (VLM Pass-Through Protection)**: Preserves MultiIndex headers while normalizing LaTeX symbols (`\pm`, `\times`) and stripping zero-width/OCR artifacts.
+2. **Stage B (Fragment Gate)**: Filters malformed sparse fragments ($>30$ columns with $<30\%$ fill).
+3. **Stage C (Header Detection & SMART Flattening)**: Detects scientific header rows and flattens multi-level headers using **SMART** hierarchical lineage (`Category > Subcategory > Field [Unit]`) with parent-child deduplication.
+4. **Stage D (Cell & Sub-Row Expansion)**: Splits horizontally squeezed numeric cells (`expand_squeezed_columns`), expands multiline sub-rows, and forward-fills stratigraphic/sample section headers.
+5. **Stage E (Formula-Injection Defense & Type Inference)**: Safely infers ints/floats (preserving long numeric IDs $>15$ digits as strings to avoid IEEE 754 truncation) and escapes leading `=`, `+`, `-`, `@` cells with `'`.
+6. **Stage F (Noise, Paywall & olmOCR 2 Footnote Isolation)**: Strips `Unnamed` placeholders, publisher boilerplate, and paywall stubs; isolates `* p < 0.05`, `Note:`, `注:` lines into `df.attrs['footnotes']` while protecting numbered data rows (`NA`, `BDL`, `Na`).
+7. **Stage G (Label & Bilingual Caption Normalization)**: Standardizes table labels (`Table 1`, `Table S1`, `表1`) and preserves full English/Chinese captions.
+
+### 5. Multi-Page Continuation Merging (MinerU 4-Way & DeepDoc Monotone DP)
+
+- **MinerU 4-Way Joint Detection**: Combines column-name Jaccard similarity, page-width alignment, header consistency, and continuation cues (`Table 1 (continued)`, `表1（续）`, `cont'd`, `续上表`) with small-table ($<3$ rows) protection.
+- **DeepDoc / MinerU 3-Way Monotone DP Column Alignment**: Preserves left-to-right column order via `(i-1, j-1)`, `(i, j-1)`, and `(i-1, j)` state transitions, handling continuation fragments with extra or omitted columns as well as horizontal split tables (`Part 1` + `Part 2`).
+- **Safe Non-Alignment Policy**: When repeated row identifiers are insufficient to verify horizontal correspondence, separate fragments are intentionally preserved rather than blindly concatenated by row index.
+
+### 6. OmniDocBench Standardization & LLM Semantic Equivalence Gate
+
+- **OmniDocBench (`CVPR 2025`, `omnidocbench.py`)**: Computes TEDS, interpolated PR-curve detection mAP (`IoU@0.50`, `0.75`, `0.50:0.95`), and end-to-end table recall across academic, textbook, and financial categories.
+- **LLM Reasoner & Semantic Equivalence Gate (`llm_reasoner.py`, `arXiv 2603.18652`)**: Supports OpenAI-compatible APIs, **key-free local endpoints** (`localhost` Ollama, vLLM, LMDeploy, SGLang), and **Agent Bridge** (`agent_bridge.py`). Every LLM-repaired table must pass 3-dimensional semantic equivalence verification (`information_completeness`, `header_semantic_fidelity`, `row_tuple_integrity`) to prevent "structure fixed, semantics broken".
+
+### 7. Publication-Grade Excel Export (`CellRichText` Sub/Superscripts)
+
+- **`openpyxl` `CellRichText` Rendering**: Renders scientific notation and chemical formulas natively (`10^{-3}`, `CaCO_3`, `H_2O`, `Fe^{3+}`) while leaving pure numeric cells untouched so Excel formulas (`SUM`, `AVERAGE`) work out of the box.
+- **Publication Styling & QuickLook Metadata**: Bold white-on-navy headers, subtle zebra striping, 200-row sampled autofit column widths, Dublin Core properties (instant macOS Finder QuickLook & Windows Explorer preview), and automatic footnote blocks below each table.
+- **Atomic & Collision-Safe Output**: Supports per-table workbooks (`Table 1.xlsx` + `table_captions.txt`) or `--single-file` multi-sheet workbooks, with `_v2`/`_v3` disk-collision avoidance.
+
+### 8. Full-Library Batch Concurrency & Industrial Robustness
+
+- **WAL-Safe SQLite Snapshots**: Clones `zotero.sqlite` along with `-wal`/`-shm` journals into temporary snapshots (`copy_sqlite_snapshot`), eliminating `database is locked` errors even while Zotero is open.
+- **Pre-Analysis & Subprocess Isolation (`batch_planner.py` + `batch_run.py`)**: Pre-resolves DOIs/URLs/years/publishers across worker threads, then runs each paper in an isolated subprocess with configurable timeouts (`--timeout 300`), `--resume` skipping, and `--recheck` label-coverage auditing.
+
+### 9. Optional PyZotero & Zotero-Better-Notes Ecosystem Sync
+
+- **Opt-In by Default (`ZOTERO_SYNC_ENABLED=false`)**: Remains lightweight and strictly local unless enabled via `config.json` or `--sync-zotero`.
+- **Attachment & Rich-Note Sync (`zotero_sync.py`)**: Resolves parent Zotero item keys via WAL-safe SQLite lookup, attaches generated `.xlsx` files as child attachments via PyZotero, and creates `📊 Extracted Tables (N tables)` rich-HTML preview notes compatible with **Zotero-Better-Notes** (plus a local `_better_notes.html` fallback).
+
+---
+
+## 🏗 Architecture & Data Flow
 
 ```mermaid
 flowchart TD
-    subgraph S1["1. 任务入口与调度层"]
-        IN["用户输入<br/>• Zotero 条目 / 本地 PDF<br/>• 批量目录 / 清单 .txt<br/>• 在线 URL / DOI"] --> CLI["主 CLI 调度器<br/>extract_zotero_table.py"]
-        BATCH["全库批量总控<br/>batch_run.py"] -->|进程隔离并发| CLI
-        PLAN["批量规划器<br/>batch_planner.py"] -->|预分析元数据| BATCH
+    subgraph S1["1. Entry, Pre-Check & Scheduling"]
+        IN["Inputs<br/>• Zotero Item / Local or Remote PDF<br/>• Directory / .txt Path List<br/>• Article URL / DOI"] --> CLI["Main CLI Dispatcher<br/>extract_zotero_table.py"]
+        BATCH["Full-Library Batch Runner<br/>batch_run.py"] -->|Subprocess Isolation| CLI
+        PLAN["Batch Pre-Planner<br/>batch_planner.py"] -->|Metadata & Year Gate| BATCH
+        CLI --> ORI["Tier-1 Lossless Orientation<br/>doc_orientation_detector.py<br/>(Vector Dir + TurboOCR doc_ori.onnx)"]
     end
 
-    subgraph S2["2. 在线 HTML 提取管线 (优先尝试)"]
-        CLI -->|解析元数据| DOI["元数据探针<br/>doi_resolver.py"]
-        DOI --> ROUTE{"在线路由分流<br/>graph.py"}
-        ROUTE -->|Elsevier专线| ELS["Elsevier XOCS XML 专线<br/>100% 零误差 XML"]
-        ROUTE -->|知网专线| CNKI["CNKI 提取引擎<br/>Scrapling / Playwright"]
-        ROUTE -->|通用期刊| GEN["通用 HTML 提取<br/>Springer / Wiley / MDPI"]
-        ROUTE -->|备用通道| FC["Firecrawl / Scrapling 备用"]
+    subgraph S2["2. Online HTML / XML Track (Tiered Race)"]
+        ORI -->|Online Enabled| DOI["Metadata & Link Probe<br/>doi_resolver.py (WAL / Crossref / chndoi)"]
+        DOI --> RACE{"Tiered Racing Router<br/>online/graph.py"}
+        RACE -->|Tier-1 Authoritative| XML["arXiv HTML / ar5iv<br/>NCBI PMC JATS XML<br/>Elsevier XOCS XML (+InstToken)"]
+        RACE -->|Tier-1/2 Web & OA| WEB["DirectHTTP / curl_cffi / Unpaywall<br/>Crawl4AI / OA-Gated Firecrawl / Scrapling"]
+        RACE -->|Tier-3 Shared Browser| PW["Playwright & CNKI Extractors<br/>DevToolsActivePort CDP + Port Guard<br/>6-Slot Tab Lock + BrowserSkill(bsk)"]
+        RACE -->|Tier-4 Tail| TAIL["Europe PMC / Crossref / PaperFetch<br/>BrowserAct + Supp Downloader"]
     end
 
-    subgraph S3["3. 本地 PDF 提取管线 (深度兜底)"]
-        CLI -->|无在线源或漏表| PTE["本地 PDF 提取总控<br/>pdf_table_extractor.py"]
-        PTE --> INSP["PDF 预审 约80ms<br/>pdf-inspector / PyMuPDF"]
-        INSP --> TYPE{"PDF 类型判别"}
-        
-        TYPE -->|文本版| VOTE["7 引擎多方投票体系<br/>• pdf-inspector (结构树/MD)<br/>• PyMuPDF find_tables<br/>• GMFT (TATR 复合表头)<br/>• img2table (纯OpenCV免GS)<br/>• text_alignment 坐标对齐<br/>• pdfplumber 线条分析<br/>• Camelot 双策略"]
-        VOTE --> CHECK{"双向相似度核验"}
-        
-        CHECK -->|高置信度共识| IR["Table IR 领域模型<br/>ExtractedTable"]
-        CHECK -->|低置信度争议| PP["版面粗定位与切图<br/>PP-StructureV3 / DocLayout-YOLO"]
-        
-        TYPE -->|扫描版或复杂排版| PP
-        PP --> VL["视觉多模态大模型重构<br/>• 首选在线: PaddleOCR-VL-1.6<br/>• 离线备用: IBM Docling (TableFormer)"]
-        VL --> IR
+    subgraph S3["3. Local PDF Track (Structured Primary + Consensus + Visual AI)"]
+        ORI -->|PDF-only or Incomplete Online| PTE["PDF Extraction Controller<br/>pdf_table_extractor.py"]
+        PTE --> INSP["Multi-Signal Mining & Ledger<br/>pdf-inspector + Captions + Vectors + Continuations"]
+        INSP --> TYPE{"PDF Type"}
+
+        TYPE -->|Native| FAST["Fast-Path & Primary Extraction<br/>1. Tagged PDF / PDF-UA Structure Tree<br/>2. MinerU (CLI + REST / flash-extract)<br/>3. Local Numeric Gate (table_validator.py)"]
+        FAST -->|Pass & Complete| IR["Table IR Model<br/>models.py (ExtractedTable)"]
+        FAST -->|Uncovered / Gate Fail / Legacy| VOTE["9-Engine Consensus Voting<br/>pdf-inspector • PyMuPDF4LLM • find_tables<br/>GMFT • img2table • Camelot • pdfplumber<br/>RapidTable • text_alignment<br/>+ IBM TEDS Topology Arbitration"]
+        VOTE --> CHECK{"Consensus & Validation"}
+        CHECK -->|Valid| IR
+        CHECK -->|Low Confidence / Unresolved| STAGE1
+
+        TYPE -->|Scanned| VLM_FULL["PaddleOCR-VL-1.6 Full-Page<br/>(Docling Offline Fallback)"] --> IR
+        STAGE1["Stage 1: RapidTable ONNX Rescue"] -->|Unresolved| STAGE2["Stage 2: Layout Ensemble + VLM<br/>DocLayout-YOLO + PP-DocLayoutV3 / PP-StructureV3<br/>→ PaddleOCR-VL-1.6 / TeleOCR (vLLM)"]
+        STAGE2 -->|Unresolved / Offline| STAGE3["Stage 3: IBM Docling (TableFormer)<br/>Local CPU / Metal Takeover"]
+        STAGE1 -->|Resolved| IR
+        STAGE2 -->|Resolved| IR
+        STAGE3 --> IR
     end
 
-    ELS --> IR
-    CNKI --> IR
-    GEN --> IR
-    FC --> IR
+    XML --> MERGE_ON["Online-PDF Completeness &<br/>Complementary Merge"]
+    WEB --> MERGE_ON
+    PW --> MERGE_ON
+    TAIL --> MERGE_ON
+    IR --> MERGE_ON
 
-    subgraph S4["4. 质量门禁与自愈闭环"]
-        IR --> VAL{"表格质检门禁<br/>table_validator.py"}
-        VAL -->|质检通过| POST["7 阶轻量安全后处理 (table_postprocess.py)<br/>① VLM直通清洗  ② 碎片表过滤<br/>③ 复合表头重塑  ④ 多数值/多行展开<br/>⑤ 类别标签填充  ⑥ 公式转义与类型推断<br/>⑦ 噪声/付费墙清除"]
-        VAL -->|质检异常| HEAL["自愈挽救闭环<br/>agent_bridge / llm_reasoner"]
-        HEAL --> POST
+    subgraph S4["4. Post-Processing, Stitching, Export & Sync"]
+        MERGE_ON --> POST["7-Stage Post-Processing (table_postprocess.py)<br/>• MultiIndex & LaTeX Cleaning • SMART Headers<br/>• Squeezed/Subrow Expansion • Formula Defense<br/>• olmOCR 2 Footnotes • Bilingual Captions"]
+        POST --> CONT["Continuation & Split Merging<br/>MinerU 4-Way + DeepDoc Monotone DP"]
+        CONT --> LLM["Optional LLM Reasoner & Equivalence Gate<br/>(arXiv 2603.18652 / Local or Cloud LLM)"]
+        LLM --> EXP["Excel Export (excel_export.py)<br/>• openpyxl CellRichText Sub/Superscripts<br/>• Autofit Widths • Dublin Core • Atomic Write"]
+        EXP --> OUT["🎯 Publication-Grade .xlsx Workbooks"]
+        OUT --> SYNC["🔄 Optional Zotero Sync (zotero_sync.py)<br/>PyZotero Attachment + Better-Notes Card"]
     end
-
-    subgraph S5["5. 跨页拼接、成果导出与生态联动"]
-        POST --> MERGE["跨页续表合并引擎<br/>• DeepDoc/MinerU 单调DP列对齐<br/>• 纵向跨页拼接 + 横向分块合并"]
-        MERGE --> EXP["规范化 Excel 导出 (excel_export.py)<br/>• 自适应列宽采样<br/>• 注入 Dublin Core 预览元数据<br/>• 主题配色与斑马纹排版"]
-        EXP --> OUT["🎯 最终出版级 Excel 产物 (.xlsx)<br/>附带标准表号与完整中英文表题"]
-        OUT --> SYNC["🔄 Zotero 生态联动 (可选)<br/>• 挂载 .xlsx 子附件<br/>• 生成 Better-Notes 预览笔记"]
-        EXP --> AUDIT["全周期质量审计<br/>verify_tables.py / audit_reporter.py"]
-    end
-
-    style S1 fill:#eff6ff,stroke:#3b82f6,stroke-width:1px
-    style S2 fill:#ecfdf5,stroke:#10b981,stroke-width:1px
-    style S3 fill:#fffbeb,stroke:#f59e0b,stroke-width:1px
-    style S4 fill:#fef2f2,stroke:#ef4444,stroke-width:1px
-    style S5 fill:#f0fdf4,stroke:#14b8a6,stroke-width:1px
-    style OUT fill:#dcfce7,stroke:#22c55e,stroke-width:2px
 ```
 
-> **说明**：项目工程中提供了更加详尽的原生矢量全景架构图源文件，可使用 draw.io 打开并编辑：  
+> **Vector Architecture Source**: Editable draw.io source and high-resolution exports are stored under `figures/`:
 > - 📄 [figures/zotero_table_extractor_architecture.drawio](figures/zotero_table_extractor_architecture.drawio)
 > - 🖼 [figures/zotero_table_extractor_architecture.svg](figures/zotero_table_extractor_architecture.svg)
 > - 🖼 [figures/zotero_table_extractor_architecture.png](figures/zotero_table_extractor_architecture.png)
+>
+> <details>
+> <summary>Legacy v1.6.0 Reference Diagram (Chinese draw.io export — see the v1.9.7 Mermaid flowchart above for the latest architecture)</summary>
+>
+> <p align="center">
+>   <img src="figures/zotero_table_extractor_architecture.svg" alt="Zotero Table Extractor v1.6.0 Architecture Diagram" width="100%" />
+> </p>
+>
+> </details>
 
 ---
 
-## 💻 环境要求与安装
+## 💻 Requirements & Installation
 
-### 1. 基础环境
-- **操作系统**：macOS (Apple Silicon / Intel)、Linux、Windows 10/11
-- **Python 版本**：Python 3.9 及以上（推荐 Python 3.10 或 3.11）
-- **包管理器**：推荐使用极速包管理器 [uv](https://github.com/astral-sh/uv) 或原生 `pip`
+### 1. System Requirements
+- **OS**: macOS (Apple Silicon / Intel), Linux, Windows 10/11
+- **Python**: Python 3.9+ (Python 3.10 or 3.11 recommended)
+- **Package Manager**: [uv](https://github.com/astral-sh/uv) (recommended) or `pip`
 
-### 2. 系统底层依赖（可选但推荐）
-若需要启用 Camelot 的 PDF 提取支持，建议安装 Ghostscript：
-- **macOS**：
+### 2. Optional System Dependencies
+Needed only if you want `Camelot` or `tesseract`-backed OCR fallbacks (`img2table` works pure-Python without Ghostscript):
+- **macOS**:
   ```bash
   brew install ghostscript tesseract
   ```
-- **Ubuntu / Debian**：
+- **Ubuntu / Debian**:
   ```bash
   sudo apt update && sudo apt install -y ghostscript libgl1-mesa-glx tesseract-ocr
   ```
-- **Windows**：
-  可通过安装 [Ghostscript 官方安装包](https://ghostscript.com/releases/gsdnld.html) 并将其 `bin` 路径加入系统环境变量 `PATH`。
+- **Windows**: Install [Ghostscript](https://ghostscript.com/releases/gsdnld.html) and add its `bin` directory to `PATH`.
 
-### 3. 安装 Python 依赖
-
-克隆本仓库到本地后，在根目录下安装核心依赖：
+### 3. Install Python Dependencies
 
 ```bash
 git clone https://github.com/ZRyanX/zotero-table-extractor.git
 cd zotero-table-extractor
 
-# 推荐使用 uv 极速安装
+# Core dependencies (recommended with uv)
 uv pip install -r requirements.txt
-
-# 或使用标准 pip
+# Or standard pip
 pip install -r requirements.txt
 ```
 
-### 4. 安装 Playwright 浏览器内核（用于在线期刊渲染）
+Optional enhanced engines commented in `requirements.txt` (`gmft`, `img2table`, `pymupdf4llm`, `rapid-table`, `rapidocr`, `table-structure-rec`, `pyzotero`, `scrapling`, `crawl4ai`) can be installed as needed—the pipeline degrades gracefully if any optional package is absent.
+
+### 4. Install Playwright Browser Runtime (for Dynamic Publisher Pages)
+
 ```bash
 playwright install chromium
 ```
 
-### 5. 本地视觉模型准备
-项目在 `models/` 目录下默认配备了 `doclayout_yolo_docstructbench_imgsz1280_2501.onnx`（约 72.8MB）。若未找到，脚本会在首次运行检测时自动从 Hugging Face 或 hf-mirror 镜像源高速下载，或可手动放置于 `models/` 或 `~/.zotero_models/`。
+### 5. Local ONNX Visual & Orientation Models
+
+The repository ships with `models/doclayout_yolo_docstructbench_imgsz1280_2501.onnx` and `models/doc_ori.onnx`. To verify integrity or auto-download missing weights anytime:
+
+```bash
+python setup_paths.py --download-models
+```
 
 ---
 
-## ⚙️ 配置指南
+## 🔧 Configuration Guide
 
-### 1. 跨平台路径与环境交互式配置向导（强烈推荐）
-
-本项目提供了开箱即用的跨平台路径自定义与环境初始化脚本 `setup_paths.py`，无论您使用的是 macOS 还是 Windows，均可直接运行该向导，自动探测 Zotero 安装与数据路径，并自定义所有输入输出目录：
+### 1. Cross-Platform Interactive Setup Wizard (`setup_paths.py`)
 
 ```bash
-# 1. 启动交互式引导向导（推荐）
+# Interactive setup wizard (recommended)
 python setup_paths.py
 
-# 2. 或一键自动探测并保存系统推荐默认路径
+# Non-interactive auto-detection of Zotero & output paths
 python setup_paths.py --auto
 
-# 3. 随时检查当前各项路径配置与有效性状态
+# Inspect current configuration & path validity
 python setup_paths.py --show
 
-# 4. 如需重置为官方空白模板
+# Reset config.json to config.example.json (creates a backup first)
 python setup_paths.py --reset
 ```
 
-> **💡 向导特性**：
-> - 自动探测 macOS (`~/Zotero`) 与 Windows (`%USERPROFILE%\Zotero`) 数据库及附件库；
-> - 支持自定义表格 Excel 导出主目录（如外置硬盘、指定数据盘 `D:\paper_tables` 或工程目录）；
-> - 自动校验输入路径合法性，并支持一键自动创建缺失的输出目录；
-> - 可选在向导中直接配置飞桨 AIStudio、Elsevier、Firecrawl 等在线 API 密钥；
-> - 配置安全写入受 `.gitignore` 严密保护的 `config.json`，绝不污染 Git 提交。
+### 2. Manual Configuration (`config.json`)
 
-### 2. 配置文件手动初始化 (config.json)
-
-如果您希望手动编辑配置文件，可在项目根目录下复制模板：
+Copy the template and fill in only the keys you need:
 
 ```bash
 cp config.example.json config.json
 ```
 
-> [!IMPORTANT]  
-> **隐私与安全保护**：`config.json` 包含您的私有 API 密钥与个人用户目录，已被 `.gitignore` 保护，**严禁提交入库**。上传代码前请确保所有个人信息均留在未跟踪的 `config.json` 中。
+> [!IMPORTANT]
+> **Credential Protection**: `config.json` and `profiles/` are ignored by `.gitignore` and blocked by `scripts/package_release.py` and `update.py`. Never commit `config.json` or browser session folders.
 
-### 3. 环境变量优先支持
-所有关键 API 密钥与路径均支持通过系统环境变量直接注入，非常适合在 CI/CD、Docker 或受保护的服务器环境中使用：
-- `export PAPER_TABLES_DIR="/path/to/your/output"`
-- `export ZOTERO_DIR="/path/to/your/Zotero"`
-- `export FIRECRAWL_API_KEY="your-firecrawl-api-key"`
-- `export ELSEVIER_API_KEY="your-elsevier-api-key"`
-- `export PADDLEOCR_ACCESS_TOKEN="your-aistudio-access-token"`
-- `export OPENAI_API_KEY="your-llm-api-key"`
+### 3. Environment Variables & Companion Credential Discovery
 
-### 4. 详细配置项说明
+Key credentials and runtime switches can be injected via environment variables (which override `config.json`):
+- `PAPER_TABLES_DIR`, `ZOTERO_DIR`, `ZOTERO_ATTACHMENTS_BASE_DIR`
+- `ELSEVIER_API_KEY`, `ELSEVIER_INSTTOKEN`, `IS_CAMPUS_NETWORK`
+- `UNPAYWALL_EMAIL`, `CROSSREF_EMAIL`, `OPENALEX_API_KEY`, `CORE_API_KEY`
+- `FIRECRAWL_API_KEY`, `PADDLEOCR_ACCESS_TOKEN` / `PADDLEOCR_MCP_AISTUDIO_ACCESS_TOKEN`
+- `MINERU_TOKEN`, `MINERU_API_KEY`, `MINERU_API_BASE`, `MINERU_USE_CLI`, `MINERU_CLI_PATH`, `MINERU_MODEL`, `MINERU_AGENT_BACKEND`, `MINERU_POLL_TIMEOUT`, `MINERU_TABLE_MERGE_ENABLE`
+- `TELEOCR_API_BASE`, `TELEOCR_MODEL`, `TELEOCR_API_KEY`
+- `OCR_ENGINE`, `DOCLAYOUT_ENGINE`, `DOCLING_ENABLED`, `DOCLING_OFFLINE_FALLBACK`, `GMFT_ENABLED`, `IMG2TABLE_ENABLED`
+- `OPENAI_API_KEY` / `LLM_API_KEY`, `OPENAI_API_BASE` / `LLM_API_BASE`, `LLM_MODEL`, `LLM_TABLE_REASONER_ENABLED`
+- `ZOTERO_SYNC_ENABLED`, `ZOTERO_API_KEY`, `ZOTERO_USER_ID`, `ZOTERO_LIBRARY_TYPE`, `ZOTERO_BETTER_NOTES_ENABLED`, `ZOTERO_AUTO_ATTACH_XLSX`
+- Optional switches: `USE_LEGACY_VOTING=true` (bypass MinerU primary extraction and run 9-engine voting), `USE_DOC_ORIENTATION_CLASSIFY`, `RAPID_TABLE_UNITABLE=0`, `AGENT_BRIDGE_DIR`
 
-以下是 `config.json` 中的完整参数列表及说明：
+If left empty in `config.json` and env vars, `scripts/common.py` also safely checks companion academic tool configs (`~/.scansci-pdf/config.json`, `~/.journal_supp_downloader_profile/config.json`, `journal-supp-downloader/.env`) unless `ZTE_DISABLE_COMPANION_CREDS=1` is set.
 
-| 配置 Key | 类型 | 默认值 / 推荐值 | 作用说明 |
+### 4. Configuration Reference
+
+| Key | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `PAPER_TABLES_DIR` | string | `~/paper_tables` | 表格提取成果、批处理日志与质检数据库的主输出目录 |
-| `ZOTERO_DIR` | string | `~/Zotero` | 本地 Zotero 数据主目录（Windows 对应 `%USERPROFILE%\Zotero`） |
-| `ZOTERO_DB_PATH` | string | `<ZOTERO_DIR>/zotero.sqlite` | Zotero 核心 SQLite 数据库物理文件路径 |
-| `ZOTERO_STORAGE_DIR` | string | `<ZOTERO_DIR>/storage` | Zotero 论文 PDF 物理附件存储根目录 |
-| `PLAYWRIGHT_USER_DATA_DIR` | string | `~/.zotero_playwright_profile` | 浏览器 Profile 目录（持久化知网与期刊登录 Cookie 会话） |
-| `DOCLAYOUT_MODEL_DIR` | string | `"./models"` | 本地离线 DocLayout-YOLO 模型权重存放目录 |
-| `FIRECRAWL_CACHE_DIR` | string | `~/.zotero_firecrawl_cache` | 网页提取离线缓存目录 |
-| `SUPP_DOWNLOADER_SCRIPT` | string | `""` | [可选] 外部附表下载技能脚本路径 (`journal_downloader.py`) |
-| `PADDLEOCR_MCP_AISTUDIO_ACCESS_TOKEN` | string | `""` | 百度 AIStudio 访问令牌，用于调度 PP-StructureV3 与 PaddleOCR-VL-1.6 |
-| `PADDLEOCR_MCP_MODEL` | string | `"PaddleOCR-VL-1.6"` | 视觉语言大模型名称 |
-| `PP_STRUCTURE_MODEL` | string | `"PP-StructureV3"` | 版面分析与表格定位模型名称 |
-| `USE_PP_STRUCTURE` | boolean | `true` | 是否启用 PP-Structure 作为表格前置定位 |
-| `ELSEVIER_API_KEY` | string | `""` | Elsevier 机构官方 API Key，用于直取 ScienceDirect 原生 XOCS XML |
-| `FIRECRAWL_API_KEY` | string | `""` | Firecrawl 智能爬虫 API Key（用于通用网页清洗） |
-| `FIRECRAWL_MAX_AGE_MS` | int | `86400000` | Firecrawl 网页缓存生命周期（毫秒，默认 24h） |
-| `CNKI_STRATEGY` | string | `"auto"` | 知网提取策略：`auto`（自动尝试）、`scrapling`、`playwright` |
-| `CDP_URL` | string | `""` | 通用浏览器 CDP 远程调试连接地址（为空时自动按 DevToolsActivePort 动态探测或 9222 兜底） |
-| `PLAYWRIGHT_HEADED` | boolean | `false` | 是否以可见窗口启动浏览器（调试或人工验证时设为 `true`） |
-| `DOCLAYOUT_YOLO_ENABLED` | boolean | `true` | 是否启用本地 DocLayout-YOLO 视觉版面检测兜底 |
-| `DOCLAYOUT_CONF_THRESHOLD` | float | `0.25` | YOLO 目标检测置信度阈值 |
-| `DOCLING_ENABLED` | boolean | `true` | 是否启用 IBM Docling (TableFormer) 深度表格提取引擎 |
-| `DOCLING_OFFLINE_FALLBACK` | boolean | `true` | 是否在 PaddleOCR 离线/受阻时启用 Docling 作为备用降级 |
-| `GMFT_ENABLED` | boolean | `true` | 是否启用 GMFT (TATR Transformer) 参与 Native PDF 多方投票 |
-| `IMG2TABLE_ENABLED` | boolean | `true` | 是否启用 img2table 纯 OpenCV 方案参与 Native PDF 多方投票 |
-| `OCR_ENGINE` | string | `"auto"` | 首选 OCR/VLM 引擎 (`auto`, `paddleocr`, `docling`, `mineru`) |
-| `MINERU_USE_CLI` | string | `"auto"` | MinerU 执行方式：`auto`（优先 CLI，失败自动回退 REST API）、`cli`、`api` |
-| `MINERU_CLI_PATH` | string | `""` | 可选自定义 `mineru-open-api` 可执行文件路径 |
-| `MINERU_TOKEN` | string | `""` | MinerU API Token（亦支持自动读取 `~/.mineru/config.yaml`） |
-| `ZOTERO_SYNC_ENABLED` | boolean | `false` | 是否启用 PyZotero 与 Better-Notes 生态联动（默认严格保持关闭） |
-| `ZOTERO_API_KEY` | string | `""` | Zotero 官方 Web API 访问密钥（用于挂载附件与笔记） |
-| `ZOTERO_USER_ID` | string | `""` | Zotero 个人用户 ID 或群组 ID |
-| `ZOTERO_LIBRARY_TYPE` | string | `"user"` | Zotero 库类型 (`user` 或 `group`) |
-| `ZOTERO_BETTER_NOTES_ENABLED` | boolean | `true` | 生态联动时是否在条目下生成 Better-Notes 规范富文本预览笔记 |
-| `ZOTERO_AUTO_ATTACH_XLSX` | boolean | `true` | 生态联动时是否将导出的 Excel 文件作为子附件挂载至对应条目 |
-| `LLM_ENABLED` | boolean | `false` | 是否启用 LLM 辅助自愈与复杂语义推断 |
-| `LLM_API_BASE` | string | `"https://api.openai.com/v1"` | LLM 服务端点地址（兼容 OpenAI 规范） |
-| `LLM_API_KEY` | string | `""` | LLM 身份认证密钥 |
-| `LLM_MODEL` | string | `"gpt-4o-mini"` | LLM 纠错选用的模型名称 |
+| `PAPER_TABLES_DIR` | string | `""` | Default root directory for exported `.xlsx` tables and batch logs |
+| `ZOTERO_DIR` / `ZOTERO_DB_PATH` / `ZOTERO_STORAGE_DIR` | string | `""` | Local Zotero data folder, `zotero.sqlite`, and `storage/` paths |
+| `SUPP_DOWNLOADER_SCRIPT` | string | `""` | Optional path to external `journal_downloader.py` supplementary fetcher |
+| `ELSEVIER_API_KEY` / `ELSEVIER_INSTTOKEN` | string | `""` | Elsevier Developer API key and institutional token (`X-ELS-InstToken`) |
+| `IS_CAMPUS_NETWORK` | boolean | `false` | Indicates active campus/institutional network access |
+| `UNPAYWALL_EMAIL` / `CROSSREF_EMAIL` | string | `""` | Polite Pool contact emails for Unpaywall and Crossref APIs |
+| `OPENALEX_API_KEY` / `CORE_API_KEY` | string | `""` | Optional OpenAlex and CORE academic search API keys |
+| `FIRECRAWL_API_KEY` | string | `""` | Firecrawl API key (used strictly on confirmed Open-Access papers) |
+| `FIRECRAWL_MAX_AGE_MS` / `FIRECRAWL_PAGE_TIMEOUT_MS` | int | `86400000` / `30000` | Firecrawl cache max age and request timeout (ms) |
+| `FIRECRAWL_CACHE_DIR` / `FIRECRAWL_CACHE_TTL_S` | string / int | `~/.zotero_firecrawl_cache` / `86400` | Local Firecrawl response cache directory and TTL (s) |
+| `CNKI_STRATEGY` | string | `"auto"` | CNKI extraction mode (`auto`, `scrapling`, `playwright`) |
+| `PLAYWRIGHT_HEADED` / `PLAYWRIGHT_EXECUTABLE_PATH` | bool / string | `false` / `""` | Launch visible browser or specify custom Chrome/Chromium binary |
+| `PLAYWRIGHT_USER_DATA_DIR` / `PLAYWRIGHT_USER_DATA_DIR_MAC` / `PLAYWRIGHT_USER_DATA_DIR_WINDOWS` | string | `""` | Persistent browser profile directories for publisher/CNKI cookies |
+| `CDP_URL` / `CRAWL4AI_CDP_URL` | string | `""` | Browser CDP endpoint (auto-discovers `DevToolsActivePort` when empty) |
+| `CRAWL4AI_PAGE_TIMEOUT_MS` / `CRAWL4AI_MAX_CONCURRENT` | int | `45000` / `2` | Crawl4AI timeout (ms) and concurrency limit |
+| `PADDLEOCR_MCP_AISTUDIO_ACCESS_TOKEN` / `PADDLEOCR_MCP_PPOCR_SOURCE` | string | `""` / `"aistudio"` | Baidu AIStudio Access Token and legacy PaddleOCR MCP source metadata (active routing uses `OCR_ENGINE`) |
+| `PADDLEOCR_MCP_MODEL` / `PP_STRUCTURE_MODEL` | string | `"PaddleOCR-VL-1.6"` / `"PP-StructureV3"` | Remote PaddleOCR VLM and layout model names |
+| `UV_INDEX_URL` | string | `"https://pypi.tuna.tsinghua.edu.cn/simple"` | PyPI mirror URL used by `uv`/`pip` fallback installers |
+| `USE_PP_STRUCTURE` | boolean | `true` | Enable online `PP-StructureV3` pre-cropping |
+| `DOCLAYOUT_ENGINE` | string | `"ensemble"` | Local layout detector (`yolo`, `pp_doclayoutv3`, `ensemble`) |
+| `DOCLAYOUT_YOLO_ENABLED` / `PP_DOCLAYOUT_ENABLED` | boolean | `true` / `true` | Toggle DocLayout-YOLO (1280px) and PP-DocLayoutV3 (25-class polygon) |
+| `DOCLAYOUT_MODEL_DIR` / `DOCLAYOUT_CONF_THRESHOLD` | string / float | `"./models"` / `0.25` | Local ONNX model folder and detection confidence threshold |
+| `OCR_ENGINE` | string | `"auto"` | Preferred OCR/VLM engine (`auto`, `paddleocr`, `docling`, `mineru`) |
+| `MINERU_TOKEN` / `MINERU_API_KEY` | string | `""` | MinerU API credentials (synced automatically; also reads `~/.mineru/config.yaml`) |
+| `MINERU_API_BASE` / `MINERU_USE_CLI` / `MINERU_CLI_PATH` | string | `"https://mineru.net"` / `"auto"` / `""` | MinerU endpoint, dispatch mode (`auto`/`cli`/`api`), and CLI binary path |
+| `MINERU_MODEL` / `MINERU_AGENT_BACKEND` | string | `"vlm"` / `"vlm"` | MinerU parsing model (`vlm`, `pipeline`, `html`) and zero-Token Agent backend |
+| `MINERU_ENABLE_FLASH_EXTRACT` / `MINERU_TABLE_MERGE_ENABLE` | boolean | `true` / `true` | Zero-Token `flash-extract` routing & 4-way continuation merge switch |
+| `TELEOCR_API_BASE` / `TELEOCR_MODEL` / `TELEOCR_API_KEY` | string | `""` / `"TeleOCR"` / `""` | Optional TeleOCR vLLM / OpenAI-compatible vision endpoint |
+| `DOCLING_ENABLED` / `DOCLING_OFFLINE_FALLBACK` / `DOCLING_IMAGES_SCALE` | bool / bool / float | `true` / `true` / `2.0` | IBM Docling (TableFormer) engine, offline fallback, and render scale |
+| `GMFT_ENABLED` / `IMG2TABLE_ENABLED` / `PYMUPDF4LLM_ENABLED` / `RAPID_TABLE_ENABLED` | boolean | `true` | Toggle individual local PDF voting/rescue engines |
+| `TEDS_METRIC_ENABLED` / `OMNIDOCBENCH_ENABLED` / `SMART_HEADER_FLATTEN_ENABLED` | boolean | `true` | Enable IBM TEDS arbitration, OmniDocBench metrics, and SMART header flattening |
+| `ARXIV_HTML_ENABLED` / `NCBI_PMC_ENABLED` | boolean | `true` | Prioritize arXiv HTML/ar5iv and NCBI PMC JATS XML native extraction |
+| `LLM_ENABLED` / `LLM_API_BASE` / `LLM_API_KEY` / `LLM_MODEL` / `LLM_TIMEOUT` | mixed | `false` / `"https://api.openai.com/v1"` / `""` / `"gpt-4o-mini"` / `60` | LLM table repair & semantic equivalence verification (supports key-free `localhost`) |
+| `ZOTERO_SYNC_ENABLED` / `ZOTERO_API_KEY` / `ZOTERO_USER_ID` / `ZOTERO_LIBRARY_TYPE` | mixed | `false` / `""` / `""` / `"user"` | Optional PyZotero attachment sync (strictly off by default) |
+| `ZOTERO_BETTER_NOTES_ENABLED` / `ZOTERO_AUTO_ATTACH_XLSX` | boolean | `true` / `true` | Generate Better-Notes preview cards and attach `.xlsx` files when sync is enabled |
 
-### 4. 各种 API 获取方式
+### 5. Obtaining API Keys & CLI Tools
 
-#### 1. 百度飞桨 AIStudio Access Token（强烈推荐，用于 PP-StructureV3 与 PaddleOCR-VL-1.6）
-1. 访问 [百度飞桨 AIStudio](https://aistudio.baidu.com/) 并登录百度账号；
-2. 进入个人中心 -> **访问令牌 (Access Token)** -> 点击 **创建令牌**；
-3. 将生成的 Token 填入 `config.json` 的 `PADDLEOCR_MCP_AISTUDIO_ACCESS_TOKEN`，或导出为环境变量 `PADDLEOCR_ACCESS_TOKEN`。
+- **MinerU (Recommended for Structured PDF Primary Extraction)**: Register at [mineru.net](https://mineru.net/), generate a token in [API Token Management](https://mineru.net/apiManage/token), and optionally install the official CLI:
+  ```bash
+  npm install -g mineru-open-api
+  # or via Go:
+  go install github.com/opendatalab/MinerU-Ecosystem/cli/mineru-open-api@latest
+  mineru-open-api auth
+  ```
+- **Baidu AIStudio (for `PaddleOCR-VL-1.6` & `PP-StructureV3`)**: Sign in at [aistudio.baidu.com](https://aistudio.baidu.com/), create an Access Token in User Center, and set `PADDLEOCR_MCP_AISTUDIO_ACCESS_TOKEN` or `$PADDLEOCR_ACCESS_TOKEN`.
+- **Elsevier ScienceDirect**: Register at [dev.elsevier.com](https://dev.elsevier.com/) to obtain `ELSEVIER_API_KEY` (and institutional `ELSEVIER_INSTTOKEN` if available).
+- **TeleOCR (Optional VLM Endpoint)**: Set `TELEOCR_API_BASE`, `TELEOCR_MODEL`, and optional `TELEOCR_API_KEY` for self-hosted vLLM / OpenAI-compatible vision endpoints.
+- **LLM Endpoints (Optional, for `--enable-llm`)**: Configure any OpenAI-compatible API (`LLM_API_BASE`, `LLM_API_KEY`, `LLM_MODEL`), a key-free local `localhost` endpoint (Ollama, vLLM, LMDeploy, SGLang), or use the built-in Agent Bridge (`agent_bridge.py`).
+- **Firecrawl (Optional)**: Obtain a key at [firecrawl.dev](https://www.firecrawl.dev/) for OA fallback scraping.
 
-#### 2. Elsevier ScienceDirect API Key（推荐高校/科研机构人员配置）
-1. 访问 [Elsevier Developer Portal](https://dev.elsevier.com/) 并注册账号；
-2. 点击 **Create API Key**，输入应用名称与所在机构域名；
-3. 将生成的 API Key 填入 `config.json` 的 `ELSEVIER_API_KEY`。配置后可直接以 100% 数字保真度提取 Elsevier 旗下所有论文的表格。
+### 6. Safe Self-Updating & Config Protection (`update.py`)
 
-#### 3. MinerU API Token 与 Open API CLI（强烈推荐，用于官方高保真结构化表格抽取）
-1. 访问 [MinerU 官方平台](https://mineru.net/) 注册/登录，在 [API Token 管理](https://mineru.net/apiManage/token) 获取 Token；
-2. 安装官方 Open API CLI 工具（支持 npm 或 Go 安装）：
-   ```bash
-   npm install -g mineru-open-api
-   # 或 macOS/Linux (Go):
-   go install github.com/opendatalab/MinerU-Ecosystem/cli/mineru-open-api@latest
-   ```
-3. 运行 `mineru-open-api auth` 绑定 Token，或在 `config.json` 中配置 `"MINERU_TOKEN": "your-token"`；
-4. 安装后，本技能将自动启用 Open API CLI 双引擎调度，由官方 CLI 一键代管文档上传、异步轮询、结果下载与解压，且在无 CLI 环境中无缝平滑回退至纯 Python REST 客户端！
-
-#### 4. Firecrawl API Key（可选）
-1. 访问 [Firecrawl 官网](https://www.firecrawl.dev/) 注册并获取 API Key；
-2. 填入 `config.json` 的 `FIRECRAWL_API_KEY`。
-
-### 5. 技能在线更新与配置防护机制 (update.py)
-
-为了确保用户能够始终享受到上游算法优化与功能修复，同时**绝对杜绝更新时覆盖用户配置好的 API 密钥与个人目录（如 Zotero 数据路径、Excel 导出目录、本地模型等）**，本项目内置了企业级的在线更新与个人配置绝对保护引擎：
-
-#### 🌟 核心防护特性
-1. **零覆盖保证 (Zero-Overwrite)**：无论远端代码如何迭代，现有 `config.json` 中的所有个人凭据（`FIRECRAWL_API_KEY`、`ELSEVIER_API_KEY`、`PADDLEOCR_MCP_AISTUDIO_ACCESS_TOKEN`、`LLM_API_KEY` 等）与个性化路径绝对 100% 保持原样；
-2. **智能双向合并 (Intelligent 2-Way Merge)**：上游 `config.example.json` 若引入了新的特性参数，引擎会自动检测并无缝增量补充进用户的 `config.json` 中，无需用户手动对比复制；
-3. **多版本自动快照与一键回滚 (Rollback)**：每次更新前，系统会在 `.backups/` 目录中建立带时间戳的全量快照与校验 Manifest。如遇异常或需退回，只需一条命令即可毫秒级回滚；
-4. **Git 与 Release 归档双模支持**：
-   - **Git 环境**：自动探测分支、安全 Stash 本地已跟踪修改、执行快进合并；
-   - **免 Git / ZIP 部署环境**：自动从 GitHub Releases / Archive 拉取最新稳定归档包，遵循白名单过滤机制，绝对屏蔽并保护 `config.json`、`profiles/`、本地模型与用户数据库；
-5. **凭据脱敏核验单**：更新后在终端高亮打印脱敏核验清单，直观确认各项私有密钥毫发无损。
-
-#### 常用更新命令参考
+Upgrade safely via Git or GitHub Release archives without ever overwriting your personal `config.json`, API keys, browser profiles, or custom paths:
 
 ```bash
-# 1. 一键在线安全更新（自动检测、安全拉取、配置智能合并）
-python update.py
-# 或通过配置向导调用：
-python setup_paths.py --update
-
-# 2. 仅检查远端是否有新版本及本地是否缺失新配置项（只读安全探测）
-python update.py --check
-# 或：
-python setup_paths.py --check-update
-
-# 3. 演练模式（Dry-run 模拟更新全流程，不修改任何磁盘文件）
-python update.py --dry-run
-
-# 4. 回滚至最近一次备份的配置状态
-python update.py --rollback
-
-# 5. 列出所有历史配置快照列表
-python update.py --list-backups
-
-# 6. 仅同步 config.example.json 最新模板项进 config.json（不拉取代码）
-python update.py --merge-only
-
-# 7. 更新后自动升级 Python 运行依赖
-python update.py --install-deps
-
-# 8. 以结构化 JSON 输出结果（专为 Agent、MCP 工具与自动化脚本设计）
-python update.py --check --json
+python update.py                 # Safe online update + 2-way config merge + automatic snapshot
+python update.py --check         # Read-only check for remote updates and new config keys
+python update.py --dry-run       # Simulate update without writing to disk
+python update.py --rollback      # Roll back config.json to the latest backup snapshot
+python update.py --list-backups  # List available configuration snapshots
+python update.py --merge-only    # Merge new keys from config.example.json without pulling code
+python update.py --check --json  # Machine-readable JSON output for agents/CI
 ```
 
-### 6. 期刊与知网登录向导 (login.py)
+### 7. Publisher & CNKI Login Wizard (`login.py`)
 
-为了让爬虫能够下载或查看机构订阅的高校数据库（如知网、Springer、Wiley），项目提供了统一的交互式登录与 Cookie 保持向导：
+For institutional subscriptions without an active Chrome/Edge CDP debugging session:
 
 ```bash
-# 1. 知网快捷登录并自动抓取保存 Cookies
-python scripts/login.py cnki
-
-# 2. 主流学术出版社 Chrome 调试端口桥接登录
-python scripts/login.py publishers
-
-# 3. Crawl4AI 模式登录
-python scripts/login.py crawl4ai
+python scripts/login.py cnki        # Interactive CNKI login & cookie capture
+python scripts/login.py publishers  # Chrome CDP bridge login for international publishers
+python scripts/login.py crawl4ai    # Stealth Crawl4AI login & cookie export
 ```
-
-登录完成后，Cookies 会自动持久化到本地用户配置目录，后续提取管线将全自动复用已登录会话。
 
 ---
 
-## 🚀 使用方法
+## 🚀 Usage
 
-### 单篇 PDF 表格提取
-
-最基础的用法，直接传入本地 PDF 路径并指定输出路径：
+### Single PDF Extraction
 
 ```bash
+# Extract all tables to per-table .xlsx files + table_captions.txt
 python scripts/extract_zotero_table.py \
   --pdf "/path/to/paper.pdf" \
   --output "/path/to/output_dir"
+
+# Export into a single multi-sheet workbook with LLM semantic header repair
+python scripts/extract_zotero_table.py \
+  --pdf "/path/to/paper.pdf" \
+  --output "/path/to/tables.xlsx" \
+  --single-file \
+  --enable-llm
+
+# Skip publisher web scraping and run the PDF extraction pipeline directly
+python scripts/extract_zotero_table.py --pdf "/path/to/paper.pdf" --output "/path/to/output_dir" --pdf-only
+
+# Online HTML/XML only (no local PDF fallback)
+python scripts/extract_zotero_table.py --pdf "/path/to/paper.pdf" --output "/path/to/output_dir" --online-only
+
+# Specify preferred OCR/VLM engine, disable online concurrent racing, or sync back to Zotero
+python scripts/extract_zotero_table.py \
+  --pdf "/path/to/paper.pdf" \
+  --output "/path/to/output_dir" \
+  --ocr-engine mineru \
+  --sequential \
+  --sync-zotero
 ```
 
-**高级选项参数**：
-- `--single-file`：启用单文件汇总模式，将整篇论文所有表格输出至单个 `.xlsx` 文件的多个 Sheet 中（也可直接将 `--output` 指定为以 `.xlsx` 结尾的文件路径）；
-- `--enable-llm`：开启 LLM 复杂语义推断与表格残损自愈（需在 `config.json` 或环境变量中配置 `OPENAI_API_KEY` 或兼容服务）；
-- `--headers "Col1,Col2,Col3"`：手动指定或修正表头列名；
-- `--table-idx 0`（或 `all`）：仅提取第 1 张表（从 0 开始），或提取全部表格；
-- `--pdf-only`：跳过任何在线探测，强制走本地 PDF 深度提取流水线；
-- `--online-only`：仅尝试在线 HTML/XML 抓取，不回退本地提取；
-- `--sync-zotero`：启用 PyZotero 与 Better-Notes 生态联动（将提取产物自动挂载至 Zotero 条目子附件并生成预览笔记）；
-- `--ocr-engine auto`：指定 OCR/VLM 解析引擎首选项（可选 `auto`, `paddleocr`, `docling`, `mineru`）；
-- `--zotero-api-key <key>`：命令行覆盖注入 Zotero Web API Key；
-- `--zotero-user-id <id>`：命令行覆盖注入 Zotero 用户/群组 ID；
-- `--skip-supplementary`：跳过附表/附录表格，仅提取正文核心表格；
-- `--headed`：使用有头浏览器排查知网等在线渲染问题。
-
-### 在线文献 URL / DOI 提取
-
-无需提前下载 PDF，直接传入在线文献 URL 或 DOI：
+### Online Article URL / DOI Extraction
 
 ```bash
-# 通过 DOI 直接提取
+# Pass an article or DOI URL directly
 python scripts/extract_zotero_table.py \
-  --pdf "10.1016/j.precamres.2021.106450" \
+  --pdf "https://doi.org/10.1016/j.precamres.2021.106450" \
   --output "./output"
 
-# 通过在线文章链接提取
+# Or pass a publisher URL directly
 python scripts/extract_zotero_table.py \
   --pdf "https://link.springer.com/article/10.1007/s00126-020-00994-x" \
   --output "./output"
 ```
 
-### 目录批量与路径清单批量提取
-
-支持传入包含多个 PDF 的文件夹，或者包含 PDF 物理路径/URL 清单的 `.txt` 文件，并设置并发工作线程数：
+### Directory & Path-List Batch Extraction
 
 ```bash
-# 1. 对整个文件夹下的所有 PDF 进行并发提取
-python scripts/extract_zotero_table.py \
-  --pdf "/path/to/pdf_folder" \
-  --output "/path/to/output_base" \
-  --workers 4
+# Extract all PDFs recursively in a directory
+python scripts/extract_zotero_table.py --pdf "/path/to/pdf_folder" --output "/path/to/output_base" --workers 4
 
-# 2. 对 .txt 清单中列出的文献批量提取
-python scripts/extract_zotero_table.py \
-  --pdf "paper_list.txt" \
-  --output "/path/to/output_base" \
-  --workers 4
+# Extract from a .txt file (one local PDF path or http(s):// URL per line)
+python scripts/extract_zotero_table.py --pdf "paper_list.txt" --output "/path/to/output_base" --workers 4
 ```
 
-### Zotero 全库一键批量提取
+### Full Zotero Library Batch Extraction
 
-针对科研工作者的 Zotero 文库，`batch_run.py` 能够自动读取 `zotero.sqlite` 本地数据库并克隆无锁快照，对整个文库或特定分类进行全量并发提取：
+`scripts/batch_run.py` reads `zotero.sqlite` via WAL-safe snapshots, pre-plans metadata/publishers with `batch_planner.py`, and processes each paper in an isolated subprocess:
 
 ```bash
 python scripts/batch_run.py \
   --db-path "~/Zotero/zotero.sqlite" \
-  --output "~/paper_tables" \
-  --workers 4
+  --paper-tables "~/paper_tables" \
+  --workers 4 \
+  --resume
+
+# Re-audit existing output folders and re-extract papers with missing table labels
+python scripts/batch_run.py --recheck --workers 2
 ```
 
-- 运行中会自动记录 `batch_extraction_log.txt`；
-- 支持断点续传，已成功提取的文献自动跳过；
-- 每篇文献独立运行在沙箱子进程中，具备超时防挂死保护。
+### AI Agent / MCP Orchestration
 
-### 结合 AI Agent / MCP 编排调用
-
-本技能完全遵循 Agent 架构设计规范。在 Cursor、Claude Desktop、Antigravity 等支持 Agent 工具调用的环境中：
-1. 上层 Agent 通过 `ai4paper-zotero` MCP 工具（如 `zotero_get_selected_items`）获取用户当前在 Zotero 软件中选中的条目物理 PDF 路径；
-2. Agent 直接调度 CLI：
+In Cursor, Claude Desktop, or Antigravity:
+1. The host agent retrieves the selected Zotero item's physical PDF path (and metadata) via `ai4paper-zotero` MCP (`zotero_get_selected_items`).
+2. The agent invokes the CLI:
    ```bash
-   python scripts/extract_zotero_table.py --pdf "<Zotero物理路径>" --output "<目标路径>"
+   python scripts/extract_zotero_table.py --pdf "<pdf_path>" --output "<target_dir>"
    ```
-3. 提取完成后向用户直接反馈生成的规范 Excel 路径与表格预览摘要。
+   Optionally passing `--doi`, `--url`, `--title`, or `--sync-zotero`.
 
-### 表格提取质量核验与清理
-
-提取完成后，可对输出目录执行自动化完整性验证，清理空表或无意义碎片表：
+### Output Verification & Cleanup
 
 ```bash
-python scripts/verify_tables.py --root "/path/to/output_dir"
+python scripts/verify_tables.py --root "/path/to/output_dir" [--fix] [--verbose]
 ```
 
 ---
 
-## 📂 文件结构
+## 📂 Repository Structure
 
 ```text
 zotero-table-extractor/
-├── README.md                         # 项目主说明文档（本文件）
-├── SKILL.md                          # AI Agent 技能协议定义与提示词
-├── update.py                         # 🔄 技能在线更新与个人配置绝对防护主入口
-├── setup_paths.py                    # 🛠 跨平台路径与环境交互式初始化配置向导
-├── requirements.txt                  # Python 依赖清单
-├── config.json                       # 运行时私有配置 (受 .gitignore 保护，切勿提交)
-├── config.example.json               # 配置文件模板
-├── .gitignore                        # Git 忽略配置 (保护密钥、缓存与临时数据库)
-├── figures/                          # 超清架构图工程文件与矢量导出
-│   ├── zotero_table_extractor_architecture.drawio # draw.io 矢量源文件
-│   ├── zotero_table_extractor_architecture.png    # 高清 PNG 架构图
-│   └── zotero_table_extractor_architecture.svg    # 原生矢量 SVG 架构图
-├── models/                           # 本地离线 ONNX 视觉模型目录
-│   └── doclayout_yolo_docstructbench_imgsz1280_2501.onnx # 1280 尺度端到端 YOLO 版面检测模型
-├── scratch/                          # 临时诊断测试与试验脚本目录
-└── scripts/                          # 核心源码库
-    ├── updater.py                    # 🛡️ 在线安全更新与智能配置迁移/回滚引擎
-    ├── setup_paths.py                # 🛠 路径配置向导入口薄壳
-    ├── extract_zotero_table.py       # 🚀 CLI 主入口：单篇/批量/清单表格提取总调度
-    ├── batch_run.py                  # 🚀 Zotero 全库并发提取调度器（子进程隔离）
-    ├── batch_planner.py              # 批量文献元数据与年份预分析规划器
-    ├── pdf_table_extractor.py        # 核心本地 PDF 提取流水线（分类+7引擎投票+双轨AI接管）
-    ├── pdf_tables.py                 # PDF 表格切图定位、坐标计算与旋转校准
-    ├── ocr_client.py                 # 百度 AIStudio 在线客户端（PP-StructureV3 & PaddleOCR-VL）与 Docling 本地离线引擎
-    ├── doclayout_yolo_detector.py    # 基于 ONNX Runtime 的本地 DocLayout-YOLO 推理器
-    ├── table_postprocess.py          # 7 阶轻量表格后处理（公式防注入/类型推断/续表合并与单调DP对齐）
-    ├── excel_export.py               # 出版级 Excel 导出器（列宽自适应/样式主题/Dublin Core）
-    ├── zotero_sync.py                # 🔄 PyZotero 与 Better-Notes 生态联动（附件挂载与笔记生成）
-    ├── models.py                     # Table IR 统一领域模型 (ExtractedTable & TableCell)
-    ├── table_validator.py            # 表格结构完整性、列数一致性与有效填充率校验器
-    ├── system_detector.py            # 跨平台环境自适应探测器（macOS/Linux/Windows）
-    ├── env_detector.py               # 环境探测别名兼容层
-    ├── common.py                     # 跨平台文件锁、文本过滤、配置加载与共享工具
-    ├── login.py                      # 统一交互式登录向导（CNKI/各大期刊/CDP桥接）
-    ├── llm_reasoner.py               # LLM 语义辅助重构与复杂表头自愈挽救器
-    ├── agent_bridge.py               # Agent 运行期交互桥接与事件通知
-    ├── pdf_page_filter.py            # 页面轻量预过滤（跳过纯正文无表页以节省算力）
-    ├── playwright_utils.py           # 浏览器环境自适应探测与启动工具
-    ├── verify_tables.py              # 提取产物质量校验与空表清理工具
-    ├── audit_reporter.py             # 质量审查与统计报告生成器
-    ├── targeted_audit_reporter.py    # 针对性异常排查报告生成器
-    ├── exhaustive_audit_runner.py    # 全量地毯式巡检执行器
-    ├── targeted_audit_runner.py      # 针对疑难样例文献的专项回归测试器
-    ├── deep_8h_iterative_healer.py   # 长效迭代自愈执行器
-    ├── export_drawio_diagram.py      # draw.io 矢量架构图自动化渲染生成脚本
-    ├── compat/                       # 兼容性包装薄壳
-    │   ├── crawl4ai_login_publishers.py
-    │   ├── login_cnki.py
-    │   ├── login_publishers.py
-    │   └── online_utils.py
-    └── online/                       # 在线 HTML / XML 提取子系统
-        ├── __init__.py
-        ├── doi_resolver.py           # DOI / arXiv / URL 解析与出版商智能分流
-        ├── strategies.py             # 多出版商专线策略（Elsevier XOCS/Scrapling/Firecrawl）
-        ├── general_html_extractor.py # 通用外文期刊 Playwright DOM 渲染与表格抽取
-        ├── cnki_html_extractor.py    # 知网专属自动化滑块绕过与 HTML 阅读提取器
-        └── graph.py                  # 多策略在线竞速与自适应降级调度 DAG
+├── README.md                         # English documentation (main entry)
+├── README.zh-CN.md                   # Simplified Chinese documentation
+├── SKILL.md                          # AI Skill specification, pipeline & CLI/config reference
+├── LICENSE                           # Apache License 2.0
+├── update.py                         # Zero-overwrite online skill updater
+├── setup_paths.py                    # Cross-platform setup & ONNX model downloader
+├── requirements.txt                  # Core & optional Python dependencies
+├── config.example.json               # Configuration template (74 keys)
+├── figures/                          # Editable draw.io architecture diagram & SVG/PNG exports
+├── models/                           # Local ONNX models (DocLayout-YOLO 1280 + TurboOCR doc_ori)
+├── benchmarks/                       # 5-group benchmark suite (fixture & live MinerU modes)
+├── tests/                            # Offline isolated regression test runner (run_offline.py)
+└── scripts/
+    ├── extract_zotero_table.py       # Main CLI entry (single PDF, URL, dir, or .txt list)
+    ├── batch_run.py                  # Full Zotero library subprocess-isolated batch runner
+    ├── batch_planner.py              # Metadata, year-gate, and publisher pre-planner
+    ├── pdf_table_extractor.py        # Local PDF pipeline (Structure Tree, MinerU, 9-engine voting, 3-stage AI)
+    ├── pdf_tables.py                 # Crop geometry, rotation baking & fallback export
+    ├── ocr_client.py                 # MinerU (CLI+REST), PaddleOCR-VL, PP-StructureV3, TeleOCR, Docling
+    ├── doclayout_yolo_detector.py    # DocLayout-YOLO + PP-DocLayoutV3 ensemble detector
+    ├── doc_orientation_detector.py   # Two-track lossless page & crop orientation detector
+    ├── rapid_table_extractor.py      # RapidAI TableStructureRec + RapidTable local engine
+    ├── pdf_page_filter.py            # Lightweight prose-page pre-filter
+    ├── table_postprocess.py          # 7-stage cleaning, SMART headers, footnotes, DP stitching
+    ├── table_validator.py            # Declaration ledger, numeric integrity gate, missed-table check
+    ├── teds.py                       # Pure-Python IBM TEDS tree-edit distance metric
+    ├── omnidocbench.py               # OmniDocBench (CVPR 2025) TEDS, mAP & recall evaluator
+    ├── excel_export.py               # Publication Excel writer (CellRichText, autofit, metadata)
+    ├── models.py                     # Unified Table IR (ExtractedTable & TableCell)
+    ├── system_detector.py            # Cross-platform OS/path detection (macOS/Linux/Windows)
+    ├── env_detector.py               # Backward-compatible system_detector alias
+    ├── common.py                     # Config loader, companion creds, file locks, WAL snapshots
+    ├── playwright_utils.py           # Chromium executable discovery
+    ├── login.py                      # Interactive CNKI / Publisher / Crawl4AI login wizard
+    ├── llm_reasoner.py               # LLM table reasoner & semantic equivalence gate (arXiv 2603.18652)
+    ├── zotero_sync.py                # Optional PyZotero attachment & Better-Notes sync
+    ├── agent_bridge.py               # Agent reasoning bridge
+    ├── verify_tables.py              # Output Excel verification & empty-file cleanup
+    ├── updater.py                    # Safe Git/Release update & config snapshot rollback engine
+    ├── package_release.py            # Release ZIP packager with secret-leak security audit
+    ├── export_drawio_diagram.py      # draw.io architecture diagram exporter
+    ├── audit/ & *audit*.py           # Library-wide audit runners, reporters & iterative healer
+    ├── compat/                       # Backward-compatibility wrappers
+    └── online/                       # Online extraction package
+        ├── graph.py                  # Tiered concurrent racing (race=True) & serial DAG
+        ├── doi_resolver.py           # DOI/PII/arXiv/PMCID/chndoi & Zotero WAL resolver
+        ├── strategies.py             # Publisher APIs, OA-gated Firecrawl, Scrapling, Crawl4AI
+        ├── general_html_extractor.py # Playwright publisher DOM adapters & modal expanders
+        ├── cnki_html_extractor.py    # CNKI slider bypass & HTML table extraction
+        └── cdp_detector.py           # DevToolsActivePort discovery, Port Guard & 6-slot tab lock
 ```
 
 ---
 
-## 🙏 鸣谢与参考开源项目
+## 🧪 Regression Testing & Benchmark Scope
 
-本项目的研发深受开源社区众多卓越项目的启发与赋能。在此向以下开源项目及其核心开发团队致以最崇高的敬意：
+- **Offline Regression Suite**:
+  ```bash
+  python tests/run_offline.py
+  # Run a specific test file:
+  python tests/run_offline.py --pattern test_online_fixes_regression.py
+  ```
+  `run_offline.py` copies the codebase into a disposable temporary workspace, omits personal `config.json`, and blocks outbound network sockets and external service calls. Live browser integration tests are skipped unless `ZOTERO_RUN_LIVE_BROWSER=1` is explicitly set.
 
-1. **[PaddlePaddle / PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR)**  
-   - 提供了强大的 **PP-StructureV3** 端到端版面分析算法与 **PaddleOCR-VL-1.6** 多模态大模型服务，极大地攻克了学术文献中无框表、重叠单元格与扫描件表格的识别难题。
-2. **[OpenDataLab / DocLayout-YOLO](https://github.com/opendatalab/DocLayout-YOLO)**  
-   - 上海人工智能实验室推出的先进文档版面分析目标检测模型，为本项目提供了高精度的本地离线表格定位能力。
-3. **[MuiseDestiny / zotero-figure](https://github.com/MuiseDestiny/zotero-figure)**  
-   - 优秀的 Zotero 配图与表格提取插件，为本项目提供了高质量的轻量化 ONNX 模型量化权重参考与提取灵感。
-4. **[PyMuPDF / fitz](https://github.com/pymupdf/PyMuPDF)**  
-   - 行业领先的高性能 PDF 渲染与解析库，本项目深度依赖其进行页面文本层提取、坐标定位、页面旋转校准与极速矢量表格探测 (`find_tables`)。
-5. **[jsvine / pdfplumber](https://github.com/jsvine/pdfplumber)**  
-   - 优秀的布局感知型 PDF 表格提取库，用于多方投票机制中的线框与字符空间关系核验。
-6. **[camelot-dev / camelot](https://github.com/camelot-dev/camelot)**  
-   - 经典的 PDF 表格提取利器，其 Lattice 与 Stream 提取思想是本项目原生投票体系不可或缺的核心基石。
-7. **[Microsoft / Playwright for Python](https://github.com/microsoft/playwright-python)**  
-   - 现代可靠的端到端浏览器自动化引擎，驱动本项目对复杂期刊网站的动态渲染与表格 DOM 抽取。
-8. **[D4Vinci / Scrapling](https://github.com/D4Vinci/Scrapling)**  
-   - 极具创新性的无感拟态极速爬虫框架，助力知网及各类期刊页面的高效获取。
-9. **[UncleCode / Crawl4AI](https://github.com/unclecode/crawl4ai)**  
-   - 针对大模型时代设计的开源异步网页爬取引擎，提供了出色的抗指纹与会话连接能力。
-10. **[MendableAI / Firecrawl](https://github.com/mendableai/firecrawl)**  
-    - 为 LLM 设计的高质量网页 Markdown 转换与抽取服务。
-11. **[firecrawl / pdf-inspector](https://github.com/firecrawl/pdf-inspector)**  
-   - 基于 Rust 编写的高性能极速 PDF 预审与版面结构分析器，单页毫秒级（约 80ms）完成 PDF 类型分类（文本版 / 扫描版）及原生 Markdown 表格初步定位与提取。
-12. **[openpyxl](https://foss.heptapod.net/openpyxl/openpyxl)**  
-    - 强大的 Excel 读写库，本项目依赖其实现出版级单元格排版、交替斑马纹、自适应列宽与 Dublin Core 属性注入。
-13. **[Microsoft / ONNX Runtime](https://github.com/microsoft/onnxruntime)**  
-    - 高性能跨平台深度学习推理引擎，保障了 DocLayout-YOLO 在 CPU 与各类 GPU 环境下的轻快运行。
-14. **[DS4SD / IBM Docling & TableFormer](https://github.com/DS4SD/docling)**  
-    - IBM 开源的现代化文档与表格解析标杆项目，为本项目提供了强大的本地离线表格拓扑结构识别（TSR）备用兜底能力。
-15. **[conjuncts / GMFT](https://github.com/conjuncts/gmft)**  
-    - 范德堡大学团队基于 Microsoft PubTables-1M / Table Transformer (TATR) 打造的轻量级学术表格提取器，为原生 PDF 投票体系提供了深度视觉多层表头与跨列对齐支持。
-16. **[xavctn / img2table](https://github.com/xavctn/img2table)**  
-    - 纯 Python + OpenCV 的高精形态学表格提取器，帮助本项目彻底摆脱系统级 Ghostscript 依赖，实现了更纯净的开箱即用体验。
-17. **[urschrei / pyzotero](https://github.com/urschrei/pyzotero) & [windingwind / zotero-better-notes](https://github.com/windingwind/zotero-better-notes)**  
-    - 卓越的 Zotero 生态库与笔记扩展，赋能本项目实现了学术表格“提取-挂载-预览”的一体化文献知识管理闭环。
-18. **[OpenDataLab / MinerU](https://github.com/opendatalab/MinerU) & [infiniflow / RAGFlow DeepDoc](https://github.com/infiniflow/ragflow)**  
-    - 业界领先的科研文献与文档理解项目，其跨页长表垂直投影与单调列对齐思想为本项目的续表拼接算法提供了宝贵启发。
+- **Benchmark Scope (`benchmarks/run_benchmark.py`)**:
+  ```bash
+  # Fixture regression mode (validates parsing, numeric gate & continuation stitching; not live accuracy)
+  python benchmarks/run_benchmark.py --pipelines p1,p2,p3 --groups A,B,C,D,E --mineru-mode fixture
+  ```
+  - `--mineru-mode fixture` (default) replays synthetic MinerU archives generated from ground truth to verify downstream parsing, numeric gating, and continuation stitching—it **must not** be cited as real MinerU recognition accuracy or service speedup.
+  - `--mineru-mode live` submits the benchmark PDFs to MinerU and ignores the synthetic fixture cache.
+  - Note that `--pdf-only` skips publisher web scraping; the PDF pipeline itself may still call configured cloud services (`MinerU`, `PaddleOCR-VL`, `TeleOCR`) unless offline engines (`Docling`, `RapidTable`, local voting) are selected.
 
 ---
 
-## 回归测试与评测范围
+## 🙏 Acknowledgements & Referenced Projects
 
-安装项目依赖后，使用 `python tests/run_offline.py` 运行回归测试。该入口在临时副本中执行，不复制个人 `config.json`，阻断网络连接和外部服务进程；真实浏览器测试默认跳过。可用 `--pattern test_audit_oct30_integrity.py` 单独验证数据完整性修复。
+This project builds on and learns from outstanding open-source work across the document AI and academic tooling communities:
 
-基准默认使用 `python benchmarks/run_benchmark.py --mineru-mode fixture`：MinerU 输入来自标准答案生成的模拟缓存，仅验证解析、质量检查与续表后处理，不代表真实模型准确率，也不包含服务调用耗时。显式使用 `--mineru-mode live` 会向 MinerU 提交测试 PDF，并忽略模拟缓存。真实论文的效果仍需独立人工标注样本验证。
+1. **[PaddlePaddle / PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR)** — PP-StructureV3, PP-DocLayoutV3, and PaddleOCR-VL-1.6 multimodal parsing.
+2. **[OpenDataLab / MinerU](https://github.com/opendatalab/MinerU)** — Structured PDF extraction, `mineru-open-api` CLI, and 4-way continuation heuristics.
+3. **[OpenDataLab / DocLayout-YOLO](https://github.com/opendatalab/DocLayout-YOLO)** & **[MuiseDestiny / zotero-figure](https://github.com/MuiseDestiny/zotero-figure)** — High-resolution local ONNX layout detection.
+4. **[DS4SD / IBM Docling (TableFormer)](https://github.com/DS4SD/docling)** — Offline CPU/Metal table structure recognition.
+5. **[RapidAI / TableStructureRec & RapidTable](https://github.com/RapidAI/TableStructureRec)** — Lightweight ONNX/PyTorch wired & lineless table recognition.
+6. **[firecrawl / pdf-inspector](https://github.com/firecrawl/pdf-inspector)** — Fast Rust PDF classification, Tagged PDF structure tree parsing, and Markdown extraction.
+7. **[PyMuPDF](https://github.com/pymupdf/PyMuPDF)** & **[PyMuPDF4LLM](https://github.com/pymupdf/PyMuPDF4LLM)** — Vector geometry, `find_tables`, and LLM-ready Markdown tables.
+8. **[conjuncts / GMFT](https://github.com/conjuncts/gmft)**, **[xavctn / img2table](https://github.com/xavctn/img2table)**, **[jsvine / pdfplumber](https://github.com/jsvine/pdfplumber)**, and **[camelot-dev / camelot](https://github.com/camelot-dev/camelot)** — Native PDF table consensus engines.
+9. **[IBM PubTabNet (TEDS)](https://github.com/ibm-aur-nlp/PubTabNet)** & **[OpenDataLab / OmniDocBench](https://github.com/opendatalab/OmniDocBench)** — Tree-edit distance and standardized document benchmarks.
+10. **[infiniflow / RAGFlow DeepDoc](https://github.com/infiniflow/ragflow)** — Cross-page column projection and monotone DP alignment inspiration.
+11. **[Microsoft Playwright](https://github.com/microsoft/playwright-python)**, **[D4Vinci / Scrapling](https://github.com/D4Vinci/Scrapling)**, **[UncleCode / Crawl4AI](https://github.com/unclecode/crawl4ai)**, and **[MendableAI / Firecrawl](https://github.com/mendableai/firecrawl)** — Dynamic browser automation and web extraction.
+12. **[openpyxl](https://foss.heptapod.net/openpyxl/openpyxl)**, **[urschrei / pyzotero](https://github.com/urschrei/pyzotero)**, and **[windingwind / zotero-better-notes](https://github.com/windingwind/zotero-better-notes)** — Rich-text Excel export and Zotero knowledge management integration.
 
-`--pdf-only` 表示跳过出版社网页抓取；PDF 流程中的 MinerU/OCR 仍可能使用云端服务。
+---
 
-## 📄 开源协议与免责声明
+## 📄 License & Disclaimer
 
-- **开源协议**：本项目基于 [Apache License 2.0](LICENSE) 协议开源。
-- **免责声明**：
-  1. 本项目仅供学术研究、个人文献阅读整理及非营利性科研用途使用；
-  2. 使用在线抓取或 API 功能时，请严格遵守各大学术出版社、文献数据库（如 CNKI、Elsevier、Springer 等）的版权保护政策、用户协议与 `robots.txt` 规则；
-  3. 请妥善保管您的机构 API 密钥与登录凭证，因用户不当配置或泄露个人密钥导致的任何纠纷由使用者自行承担。
+- **License**: Released under the [Apache License 2.0](LICENSE).
+- **Disclaimer**:
+  1. Intended strictly for academic research, personal literature organization, and non-commercial scientific workflows.
+  2. When using online extraction or publisher APIs, comply with all publisher terms of service, copyright policies, institutional access rules, and `robots.txt`.
+  3. Keep your `config.json` API keys and browser session profiles private; users assume full responsibility for their credentials and usage.
 
 ---
 
 <p align="center">
-  如果本项目对您的学术科研或文献处理有所帮助，欢迎在 GitHub 上点亮一颗 ⭐ <b>Star</b>！<br/>
-  欢迎提交 Issue 与 Pull Request 共同完善生态。
+  If this project helps your research workflow, please consider giving it a ⭐ <b>Star</b> on GitHub!<br/>
+  Issues and Pull Requests are warmly welcome.
 </p>
