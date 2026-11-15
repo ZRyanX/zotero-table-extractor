@@ -152,28 +152,45 @@
 
 ```mermaid
 flowchart LR
-    IN["输入与无损预检<br/>extract_zotero_table · batch_run<br/>TurboOCR doc_ori.onnx"] --> ROUTE{"双轨调度<br/>路由"}
+    IN["输入与 CLI 调度<br/>extract_zotero_table / batch_run"] --> ORI["Tier-1 无损旋转自愈<br/>Native /Rotate · 扫描 150dpi"]
+    ORI --> ROUTE{"入口条件路由"}
 
-    subgraph ON["在线 HTML / XML 竞速管线"]
-        direction TB
-        ON1["Tier 1: arXiv · NCBI PMC JATS · Elsevier XOCS"]
-        ON2["Tier 2-4: Crawl4AI · Firecrawl(OA) · CDP · CNKI"]
+    subgraph ON["在线 HTML / XML 管线 (race=True / --sequential)"]
+        ON_SRC["Tier 1: arXiv · PMC JATS · Elsevier XOCS (礼让窗口)<br/>Tier 2-4: Unpaywall · Crawl4AI · Firecrawl(OA+403熔断) · CDP · CNKI"] --> ON_GATE{"覆盖全文表号?"}
     end
 
-    subgraph PDF["本地 PDF 深度管线 (主抽取 → 投票 → 视觉AI)"]
-        direction TB
-        PDF1["主抽取: Tagged PDF · MinerU · 数值门禁"]
-        PDF2["兜底: 9 引擎 TEDS 投票 · 3 阶视觉 AI"]
-        PDF1 -->|未覆盖 / 未通过| PDF2
+    subgraph PDF["本地 PDF 深度管线"]
+        LEDGER["声明账本 + pdf-inspector"] --> PTYPE{"PDF 类型"}
+        PTYPE -->|文本 / 混合| PRIM["主抽取: Tagged PDF → MinerU → 数值门禁"]
+        PRIM --> NGATE{"全覆盖且通过?"}
+        NGATE -->|未覆盖 / 失败 / Legacy| VOTE["9 引擎 + IBM TEDS 投票"]
+        VOTE --> VGATE{"TEDS >= 0.75?"}
+        PTYPE -->|纯扫描| AI["3 阶视觉 AI 接管<br/>① RapidTable → ② YOLO/PP-V3+VLM → ③ Docling"]
+        VGATE -->|低置信 / 漏表| AI
+        AI --> GUARD{"防劣退质检<br/>门禁"}
     end
 
-    ROUTE -->|在线| ON
-    ROUTE -->|仅 PDF| PDF
-    ON -->|漏表 / 截断补全| PDF
+    ROUTE -->|"默认开启在线"| ON_SRC
+    ROUTE -->|"--pdf-only / 2020前中文"| LEDGER
+    ON_GATE -->|"完整 / --online-only"| MERGE["在线-PDF 互补合并<br/>与 7 阶安全后处理"]
+    ON_GATE -->|"缺失 / 截断补漏"| LEDGER
 
-    ON --> REFINE["后处理与拼接校验<br/>Table IR · 7 阶清洗<br/>单调 DP · LLM 语义门禁"]
-    PDF --> REFINE
-    REFINE --> EXPORT["导出与生态联动<br/>CellRichText .xlsx<br/>质量审计 · Zotero 挂载"]
+    NGATE -->|通过| IR["Table IR<br/>(models.py)"]
+    VGATE -->|共识采纳| IR
+    GUARD -->|优于原生| IR
+    GUARD -.->|拒绝劣退回退原生| IR
+    IR --> MERGE
+
+    MERGE --> CONT{"可对齐<br/>跨页续表?"}
+    CONT -->|是| DP["MinerU 4-Way + DeepDoc 单调 DP"]
+    CONT -->|否| FRAG["保留独立片段防误拼"]
+    DP --> LLM_G{"--enable-llm?"}
+    FRAG --> LLM_G
+    LLM_G -->|是| LLM["LLM 修复 + 语义等价门禁"]
+    LLM_G -->|否| EXP["出版级 Excel (.xlsx)<br/>CellRichText 上下标保真"]
+    LLM -->|通过 / 安全回退| EXP
+    EXP --> SYNC_G{"--sync-zotero?"}
+    SYNC_G -->|默认关闭·显式开启| ZSYNC["PyZotero + Better-Notes"]
 ```
 
 > **可编辑矢量架构图源文件**：由 `scripts/export_drawio_diagram.py` 维护并导出至 `figures/`：

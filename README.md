@@ -162,28 +162,45 @@ Every extracted table passes through a 7-stage pipeline (`table_postprocess.py`)
 
 ```mermaid
 flowchart LR
-    IN["Inputs & Pre-Check<br/>extract_zotero_table · batch_run<br/>TurboOCR doc_ori.onnx"] --> ROUTE{"Dual-Track<br/>Router"}
+    IN["Inputs & CLI<br/>extract_zotero_table / batch_run"] --> ORI["Tier-1 Orientation<br/>Native /Rotate · Scanned 150dpi"]
+    ORI --> ROUTE{"Pre-Check Gate"}
 
-    subgraph ON["Online HTML/XML Track (Tiered Race)"]
-        direction TB
-        ON1["Tier 1: arXiv · NCBI PMC JATS · Elsevier XOCS"]
-        ON2["Tier 2-4: Crawl4AI · Firecrawl(OA) · CDP · CNKI"]
+    subgraph ON["Online HTML / XML Track (race=True / --sequential)"]
+        ON_SRC["Tier 1: arXiv · PMC JATS · Elsevier XOCS (Grace Window)<br/>Tier 2-4: Unpaywall · Crawl4AI · Firecrawl(OA+403 CB) · CDP · CNKI"] --> ON_GATE{"Match PDF Ledger?"}
     end
 
-    subgraph PDF["Local PDF Track (Primary → Voting → AI)"]
-        direction TB
-        PDF1["Primary: Tagged PDF · MinerU · Numeric Gate"]
-        PDF2["Fallback: 9-Engine TEDS · 3-Stage Visual AI"]
-        PDF1 -->|Uncovered| PDF2
+    subgraph PDF["Local PDF Track"]
+        LEDGER["Declaration Ledger + pdf-inspector"] --> PTYPE{"PDF Type"}
+        PTYPE -->|Native / Mixed| PRIM["Fast-Path: Tagged PDF → MinerU → Numeric Gate"]
+        PRIM --> NGATE{"Covered & Pass?"}
+        NGATE -->|Uncovered / Fail / Legacy| VOTE["9-Engine + IBM TEDS Voting"]
+        VOTE --> VGATE{"TEDS >= 0.75?"}
+        PTYPE -->|Scanned| AI["3-Stage Visual AI<br/>① RapidTable → ② YOLO/PP-V3 + VLM → ③ Docling"]
+        VGATE -->|Low Conf / Unresolved| AI
+        AI --> GUARD{"Anti-Regression<br/>Guard"}
     end
 
-    ROUTE -->|Online| ON
-    ROUTE -->|PDF-only| PDF
-    ON -->|Missing / Incomplete| PDF
+    ROUTE -->|"--online (default)"| ON_SRC
+    ROUTE -->|"--pdf-only / Pre-2020 CN"| LEDGER
+    ON_GATE -->|"Complete / --online-only"| MERGE["Online–PDF Merge<br/>& 7-Stage Post-Process"]
+    ON_GATE -->|"Missing / Truncated"| LEDGER
 
-    ON --> REFINE["Refine & Stitch<br/>Table IR · 7-Stage Clean<br/>Monotone DP · LLM Gate"]
-    PDF --> REFINE
-    REFINE --> EXPORT["Export & Sync<br/>CellRichText .xlsx<br/>QA Audit · Zotero Sync"]
+    NGATE -->|Pass| IR["Table IR<br/>(models.py)"]
+    VGATE -->|Consensus| IR
+    GUARD -->|Accepted| IR
+    GUARD -.->|Reject Empty/Degraded| IR
+    IR --> MERGE
+
+    MERGE --> CONT{"Alignable<br/>Continuation?"}
+    CONT -->|Yes| DP["MinerU 4-Way + DeepDoc DP Merge"]
+    CONT -->|No| FRAG["Keep Separate Fragments"]
+    DP --> LLM_G{"--enable-llm?"}
+    FRAG --> LLM_G
+    LLM_G -->|Yes| LLM["LLM Repair + Equivalence Gate"]
+    LLM_G -->|No| EXP["Excel Export (.xlsx)<br/>CellRichText Sub/Superscripts"]
+    LLM -->|Pass / Safe Fallback| EXP
+    EXP --> SYNC_G{"--sync-zotero?"}
+    SYNC_G -->|Opt-in True| ZSYNC["PyZotero + Better-Notes"]
 ```
 
 > **Editable Architecture Assets**: Maintained via `scripts/export_drawio_diagram.py` under `figures/`:
