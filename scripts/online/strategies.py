@@ -331,12 +331,17 @@ _DOM_WRAPPER_SELECTORS = (
     "div.c-article-table", ".html-table-container", "section.article-section__table",
     "div[data-widget-def='tableWidget']", "div.entry-table", "div.table-item",
     ".table-wrap-content", ".table-box",
+    "div.figure.table_new", ".article_table_fullText", ".tableTextBox",
 )
 _DOM_CAPTION_SELECTORS = (
     "span.captions", "div.captions", "header.u-mb-16", ".c-article-table__figcaption",
     ".html-caption", "header.article-table-caption", "header.article-fulltext-label-header",
-    "figcaption", "caption", ".table-caption", ".c-article-table__caption",
-    ".caption", ".table-wrap-title", ".table-title", ".table-header", ".html-table-title",
+    ".table-wrap-title", ".figureTitle", "figcaption", "caption", ".table-caption",
+    ".c-article-table__caption", ".caption", ".table-title", ".table-header", ".html-table-title",
+)
+_DOM_LABEL_BADGE_SELECTORS = (
+    ".table-label", ".table-wrap-label", "span.label", ".label",
+    ".c-article-table__label", ".article-table-label",
 )
 _DOM_FOOTNOTE_SELECTORS = (
     "div.c-article-table-footer", ".html-table_foot", "div.article-section__table-footnotes",
@@ -344,6 +349,50 @@ _DOM_FOOTNOTE_SELECTORS = (
     ".table-wrap-foot", ".table-footnotes", ".c-article-table__notes",
     ".table-foot", ".table-footnote", ".table-note", ".html-table-footnote", "tfoot",
 )
+
+
+def _extract_normalized_table_label(text: str) -> str:
+    """Normalize a table label prefix from caption/header text using common.TABLE_LABEL_RE when available."""
+    if not text:
+        return ""
+    norm = re.sub(r'\s+', ' ', text.replace('\xa0', ' ').replace('\u3000', ' ')).strip()
+    lbl_re = getattr(common, "TABLE_LABEL_RE", None)
+    fmt_fn = getattr(common, "format_table_label", None)
+
+    def _fmt(raw_val: str) -> str:
+        raw_val = raw_val.strip()
+        if callable(fmt_fn):
+            formatted = fmt_fn(raw_val)
+            if formatted:
+                return formatted
+        return raw_val
+
+    if lbl_re is not None:
+        m = re.match(r'^(?:' + lbl_re.pattern + r')', norm, re.IGNORECASE)
+        if m:
+            return _fmt(m.group(0))
+        # Handle "Additional file 1: Table S1", "ESM 1. Table S1", or short prefix noise before real Table label
+        m_sub = re.match(
+            r'^(?:Additional\s+file\s+\d+|ESM\s*\d+|Electronic\s+Supplementary\s+Material(?:\s*\d+)?)\s*[:.\-\u2014]?\s*(.+)$',
+            norm,
+            re.IGNORECASE,
+        )
+        if m_sub:
+            m_inner = re.match(r'^(?:' + lbl_re.pattern + r')', m_sub.group(1).strip(), re.IGNORECASE)
+            if m_inner:
+                return _fmt(m_inner.group(0))
+    m = re.match(
+        r'^((?:Supplementary\s+Table|Supplemental\s+Table|Extended\s+Data\s+Table|Appendix\s+Table|T\s*A\s*B\s*L\s*E\s*A\s*U\s*X?|T\s*A\s*B\s*L\s*E|T\s*A\s*B\s*\.|附表|附录表|补充表|表))\s*([A-Za-z]?\d+(?:[.\-]\d+)*|[ivxlcdm]+|[A-Za-z])',
+        norm,
+        re.IGNORECASE,
+    )
+    if m:
+        raw_prefix = re.sub(r'\s+', '', m.group(1))
+        num_part = m.group(2)
+        if any(k in raw_prefix for k in ("附表", "附录表", "补充表", "表")):
+            return f"{raw_prefix}{num_part}"
+        return _fmt(f"{m.group(1).strip()} {num_part}")
+    return ""
 
 
 def _extract_caption_and_label_from_wrapper(wrapper):
@@ -371,22 +420,79 @@ def _extract_caption_and_label_from_wrapper(wrapper):
                 if txt:
                     caption_text = txt
                     break
-    label_text = ""
+
+    # Silverchair/GSW 等将表号放在 .label / .table-label、描述放在 .caption 中时合并提取
+    label_text = _extract_normalized_table_label(caption_text)
+    if not label_text:
+        for lsel in _DOM_LABEL_BADGE_SELECTORS:
+            lel = wrapper.select_one(lsel)
+            if lel:
+                ltxt = clean_text(lel.get_text(" ", strip=True))
+                cand_lbl = _extract_normalized_table_label(ltxt)
+                if cand_lbl:
+                    label_text = cand_lbl
+                    if caption_text and cand_lbl.lower() not in caption_text.lower():
+                        caption_text = f"{ltxt.rstrip('. ')}: {caption_text}"
+                    elif not caption_text:
+                        caption_text = ltxt
+                    break
+
+    # Springer /tables/N 子页 (<main><header class="u-mb-16"><h1>Table 1...</h1></header><div class="c-article-table-container">)
+    # 与中文 Magtech 平台 (<div class="figure"><div class="figureTitle">表 1...</div><div class="article_table_fullText">...)
+    if not caption_text or not label_text:
+        sib_candidates = []
+        prev = wrapper.find_previous_sibling()
+        for _ in range(3):
+            if prev is None:
+                break
+            if getattr(prev, "name", None):
+                sib_candidates.append(prev)
+            prev = prev.find_previous_sibling()
+        parent = getattr(wrapper, "parent", None)
+        if parent is not None and getattr(parent, "name", None) in ("main", "div", "section", "article"):
+            for sel in ("header.u-mb-16", "h1.c-article-satellite-title", ".figureTitle"):
+                try:
+                    el = parent.select_one(f":scope > {sel}")
+                except Exception:
+                    el = None
+                if el and el not in sib_candidates:
+                    sib_candidates.append(el)
+        for cand_el in sib_candidates:
+            cand_txt = clean_text(cand_el.get_text(" ", strip=True))
+            if not cand_txt:
+                continue
+            cand_lbl = _extract_normalized_table_label(cand_txt)
+            if cand_lbl:
+                label_text = label_text or cand_lbl
+                if not caption_text:
+                    caption_text = cand_txt
+                elif cand_lbl.lower() not in caption_text.lower():
+                    caption_text = f"{cand_txt} {caption_text}"
+                break
+
     if caption_text:
-        m = re.match(
-            r'^(T\s*A\s*B\s*L\s*E\s*A\s*U\s*X?|T\s*A\s*B\s*L\s*E|T\s*A\s*B\s*\.|表)(?:\s*S\s*)?\s*(\d+|[ivxlcdm]+|S\d+|[a-z])',
-            caption_text,
-            re.IGNORECASE,
-        )
-        if m:
-            label_text = f"表 {m.group(2)}" if "表" in m.group(1) else f"Table {m.group(2)}"
+        caption_text = re.sub(r"\s+", " ", caption_text.replace("\xa0", " ")).strip()
+    if not label_text and caption_text:
+        label_text = _extract_normalized_table_label(caption_text)
     return caption_text, label_text
 
 
-def _is_dom_noise_table(table_el) -> bool:
-    """Skip publisher boilerplate, disclaimer, supporting-info, and duplicate modal tables."""
+def _is_dom_noise_table(table_el, check_nested: bool = True) -> bool:
+    """Skip publisher boilerplate, disclaimer, supporting-info, form, citation, and duplicate modal tables."""
     if table_el.find_parent("section", class_="html-fn_group") or table_el.find_parent(class_="html-fn_group"):
         return True
+    for noise_cls in ("messageBoard", "messageBoardWrap", "copyCitationInfo", "citationCn", "citationEn", "quot"):
+        if table_el.find_parent(class_=noise_cls):
+            return True
+    if check_nested:
+        # 嵌套排版外框表（含内层 <table>）：只解析内层实际数据表
+        if table_el.find("table") is not None:
+            return True
+        if len(table_el.find_all(["input", "textarea", "select"])) >= 2:
+            return True
+    else:
+        if table_el.find("table") is None and len(table_el.find_all(["input", "textarea", "select"])) >= 2:
+            return True
     cls = table_el.get("class") or []
     if "support-info__table" in cls or table_el.find_parent(class_="support-info__table-wrapper") or table_el.find_parent("section", class_="article-section__supporting"):
         return True
@@ -426,6 +532,7 @@ def _parse_dom_wrappers_bs4(html_content, read_html_fn):
         return []
 
     seen_tables = set()
+    seen_signatures = set()
     valid_dfs = []
     for wrapper in wrappers:
         table_els = [wrapper] if wrapper.name == "table" else wrapper.find_all("table")
@@ -448,7 +555,10 @@ def _parse_dom_wrappers_bs4(html_content, read_html_fn):
                 if not footnote_text:
                     footnote_text = clean_text(tf.get_text(" ", strip=True))
                 tf.decompose()
-            sub_dfs = read_html_fn(str(tbl_copy))
+            try:
+                sub_dfs = read_html_fn(str(tbl_copy))
+            except (ValueError, IndexError):
+                continue
             for df in sub_dfs:
                 if df.empty or len(df.columns) < 1 or len(df) < 1:
                     continue
@@ -463,6 +573,11 @@ def _parse_dom_wrappers_bs4(html_content, read_html_fn):
                     df.attrs['footnotes'] = [footnote_text]
                 if is_metadata_table(df):
                     continue
+                first_row_sig = tuple(str(v) for v in df.iloc[0].tolist()) if len(df) else ()
+                sig = (label_text.lower() if label_text else "", df.shape, tuple(df.columns), first_row_sig)
+                if sig in seen_signatures:
+                    continue
+                seen_signatures.add(sig)
                 valid_dfs.append(df)
     return valid_dfs
 
@@ -483,12 +598,27 @@ def parse_tables_from_html(html_content, table_idx="all"):
         valid_dfs = _parse_dom_wrappers_bs4(html_content, read_html_preserving_text)
 
         if not valid_dfs:
-            dfs = read_html_preserving_text(html_content)
+            filtered_html = html_content
+            try:
+                from bs4 import BeautifulSoup
+                _soup = BeautifulSoup(html_content, "html.parser")
+                for _tbl in list(_soup.find_all("table")):
+                    if getattr(_tbl, "parent", None) is None:
+                        continue
+                    if _is_dom_noise_table(_tbl, check_nested=False):
+                        _tbl.decompose()
+                    elif _tbl.find("table") is not None:
+                        _tbl.unwrap()
+                filtered_html = str(_soup)
+            except Exception:
+                filtered_html = html_content
+
+            dfs = read_html_preserving_text(filtered_html)
             if not dfs:
                 return []
 
-            # Split html_content by <table to find preceding text blocks
-            parts = html_content.split('<table')
+            # Split filtered_html by <table to find preceding text blocks
+            parts = re.split(r'<table\b', filtered_html, flags=re.IGNORECASE)
 
             valid_dfs = []
             for idx, df in enumerate(dfs):
@@ -511,23 +641,18 @@ def parse_tables_from_html(html_content, table_idx="all"):
                         line_no_html = re.sub(r'<[^>]+>', '', line_clean).strip()
                         # Strip leading markdown/formatting chars
                         line_stripped = re.sub(r'^[#*_\-\s\(\)\:\.\,\»]+', '', line_no_html).strip()
-                        # Robust pattern matching for spaced spelling like T A B L E
-                        pattern = r'^(T\s*A\s*B\s*L\s*E\s*A\s*U\s*X?|T\s*A\s*B\s*L\s*E|T\s*A\s*B\s*\.|表)(?:\s*S\s*)?\s*(\d+|[ivxlcdm]+|ni|rn|[a-z])'
-                        match = re.match(pattern, line_stripped, re.IGNORECASE)
-                        if match:
+                        lbl_cand = _extract_normalized_table_label(line_stripped)
+                        if lbl_cand:
                             caption_text = line_stripped
-                            tbl_word = match.group(1).upper()
-                            tbl_num = match.group(2)
-                            if "表" in tbl_word:
-                                label_text = f"表 {tbl_num}"
-                            else:
-                                label_text = f"Table {tbl_num}"
+                            label_text = lbl_cand
                             break
 
                 if label_text:
                     df.attrs['label'] = label_text
                 if caption_text:
                     df.attrs['table_title'] = caption_text
+                if common.is_unlabeled_single_col_layout_shell(df, has_explicit_label=bool(label_text or caption_text)):
+                    continue
                 if is_metadata_table(df):
                     continue
 
@@ -593,23 +718,25 @@ def parse_tables_from_markdown(md_content, table_idx="all"):
                     prec_clean = prec_line.strip()
                     # Strip leading markdown formatting characters
                     prec_clean_stripped = re.sub(r'^[#*_\-\s\(\)\:\.\,\»]+', '', prec_clean).strip()
-                    # Robust pattern matching for spaced spelling like T A B L E
-                    pattern = r'^(T\s*A\s*B\s*L\s*E\s*A\s*U\s*X?|T\s*A\s*B\s*L\s*E|T\s*A\s*B\s*\.|表)(?:\s*S\s*)?\s*(\d+|[ivxlcdm]+|ni|rn|[a-z])'
-                    match = re.match(pattern, prec_clean_stripped, re.IGNORECASE)
-                    if match:
+                    lbl_cand = _extract_normalized_table_label(prec_clean_stripped)
+                    if lbl_cand:
                         caption_text = prec_clean_stripped
-                        tbl_word = match.group(1).upper()
-                        tbl_num = match.group(2)
-                        if "表" in tbl_word:
-                            label_text = f"表 {tbl_num}"
-                        else:
-                            label_text = f"Table {tbl_num}"
+                        label_text = lbl_cand
                         break
-                        
+
+                non_empty_cols = sum(
+                    1
+                    for col_i in range(len(df.columns))
+                    if str(df.columns[col_i]).strip() or df.iloc[:, col_i].astype(str).str.strip().ne("").any()
+                )
+                if non_empty_cols < 2 and not label_text and not caption_text:
+                    return
                 if label_text:
                     df.attrs['label'] = label_text
                 if caption_text:
                     df.attrs['table_title'] = caption_text
+                if is_metadata_table(df):
+                    return
                 tables_found.append(df)
         except Exception:
             pass
@@ -885,10 +1012,12 @@ def extract_elsevier_supplementary_tables(doi, api_key, insttoken=""):
     return supplementary_dfs
 
 
-def extract_general_supplementary_tables(url):
+def extract_general_supplementary_tables(url, cancel_event=None, max_timeout=30):
     """
     Calls the journal-supp-downloader script to download supplementary files,
     then parses tables from them in-memory or from temp files.
+    Supports cooperative cancellation via cancel_event and terminates the child
+    process tree immediately on cancel or timeout.
     """
     import subprocess
     import tempfile
@@ -904,6 +1033,9 @@ def extract_general_supplementary_tables(url):
     except ImportError:
         fitz = None
 
+    if cancel_event is not None and cancel_event.is_set():
+        return []
+
     supplementary_dfs = []
     
     # Locate the journal_downloader.py script in the workspace
@@ -918,9 +1050,40 @@ def extract_general_supplementary_tables(url):
     temp_dir = tempfile.mkdtemp(prefix="supp_dl_")
     try:
         print(f"[在线提取] 调用 journal-supp-downloader 脚本获取补充文件: {url}")
-        # Run the downloader script
         cmd = [sys.executable, downloader_script, url, "-o", temp_dir]
-        subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        deadline = time.monotonic() + max(5.0, float(max_timeout or 30))
+        while proc.poll() is None:
+            if (cancel_event is not None and cancel_event.is_set()) or time.monotonic() >= deadline:
+                reason = "取消信号" if (cancel_event is not None and cancel_event.is_set()) else f"{max_timeout}s 超时"
+                print(f"[在线提取] journal-supp-downloader 收到{reason}，终止子进程。")
+                try:
+                    if os.name == "nt":
+                        subprocess.run(
+                            ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                            capture_output=True,
+                            timeout=5,
+                        )
+                    proc.kill()
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                try:
+                    proc.wait(timeout=3)
+                except Exception:
+                    pass
+                return supplementary_dfs
+            time.sleep(0.25)
+        try:
+            proc.communicate(timeout=2)
+        except Exception:
+            pass
         
         # Search the temp_dir recursively for downloaded files
         downloaded_files = []
@@ -1590,8 +1753,10 @@ def _extract_table_subpage_urls(base_url, html_text, limit=12):
     return urls
 
 
-def _follow_table_subpages(base_url, html_text, fetch_html_fn, table_idx="all"):
+def _follow_table_subpages(base_url, html_text, fetch_html_fn, table_idx="all", cancel_event=None):
     """Follow /tables/N subpage links or Copernicus JATS XML links using fetch_html_fn."""
+    if cancel_event is not None and cancel_event.is_set():
+        return []
     # Copernicus & open-access JATS XML link (e.g. se-9-373-2018.xml)
     if "copernicus.org" in (base_url or "").lower():
         xml_m = re.search(r'(?:href|content)=["\']([^"\']+?\.xml)["\']', html_text or "", re.IGNORECASE)
@@ -1608,6 +1773,8 @@ def _follow_table_subpages(base_url, html_text, fetch_html_fn, table_idx="all"):
         return []
     all_dfs = []
     for sub_u in sub_urls:
+        if cancel_event is not None and cancel_event.is_set():
+            break
         sub_html = fetch_html_fn(sub_u)
         if not sub_html or is_anti_bot_blocked("", sub_html):
             continue
@@ -1663,7 +1830,10 @@ def extract_tables_via_direct_http(url, table_idx="all", cancel_event=None):
 
             dfs = parse_tables_from_html(text, table_idx)
             if not dfs:
-                dfs = _follow_table_subpages(url, text, lambda su: (_fetch_one(su)[1] if _fetch_one(su)[0] == 200 else ""), table_idx)
+                def _fetch_ok_html(su):
+                    sc, body = _fetch_one(su)
+                    return body if sc == 200 else ""
+                dfs = _follow_table_subpages(url, text, _fetch_ok_html, table_idx, cancel_event=cancel_event)
             if dfs:
                 print(f"本地直接 HTTP 提取成功，解析到 {len(dfs)} 个表格。")
                 return dfs
@@ -1677,12 +1847,125 @@ def extract_tables_via_direct_http(url, table_idx="all", cancel_event=None):
 
 
 # ---------------------------------------------------------------------------
-# Firecrawl（云端 API）共享状态：进程内 memo、磁盘缓存、402 熔断
+# Firecrawl（云端 API）共享状态：进程内 memo、磁盘缓存、401/402/403 熔断
 # ---------------------------------------------------------------------------
 
 _FIRECRAWL_MEMO = {}
 _FIRECRAWL_MEMO_LOCK = threading.Lock()
-_FIRECRAWL_DISABLED = False  # 402（额度耗尽）时置 True，本次进程内禁用该渠道
+_FIRECRAWL_DISABLED = False  # 401/402/403（认证失败/封禁/额度耗尽）时置 True，本次进程内禁用该渠道
+_OA_CHECK_CACHE = {}
+_OA_CHECK_LOCK = threading.Lock()
+_KNOWN_OA_DOMAINS = (
+    "arxiv.org",
+    "ncbi.nlm.nih.gov/pmc",
+    "pmc.ncbi.nlm.nih.gov",
+    "europepmc.org",
+    "biorxiv.org",
+    "medrxiv.org",
+    "zenodo.org",
+    "researchsquare.com",
+    "mdpi.com",
+    "frontiersin.org",
+    "copernicus.org",
+    "plos.org",
+    "hindawi.com",
+    "peerj.com",
+    "elifesciences.org",
+    "f1000research.com",
+    "scielo.",
+)
+
+
+def _looks_like_pdf_url(url: str) -> bool:
+    """Return True if the URL path clearly points to a direct PDF binary/endpoint."""
+    if not url:
+        return False
+    low = str(url).strip().lower()
+    path = urllib.parse.urlsplit(low).path or low
+    return bool(re.search(r"(?:\.pdf|/e?pdf)(?:$)", path))
+
+
+def _extract_doi_from_url(url: str) -> str:
+    """Best-effort DOI extraction from publisher or resolver URLs."""
+    if not url:
+        return ""
+    decoded = urllib.parse.unquote(str(url))
+    m = re.search(r"(10\.\d{4,9}/[-._;()/:A-Za-z0-9]+)", decoded)
+    if not m:
+        return ""
+    doi = m.group(1).rstrip(".,;:/")
+    for suffix in ("/full", "/abstract", "/pdf", "/epdf", "/meta"):
+        if doi.lower().endswith(suffix):
+            doi = doi[: -len(suffix)]
+    doi = re.sub(r"/tables?/\d+$", "", doi, flags=re.IGNORECASE)
+    return doi
+
+
+def is_open_access_paper(url=None, doi=None, cancel_event=None) -> bool:
+    """Determine whether a paper/URL is verified Open Access before invoking Firecrawl.
+
+    Fail-closed by design: only verified OA domains or Unpaywall/OpenAlex ``is_oa=True``
+    records pass so paid Firecrawl credits and wait time are never spent on paywalled
+    abstract pages.
+    """
+    if cancel_event is not None and cancel_event.is_set():
+        return False
+
+    low_url = str(url or "").lower()
+    if low_url and any(dom in low_url for dom in _KNOWN_OA_DOMAINS):
+        return True
+
+    clean_doi = (doi or _extract_doi_from_url(url) or "").strip().lower()
+    if not clean_doi:
+        return False
+
+    with _OA_CHECK_LOCK:
+        if clean_doi in _OA_CHECK_CACHE:
+            return bool(_OA_CHECK_CACHE[clean_doi])
+
+    is_oa = False
+    try:
+        config = load_config()
+        polite_email = get_polite_email(config, service="unpaywall")
+        oa_api = f"https://api.unpaywall.org/v2/{urllib.parse.quote(clean_doi, safe='')}?email={urllib.parse.quote(polite_email)}"
+        resp = requests.get(
+            oa_api,
+            headers={"User-Agent": f"ZoteroTableExtractor/1.0 (mailto:{polite_email})"},
+            timeout=6,
+        )
+        if resp.status_code == 200:
+            data = resp.json() or {}
+            is_oa = bool(data.get("is_oa"))
+        else:
+            oa_oa = requests.get(
+                f"https://api.openalex.org/works/https://doi.org/{urllib.parse.quote(clean_doi, safe='')}?select=open_access",
+                headers={"User-Agent": f"ZoteroTableExtractor/1.0 (mailto:{polite_email})"},
+                timeout=6,
+            )
+            if oa_oa.status_code == 200:
+                is_oa = bool(((oa_oa.json() or {}).get("open_access") or {}).get("is_oa"))
+    except Exception:
+        is_oa = False
+
+    with _OA_CHECK_LOCK:
+        _OA_CHECK_CACHE[clean_doi] = is_oa
+    return is_oa
+
+
+def is_firecrawl_disabled() -> bool:
+    """Thread-safe check for whether Firecrawl API has been circuit-broken."""
+    with _FIRECRAWL_MEMO_LOCK:
+        return bool(_FIRECRAWL_DISABLED)
+
+
+def disable_firecrawl(reason: str = "") -> None:
+    """Trip the process-wide Firecrawl circuit-breaker (shared across all extractors)."""
+    global _FIRECRAWL_DISABLED
+    with _FIRECRAWL_MEMO_LOCK:
+        already = _FIRECRAWL_DISABLED
+        _FIRECRAWL_DISABLED = True
+    if not already and reason:
+        print(f"[Firecrawl] {reason}，本次运行内禁用 Firecrawl 渠道。")
 
 
 def _select_tables(dfs, table_idx):
@@ -1744,8 +2027,18 @@ def _firecrawl_write_cache(url, data):
         pass
 
 
+def _is_firecrawl_noise_table(df) -> bool:
+    """Filter bibliographic, author-roster, attachment, or LLM prose-summary tables."""
+    if is_metadata_table(df):
+        return True
+    cols_low = {str(c).strip().lower() for c in df.columns}
+    if cols_low in ({"field", "details"}, {"finding", "description"}, {"zoom option"}):
+        return True
+    return False
+
+
 def _firecrawl_tables_to_dfs(tables):
-    """Firecrawl JSON 结构化抽取结果 -> DataFrame 列表。"""
+    """Firecrawl JSON 结构化抽取结果 -> DataFrame 列表（过滤元信息与伪表）。"""
     dfs = []
     for idx, t in enumerate(tables or []):
         if not isinstance(t, dict):
@@ -1766,6 +2059,9 @@ def _firecrawl_tables_to_dfs(tables):
         except ValueError:
             # 列数不匹配（LLM 抽取错位），放弃该表，级联将尝试 HTML/Markdown 格式
             continue
+        # 先检测元信息/假表，防止伪造的 Table 1 标签绕过 is_metadata_table() 检查
+        if _is_firecrawl_noise_table(df):
+            continue
         df.attrs['label'] = clean_text(t.get("table_label") or f"Table {idx+1}")
         df.attrs['table_title'] = clean_text(t.get("table_title") or t.get("table_label") or "")
         dfs.append(df)
@@ -1774,9 +2070,9 @@ def _firecrawl_tables_to_dfs(tables):
 
 def _firecrawl_parse_response(data, table_idx):
     """
-    从 Firecrawl 单次抓取的响应数据（含 json/html/markdown 多格式）中级联解析表格。
-    复杂表（HTML 含 colspan/rowspan 合并单元格）优先走原始 HTML 解析，
-    避免 LLM 扁平化导致多级表头错位。
+    从 Firecrawl 单次抓取的响应数据（含 html/markdown/json 多格式）中级联解析表格。
+    始终优先使用原始 HTML -> Markdown 规则解析（保留完整多表与合并表头，杜绝 LLM
+    对摘要页造假表或截断多表），仅在前两项无结果时兜底已过滤的 JSON 结构化表。
     """
     if not isinstance(data, dict):
         return []
@@ -1796,24 +2092,24 @@ def _firecrawl_parse_response(data, table_idx):
         json_tables = data["tables"]
 
     html_l = html.lower()
-    has_complex = "<table" in html_l and ("colspan" in html_l or "rowspan" in html_l)
-    order = ("html", "json", "markdown") if has_complex else ("json", "html", "markdown")
+    order = ("html", "markdown", "json")
 
     last_dfs = []
     for kind in order:
         dfs = []
         if kind == "json":
-            if json_tables:
+            # 若原网页连 <table> 标签都不存在，LLM JSON 极易在摘要页凭空总结假表，直接跳过
+            if json_tables and "<table" in html_l:
                 dfs = _firecrawl_tables_to_dfs(json_tables)
         elif kind == "html":
             if "<table" in html_l:
-                dfs = parse_tables_from_html(html, "all")
+                dfs = [d for d in parse_tables_from_html(html, "all") if not _is_firecrawl_noise_table(d)]
         else:
             if md:
                 if "<table" in md.lower():
-                    dfs = parse_tables_from_html(md, "all")
+                    dfs = [d for d in parse_tables_from_html(md, "all") if not _is_firecrawl_noise_table(d)]
                 if not dfs:
-                    dfs = parse_tables_from_markdown(md, "all")
+                    dfs = [d for d in parse_tables_from_markdown(md, "all") if not _is_firecrawl_noise_table(d)]
         if dfs:
             last_dfs = dfs
         selected = _select_tables(dfs, table_idx)
@@ -1825,25 +2121,28 @@ def _firecrawl_parse_response(data, table_idx):
     return last_dfs
 
 
-def extract_tables_via_firecrawl(url, api_key=None, table_idx="all", cancel_event=None):
+def extract_tables_via_firecrawl(url, api_key=None, table_idx="all", cancel_event=None, is_oa=None, doi=None):
     """
-    Firecrawl Scrape API v2 —— 单次请求多格式（json + html + markdown）抓取。
+    Firecrawl Scrape API v2 —— OA 门控 + 轻量多格式（html + markdown）抓取。
 
-    相对旧版三次串行 scrape 的优化：
-    - 单次 scrape 同时返回结构化 JSON / 原始 HTML / Markdown，本地级联解析，
-      费用与延迟均降至旧版的约 1/3；
-    - maxAge 云端缓存（FIRECRAWL_MAX_AGE_MS）+ 本地磁盘缓存（默认 24h TTL），
-      重复 URL 近零成本；
-    - per-URL 进程内 memo：竞速管线内 Unpaywall / Tier-2 / tail race 不重复扣费；
-    - 402 熔断：额度耗尽后本次运行内禁用 Firecrawl 渠道；
-    - 429 按 Retry-After 退避重试一次；
-    - cancel_event：外层竞速已分出胜负时不再发起付费请求。
+    优化要点：
+    - 严格先验判断 OA（开放获取才进入），避免在闭源订阅摘要页浪费等待时间与额度；
+    - 默认仅请求 html + markdown（约 1 credit/次），避免 LLM JSON 抽取在无表页面造假表及额外扣费；
+    - 本地磁盘缓存（默认 24h TTL）+ 进程内 memo；
+    - 401/402/403 全局熔断 + 429 退避重试 + cancel_event 响应。
     """
-    global _FIRECRAWL_DISABLED
-    if _FIRECRAWL_DISABLED:
-        print("[Firecrawl] 已熔断（额度耗尽），跳过。")
+    if is_firecrawl_disabled():
+        print("[Firecrawl] 已熔断（认证/额度受限），跳过。")
         return []
     if cancel_event is not None and cancel_event.is_set():
+        return []
+    if _looks_like_pdf_url(url):
+        print(f"[Firecrawl] 目标链接指向 PDF 文件，跳过网页抓取: {url}")
+        return []
+    if is_oa is None:
+        is_oa = is_open_access_paper(url=url, doi=doi, cancel_event=cancel_event)
+    if not is_oa:
+        print(f"[Firecrawl] 非开放获取文献（OA 检查未通过），跳过云端抓取，节省时间与额度: {url}")
         return []
 
     memo_key = (url, str(table_idx))
@@ -1866,46 +2165,43 @@ def extract_tables_via_firecrawl(url, api_key=None, table_idx="all", cancel_even
     if cached is not None:
         return _finish(_firecrawl_parse_response(cached, table_idx))
 
-    # Table JSON Schema for Structured Extraction
-    table_schema = {
-        "type": "object",
-        "properties": {
-            "tables": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "table_label": {"type": "string", "description": "e.g., Table 1, Table 2, 表 1"},
-                        "table_title": {"type": "string", "description": "Full caption/title of the table"},
-                        "headers": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Column names of the table"
-                        },
-                        "rows": {
-                            "type": "array",
-                            "items": {
+    formats = ["html", "markdown"]
+    if bool(config.get("FIRECRAWL_ENABLE_JSON_EXTRACT")):
+        table_schema = {
+            "type": "object",
+            "properties": {
+                "tables": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "table_label": {"type": "string", "description": "e.g., Table 1, Table 2, 表 1"},
+                            "table_title": {"type": "string", "description": "Full caption/title of the table"},
+                            "headers": {
                                 "type": "array",
-                                "items": {"type": "string"}
+                                "items": {"type": "string"},
+                                "description": "Column names of the table"
                             },
-                            "description": "Rows of data. Each row must be an array of strings representing the cells corresponding to headers."
-                        }
-                    },
-                    "required": ["table_label", "headers", "rows"]
+                            "rows": {
+                                "type": "array",
+                                "items": {
+                                    "type": "array",
+                                    "items": {"type": "string"}
+                                },
+                                "description": "Rows of data. Each row must be an array of strings representing the cells corresponding to headers."
+                            }
+                        },
+                        "required": ["table_label", "headers", "rows"]
+                    }
                 }
-            }
-        },
-        "required": ["tables"]
-    }
+            },
+            "required": ["tables"]
+        }
+        formats = [{"type": "json", "schema": table_schema}, "html", "markdown"]
 
-    # 单次请求同时获取三种格式，本地级联解析（不再为同一 URL 重复付费渲染）
     payload = {
         "url": url,
-        "formats": [
-            {"type": "json", "schema": table_schema},
-            "html",
-            "markdown"
-        ],
+        "formats": formats,
         "onlyMainContent": True,
     }
     try:
@@ -1951,9 +2247,14 @@ def extract_tables_via_firecrawl(url, api_key=None, table_idx="all", cancel_even
                 _firecrawl_write_cache(url, payload_data)
             return _finish(_firecrawl_parse_response(payload_data, table_idx))
 
-        if response.status_code == 402:
-            print("[Firecrawl] 云端额度耗尽（402），本次运行内禁用 Firecrawl 渠道。")
-            _FIRECRAWL_DISABLED = True
+        if response.status_code in (401, 402, 403):
+            err_msg = ""
+            try:
+                err_msg = str((response.json() or {}).get("error") or "")[:120]
+            except Exception:
+                err_msg = (response.text or "")[:120]
+            reason_tag = "云端额度耗尽（402）" if response.status_code == 402 else f"认证失败或账号受限（{response.status_code}{': ' + err_msg if err_msg else ''}）"
+            disable_firecrawl(reason_tag)
             break
 
         if response.status_code == 429 and attempt == 0:
@@ -1963,7 +2264,11 @@ def extract_tables_via_firecrawl(url, api_key=None, table_idx="all", cancel_even
             except (TypeError, ValueError):
                 wait_s = 5.0
             print(f"[Firecrawl] 触发限流（429），{wait_s:.0f}s 后重试一次...")
-            time.sleep(wait_s)
+            if cancel_event is not None:
+                if cancel_event.wait(wait_s):
+                    return []
+            else:
+                time.sleep(wait_s)
             continue
 
         print(f"[Firecrawl] 请求失败，状态码: {response.status_code}")
@@ -2381,12 +2686,14 @@ def _collect_domain_cookies_for_scrapling(url):
     return _normalize_cookies_for_scrapling(matched, default_url=url)
 
 
-def extract_tables_via_scrapling(url, table_idx="all", force_headed=False):
+def extract_tables_via_scrapling(url, table_idx="all", force_headed=False, cancel_event=None):
     """
     Invokes Scrapling StealthyFetcher, auto-retrying in headed mode (real Chrome when installed)
     when headless is blocked by Cloudflare Turnstile, Radware Bot Manager, or Access Denied,
     and optionally escalating to Tencent BrowserSkill if installed and ready.
     """
+    if cancel_event is not None and cancel_event.is_set():
+        return []
     try:
         from .cdp_detector import has_system_chrome, try_fetch_html_via_browserskill
     except ImportError:
@@ -2413,6 +2720,8 @@ def extract_tables_via_scrapling(url, table_idx="all", force_headed=False):
             first_kwargs["cookies"] = domain_cookies
 
         html = _scrapling_fetch_html(url, first_kwargs)
+        if cancel_event is not None and cancel_event.is_set():
+            return []
         if not force_headed and (not html or is_anti_bot_blocked("", html)):
             print("Scrapling 无头模式受阻，自动切换有头浏览器模式重试...")
             used_headless = False
@@ -2428,11 +2737,15 @@ def extract_tables_via_scrapling(url, table_idx="all", force_headed=False):
             if domain_cookies:
                 headed_kwargs["cookies"] = domain_cookies
             html = _scrapling_fetch_html(url, headed_kwargs)
+            if cancel_event is not None and cancel_event.is_set():
+                return []
 
         if (not html or is_anti_bot_blocked("", html)) and try_fetch_html_via_browserskill:
             bsk_html, _bsk_status, _bsk_final = try_fetch_html_via_browserskill(url, timeout=30.0)
             if bsk_html and not is_anti_bot_blocked("", bsk_html):
                 html = bsk_html
+            if cancel_event is not None and cancel_event.is_set():
+                return []
 
         if html and not is_anti_bot_blocked("", html):
             dfs = parse_tables_from_html(html, table_idx)
@@ -2444,8 +2757,9 @@ def extract_tables_via_scrapling(url, table_idx="all", force_headed=False):
                 dfs = _follow_table_subpages(
                     url,
                     html,
-                    lambda su: _scrapling_fetch_html(su, {"headless": used_headless, "solve_cloudflare": not used_headless, "network_idle": False}),
+                    lambda su: ("" if (cancel_event is not None and cancel_event.is_set()) else _scrapling_fetch_html(su, {"headless": used_headless, "solve_cloudflare": not used_headless, "network_idle": False})),
                     table_idx,
+                    cancel_event=cancel_event,
                 )
             if dfs:
                 return dfs
@@ -2564,13 +2878,26 @@ def has_image_based_tables(html):
     return False
 
 
-def extract_cnki_tables_via_scrapling(url, table_idx="all", cookies_path=None):
+def extract_cnki_tables_via_scrapling(url, table_idx="all", cookies_path=None, cancel_event=None):
     """
     Fetches CNKI page using Scrapling StealthyFetcher with optional cookies.
     """
     try:
+        if cancel_event is not None and cancel_event.is_set():
+            return []
+        if "chndoi.org" in (url or "").lower() or "chinadoi.cn" in (url or "").lower():
+            try:
+                from .doi_resolver import resolve_chinese_doi
+            except ImportError:
+                from doi_resolver import resolve_chinese_doi
+            url = resolve_chinese_doi(url)
+        if cancel_event is not None and cancel_event.is_set():
+            return []
         print(f"CNKI Scrapling: Loading {url}...")
-        extra_kwargs = {}
+        extra_kwargs = {
+            "solve_cloudflare": False,
+            "timeout": 12000,
+        }
         if cookies_path and os.path.exists(cookies_path):
             cookies = load_cookies_from_file(cookies_path)
             if cookies:
@@ -2674,14 +3001,36 @@ def _crawl4ai_cdp_url():
     """
     确定 Crawl4AI 是否通过 CDP 接管技能已有的调试 Chrome。
     config CRAWL4AI_CDP_URL / CDP_URL 显式指定优先；为空时自动动态探测 DevToolsActivePort / 9222
-    （每进程仅探测一次）。返回 None 表示自启独立 stealth 浏览器。
+    （缓存已检测到的存活端点，若端点失活则自动失效重探）。返回 None 表示自启独立 stealth 浏览器。
     """
     config = load_config()
     explicit = (config.get("CRAWL4AI_CDP_URL") or config.get("CDP_URL") or "").strip()
     if explicit:
         return explicit
     if _CRAWL4AI_CDP_CACHE["checked"]:
-        return _CRAWL4AI_CDP_CACHE["url"]
+        cached_url = _CRAWL4AI_CDP_CACHE["url"]
+        if not cached_url:
+            return None
+        # Verify cached CDP endpoint is still alive before reusing it
+        alive = False
+        try:
+            import urllib.parse
+            parsed = urllib.parse.urlparse(cached_url)
+            host = parsed.hostname or "127.0.0.1"
+            port = parsed.port or 9222
+            from .cdp_detector import check_cdp_endpoint_alive
+            alive = bool(check_cdp_endpoint_alive(host=host, port=port, timeout=0.5))
+        except Exception:
+            try:
+                import urllib.request
+                with urllib.request.urlopen(cached_url.rstrip("/") + "/json/version", timeout=0.5) as resp:
+                    alive = (resp.status == 200)
+            except Exception:
+                alive = False
+        if alive:
+            return cached_url
+        _CRAWL4AI_CDP_CACHE["checked"] = False
+        _CRAWL4AI_CDP_CACHE["url"] = None
     probe = None
     try:
         from .cdp_detector import find_active_cdp_endpoint
@@ -2708,7 +3057,13 @@ def _filter_kwargs(cls, kwargs):
     accepted = set()
     try:
         import inspect
-        accepted |= set(inspect.signature(cls.__init__).parameters) - {"self"}
+        target = cls.__init__ if isinstance(cls, type) else cls
+        sig = inspect.signature(target)
+        for param in sig.parameters.values():
+            if param.kind == inspect.Parameter.VAR_KEYWORD:
+                return kwargs
+            if param.name != "self":
+                accepted.add(param.name)
     except Exception:
         pass
     fields = getattr(cls, "model_fields", None) or getattr(cls, "__fields__", None) or {}
@@ -2780,8 +3135,7 @@ def extract_tables_via_crawl4ai(url, table_idx="all", cancel_event=None):
 
         # CDP 模式复用真实浏览器（自带登录态），无需注入 Cookie；
         # 自启浏览器模式按目标域名过滤注入已保存的 Cookie（含 journal-supp-downloader 共享 cookie）。
-        cookies_list = None
-        if not cdp_url:
+        def _load_domain_cookies():
             cookie_paths = []
             primary_cp = get_crawl4ai_cookies_path()
             if os.path.exists(primary_cp):
@@ -2809,25 +3163,33 @@ def extract_tables_via_crawl4ai(url, table_idx="all", cancel_event=None):
                 except Exception as e:
                     print(f"[Crawl4AI Warning] Failed to load cookies from {cp}: {e}")
             if merged_cookies:
-                cookies_list = _cookies_for_domain(merged_cookies, url)
-                print(f"[Crawl4AI] Loaded {len(cookies_list or [])} domain-matched cookies from {len(cookie_paths)} store(s)")
+                filtered = _cookies_for_domain(merged_cookies, url)
+                print(f"[Crawl4AI] Loaded {len(filtered or [])} domain-matched cookies from {len(cookie_paths)} store(s)")
+                return filtered
+            return None
 
-        async def _crawl():
+        async def _crawl(active_cdp_url):
+            os.environ.setdefault("CRAWL4AI_NO_CLOUD_NOTICE", "1")
             from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
 
             browser_kwargs = {
-                "headless": cdp_url is None,
-                "enable_stealth": cdp_url is None,
+                "headless": active_cdp_url is None,
+                "enable_stealth": active_cdp_url is None,
             }
-            if cdp_url:
-                # 接管技能已有的调试 Chrome（跨进程复用，替代不可行的进程池）
+            if active_cdp_url:
+                # 接管技能已有的调试 Chrome，并强制隔离上下文 + 退出清理，避免多并发共享 context.pages[0] 冲突
                 browser_kwargs.update({
                     "use_managed_browser": True,
                     "browser_mode": "cdp",  # 新版参数名；旧版本由签名过滤丢弃
-                    "cdp_url": cdp_url,
+                    "cdp_url": active_cdp_url,
+                    "create_isolated_context": True,
+                    "cdp_cleanup_on_close": True,
+                    "cdp_close_delay": 0.0,
                 })
-            elif cookies_list:
-                browser_kwargs["cookies"] = cookies_list
+            else:
+                cookies_list = _load_domain_cookies()
+                if cookies_list:
+                    browser_kwargs["cookies"] = cookies_list
             browser_config = BrowserConfig(**_filter_kwargs(BrowserConfig, browser_kwargs))
 
             run_kwargs = {
@@ -2838,31 +3200,36 @@ def extract_tables_via_crawl4ai(url, table_idx="all", cancel_event=None):
             }
             try:
                 from crawl4ai.table_extraction import DefaultTableExtraction
-                run_kwargs["table_extraction_strategy"] = DefaultTableExtraction()
+                run_kwargs["table_extraction"] = DefaultTableExtraction()
             except Exception:
                 try:
                     import crawl4ai as _c4a
                     _dte = getattr(_c4a, "DefaultTableExtraction", None)
                     if _dte is not None:
-                        run_kwargs["table_extraction_strategy"] = _dte()
+                        run_kwargs["table_extraction"] = _dte()
                 except Exception:
                     pass
             run_config = CrawlerRunConfig(**_filter_kwargs(CrawlerRunConfig, run_kwargs))
 
             async with AsyncWebCrawler(config=browser_config) as crawler:
-                task = asyncio.ensure_future(crawler.arun(url=url, config=run_config))
-                while True:
-                    if cancel_event is not None and cancel_event.is_set():
-                        task.cancel()
-                        print("[Crawl4AI] 收到取消信号，已中止抓取。")
-                        return None, None, None, "cancel"
-                    done, _pending = await asyncio.wait({task}, timeout=0.5)
-                    if done:
-                        break
-                try:
-                    result = task.result()
-                except asyncio.CancelledError:
-                    return None, None, None, "cancel"
+                async def _arun_cancellable(target_u):
+                    task = asyncio.ensure_future(crawler.arun(url=target_u, config=run_config))
+                    while True:
+                        if cancel_event is not None and cancel_event.is_set():
+                            task.cancel()
+                            return None, True
+                        done, _pending = await asyncio.wait({task}, timeout=0.5)
+                        if done:
+                            break
+                    try:
+                        return task.result(), False
+                    except asyncio.CancelledError:
+                        return None, True
+
+                result, _cancelled = await _arun_cancellable(url)
+                if _cancelled or result is None:
+                    print("[Crawl4AI] 收到取消信号，已中止抓取。")
+                    return None, None, None, "cancel", {}
                 if result.success:
                     md_obj = result.markdown
                     if md_obj is not None and not isinstance(md_obj, str):
@@ -2871,11 +3238,27 @@ def extract_tables_via_crawl4ai(url, table_idx="all", cancel_event=None):
                     else:
                         md_text = md_obj
                     c4_tables = getattr(result, "tables", None)
-                    return result.html, md_text, c4_tables, "ok"
+                    sub_htmls = {}
+                    # 若正文 HTML 未提取出有效表格（哪怕 c4_tables 含布局噪声表）且含 /tables/N 等子页链接，复用当前 crawler 抓取子页
+                    if result.html:
+                        sub_urls = _extract_table_subpage_urls(url, result.html)
+                        if sub_urls and not parse_tables_from_html(result.html, table_idx):
+                            for sub_u in sub_urls:
+                                if cancel_event is not None and cancel_event.is_set():
+                                    break
+                                try:
+                                    sub_res, sub_cancelled = await _arun_cancellable(sub_u)
+                                    if sub_cancelled:
+                                        break
+                                    if getattr(sub_res, "success", False) and getattr(sub_res, "html", None):
+                                        sub_htmls[sub_u] = sub_res.html
+                                except Exception:
+                                    pass
+                    return result.html, md_text, c4_tables, "ok", sub_htmls
                 print(f"[Crawl4AI] Crawl failed: {result.error_message}")
-                return None, None, None, "fail"
+                return None, None, None, "fail", {}
 
-        try:
+        def _run_crawl_attempt(active_cdp_url):
             try:
                 running_loop = asyncio.get_running_loop()
             except RuntimeError:
@@ -2883,14 +3266,32 @@ def extract_tables_via_crawl4ai(url, table_idx="all", cancel_event=None):
             if running_loop is not None:
                 import nest_asyncio
                 nest_asyncio.apply()
-                html, markdown, c4_tables, status = running_loop.run_until_complete(_crawl())
-            else:
-                html, markdown, c4_tables, status = asyncio.run(_crawl())
+                return running_loop.run_until_complete(_crawl(active_cdp_url))
+            return asyncio.run(_crawl(active_cdp_url))
+
+        html = markdown = c4_tables = None
+        sub_htmls = {}
+        status = "fail"
+        try:
+            html, markdown, c4_tables, status, sub_htmls = _run_crawl_attempt(cdp_url)
         except Exception as e:
             print(f"[Crawl4AI Error] Exception during crawl: {e}")
-            _crawl4ai_record(url, hard_failure=True)
-            return []
+            status = "fail"
 
+        # If CDP mode failed/aborted/collided and run wasn't cancelled, invalidate stale CDP cache
+        # and fall back once to an isolated stealth Crawl4AI browser.
+        if cdp_url and status == "fail" and not (cancel_event is not None and cancel_event.is_set()):
+            print(f"[Crawl4AI] CDP 模式 ({cdp_url}) 失败或冲突，清除缓存并回退至独立隔离浏览器重试...")
+            _CRAWL4AI_CDP_CACHE["checked"] = False
+            _CRAWL4AI_CDP_CACHE["url"] = None
+            try:
+                html, markdown, c4_tables, status, sub_htmls = _run_crawl_attempt(None)
+            except Exception as e:
+                print(f"[Crawl4AI Error] Isolated fallback exception: {e}")
+                status = "fail"
+
+        if status == "cancel":
+            return []
         if status == "fail":
             _crawl4ai_record(url, hard_failure=True)
             return []
@@ -2900,6 +3301,14 @@ def extract_tables_via_crawl4ai(url, table_idx="all", cancel_event=None):
             _crawl4ai_record(url, hard_failure=False)
             if html:
                 dfs = parse_tables_from_html(html, table_idx)
+                if not dfs and sub_htmls:
+                    dfs = _follow_table_subpages(
+                        url,
+                        html,
+                        lambda su: sub_htmls.get(su, ""),
+                        table_idx,
+                        cancel_event=cancel_event,
+                    )
                 if dfs:
                     print(f"[Crawl4AI] Successfully extracted {len(dfs)} tables from HTML.")
                     return dfs
@@ -2918,11 +3327,20 @@ def extract_tables_via_crawl4ai(url, table_idx="all", cancel_event=None):
                             df_t = pd.DataFrame(rows, columns=[clean_text(h) for h in headers], dtype=str)
                         else:
                             df_t = _rows_to_dataframe(rows)
-                        if df_t is not None and not df_t.empty:
-                            if t_item.get("caption"):
-                                df_t.attrs["table_title"] = clean_text(t_item["caption"])
-                            df_t.attrs["extractor"] = "crawl4ai_table"
-                            parsed_c4.append(df_t)
+                        if df_t is None or df_t.empty:
+                            continue
+                        cap_text = clean_text(t_item.get("caption") or "")
+                        lbl_text = _extract_normalized_table_label(cap_text) if cap_text else ""
+                        if common.is_unlabeled_single_col_layout_shell(df_t, has_explicit_label=bool(lbl_text or cap_text)):
+                            continue
+                        if is_metadata_table(df_t):
+                            continue
+                        if cap_text:
+                            df_t.attrs["table_title"] = cap_text
+                        if lbl_text:
+                            df_t.attrs["label"] = lbl_text
+                        df_t.attrs["extractor"] = "crawl4ai_table"
+                        parsed_c4.append(df_t)
                     except Exception:
                         pass
                 if parsed_c4:
@@ -2986,27 +3404,46 @@ def extract_tables_via_unpaywall(doi, table_idx="all", cancel_event=None):
 
         print(f"[Unpaywall] \u627e\u5230\u5f00\u653e\u83b7\u53d6\u7248\u672c: {best_url}")
 
-        # Try Firecrawl on OA URL
-        config = load_config()
-        key = config.get("FIRECRAWL_API_KEY") or os.environ.get("FIRECRAWL_API_KEY")
-        if key:
-            dfs = extract_tables_via_firecrawl(best_url, key, table_idx, cancel_event=cancel_event)
-            if dfs:
-                print(f"[Unpaywall] \u901a\u8fc7 Firecrawl \u4ece\u5f00\u653e\u7248\u672c\u63d0\u53d6\u5230 {len(dfs)} \u5f20\u8868\u683c\u3002")
-                return dfs
+        # Skip PDF binaries/viewers in HTML/Firecrawl extractors
+        if _looks_like_pdf_url(best_url):
+            return []
 
-        # Direct HTTP parse
+        # 1) Direct HTTP parse FIRST (0 credits, sub-second on permissive OA hosts)
+        is_pdf_response = False
         try:
-            r = requests.get(best_url, timeout=20, headers={
+            r = requests.get(best_url, timeout=12, headers={
                 "User-Agent": "Mozilla/5.0 (compatible; ZoteroTableExtractor/1.0)"
             })
-            if r.status_code == 200:
-                dfs = parse_tables_from_html(r.text, table_idx)
+            ctype = (r.headers.get("Content-Type") or "").lower()
+            raw_head = (getattr(r, "content", None) or b"")[:5]
+            if "application/pdf" in ctype or raw_head == b"%PDF-":
+                is_pdf_response = True
+            elif r.status_code == 200 and not is_anti_bot_blocked("", r.text[:4000]):
+                dfs = [d for d in parse_tables_from_html(r.text, table_idx) if not _is_firecrawl_noise_table(d)]
                 if dfs:
                     print(f"[Unpaywall] \u901a\u8fc7\u76f4\u63a5 HTTP \u4ece\u5f00\u653e\u7248\u672c\u63d0\u53d6\u5230 {len(dfs)} \u5f20\u8868\u683c\u3002")
                     return dfs
         except Exception as e:
             print(f"[Unpaywall] \u76f4\u63a5 HTTP \u83b7\u53d6\u5931\u8d25: {e}")
+
+        if is_pdf_response:
+            return []
+
+        # 2) Fallback to Firecrawl ONLY for verified non-PDF OA landing URLs
+        config = load_config()
+        key = config.get("FIRECRAWL_API_KEY") or os.environ.get("FIRECRAWL_API_KEY")
+        if key:
+            dfs = extract_tables_via_firecrawl(
+                best_url,
+                key,
+                table_idx,
+                cancel_event=cancel_event,
+                is_oa=True,
+                doi=doi,
+            )
+            if dfs:
+                print(f"[Unpaywall] \u901a\u8fc7 Firecrawl \u4ece\u5f00\u653e\u7248\u672c\u63d0\u53d6\u5230 {len(dfs)} \u5f20\u8868\u683c\u3002")
+                return dfs
 
     except Exception as e:
         print(f"[Unpaywall] \u67e5\u8be2\u5931\u8d25: {e}")

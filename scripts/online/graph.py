@@ -179,6 +179,21 @@ def _normalize_publisher_url(url: str) -> str:
     return url
 
 
+def _resolve_chinese_doi_and_classify(url: str, is_cnki: bool = False):
+    """Resolve chndoi.org/chinadoi.cn to domestic CNKI link and update is_cnki classification."""
+    if not url:
+        return url, is_cnki
+    low = url.lower()
+    if "chndoi.org" in low or "chinadoi.cn" in low:
+        resolved = resolve_chinese_doi(url)
+        if resolved and resolved != url:
+            url = resolved
+            low = url.lower()
+    if "cnki.net" in low or "cnki.com.cn" in low:
+        is_cnki = True
+    return url, is_cnki
+
+
 class ResolveMetadataNode(ExtractionNode):
     def __init__(self, fallback_node=None):
         super().__init__("ResolveMetadataNode", fallback_node)
@@ -191,12 +206,16 @@ class ResolveMetadataNode(ExtractionNode):
         # 0. Check if pdf_path is already a URL
         if isinstance(pdf_path, str) and (pdf_path.startswith("http://") or pdf_path.startswith("https://")):
             url = _normalize_publisher_url(pdf_path)
-            is_cnki = "cnki.net" in url or "cnki.com.cn" in url
+            url, is_cnki = _resolve_chinese_doi_and_classify(url, False)
             doi = None
             if "doi.org/" in url:
                 _doi_match = re.search(r'doi\.org/(10\.\d{4,9}/[-._;()/:A-Z0-9]+)', url, re.IGNORECASE)
                 if _doi_match:
                     doi = _doi_match.group(1)
+            elif "chndoi.org" in pdf_path.lower() or "chinadoi.cn" in pdf_path.lower():
+                _doi_match = re.search(r'[?&]doi=(10\.\d{4,9}/[^\s&]+)', pdf_path, re.IGNORECASE)
+                if _doi_match:
+                    doi = urllib.parse.unquote(_doi_match.group(1))
             state["url"] = url
             state["doi"] = doi
             state["is_cnki"] = is_cnki
@@ -228,12 +247,9 @@ class ResolveMetadataNode(ExtractionNode):
             
             # Prioritize direct Zotero URL if available (saves redirect timeouts)
             if url and isinstance(url, str) and url.startswith("http"):
-                if "cnki.net" in url or "cnki.com.cn" in url:
-                    is_cnki = True
+                url, is_cnki = _resolve_chinese_doi_and_classify(url, is_cnki)
             elif zotero_url and zotero_url.startswith("http"):
-                url = zotero_url
-                if "cnki.net" in url or "cnki.com.cn" in url:
-                    is_cnki = True
+                url, is_cnki = _resolve_chinese_doi_and_classify(zotero_url, is_cnki)
             elif cnki_url:
                 is_cnki = True
                 url = cnki_url
@@ -522,10 +538,44 @@ class PlaywrightGeneralNode(ExtractionNode):
                 user_data_dir = get_domain_profile_dir(url)
             
         from . import general_html_extractor
+        cancel_event = state.get("cancel_event")
+        if cancel_event is not None and cancel_event.is_set():
+            return state, None
             
         # 共享浏览器状态调度：若已有 CDP 实例则免全局锁走 Tab 隔离并发，否则全局加锁保护 profile
+        _pw_meta = {}
         with browser_task_concurrency_guard(user_data_dir=user_data_dir, config=config):
-            res = general_html_extractor.extract_general_html_tables(url, table_idx, headed, user_data_dir, api_key)
+            try:
+                res = general_html_extractor.extract_general_html_tables(
+                    url,
+                    table_idx,
+                    headed,
+                    user_data_dir,
+                    api_key,
+                    cancel_event=cancel_event,
+                    skip_stealth_fallback=bool(state.get("_skip_stealth_fallback", False)),
+                    meta_out=_pw_meta,
+                )
+            except TypeError:
+                res = general_html_extractor.extract_general_html_tables(
+                    url,
+                    table_idx,
+                    headed,
+                    user_data_dir,
+                    api_key,
+                    cancel_event=cancel_event,
+                    skip_stealth_fallback=bool(state.get("_skip_stealth_fallback", False)),
+                )
+        _reroute_cnki = _pw_meta.get("reroute_cnki_url")
+        if _reroute_cnki:
+            print(f"[在线提取] 检测到 chndoi/跳转落地知网 ({_reroute_cnki})，动态重路由至 CNKI 专用抽取器...")
+            cnki_state = dict(state)
+            cnki_state["url"] = _reroute_cnki
+            cnki_state["is_cnki"] = True
+            state["url"] = _reroute_cnki
+            state["is_cnki"] = True
+            return PlaywrightCNKINode(fallback_node=self.fallback_node).execute(cnki_state)
+
         if isinstance(res, tuple):
             dfs, resolved_title = res
             _error_titles = {
@@ -540,18 +590,28 @@ class PlaywrightGeneralNode(ExtractionNode):
                     state["title"] = resolved_title
         else:
             dfs = res
+
+        if cancel_event is not None and cancel_event.is_set():
+            if dfs:
+                state["dfs"] = dfs
+            return state, None
             
         if dfs:
             # Also attempt to download and parse general supplementary tables via journal-supp-downloader
-            supp_dfs = extract_general_supplementary_tables(url)
+            supp_dfs = extract_general_supplementary_tables(url, cancel_event=cancel_event, max_timeout=30)
             if supp_dfs:
                 dfs.extend(supp_dfs)
                 print(f"[在线提取] 成功获取并追加了 {len(supp_dfs)} 个补充表格。")
             state["dfs"] = dfs
             return state, None
             
-        # If no main tables found, still try to extract supplementary tables alone
-        supp_dfs = extract_general_supplementary_tables(url)
+        if _pw_meta.get("was_dead_http") and not dfs:
+            print("[在线提取] 页面返回 HTTP 404/410 死链，跳过补充材料子进程下载。")
+            return state, self.fallback_node
+
+        # If no main tables found, still try bounded supplementary extraction
+        _supp_timeout = 20 if _pw_meta.get("was_blocked") else 30
+        supp_dfs = extract_general_supplementary_tables(url, cancel_event=cancel_event, max_timeout=_supp_timeout)
         if supp_dfs:
             state["dfs"] = supp_dfs
             print(f"[在线提取] 成功提取并载入 {len(supp_dfs)} 个补充表格。")
@@ -599,10 +659,13 @@ class FirecrawlNode(ExtractionNode):
 
     def execute(self, state):
         url = state.get("url")
+        doi = state.get("doi")
         table_idx = state.get("table_idx", "all")
         api_key = state.get("api_key")
 
-        dfs = extract_tables_via_firecrawl(url, api_key, table_idx, cancel_event=state.get("cancel_event"))
+        dfs = extract_tables_via_firecrawl(
+            url, api_key, table_idx, cancel_event=state.get("cancel_event"), doi=doi
+        )
         if dfs:
             state["dfs"] = dfs
             return state, None
@@ -619,13 +682,19 @@ class AcademicSearchGraphNode(ExtractionNode):
         title = state.get("title")
         table_idx = state.get("table_idx", "all")
         api_key = state.get("api_key")
+        cancel_event = state.get("cancel_event")
+
+        if cancel_event is not None and cancel_event.is_set():
+            return state, None
         
         # 1. Unpaywall fallback
         if doi:
             print("[AcademicSearchGraph] Querying Unpaywall for open-access URLs...")
-            dfs = extract_tables_via_unpaywall(doi, table_idx, cancel_event=state.get("cancel_event"))
+            dfs = extract_tables_via_unpaywall(doi, table_idx, cancel_event=cancel_event)
             if dfs:
                 state["dfs"] = dfs
+                return state, None
+            if cancel_event is not None and cancel_event.is_set():
                 return state, None
                 
             # 2. Europe PMC search
@@ -642,25 +711,33 @@ class AcademicSearchGraphNode(ExtractionNode):
                             pmc_landing = f"https://www.ncbi.nlm.nih.gov/pmc/articles/{pmcid}/"
                             print(f"[AcademicSearchGraph] Found PMC version: {pmc_landing}")
                             
-                            dfs = extract_tables_via_direct_http(pmc_landing, table_idx)
+                            dfs = extract_tables_via_direct_http(pmc_landing, table_idx, cancel_event=cancel_event)
                             if dfs:
                                 state["dfs"] = dfs
                                 return state, None
+                            if cancel_event is not None and cancel_event.is_set():
+                                return state, None
                                 
-                            dfs = extract_tables_via_scrapling(pmc_landing, table_idx)
+                            dfs = extract_tables_via_scrapling(pmc_landing, table_idx, cancel_event=cancel_event)
                             if dfs:
                                 state["dfs"] = dfs
                                 return state, None
+                            if cancel_event is not None and cancel_event.is_set():
+                                return state, None
                                 
-                            dfs = extract_tables_via_firecrawl(pmc_landing, api_key, table_idx, cancel_event=state.get("cancel_event"))
+                            dfs = extract_tables_via_firecrawl(pmc_landing, api_key, table_idx, cancel_event=cancel_event, is_oa=True, doi=doi)
                             if dfs:
                                 state["dfs"] = dfs
                                 return state, None
             except Exception as e:
                 print(f"[AcademicSearchGraph Warning] Europe PMC search failed: {e}")
+
+        if cancel_event is not None and cancel_event.is_set():
+            return state, None
                 
         # 3. Title-based Crossref preprint search
-        if title:
+        _bogus_title_kws = ("cnki原文下载服务", "中国知网", "access denied", "just a moment", "attention required", "page not found")
+        if title and not any(k in title.lower() for k in _bogus_title_kws):
             print(f"[AcademicSearchGraph] Searching alternative open-access repositories by title: {title}")
             try:
                 polite_email = get_polite_email(load_config(), service="crossref")
@@ -677,16 +754,20 @@ class AcademicSearchGraphNode(ExtractionNode):
                     data = r.json()
                     items = data.get("message", {}).get("items", [])
                     for item in items:
+                        if cancel_event is not None and cancel_event.is_set():
+                            return state, None
                         links = item.get("link", [])
                         for link in links:
+                            if cancel_event is not None and cancel_event.is_set():
+                                return state, None
                             cand_url = link.get("URL")
                             if cand_url and any(domain in cand_url for domain in ["biorxiv.org", "medrxiv.org", "arxiv.org", "zenodo.org", "researchsquare.com"]):
                                 print(f"[AcademicSearchGraph] Found alternative preprint link: {cand_url}")
-                                dfs = extract_tables_via_direct_http(cand_url, table_idx)
+                                dfs = extract_tables_via_direct_http(cand_url, table_idx, cancel_event=cancel_event)
                                 if dfs:
                                     state["dfs"] = dfs
                                     return state, None
-                                dfs = extract_tables_via_firecrawl(cand_url, api_key, table_idx, cancel_event=state.get("cancel_event"))
+                                dfs = extract_tables_via_firecrawl(cand_url, api_key, table_idx, cancel_event=cancel_event, is_oa=True, doi=doi)
                                 if dfs:
                                     state["dfs"] = dfs
                                     return state, None
@@ -919,7 +1000,7 @@ def _race_extract(state, cancel_event=None):
         if doi:
             candidates.append(("PaperFetch", lambda: extract_tables_via_paper_fetch(doi, table_idx, cancel_event=cancel_event)))
         if url:
-            candidates.append(("Firecrawl", lambda: extract_tables_via_firecrawl(url, api_key, table_idx, cancel_event=cancel_event)))
+            candidates.append(("Firecrawl", lambda: extract_tables_via_firecrawl(url, api_key, table_idx, cancel_event=cancel_event, doi=doi)))
         return _race_candidates(candidates, cancel_event)
 
     if state.get("is_cnki"):
@@ -928,12 +1009,14 @@ def _race_extract(state, cancel_event=None):
         cookies_path = get_cnki_cookies_path()
 
         tier1 = []
-        if cnki_strategy in ("auto", "scrapling"):
-            tier1.append(("ScraplingCNKI",
-                          lambda: extract_cnki_tables_via_scrapling(url, table_idx, cookies_path)))
-        if cnki_strategy in ("auto",):
-            tier1.append(("Crawl4AICNKI",
-                          lambda: extract_tables_via_crawl4ai(url, table_idx, cancel_event=cancel_event)))
+        _is_cnki_abstract_shell = bool(url and "link.cnki.net/doi/" in url.lower())
+        if not (cnki_strategy == "auto" and _is_cnki_abstract_shell):
+            if cnki_strategy in ("auto", "scrapling"):
+                tier1.append(("ScraplingCNKI",
+                              lambda: extract_cnki_tables_via_scrapling(url, table_idx, cookies_path, cancel_event=cancel_event)))
+            if cnki_strategy in ("auto",):
+                tier1.append(("Crawl4AICNKI",
+                              lambda: extract_tables_via_crawl4ai(url, table_idx, cancel_event=cancel_event)))
         dfs, winner = _race_candidates(tier1, cancel_event)
         history.append(f"cnki-tier1:{winner or 'none'}")
         if dfs:
@@ -1028,8 +1111,8 @@ def _race_extract(state, cancel_event=None):
     tier2 = []
     if url:
         tier2.append(("Crawl4AI", lambda: extract_tables_via_crawl4ai(url, table_idx, cancel_event=cancel_event)))
-        tier2.append(("Firecrawl", lambda: extract_tables_via_firecrawl(url, api_key, table_idx, cancel_event=cancel_event)))
-        tier2.append(("Scrapling", lambda: extract_tables_via_scrapling(url, table_idx)))
+        tier2.append(("Firecrawl", lambda: extract_tables_via_firecrawl(url, api_key, table_idx, cancel_event=cancel_event, doi=doi)))
+        tier2.append(("Scrapling", lambda: extract_tables_via_scrapling(url, table_idx, cancel_event=cancel_event)))
     dfs, winner = _race_candidates(tier2, cancel_event)
     history.append(f"general-tier2:{winner or 'none'}")
     if dfs and len(dfs) > len(best_partial):
@@ -1040,7 +1123,9 @@ def _race_extract(state, cancel_event=None):
     # Tier-3: 共享浏览器 Playwright（锁内串行，含补充材料下载）
     if url:
         print("[Race] General Tier-3: PlaywrightGeneral（浏览器锁内）")
-        s, _n = _run_node_locked(PlaywrightGeneralNode(), state)
+        tier3_state = dict(state)
+        tier3_state["_skip_stealth_fallback"] = True
+        s, _n = _run_node_locked(PlaywrightGeneralNode(), tier3_state)
         history.append("general-tier3:playwright")
         if s.get("dfs") and len(s["dfs"]) > len(best_partial):
             return s["dfs"], history
@@ -1097,11 +1182,18 @@ def extract_tables_online(pdf_path, table_idx="all", db_path=None, api_key=None,
         state["title"] = pre_resolved.get("title")
         state["is_cnki"] = pre_resolved.get("is_cnki", False)
 
+    if state.get("url"):
+        resolved_u, resolved_cnki = _resolve_chinese_doi_and_classify(state["url"], bool(state.get("is_cnki")))
+        state["url"] = resolved_u
+        state["is_cnki"] = resolved_cnki
+
     if race:
         # 并行竞速管线（url 缺失时仍进解析节点做 URL 解析；节点对已有 doi 幂等）
         if not state.get("url"):
             node_state, _n = ResolveMetadataNode().execute(state)
             state.update({k: node_state.get(k) for k in ("url", "doi", "title", "is_cnki")})
+        else:
+            state["url"] = _normalize_publisher_url(state["url"])
         print(f"[Race] 在线分层竞速开始: URL={state.get('url')}, DOI={state.get('doi')}, is_cnki={state.get('is_cnki')}")
         dfs, history = _race_extract(state, cancel_event)
         print(f"[Race] 竞速管线结束. History: {history}")

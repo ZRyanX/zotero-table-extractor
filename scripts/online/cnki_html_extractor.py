@@ -15,9 +15,9 @@ except ImportError:
 
 # Shared helpers (text cleaning, table filtering, cookie parsing)
 try:
-    from ..common import clean_text, escape_formula, is_metadata_table, clean_table_filename, load_cookies_from_file, df_map
+    from ..common import clean_text, escape_formula, is_metadata_table, clean_table_filename, load_cookies_from_file, df_map, TABLE_LABEL_RE, format_table_label
 except ImportError:
-    from common import clean_text, escape_formula, is_metadata_table, clean_table_filename, load_cookies_from_file, df_map
+    from common import clean_text, escape_formula, is_metadata_table, clean_table_filename, load_cookies_from_file, df_map, TABLE_LABEL_RE, format_table_label
 
 def simulate_human_drag(page, handler_selector, distance):
     handler = page.wait_for_selector(handler_selector, timeout=15000)
@@ -186,9 +186,15 @@ def extract_tables_from_page(page, table_idx="all"):
             df.columns = [escape_formula(c) for c in df.columns]
             df = df_map(df, escape_formula)
                 
-            # Set custom title attribute
+            # Set custom title & label attributes
             cleaned_title = clean_table_filename(raw_title, t_idx + 1)
             df.attrs['table_title'] = cleaned_title
+            for _cand_lbl_src in (raw_title, cleaned_title):
+                if _cand_lbl_src:
+                    _m_lbl = TABLE_LABEL_RE.match(str(_cand_lbl_src).replace('\xa0', ' ').strip())
+                    if _m_lbl:
+                        df.attrs['label'] = format_table_label(_m_lbl.group(0))
+                        break
             
             all_dfs.append(df)
             print(f"  -> 表格 {t_idx+1}: 成功提取 {len(data_rows)} 行，{len(unique_header)} 列。 标题: {cleaned_title}")
@@ -213,6 +219,15 @@ def extract_cnki_html_tables(url, cookies_path=None, table_idx="all", headed=Fal
     """
     Automated pipeline to bypass CNKI slider and extract tables from HTML Reader page.
     """
+    if url and ("chndoi.org" in url.lower() or "chinadoi.cn" in url.lower()):
+        try:
+            try:
+                from .doi_resolver import resolve_chinese_doi
+            except ImportError:
+                from doi_resolver import resolve_chinese_doi
+            url = resolve_chinese_doi(url)
+        except Exception:
+            pass
     headless = not headed
     print(f"[知网自动化] 启动 HTML 阅读提取器 (headless={headless}, user_data_dir={user_data_dir})...")
     
@@ -330,7 +345,11 @@ def extract_cnki_html_tables(url, cookies_path=None, table_idx="all", headed=Fal
         new_page = None
         try:
             print(f"[知网自动化] 正在载入详情页: {url}")
-            page.goto(url, wait_until="networkidle", timeout=60000)
+            page.goto(url, wait_until="domcontentloaded", timeout=25000)
+            try:
+                page.wait_for_selector("a:has-text('HTML阅读'), li:has-text('境内') a, a:has-text('境内')", timeout=5000)
+            except Exception:
+                pass
             
             # ── China DOI (chndoi.org / chinadoi.cn) Multi-resolution Chooser ──
             if "chndoi.org" in page.url or "chinadoi.cn" in page.url or page.locator("text=多重解析地址").count() > 0:
@@ -341,7 +360,11 @@ def extract_cnki_html_tables(url, cookies_path=None, table_idx="all", headed=Fal
                         dom_url = link_el.get_attribute("href")
                         if dom_url:
                             print(f"[知网自动化] 自动跳转至境内地址: {dom_url}")
-                            page.goto(dom_url, wait_until="networkidle", timeout=60000)
+                            page.goto(dom_url, wait_until="domcontentloaded", timeout=25000)
+                            try:
+                                page.wait_for_selector("a:has-text('HTML阅读')", timeout=5000)
+                            except Exception:
+                                pass
                 except Exception:
                     pass
 
@@ -352,12 +375,16 @@ def extract_cnki_html_tables(url, cookies_path=None, table_idx="all", headed=Fal
                 return [], None
                 
             print("[知网自动化] 发现 'HTML阅读' 按钮，正在跳转至阅读页面...")
-            with context.expect_page() as new_page_info:
+            with context.expect_page(timeout=15000) as new_page_info:
                 html_button.click()
                 
             new_page = new_page_info.value
-            new_page.wait_for_load_state("networkidle", timeout=60000)
-            new_page.wait_for_timeout(3000)
+            new_page.wait_for_load_state("domcontentloaded", timeout=25000)
+            try:
+                new_page.wait_for_selector("table, .slider-wrapper", timeout=6000)
+            except Exception:
+                pass
+            new_page.wait_for_timeout(1500)
             
             # Check for slider verification
             wrapper = new_page.query_selector(".slider-wrapper")
@@ -365,7 +392,7 @@ def extract_cnki_html_tables(url, cookies_path=None, table_idx="all", headed=Fal
                 print("[知网自动化] 检测到滑动验证，正在启动自动滑块模拟...")
                 wrapper_box = wrapper.bounding_box()
                 handler = new_page.query_selector("#js-handler")
-                handler_box = handler.bounding_box()
+                handler_box = handler.bounding_box() if handler else None
                 
                 if wrapper_box and handler_box:
                     drag_distance = wrapper_box["width"] - handler_box["width"] + 10
@@ -380,7 +407,10 @@ def extract_cnki_html_tables(url, cookies_path=None, table_idx="all", headed=Fal
                 print("[知网自动化] 无需滑动验证，直接提取表格。")
                 
             # Parse tables and get paper title from the page title
-            page_title = new_page.title()
+            try:
+                page_title = new_page.title()
+            except Exception:
+                page_title = ""
             if page_title:
                 for pattern in [" - 中国知网", " - 手机知网", " - kns.cnki.net", "-中国知网", "-手机知网", "HTML阅读-", "HTML阅读_"]:
                     if pattern in page_title:
@@ -389,6 +419,9 @@ def extract_cnki_html_tables(url, cookies_path=None, table_idx="all", headed=Fal
             
             dfs = extract_tables_from_page(new_page, table_idx)
             return dfs, page_title
+        except Exception as e:
+            print(f"[知网自动化] 提取异常，安全跳过: {e}")
+            return [], None
         finally:
             if connected_via_cdp:
                 if page:

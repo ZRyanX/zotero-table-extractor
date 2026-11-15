@@ -15,9 +15,9 @@ except ImportError:
 
 # Shared helpers (text cleaning, table filtering, config)
 try:
-    from ..common import clean_text, escape_formula, is_supplementary, clean_table_filename, load_config, is_metadata_table, is_anti_bot_blocked, df_map
+    from ..common import clean_text, escape_formula, is_supplementary, clean_table_filename, load_config, is_metadata_table, is_anti_bot_blocked, df_map, format_table_label, is_unlabeled_single_col_layout_shell
 except ImportError:
-    from common import clean_text, escape_formula, is_supplementary, clean_table_filename, load_config, is_metadata_table, is_anti_bot_blocked, df_map
+    from common import clean_text, escape_formula, is_supplementary, clean_table_filename, load_config, is_metadata_table, is_anti_bot_blocked, df_map, format_table_label, is_unlabeled_single_col_layout_shell
 
 
 def get_table_number(title):
@@ -38,16 +38,31 @@ def extract_table_label_from_title(title):
         return None
     if re.search(r'\b(?:Table\s+of\s+contents|Contents|List\s+of\s+tables)\b', title, re.IGNORECASE):
         return None
-    token = r'(?:\d+(?:[\.\-]\d+)?|\b[ivxlcdm]+\b|[A-Za-z]\b)'
+    cleaned_input = title.strip()
+    token = r'(?:[A-Za-z]?\d+(?:[\.\-]\d+)*|\b[ivxlcdm]+\b|[一二三四五六七八九十百千万零壹贰叁肆伍陆柒捌玖拾]+|[A-Za-z]\b)'
     sep_token = rf'(?:\s*[\/\-_&,]\s*(?:S\s*)?{token})*'
-    prefix = r'(?:Tableau?x?|Tables?|Tab\b|表|Supplementary\s+material|Additional\s+Table|Additional\s+file)'
-    match = re.search(rf'^(?:{prefix}\.?\s*(?:S\s*)?{token}{sep_token})', title, re.IGNORECASE)
+    prefix = r'(?:Supplementary\s+(?:Table|material)|Supplemental\s+Table|Extended\s+Data\s+Table|Appendix\s+Table|Additional\s+(?:Table|file)|Tableau?x?|Tables?|Tab\b|附表|附录表|补充表|表)'
+
+    # Handle "ESM 1: Table S1" / "Additional file 1: Table S1" by preferring inner Table S1 label
+    m_inner_wrap = re.match(
+        r'^(?:Additional\s+file\s+\d+|ESM\s*\d+|Electronic\s+Supplementary\s+Material(?:\s*\d+)?)\s*[:.\-\u2014]?\s*(.+)$',
+        cleaned_input,
+        re.IGNORECASE,
+    )
+    if m_inner_wrap:
+        inner_lbl = extract_table_label_from_title(m_inner_wrap.group(1))
+        if inner_lbl:
+            return inner_lbl
+
+    match = re.search(rf'^(?:{prefix}\.?\s*(?:S\s*)?{token}{sep_token})', cleaned_input, re.IGNORECASE)
     if match:
         label = match.group(0).strip()
         label = re.sub(r'[\/\-_&,]+$', '', label).strip()
         label = re.sub(r'\s+', ' ', label)
-        label = label.replace(' / ', '_').replace('/', '_').replace(' - ', '_').replace('-', '_')
-        return label
+        if re.search(r'[\/&_]| - ', label):
+            label = label.replace(' / ', '_').replace('/', '_').replace(' - ', '_').replace('-', '_')
+            return label
+        return format_table_label(label)
     return None
 
 def is_duplicate_table(df, existing_dfs):
@@ -130,7 +145,9 @@ def extract_tables_from_element(element, table_idx="all", default_title=None):
                 // IOPscience
                 "div.boxout.boxout-bdr-grey",
                 // Silverchair (GSW, OUP) & CNKI
-                ".table-wrap-content", ".table-box", "div[role='grid']", ".table-modal"
+                ".table-wrap-content", ".table-box", "div[role='grid']", ".table-modal",
+                // 中文 Magtech 期刊平台 (岩石学报、地球科学、地质力学学报等)
+                "div.figure.table_new", ".article_table_fullText", ".tableTextBox"
             ];
 
             let candidateWrappers = [];
@@ -151,6 +168,10 @@ def extract_tables_from_element(element, table_idx="all", default_title=None):
             const isNoiseTable = (tableEl, wrapper) => {
                 // MDPI 免责声明/出版商声明 1x2 表格
                 if (tableEl.closest('section.html-fn_group, .html-fn_group')) return true;
+                // 中文期刊留言板表单 / 复制引文小框 / 嵌套外框排版表
+                if (tableEl.closest('.messageBoard, .messageBoardWrap, .copyCitationInfo, .citationCn, .citationEn, .quot')) return true;
+                if (tableEl.querySelectorAll('input, textarea, select').length >= 2) return true;
+                if (tableEl.querySelector('table')) return true;
                 // Wiley/Atypon 支撑材料文件列表表 (Filename | Description)
                 if (tableEl.matches('.support-info__table') || tableEl.closest('.support-info__table-wrapper, section.article-section__supporting')) return true;
                 // Silverchair/GSW 同一表格会在 .table-overflow 与 .table-modal 中重复渲染两次
@@ -167,6 +188,8 @@ def extract_tables_from_element(element, table_idx="all", default_title=None):
                 }
                 return false;
             };
+
+            const hasTableLabel = (txt) => /^(?:(?:Supplementary|Supplemental|Extended\\s+Data|Appendix)\\s+)?(?:表|Table|Tab\\.|TABLE|附表|附录表|补充表)\\s*(?:[A-Za-z]?\\d+|[ivxlcdm]+|[一二三四五六七八九十]+|[A-Za-z]\\b)/i.test((txt || '').replace(/\\u00a0/g, ' ').trim());
 
             candidateWrappers.forEach((wrapper, wIdx) => {
                 const tableEls = wrapper.tagName === 'TABLE' ? [wrapper] : Array.from(wrapper.querySelectorAll('table'));
@@ -188,20 +211,38 @@ def extract_tables_from_element(element, table_idx="all", default_title=None):
                             .map(s => (s || '').trim()).filter(Boolean).join(' ');
                     }
                 }
-                const capEl = !captionText && wrapper.querySelector('span.captions, div.captions, header.u-mb-16, .c-article-table__figcaption, .html-caption, header.article-table-caption, header.article-fulltext-label-header, figcaption, caption, .table-caption, .c-article-table__caption, .caption, .table-wrap-title, .table-title, .table-header, .table-intro, .html-table-title, .entry-table-title, header.article-table-header');
+                const capEl = !captionText && wrapper.querySelector('span.captions, div.captions, header.u-mb-16, .c-article-table__figcaption, .html-caption, header.article-table-caption, header.article-fulltext-label-header, .table-wrap-title, .figureTitle, figcaption, caption, .table-caption, .c-article-table__caption, .caption, .table-title, .table-header, .table-intro, .html-table-title, .entry-table-title, header.article-table-header');
                 if (capEl) {
                     captionText = (capEl.innerText || capEl.textContent || '').trim();
                 }
-                if (!captionText) {
-                    // 向上回溯兄弟节点
+                if (!hasTableLabel(captionText)) {
+                    const badgeEl = wrapper.querySelector('.table-label, .table-wrap-label, span.label, .label, .c-article-table__label');
+                    if (badgeEl) {
+                        const bTxt = (badgeEl.innerText || badgeEl.textContent || '').trim();
+                        if (hasTableLabel(bTxt)) {
+                            captionText = captionText ? `${bTxt.replace(/\.+$/, '')}: ${captionText}` : bTxt;
+                        }
+                    }
+                }
+                if (!captionText || !hasTableLabel(captionText)) {
+                    // 向上回溯兄弟节点及父容器独立标题（适配 Springer /tables/N 与 Magtech .figureTitle）
+                    const sibs = [];
                     let prev = wrapper.previousElementSibling;
                     for (let i = 0; i < 3 && prev; i++) {
-                        const txt = (prev.innerText || prev.textContent || '').trim();
-                        if (txt && (/^(?:表|Table|Tab\\.|TABLE)\\s*\\d+/i.test(txt) || txt.toLowerCase().includes('table'))) {
-                            captionText = txt;
+                        sibs.push(prev);
+                        prev = prev.previousElementSibling;
+                    }
+                    if (wrapper.parentElement) {
+                        wrapper.parentElement.querySelectorAll(':scope > header.u-mb-16, :scope > h1.c-article-satellite-title, :scope > .figureTitle').forEach(el => {
+                            if (!sibs.includes(el)) sibs.push(el);
+                        });
+                    }
+                    for (const cand of sibs) {
+                        const txt = (cand.innerText || cand.textContent || '').trim();
+                        if (txt && (hasTableLabel(txt) || (!captionText && txt.toLowerCase().includes('table')))) {
+                            captionText = (!captionText) ? txt : `${txt} ${captionText}`;
                             break;
                         }
-                        prev = prev.previousElementSibling;
                     }
                 }
 
@@ -285,7 +326,8 @@ def extract_tables_from_element(element, table_idx="all", default_title=None):
         if not rows_data or len(rows_data) < 2:
             continue
 
-        raw_title = t_data.get('caption', '') or default_title or f"Table {t_idx + 1}"
+        explicit_title = (t_data.get('caption') or default_title or '').strip()
+        raw_title = explicit_title or f"Table {t_idx + 1}"
         footnote = t_data.get('footnote', '')
 
         max_cols = max(len(r) for r in rows_data)
@@ -310,17 +352,21 @@ def extract_tables_from_element(element, table_idx="all", default_title=None):
                 unique_header.append(col)
 
         df = pd.DataFrame(data_rows, columns=unique_header)
+        if is_unlabeled_single_col_layout_shell(df, has_explicit_label=bool(explicit_title)):
+            continue
         if is_metadata_table(df):
             continue
 
         df.columns = [escape_formula(clean_text(c)) for c in df.columns]
         df = df_map(df, lambda v: escape_formula(clean_text(v)))
 
+        label = extract_table_label_from_title(raw_title)
         cleaned_title = clean_table_filename(raw_title, t_idx + 1)
         df.attrs['table_title'] = cleaned_title
         if footnote:
             df.attrs['footnotes'] = footnote
-        label = extract_table_label_from_title(cleaned_title)
+        if not label:
+            label = extract_table_label_from_title(cleaned_title)
         if label:
             df.attrs['label'] = label
 
@@ -635,12 +681,38 @@ _STEALTH_INIT_SCRIPT = (
     "window.chrome = {runtime: {}};"  # Fake chrome object
 )
 
-def _inject_cookies_from_profile(context, user_data_dir):
+def _inject_cookies_from_profile(context, user_data_dir, url=None):
     cookie_files = []
+
+    def _add_cookie_file(path_cand):
+        if path_cand and os.path.isfile(path_cand):
+            norm = os.path.abspath(path_cand)
+            if norm not in cookie_files:
+                cookie_files.append(norm)
+
     if user_data_dir:
-        cookies_json = os.path.join(user_data_dir, "cookies.json")
-        if os.path.exists(cookies_json):
-            cookie_files.append(cookies_json)
+        _add_cookie_file(os.path.join(user_data_dir, "cookies.json"))
+
+    # Also include login.py's ~/.zotero_playwright_profile/cookies.json & domain profile cookies
+    home = os.path.expanduser("~")
+    _add_cookie_file(os.path.join(home, ".zotero_playwright_profile", "cookies.json"))
+
+    if url:
+        try:
+            from . import strategies as _strat_mod
+        except ImportError:
+            try:
+                import strategies as _strat_mod
+            except ImportError:
+                _strat_mod = None
+        if _strat_mod and callable(getattr(_strat_mod, "get_domain_profile_dir", None)):
+            try:
+                dom_dir = _strat_mod.get_domain_profile_dir(url)
+                if dom_dir:
+                    _add_cookie_file(os.path.join(dom_dir, "cookies.json"))
+            except Exception:
+                pass
+
     try:
         from .. import common as _common_mod
     except ImportError:
@@ -650,22 +722,53 @@ def _inject_cookies_from_profile(context, user_data_dir):
             _common_mod = None
     if _common_mod and callable(getattr(_common_mod, "get_companion_cookie_paths", None)):
         for cp in _common_mod.get_companion_cookie_paths():
-            if cp not in cookie_files:
-                cookie_files.append(cp)
+            _add_cookie_file(cp)
 
+    if not cookie_files:
+        return
+
+    existing_keys = set()
+    try:
+        for ec in context.cookies() or []:
+            if isinstance(ec, dict) and ec.get("name"):
+                existing_keys.add((ec.get("name"), (ec.get("domain") or "").lstrip("."), ec.get("path", "/")))
+    except Exception:
+        pass
+
+    valid_keys = {"name", "value", "url", "domain", "path", "expires", "httpOnly", "secure", "sameSite"}
+    import json
     for cookies_json in cookie_files:
         try:
-            import json
             with open(cookies_json, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             cookies = data.get("cookies", []) if isinstance(data, dict) else data
-            if isinstance(cookies, list) and cookies:
-                for c in cookies:
+            if not isinstance(cookies, list) or not cookies:
+                continue
+            prepared = []
+            for c in cookies:
+                if not isinstance(c, dict) or not c.get("name") or not (c.get("domain") or c.get("url")):
+                    continue
+                k = (c.get("name"), (c.get("domain") or "").lstrip("."), c.get("path", "/"))
+                if k in existing_keys:
+                    continue
+                clean_c = {fk: c[fk] for fk in valid_keys if fk in c and c[fk] is not None}
+                prepared.append(clean_c)
+                existing_keys.add(k)
+            if not prepared:
+                continue
+            added = 0
+            try:
+                context.add_cookies(prepared)
+                added = len(prepared)
+            except Exception:
+                for c in prepared:
                     try:
                         context.add_cookies([c])
+                        added += 1
                     except Exception:
                         pass
-                print(f"[通用自动化] 从 {os.path.basename(cookies_json)} 成功注入并载入了 {len(cookies)} 个会话 Cookies。")
+            if added:
+                print(f"[通用自动化] 从 {os.path.basename(cookies_json)} 成功注入并载入了 {added} 个会话 Cookies。")
         except Exception as e:
             print(f"[通用自动化] 载入 {os.path.basename(cookies_json)} 失败: {e}")
 
@@ -714,8 +817,12 @@ def _extract_local_heuristic_grids(page, table_idx="all"):
                 let tableCount = 0;
                 candidates.forEach((container) => {
                     if (container.offsetWidth === 0 || container.offsetHeight === 0) return;
-                    
+
                     const role = container.getAttribute("role") || "";
+                    const clsAndId = ((container.className && typeof container.className === "string" ? container.className : "") + " " + (container.id || "")).toLowerCase();
+                    if (role !== "grid" && /(author|byline|affil|correspond|contributor|citation|meta|header|footer|nav|sidebar|menu|toolbar|share|social)/.test(clsAndId)) {
+                        return;
+                    }
                     const display = window.getComputedStyle(container).display;
                     const isGridLike = role === "grid" || display === "grid" || container.classList.contains("grid-container") || container.classList.contains("ag-theme-balham");
                     
@@ -832,6 +939,19 @@ def _extract_custom_grid_tables(page, url, api_key=None):
     then uses Playwright to extract rows/columns.
     """
     import requests
+    try:
+        from . import strategies as _fc_strategies
+    except ImportError:
+        try:
+            import strategies as _fc_strategies
+        except ImportError:
+            _fc_strategies = None
+
+    if _fc_strategies is not None and _fc_strategies.is_firecrawl_disabled():
+        return []
+    if _fc_strategies is not None and hasattr(_fc_strategies, "is_open_access_paper"):
+        if not _fc_strategies.is_open_access_paper(url=url):
+            return []
     
     # 1. Resolve key
     key = api_key
@@ -882,6 +1002,10 @@ def _extract_custom_grid_tables(page, url, api_key=None):
     
     try:
         response = requests.post("https://api.firecrawl.dev/v2/scrape", json=payload, headers=headers, timeout=25)
+        if response.status_code in (401, 402, 403):
+            if _fc_strategies is not None:
+                _fc_strategies.disable_firecrawl(f"自定义网格提取认证/额度受限（{response.status_code}）")
+            return []
         if response.status_code == 200:
             data = response.json()
             json_data = data.get("data", {}).get("json", {})
@@ -949,6 +1073,55 @@ def _extract_custom_grid_tables(page, url, api_key=None):
         
     return []
 
+_OWNED_DEBUG_CHROME_PROCS = []
+
+
+def _cleanup_owned_debug_chrome(min_index=0):
+    """Terminate only debug Chrome processes spawned by _ensure_chrome_debug_running()."""
+    global _OWNED_DEBUG_CHROME_PROCS
+    idx = max(0, int(min_index or 0))
+    kept = list(_OWNED_DEBUG_CHROME_PROCS[:idx])
+    targets = list(_OWNED_DEBUG_CHROME_PROCS[idx:])
+    for proc in targets:
+        try:
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except Exception:
+                    if os.name == "nt" and getattr(proc, "pid", None):
+                        try:
+                            import subprocess as _sp
+                            _sp.run(
+                                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                                stdout=_sp.DEVNULL,
+                                stderr=_sp.DEVNULL,
+                                timeout=5,
+                            )
+                        except Exception:
+                            pass
+                    try:
+                        if proc.poll() is None:
+                            proc.kill()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    _OWNED_DEBUG_CHROME_PROCS = kept
+    if targets:
+        try:
+            from . import strategies as _strat_mod
+            if hasattr(_strat_mod, "_CRAWL4AI_CDP_CACHE"):
+                _strat_mod._CRAWL4AI_CDP_CACHE["checked"] = False
+                _strat_mod._CRAWL4AI_CDP_CACHE["url"] = None
+        except Exception:
+            pass
+
+
+import atexit as _atexit
+_atexit.register(_cleanup_owned_debug_chrome)
+
+
 def _ensure_chrome_debug_running():
     import subprocess
     import platform
@@ -1008,8 +1181,12 @@ def _ensure_chrome_debug_running():
         print("[通用自动化] 未能自动识别到 Google Chrome 浏览器的可执行文件路径。")
         return False
 
-    profile_dir = os.path.join(tempfile.gettempdir(), "chrome_debug_profile")
-    os.makedirs(profile_dir, exist_ok=True)
+    persistent_debug_profile = os.path.join(os.path.expanduser("~"), ".zotero_chrome_debug_profile")
+    if os.path.isdir(persistent_debug_profile):
+        profile_dir = persistent_debug_profile
+    else:
+        profile_dir = os.path.join(tempfile.gettempdir(), "chrome_debug_profile")
+        os.makedirs(profile_dir, exist_ok=True)
 
     print(f"[通用自动化] 自动启动调试版 Chrome: {chrome_path}")
     print(f"[通用自动化] 调试会话独立隔离用户目录: {profile_dir} (零 SQLite 拷贝)")
@@ -1020,7 +1197,8 @@ def _ensure_chrome_debug_running():
         f"--user-data-dir={profile_dir}"
     ]
     try:
-        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        _OWNED_DEBUG_CHROME_PROCS.append(proc)
         for _ in range(30):
             time.sleep(0.5)
             if find_active_cdp_endpoint:
@@ -1039,6 +1217,11 @@ def _ensure_chrome_debug_running():
                     return True
                 except Exception:
                     pass
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+        except Exception:
+            pass
     except Exception as e:
         print(f"[通用自动化] 自动启动 Chrome 失败: {e}")
 
@@ -1211,7 +1394,10 @@ def _download_tandfonline_csvs(page, context, url_no_fragment):
             except Exception:
                 pass
             finally:
-                dl_page.close()
+                try:
+                    dl_page.close()
+                except Exception:
+                    pass
             if temp_csv_path and os.path.exists(temp_csv_path):
                 try:
                     with open(temp_csv_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -1274,7 +1460,34 @@ def _extract_copernicus_xml_tables(page, table_idx="all"):
     return []
 
 
-def extract_general_html_tables(url, table_idx="all", headed=False, user_data_dir=None, api_key=None, _allow_headed_fallback=True):
+def _is_page_closed(page) -> bool:
+    """Safely check whether a Playwright page has already been closed."""
+    if page is None:
+        return True
+    try:
+        is_closed_fn = getattr(page, "is_closed", None)
+        if callable(is_closed_fn):
+            return bool(is_closed_fn())
+    except Exception:
+        return True
+    return False
+
+
+def _safe_page_title(page):
+    """Safely fetch page.title(), returning (title, page_closed)."""
+    if _is_page_closed(page):
+        return "", True
+    try:
+        return (page.title() or ""), False
+    except Exception as e:
+        err_name = type(e).__name__
+        err_msg = str(e)
+        if "TargetClosed" in err_name or "has been closed" in err_msg or _is_page_closed(page):
+            return "", True
+        return "", False
+
+
+def extract_general_html_tables(url, table_idx="all", headed=False, user_data_dir=None, api_key=None, _allow_headed_fallback=True, cancel_event=None, skip_stealth_fallback=False, meta_out=None):
     """
     General purpose table crawler. Follows subpages and checks tabs/iframes.
     Supports real Chrome user session (user_data_dir) to access paywalled content.
@@ -1283,6 +1496,27 @@ def extract_general_html_tables(url, table_idx="all", headed=False, user_data_di
     修复：不再因摘要页 URL 就整体跳过——逐表交由 is_metadata_table() 过滤
     文献信息框/摘要版权框/目录大纲/参考文献列表，仅保留真正的数据表。
     """
+    _owned_chrome_count_before = len(_OWNED_DEBUG_CHROME_PROCS)
+    try:
+        return _extract_general_html_tables_impl(
+            url,
+            table_idx=table_idx,
+            headed=headed,
+            user_data_dir=user_data_dir,
+            api_key=api_key,
+            _allow_headed_fallback=_allow_headed_fallback,
+            cancel_event=cancel_event,
+            skip_stealth_fallback=skip_stealth_fallback,
+            meta_out=meta_out,
+        )
+    finally:
+        if len(_OWNED_DEBUG_CHROME_PROCS) > _owned_chrome_count_before:
+            _cleanup_owned_debug_chrome(min_index=_owned_chrome_count_before)
+
+
+def _extract_general_html_tables_impl(url, table_idx="all", headed=False, user_data_dir=None, api_key=None, _allow_headed_fallback=True, cancel_event=None, skip_stealth_fallback=False, meta_out=None):
+    if cancel_event is not None and cancel_event.is_set():
+        return [], None
     # Parse URL fragment to detect specific target table (e.g. #Tab2 or #table-3)
     parsed_url = urllib.parse.urlparse(url)
     fragment = parsed_url.fragment  # e.g., 'Tab2' or 'table-2'
@@ -1307,6 +1541,7 @@ def extract_general_html_tables(url, table_idx="all", headed=False, user_data_di
 
     headless = not headed
     was_blocked = False
+    was_dead_http = False
     _effective_profile = user_data_dir
 
     # Prefer configured OS-specific persistent profile (with cookies.json), then real Chrome user data
@@ -1377,7 +1612,6 @@ def extract_general_html_tables(url, table_idx="all", headed=False, user_data_di
         if find_active_cdp_endpoint:
             cfg = None
             try:
-                from . import load_config
                 cfg = load_config()
             except Exception:
                 try:
@@ -1430,6 +1664,7 @@ def extract_general_html_tables(url, table_idx="all", headed=False, user_data_di
                     skip_navigation = False
                 connected_via_cdp = True
                 print("[通用自动化] CDP 内存直连成功！零磁盘损耗继承当前 Chrome 登录态（校园网/CARSI 等）。")
+                _inject_cookies_from_profile(context, user_data_dir, url=url)
                 if install_cdp_port_guard:
                     if context:
                         install_cdp_port_guard(context, cdp_port=cdp_port)
@@ -1448,8 +1683,7 @@ def extract_general_html_tables(url, table_idx="all", headed=False, user_data_di
                 user_data_dir = None
             page = context.pages[0] if context.pages else context.new_page()
             page.add_init_script(_STEALTH_INIT_SCRIPT)
-            if user_data_dir:
-                _inject_cookies_from_profile(context, user_data_dir)
+            _inject_cookies_from_profile(context, user_data_dir, url=url)
             if install_cdp_port_guard:
                 install_cdp_port_guard(context)
                 install_cdp_port_guard(page)
@@ -1466,11 +1700,28 @@ def extract_general_html_tables(url, table_idx="all", headed=False, user_data_di
         if install_slow_tracker_route_blocker:
             install_slow_tracker_route_blocker(page, url_no_fragment)
 
+        _cancelled_early = False
+        _reroute_cnki_url = None
         if not skip_navigation:
             print(f"[通用自动化] 正在载入主页面: {url_no_fragment}")
             try:
-                page.goto(url_no_fragment, wait_until="domcontentloaded", timeout=60000)
-                page.wait_for_timeout(4000)
+                _goto_timeout = 30000 if "springer.com" in url_no_fragment.lower() else 50000
+                try:
+                    _main_resp = page.goto(url_no_fragment, wait_until="domcontentloaded", timeout=_goto_timeout)
+                except Exception as _goto_err:
+                    _cur_err_url = (getattr(page, "url", "") or "").lower()
+                    if "idp.springer.com" in _cur_err_url or "wayf.springernature.com" in _cur_err_url:
+                        print(f"[Springer IDP] 页面加载触发超时 ({_goto_err})，尝试从授权跳转参数恢复...")
+                        _main_resp = None
+                    else:
+                        raise
+                if _main_resp is not None and _main_resp.status in (404, 410):
+                    was_dead_http = True
+                page.wait_for_timeout(3000)
+                if cancel_event is not None and cancel_event.is_set():
+                    print("[通用自动化] 收到取消信号，提前退出提取。")
+                    _cancelled_early = True
+                    raise RuntimeError("cancelled")
 
                 # ── Crossref Chooser Resolver ──
                 current_url = page.url
@@ -1547,30 +1798,22 @@ def extract_general_html_tables(url, table_idx="all", headed=False, user_data_di
                 except Exception:
                     pass
 
-                # ── Elsevier linkinghub meta-refresh / crasolve / Turnstile / F5 /tspd/ / AIP loading 有界等待 ──
+                # ── Elsevier linkinghub meta-refresh / crasolve / Turnstile / F5 /tspd/ / Springer idp / AIP loading 有界等待 ──
                 if wait_through_transient_challenge:
                     wait_through_transient_challenge(page, max_wait_s=8.0)
 
-                # ── CNKI Abstract -> HTML阅读 link follow-up (after chndoi.org resolution) ──
-                if "cnki.net" in (page.url or "").lower():
-                    try:
-                        html_btn = page.locator("a:has-text('HTML阅读')").first
-                        if html_btn.count() > 0 and html_btn.is_visible(timeout=2000):
-                            print("[通用自动化] 在知网详情页发现 'HTML阅读' 链接，正在打开正文...")
-                            try:
-                                with context.expect_page(timeout=8000) as new_pg_info:
-                                    html_btn.click()
-                                reader_pg = new_pg_info.value
-                                reader_pg.wait_for_load_state("domcontentloaded", timeout=30000)
-                                reader_pg.wait_for_timeout(2500)
-                                page = reader_pg
-                            except Exception:
-                                html_href = html_btn.get_attribute("href")
-                                if html_href:
-                                    page.goto(urllib.parse.urljoin(page.url, html_href), wait_until="domcontentloaded", timeout=30000)
-                                    page.wait_for_timeout(2500)
-                    except Exception:
-                        pass
+                # ── Dynamic chndoi.org -> CNKI Rerouting ──
+                try:
+                    _cnki_cur_url = (page.url or "").lower() if not _is_page_closed(page) else ""
+                except Exception:
+                    _cnki_cur_url = ""
+                if "cnki.net" in _cnki_cur_url or "cnki.com.cn" in _cnki_cur_url:
+                    _reroute_cnki_url = page.url
+                    print(f"[通用自动化] 检测到跳转落地为知网链接 ({_reroute_cnki_url})，重路由至 CNKI 专用抽取器...")
+                    if isinstance(meta_out, dict):
+                        meta_out["reroute_cnki_url"] = _reroute_cnki_url
+                    _cancelled_early = True
+                    raise RuntimeError("reroute_cnki")
 
                 # Try to wait for publisher-specific table containers/tables
                 try:
@@ -1590,69 +1833,107 @@ def extract_general_html_tables(url, table_idx="all", headed=False, user_data_di
                     except Exception:
                         pass
             except Exception as e:
-                print(f"[通用自动化] 页面加载警告: {e}")
+                if str(e) not in ("cancelled", "reroute_cnki"):
+                    print(f"[通用自动化] 页面加载警告: {e}")
 
-        # Auto-dismiss GDPR cookie consent and expand GeoScienceWorld/Silverchair tables
-        _dismiss_cookie_consent(page)
-        _expand_silverchair_gsw_tables(page)
-
-        # Scroll through the full page to trigger lazy-loaded table links
-
-        try:
-            page.evaluate("""
-            async () => {
-                const delay = ms => new Promise(r => setTimeout(r, ms));
-                const scrollStep = Math.floor(window.innerHeight * 0.8);
-                let lastH = 0;
-                let steps = 0;
-                while (steps < 40) {
-                    window.scrollBy(0, scrollStep);
-                    await delay(250);  // reduced from 400ms
-                    const newH = document.body.scrollHeight;
-                    if (window.scrollY + window.innerHeight >= newH && newH === lastH) break;
-                    lastH = newH;
-                    steps++;
-                }
-                window.scrollTo(0, 0);
-            }
-            """)
-            page.wait_for_timeout(1500)
-        except Exception:
-            pass
-            
-        # ── NEW: Purge boilerplate components (headers, footers, sidebars, ads) ──
-        if not is_gsw:
-            _purge_boilerplate_dom(page)
-        else:
-            print("[通用自动化] GeoscienceWorld/Lyell 目标平台：跳过 DOM 净化以保留分片侧栏表格容器。")
-            
-        page_title = page.title()
-        try:
-            _body_sample = page.evaluate("document.body ? document.body.innerText.slice(0, 4000) : ''")
-        except Exception:
-            _body_sample = ""
-        was_blocked = is_anti_bot_blocked(page_title, _body_sample)
-        if was_blocked and headed:
-            print(f"[通用自动化] 有头模式检测到反爬验证页面 ({page_title})，等待 3.5 秒观察自动验证/Cookies 生效...")
-            page.wait_for_timeout(3500)
-            _dismiss_cookie_consent(page)
-            page_title = page.title()
+        if not _cancelled_early and not was_dead_http and not _is_page_closed(page):
+            # Auto-dismiss GDPR cookie consent and expand GeoScienceWorld/Silverchair tables
             try:
-                _body_sample = page.evaluate("document.body ? document.body.innerText.slice(0, 4000) : ''")
-            except Exception:
-                _body_sample = ""
-            was_blocked = is_anti_bot_blocked(page_title, _body_sample)
+                _dismiss_cookie_consent(page)
+                _expand_silverchair_gsw_tables(page)
+            except Exception as e:
+                print(f"[通用自动化] 页面交互预处理警告: {e}")
+
+            # Scroll through the full page to trigger lazy-loaded table links
+
+            if not _is_page_closed(page):
+                try:
+                    page.evaluate("""
+                async () => {
+                    const delay = ms => new Promise(r => setTimeout(r, ms));
+                    const scrollStep = Math.floor(window.innerHeight * 0.8);
+                    let lastH = 0;
+                    let steps = 0;
+                    while (steps < 40) {
+                        window.scrollBy(0, scrollStep);
+                        await delay(250);  // reduced from 400ms
+                        const newH = document.body.scrollHeight;
+                        if (window.scrollY + window.innerHeight >= newH && newH === lastH) break;
+                        lastH = newH;
+                        steps++;
+                    }
+                    window.scrollTo(0, 0);
+                }
+                """)
+                    page.wait_for_timeout(1500)
+                except Exception:
+                    pass
+
+            # ── NEW: Purge boilerplate components (headers, footers, sidebars, ads) ──
+            if not _is_page_closed(page):
+                if not is_gsw:
+                    _purge_boilerplate_dom(page)
+                else:
+                    print("[通用自动化] GeoscienceWorld/Lyell 目标平台：跳过 DOM 净化以保留分片侧栏表格容器。")
+
+        _page_closed = False
+        if not _cancelled_early:
+            page_title, _page_closed = _safe_page_title(page)
+            if not _page_closed:
+                try:
+                    _body_sample = page.evaluate("document.body ? document.body.innerText.slice(0, 4000) : ''")
+                except Exception:
+                    _body_sample = ""
+                was_blocked = is_anti_bot_blocked(page_title, _body_sample)
+                if was_blocked and headed:
+                    print(f"[通用自动化] 有头模式检测到反爬验证页面 ({page_title})，等待 3.5 秒观察自动验证/Cookies 生效...")
+                    try:
+                        page.wait_for_timeout(3500)
+                        _dismiss_cookie_consent(page)
+                    except Exception:
+                        pass
+                    page_title, _page_closed = _safe_page_title(page)
+                    if not _page_closed:
+                        try:
+                            _body_sample = page.evaluate("document.body ? document.body.innerText.slice(0, 4000) : ''")
+                        except Exception:
+                            _body_sample = ""
+                        was_blocked = is_anti_bot_blocked(page_title, _body_sample)
+                    else:
+                        was_blocked = False
+            else:
+                print("[通用自动化] 页面或上下文已关闭，跳过标题与 DOM 提取。")
+                was_blocked = False
+        else:
+            was_blocked = False
+        if was_dead_http and not was_blocked:
+            print(f"[通用自动化] 目标页面返回 HTTP 404/410 死链 ({url_no_fragment})，快速跳过。")
+            was_dead_http = True
+        else:
+            was_dead_http = False
+        _skip_dom_extract = _cancelled_early or _page_closed or was_dead_http or _is_page_closed(page) or (cancel_event is not None and cancel_event.is_set())
 
         # ── Special Taylor & Francis Direct CSV Download Pipeline ──
-        if "tandfonline.com" in (page.url or url_no_fragment) and not was_blocked:
+        try:
+            _cur_page_url = (page.url or url_no_fragment) if not _skip_dom_extract else url_no_fragment
+        except Exception:
+            _cur_page_url = url_no_fragment
+        if not _skip_dom_extract and "tandfonline.com" in _cur_page_url and not was_blocked:
             all_dfs.extend(_download_tandfonline_csvs(page, context, url_no_fragment))
-        if not all_dfs and "copernicus.org" in (page.url or url_no_fragment):
+        if not _skip_dom_extract and not all_dfs and "copernicus.org" in _cur_page_url:
             all_dfs.extend(_extract_copernicus_xml_tables(page, table_idx=table_idx))
         # ── NEW: prioritize anchor-targeted table for Springer/Nature inline tables (including iframes) ──
-        if fragment and target_table_num is not None:
-            anchor_dfs = _extract_anchor_table(page, fragment, target_table_num)
+        if not _skip_dom_extract and fragment and target_table_num is not None:
+            try:
+                anchor_dfs = _extract_anchor_table(page, fragment, target_table_num)
+            except Exception:
+                anchor_dfs = []
             if not anchor_dfs:
-                for frame in page.frames:
+                try:
+                    _cur_frames = page.frames
+                except Exception:
+                    _cur_frames = []
+                for frame in _cur_frames:
                     try:
                         anchor_dfs = _extract_anchor_table(frame, fragment, target_table_num)
                         if anchor_dfs:
@@ -1663,8 +1944,11 @@ def extract_general_html_tables(url, table_idx="all", headed=False, user_data_di
                 print(f"[通用自动化] 通过锚点 #{fragment} 直接提取到 {len(anchor_dfs)} 个内联表格。")
                 all_dfs.extend(anchor_dfs)
 
-        if not all_dfs:
-            frames = page.frames
+        if not _skip_dom_extract and not all_dfs:
+            try:
+                frames = page.frames
+            except Exception:
+                frames = []
             for f_idx, frame in enumerate(frames):
                 try:
                     frame_dfs = extract_tables_from_element(frame, table_idx)
@@ -1675,7 +1959,7 @@ def extract_general_html_tables(url, table_idx="all", headed=False, user_data_di
                     pass
                     
             # ── NEW: Local Heuristic Grid Extractor & Adaptive Selector Fallback ──
-            if not all_dfs:
+            if not all_dfs and not _is_page_closed(page):
                 try:
                     # Stage 1: Local Heuristic Grid Extraction (Offline-First)
                     heuristic_dfs = _extract_local_heuristic_grids(page, table_idx)
@@ -1693,7 +1977,13 @@ def extract_general_html_tables(url, table_idx="all", headed=False, user_data_di
                     print(f"[通用自动化] 动态网格自适应提取或启发式提取抛出异常: {e}")
                 
         # 2. Discover potential table subpage links (Springer / Silverchair style)
-        links = page.query_selector_all("a")
+        if _skip_dom_extract or _is_page_closed(page):
+            links = []
+        else:
+            try:
+                links = page.query_selector_all("a")
+            except Exception:
+                links = []
         subpage_urls = set()
         
         for link in links:
@@ -1749,7 +2039,7 @@ def extract_general_html_tables(url, table_idx="all", headed=False, user_data_di
             if m:
                 springer_base = m.group(1)
                 break
-        if springer_base:
+        if not _skip_dom_extract and springer_base:
             existing_nums = set()
             for su in subpage_urls:
                 m = re.search(r'/tables/(\d+)$', su)
@@ -1758,6 +2048,8 @@ def extract_general_html_tables(url, table_idx="all", headed=False, user_data_di
             # Probe up to table 20 (break on 2 consecutive misses)
             consecutive_misses = 0
             for n in range(1, 21):
+                if cancel_event is not None and cancel_event.is_set():
+                    break
                 if n in existing_nums:
                     consecutive_misses = 0
                     continue
@@ -1766,7 +2058,7 @@ def extract_general_html_tables(url, table_idx="all", headed=False, user_data_di
                     # Use Playwright's built-in request API instead of requests.head().
                     # This reuses the browser's Chrome Session cookies (institutional auth),
                     # is faster (no extra auth redirects), and has a shorter timeout.
-                    resp = page.request.fetch(probe_url, method="HEAD", timeout=4000)
+                    resp = page.request.fetch(probe_url, method="HEAD", timeout=3000)
                     if resp.status == 200:
                         subpage_urls.add(probe_url)
                         print(f"[通用自动化] 探测到额外表格子页: {probe_url}")
@@ -1780,7 +2072,7 @@ def extract_general_html_tables(url, table_idx="all", headed=False, user_data_di
                     if consecutive_misses >= 2:
                         break
 
-        if subpage_urls:
+        if subpage_urls and not was_dead_http and not _is_page_closed(page) and not (cancel_event is not None and cancel_event.is_set()):
             # Sort by table number for deterministic ordering
             def _table_num(u):
                 m = re.search(r'/(\d+)$', u)
@@ -1789,6 +2081,12 @@ def extract_general_html_tables(url, table_idx="all", headed=False, user_data_di
 
             print(f"[通用自动化] 发现 {len(sorted_subpage_urls)} 个表格子页面链接，开始深入抓取...")
             for idx, sub_url in enumerate(sorted_subpage_urls):
+                if cancel_event is not None and cancel_event.is_set():
+                    print("[通用自动化] 收到取消信号，中止子页面抓取。")
+                    break
+                if _is_page_closed(page):
+                    print("[通用自动化] 页面或上下文已关闭，中止子页面抓取。")
+                    break
                 print(f"  -> 抓取子页面 [{idx+1}/{len(sorted_subpage_urls)}]: {sub_url}")
                 try:
                     # ── KEY FIX: navigate the SAME page (not a new tab) ──
@@ -1804,7 +2102,7 @@ def extract_general_html_tables(url, table_idx="all", headed=False, user_data_di
                     # Scrape subpage heading for title
                     sub_title = ""
                     try:
-                        h1 = page.query_selector(".c-article-table-heading, .c-article-table-title, .table-title, .table-caption, caption")
+                        h1 = page.query_selector("header.u-mb-16, h1.c-article-satellite-title, .c-article-table-heading, .c-article-table-title, .table-title, .table-caption, caption")
                         if h1 and h1.inner_text().strip():
                             sub_title = h1.inner_text().strip()
                         else:
@@ -1862,9 +2160,27 @@ def extract_general_html_tables(url, table_idx="all", headed=False, user_data_di
             if suffix in page_title:
                 page_title = page_title.replace(suffix, "").strip()
 
+    if isinstance(meta_out, dict):
+        meta_out["was_dead_http"] = was_dead_http
+        meta_out["was_blocked"] = was_blocked
+
+    # Standalone dynamic reroute to CNKI dedicated extractor when called without graph meta_out
+    if _reroute_cnki_url and meta_out is None:
+        try:
+            from . import cnki_html_extractor as _cnki_mod
+            from . import strategies as _strat_mod
+        except ImportError:
+            import cnki_html_extractor as _cnki_mod
+            import strategies as _strat_mod
+        cookies_path = _strat_mod.get_cnki_cookies_path() if hasattr(_strat_mod, "get_cnki_cookies_path") else None
+        return _cnki_mod.extract_cnki_html_tables(_reroute_cnki_url, cookies_path, table_idx, headed, user_data_dir)
+    if _reroute_cnki_url:
+        return [], page_title
+
     # Headless -> Headed everyday Chrome -> StealthyFetcher Turnstile escalation (outside sync_playwright)
     _is_gated_domain = any(dom in url.lower() for dom in _GATED_PUBLISHER_DOMAINS)
-    if not all_dfs and _allow_headed_fallback and (was_blocked or (headless and _is_gated_domain)):
+    _is_cancelled = cancel_event is not None and cancel_event.is_set()
+    if not all_dfs and not was_dead_http and not _is_cancelled and _allow_headed_fallback and (was_blocked or (headless and _is_gated_domain and not (connected_via_cdp and is_gsw))):
         if headless:
             print(f"[通用自动化] 无头模式{'被反爬拦截' if was_blocked else '未发现表格'}，自动切换日常有头 Chrome 浏览器重试 (自动接受 Cookies)...")
             headed_dfs, headed_title = extract_general_html_tables(
@@ -1874,17 +2190,21 @@ def extract_general_html_tables(url, table_idx="all", headed=False, user_data_di
                 user_data_dir=_effective_profile or user_data_dir,
                 api_key=api_key,
                 _allow_headed_fallback=False,
+                cancel_event=cancel_event,
+                skip_stealth_fallback=skip_stealth_fallback,
+                meta_out=meta_out,
             )
             if headed_dfs:
                 return headed_dfs, headed_title or page_title
             if headed_title and not is_anti_bot_blocked(headed_title):
                 page_title = headed_title
 
-        stealth_dfs = _stealth_fallback_extract(url, table_idx=table_idx)
-        if stealth_dfs:
-            all_dfs = stealth_dfs
-            if is_anti_bot_blocked(page_title):
-                page_title = ""
+        if not skip_stealth_fallback and not (cancel_event is not None and cancel_event.is_set()):
+            stealth_dfs = _stealth_fallback_extract(url, table_idx=table_idx)
+            if stealth_dfs:
+                all_dfs = stealth_dfs
+                if is_anti_bot_blocked(page_title):
+                    page_title = ""
 
     # NOTE: We do NOT filter final DataFrames by fragment/anchor number.
     # All tables from all subpages are returned regardless of which #TabN was in the URL.

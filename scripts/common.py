@@ -781,8 +781,17 @@ def clean_table_filename(raw_title, index):
     cleaned = re.sub(r'[\\/*?:"<>|]', '_', cleaned)
     cleaned = cleaned[:100].strip()
 
-    # Check if it already starts with "表几" or "Table几" or "Supplementary material几" or "Additional Table几" or "Additional file几"
-    pattern = r'^([表T][a-z]*\.?\s*(?:S\s*)?(?:\d+|[ivxlcdm]+|ni|rn|[a-z])|Supplementary\s+material\s+(?:\d+|[ivxlcdm]+|ni|rn|[a-z])|Additional\s+Table\s+(?:\d+|[ivxlcdm]+|ni|rn|[a-z])|Additional\s+file\s+(?:\d+|[ivxlcdm]+|ni|rn|[a-z]))'
+    # Check if it already starts with "表几" / "附表几" / "Table几" / "Appendix Table A1" / "Supplementary Table S1" etc.
+    pattern = (
+        r'^(?:'
+        r'附表|附录表|补充表|表|'
+        r'Supplementary\s+(?:Table|material)|Supplemental\s+Table|'
+        r'Extended\s+Data\s+Table|Appendix\s+Table|'
+        r'Additional\s+(?:Table|file)|'
+        r'Tableau?x?|Tables?|Tab\b'
+        r')\.?\s*'
+        r'(?:[A-Za-z]?\d+(?:[\.\-]\d+)*|[ivxlcdm]+|ni|rn|[一二三四五六七八九十百千万零壹贰叁肆伍陆柒捌玖拾]+|[A-Za-z]\b)'
+    )
     if not re.match(pattern, cleaned, re.IGNORECASE):
         return f"Table {index} {cleaned}"
 
@@ -1029,10 +1038,58 @@ def is_metadata_table(df):
 
     # 1. 严格多特征共现判定：单独一列"单位"绝对不构成元数据表（单位是常见物理量/计量单位列）
     col_set = set(str(c).lower().strip() for c in df.columns)
-    if "作者" in col_set and ("单位" in col_set or "机构" in col_set or "affiliation" in col_set) and df.shape[0] <= 2:
+    row0_set = set()
+    if len(df) >= 1 and all(re.match(r'^(?:\d+|Unnamed:\s*\d+)$', str(c).strip()) for c in df.columns):
+        row0_set = set(str(v).lower().strip() for v in df.iloc[0].tolist())
+    combined_hdr_set = col_set | row0_set
+    if "作者" in combined_hdr_set and ("单位" in combined_hdr_set or "机构" in combined_hdr_set or "affiliation" in combined_hdr_set or "e-mail" in combined_hdr_set or "email" in combined_hdr_set):
         return True
-    if "作者简介" in col_set or "通讯作者" in col_set:
+    if "作者简介" in combined_hdr_set or "通讯作者" in combined_hdr_set or "通信作者" in combined_hdr_set:
         return True
+    # 英文作者-机构-邮箱名单表 / CRediT 贡献角色表（机构邮编等含数字也不应逃逸）
+    if (
+        ({"author", "authors", "name"} & combined_hdr_set)
+        and ({"affiliation", "affiliations", "lead role", "supporting role"} & combined_hdr_set)
+        and ({"email", "e-mail", "correspondence", "lead role", "supporting role"} & combined_hdr_set)
+    ):
+        return True
+    # 摘要页引文卡片 / PDF 查看器元信息 UI / 附件列表框
+    bib_card_hits = len(
+        {"title", "authors", "journal", "volume", "issue", "date", "pages", "published date", "doi", "publisher"}
+        & combined_hdr_set
+    )
+    if bib_card_hits >= 4 and df.shape[0] <= 3:
+        return True
+    if "zoom option" in combined_hdr_set and df.shape[1] == 1:
+        return True
+    if ({"filename", "file name"} & combined_hdr_set) and (
+        {"description", "file size", "pdf version", "page count", "fast web view"} & combined_hdr_set
+    ):
+        return True
+    # 期刊详情页复制引文 1x2 小框（含 "复制"/"copy" + "doi:" 或 "引用"）
+    if df.shape[0] <= 2 and df.shape[1] <= 2 and not any(
+        TABLE_LABEL_RE.search(str(getattr(df, 'attrs', {}).get(k, '') or '')) for k in ('label', 'table_title')
+    ):
+        flat_lower = " ".join(str(v).lower() for v in df.values.flatten() if v is not None)
+        if ("doi:" in flat_lower or "引用" in flat_lower) and ("复制" in flat_lower or "copy" in flat_lower or len(df) == 1):
+            return True
+
+    # 作者-单位角标映射表（如 ['邓昌州', '1'] / ['张嘉玮', '2,3,4 *']）
+    if df.shape[1] == 2 and not any(
+        TABLE_LABEL_RE.search(str(getattr(df, 'attrs', {}).get(k, '') or '')) for k in ('label', 'table_title')
+    ):
+        hdr0 = str(df.columns[0]).strip()
+        hdr1 = str(df.columns[1]).strip()
+        affil_idx_re = re.compile(r'^\d+(?:[,，、\s\-–]+\d+)*(?:\s*[*†‡§#])?$')
+        col1_vals = [str(v).strip() for v in df.iloc[:, 1].tolist() if v is not None and str(v).strip()]
+        col0_vals = [str(v).strip() for v in df.iloc[:, 0].tolist() if v is not None and str(v).strip()]
+        if col1_vals and col0_vals and affil_idx_re.match(hdr1):
+            all_col1_affil = all(affil_idx_re.match(v) for v in col1_vals)
+            all_col0_names = not re.search(r'\d', hdr0) and len(hdr0) <= 30 and all(
+                not re.search(r'\d', v) and len(v) <= 30 for v in col0_vals
+            )
+            if all_col1_affil and all_col0_names:
+                return True
 
     header_col_strs = [str(c).strip() for c in df.columns]
     has_prose_headers = any(
@@ -1299,6 +1356,47 @@ def is_metadata_table(df):
             return True
         # 无数字且全部短文本 -> 仍可能是分类列表，保留
 
+    return False
+
+
+_SINGLE_COL_CHROME_RE = re.compile(
+    r'(?:摘要|关键词|基金项目|引用本文|收稿日期|修回日期|点击次数|下载次数|下载全文|'
+    r'上一篇|下一篇|版权所有|ISSN|CNKI|DOI\s*[:：]|Abstract|Keywords|Download|Citation|'
+    r'Copyright|References|E-?mail|通讯作者|作者简介)',
+    re.IGNORECASE,
+)
+
+
+def is_unlabeled_single_col_layout_shell(df, has_explicit_label: bool = False) -> bool:
+    """
+    区分「单列外框/导航/摘要排版壳」（如 view_abstract.aspx 无表头且含论文导航/长散文的 1 列表）
+    与「合法单列数据表」（如 <table><tr><th>Items</th></tr><tr><td>Alpha</td></tr></table>）。
+    """
+    if df is None or df.empty:
+        return True
+    if df.shape[1] >= 2:
+        return False
+    if has_explicit_label or df.attrs.get('label') or df.attrs.get('table_title'):
+        return False
+    if df.shape[1] == 0:
+        return True
+
+    col0 = df.columns[0]
+    col0_s = str(col0).strip() if col0 is not None else ""
+    if not col0_s or col0_s.isdigit() or col0_s.lower().startswith("unnamed:") or col0_s.lower().startswith("col"):
+        return True
+
+    texts = [col0_s]
+    for val in df.iloc[:, 0].tolist():
+        if val is not None:
+            s = str(val).strip()
+            if s and s.lower() != "nan":
+                texts.append(s)
+    if len(texts) <= 1:
+        return True
+    for t in texts:
+        if len(t) > 80 or _SINGLE_COL_CHROME_RE.search(t):
+            return True
     return False
 
 

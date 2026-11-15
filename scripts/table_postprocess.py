@@ -40,15 +40,38 @@ def read_html_preserving_text(content, **kwargs):
     numeric labels such as <th>1</th> are not confused with generated columns.
     """
     from bs4 import BeautifulSoup
-    dfs = pd.read_html(io.StringIO(content), converters=defaultdict(lambda: str),
-                       keep_default_na=False, thousands=None, **kwargs)
+    if not content or "<table" not in content.lower():
+        return []
     tables = BeautifulSoup(content, 'html.parser').find_all('table')
-    for df, tag in zip(dfs, tables):
-        first = tag.find('tr')
-        cells = first.find_all(['td', 'th'], recursive=False) if first else []
-        if tag.find('thead') is not None or (cells and all(c.name == 'th' for c in cells)):
-            df.attrs['header_source'] = 'explicit'
-    return dfs
+    if not tables:
+        return []
+    try:
+        dfs = pd.read_html(io.StringIO(content), converters=defaultdict(lambda: str),
+                           keep_default_na=False, thousands=None, **kwargs)
+        for df, tag in zip(dfs, tables):
+            first = tag.find('tr')
+            cells = first.find_all(['td', 'th'], recursive=False) if first else []
+            if tag.find('thead') is not None or (cells and all(c.name == 'th' for c in cells)):
+                df.attrs['header_source'] = 'explicit'
+        return dfs
+    except (ValueError, IndexError):
+        # Fallback: parse each top-level table individually so one malformed/empty <table>
+        # does not trigger `list index out of range` or abort valid tables on the page.
+        dfs = []
+        for tag in tables:
+            try:
+                sub_dfs = pd.read_html(io.StringIO(str(tag)), converters=defaultdict(lambda: str),
+                                      keep_default_na=False, thousands=None, **kwargs)
+            except (ValueError, IndexError):
+                continue
+            first = tag.find('tr')
+            cells = first.find_all(['td', 'th'], recursive=False) if first else []
+            has_explicit_hdr = tag.find('thead') is not None or (cells and all(c.name == 'th' for c in cells))
+            for df in sub_dfs:
+                if has_explicit_hdr:
+                    df.attrs['header_source'] = 'explicit'
+                dfs.append(df)
+        return dfs
 
 def parse_structured_vlm_content(content):
     """

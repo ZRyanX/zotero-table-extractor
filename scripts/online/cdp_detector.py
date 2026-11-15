@@ -598,9 +598,14 @@ def find_matching_cdp_page(browser: Any, target_url: str):
 
 
 def looks_like_transient_challenge_shell(html_content: Optional[str], current_url: str = "") -> bool:
-    """识别值得短时等待的瞬态风控/跳转壳（Turnstile、F5 /tspd/、Elsevier crasolve、AIP loading 等）。"""
+    """识别值得短时等待的瞬态风控/跳转壳（Turnstile、F5 /tspd/、Elsevier crasolve、Springer idp、AIP loading 等）。"""
     low_url = (current_url or "").lower()
-    if "crasolve=1" in low_url or "linkinghub.elsevier.com" in low_url:
+    if (
+        "crasolve=1" in low_url
+        or "linkinghub.elsevier.com" in low_url
+        or "idp.springer.com" in low_url
+        or "wayf.springernature.com" in low_url
+    ):
         return True
     if not html_content or not isinstance(html_content, str):
         return True
@@ -669,7 +674,33 @@ def wait_through_transient_challenge(page: Any, max_wait_s: float = 8.0) -> bool
                 except Exception:
                     pass
 
-        # 2. 有界轮询瞬态风控壳，等待 JS/XHR 就地替换为真实文章 DOM
+        # 2. Springer idp.springer.com / wayf.springernature.com 跳转超时保护
+        if "idp.springer.com" in cur_url.lower() or "wayf.springernature.com" in cur_url.lower():
+            for _ in range(8):
+                try:
+                    page.wait_for_timeout(500)
+                    new_url = getattr(page, "url", "") or ""
+                    if new_url and "idp.springer.com" not in new_url.lower() and "wayf.springernature.com" not in new_url.lower():
+                        cur_url = new_url
+                        break
+                except Exception:
+                    break
+            else:
+                try:
+                    parsed = urllib.parse.urlparse(cur_url)
+                    qs = urllib.parse.parse_qs(parsed.query)
+                    redir_vals = qs.get("redirect_uri") or qs.get("target") or []
+                    for rv in redir_vals:
+                        if rv and rv.startswith(("http://", "https://")) and "idp.springer.com" not in rv.lower():
+                            print(f"[Springer IDP] 重定向等待超时，直接回落目标文章页: {rv}")
+                            page.goto(rv, wait_until="domcontentloaded", timeout=20000)
+                            page.wait_for_timeout(1500)
+                            cur_url = getattr(page, "url", "") or rv
+                            break
+                except Exception:
+                    pass
+
+        # 3. 有界轮询瞬态风控壳，等待 JS/XHR 就地替换为真实文章 DOM
         probe_html = page.content()
         cur_url = getattr(page, "url", "") or cur_url
         if not looks_like_transient_challenge_shell(probe_html, cur_url):

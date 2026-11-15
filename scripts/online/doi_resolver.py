@@ -262,6 +262,15 @@ def get_doi_by_title_firecrawl(title, api_key=None):
     """
     if not title or len(title) < 10:
         return None
+    try:
+        from . import strategies as _fc_strategies
+    except ImportError:
+        try:
+            import strategies as _fc_strategies
+        except ImportError:
+            _fc_strategies = None
+    if _fc_strategies is not None and _fc_strategies.is_firecrawl_disabled():
+        return None
     config = load_config()
     key = api_key or config.get("FIRECRAWL_API_KEY") or os.environ.get("FIRECRAWL_API_KEY")
     if not key:
@@ -278,6 +287,10 @@ def get_doi_by_title_firecrawl(title, api_key=None):
     }
     try:
         response = requests.get("https://api.firecrawl.dev/v2/search/research/papers", params=params, headers=headers, timeout=15)
+        if response.status_code in (401, 402, 403):
+            if _fc_strategies is not None:
+                _fc_strategies.disable_firecrawl(f"Research Index 认证或额度受限（{response.status_code}）")
+            return None
         if response.status_code == 200:
             data = response.json()
             papers = data.get("results", [])
@@ -413,27 +426,80 @@ def resolve_chinese_doi(url):
                 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
             }
             r = requests.get(url, headers=headers, timeout=8)
+            raw_url = getattr(r, "url", None)
+            final_url = raw_url.strip() if isinstance(raw_url, str) else ""
+            if final_url and "chndoi.org" not in final_url.lower() and "chinadoi.cn" not in final_url.lower():
+                print(f"[在线提取] China DOI 重定向至目标页面: {final_url}")
+                return final_url
             if r.status_code == 200:
                 html = r.text
                 from bs4 import BeautifulSoup
                 soup = BeautifulSoup(html, 'html.parser')
+                base_url = final_url or url
                 
-                # 1. 优先查找明确标注 (境内) 的列表项与链接
-                for li in soup.find_all(['li', 'tr', 'td', 'div']):
-                    li_text = li.get_text()
-                    if '境内' in li_text:
-                        a = li.find('a')
-                        if a and a.get('href'):
-                            cand = a.get('href').strip()
-                            print(f"[在线提取] 成功从 China DOI 页面解析出境内知网链接: {cand}")
-                            return cand
+                # 1. 优先查找明确标注 (境内) 的叶级列表项/单元格与链接（避免外层 <div> 包裹多个条目的陷阱）
+                leaf_candidates = list(soup.find_all(['a', 'li', 'tr', 'td']))
+                leaf_candidates.extend(
+                    d for d in soup.find_all('div') if not d.find(['li', 'tr', 'td', 'div'])
+                )
+                domestic_fallback = None
+                for el in leaf_candidates:
+                    el_text = el.get_text()
+                    if '境内' not in el_text:
+                        continue
+                    anchors = [el] if el.name == 'a' else el.find_all('a')
+                    for a in anchors:
+                        href = (a.get('href') or '').strip()
+                        if not href:
+                            continue
+                        abs_href = urllib.parse.urljoin(base_url, href)
+                        if 'oversea' not in abs_href.lower() and ('link.cnki.net' in abs_href.lower() or 'cnki' in abs_href.lower()):
+                            print(f"[在线提取] 成功从 China DOI 页面解析出境内知网链接: {abs_href}")
+                            return abs_href
+                        if domestic_fallback is None and 'oversea' not in abs_href.lower():
+                            domestic_fallback = abs_href
+                if domestic_fallback:
+                    print(f"[在线提取] 成功从 China DOI 页面解析出境内链接: {domestic_fallback}")
+                    return domestic_fallback
                             
                 # 2. 匹配非 oversea 的 link.cnki.net
                 for a in soup.find_all('a'):
-                    href = a.get('href', '').strip()
-                    if 'link.cnki.net' in href and 'oversea' not in href:
-                        print(f"[在线提取] 成功从 China DOI 页面解析出境内知网链接: {href}")
-                        return href
+                    href = (a.get('href') or '').strip()
+                    if not href:
+                        continue
+                    abs_href = urllib.parse.urljoin(base_url, href)
+                    if 'link.cnki.net' in abs_href.lower() and 'oversea' not in abs_href.lower():
+                        print(f"[在线提取] 成功从 China DOI 页面解析出境内知网链接: {abs_href}")
+                        return abs_href
+
+                # 3. 匹配已知国内数据库/期刊直链（如万方/维普等非 oversea 链接）
+                for a in soup.find_all('a'):
+                    href = (a.get('href') or '').strip()
+                    if not href:
+                        continue
+                    abs_href = urllib.parse.urljoin(base_url, href)
+                    low_href = abs_href.lower()
+                    if 'oversea' not in low_href and any(dom in low_href for dom in ('wanfangdata.', 'cqvip.', 'cnki.net', 'cnki.com.cn')):
+                        print(f"[在线提取] 成功从 China DOI 页面解析出国内链接: {abs_href}")
+                        return abs_href
+
+                # 4. 匹配 meta refresh / JS 跳转至境内 CNKI 或国内数据库
+                meta_ref = soup.find('meta', attrs={'http-equiv': re.compile(r'^refresh$', re.I)})
+                if meta_ref:
+                    m_ref = re.search(r'url\s*=\s*["\']?([^"\';\s>]+)', meta_ref.get('content') or '', re.I)
+                    if m_ref:
+                        cand_ref = urllib.parse.urljoin(base_url, m_ref.group(1).strip())
+                        low_ref = cand_ref.lower()
+                        if 'oversea' not in low_ref and any(dom in low_ref for dom in ('cnki.net', 'cnki.com.cn', 'wanfangdata.', 'cqvip.')):
+                            print(f"[在线提取] 从 China DOI meta-refresh 解析出目标链接: {cand_ref}")
+                            return cand_ref
+
+                for m_js in re.finditer(r'(?:window\.)?location(?:\.href)?\s*(?:=|\.replace\s*\()\s*["\']([^"\']+)["\']', html, re.I):
+                    cand_js = urllib.parse.urljoin(base_url, m_js.group(1).strip())
+                    low_js = cand_js.lower()
+                    if 'oversea' not in low_js and any(dom in low_js for dom in ('cnki.net', 'cnki.com.cn', 'wanfangdata.', 'cqvip.')):
+                        print(f"[在线提取] 从 China DOI JS 跳转解析出目标链接: {cand_js}")
+                        return cand_js
         except Exception as e:
             print(f"[在线提取] 解析 China DOI 页面失败: {e}")
     return url
