@@ -151,57 +151,29 @@
 ## 🏗 架构设计与数据流转图
 
 ```mermaid
-flowchart TD
-    subgraph S1["1. 任务入口、预检与调度层"]
-        IN["多态输入<br/>• Zotero 条目 / 本地或远程 PDF<br/>• 批量目录 / 清单 .txt<br/>• 文献 URL / DOI"] --> CLI["主 CLI 调度器<br/>extract_zotero_table.py"]
-        BATCH["Zotero 全库批量总控<br/>batch_run.py"] -->|子进程隔离并发| CLI
-        PLAN["批量预分析规划器<br/>batch_planner.py"] -->|元数据与年份门禁| BATCH
-        CLI --> ORI["Tier-1 无损方向自愈<br/>doc_orientation_detector.py<br/>(矢量方向 + TurboOCR doc_ori.onnx)"]
+flowchart LR
+    IN["输入与无损预检<br/>extract_zotero_table · batch_run<br/>TurboOCR doc_ori.onnx"] --> ROUTE{"双轨调度<br/>路由"}
+
+    subgraph ON["在线 HTML / XML 竞速管线"]
+        direction TB
+        ON1["Tier 1: arXiv · NCBI PMC JATS · Elsevier XOCS"]
+        ON2["Tier 2-4: Crawl4AI · Firecrawl(OA) · CDP · CNKI"]
     end
 
-    subgraph S2["2. 在线 HTML / XML 提取管线 (分层竞速)"]
-        ORI -->|允许在线| DOI["元数据与链接探针<br/>doi_resolver.py (WAL / Crossref / chndoi)"]
-        DOI --> RACE{"分层并发竞速路由<br/>online/graph.py"}
-        RACE -->|Tier-1 权威全文| XML["arXiv HTML / ar5iv<br/>NCBI PMC JATS XML<br/>Elsevier XOCS XML (+InstToken)"]
-        RACE -->|Tier-1/2 网页与 OA| WEB["DirectHTTP / curl_cffi / Unpaywall<br/>Crawl4AI / OA门控 Firecrawl / Scrapling"]
-        RACE -->|Tier-3 共享浏览器| PW["Playwright & CNKI 提取器<br/>DevToolsActivePort CDP + Port Guard<br/>6 槽位并发锁 + BrowserSkill(bsk)"]
-        RACE -->|Tier-4 检索尾流| TAIL["Europe PMC / Crossref / PaperFetch<br/>BrowserAct + 附表下载联动"]
+    subgraph PDF["本地 PDF 深度管线 (主抽取 → 投票 → 视觉AI)"]
+        direction TB
+        PDF1["主抽取: Tagged PDF · MinerU · 数值门禁"]
+        PDF2["兜底: 9 引擎 TEDS 投票 · 3 阶视觉 AI"]
+        PDF1 -->|未覆盖 / 未通过| PDF2
     end
 
-    subgraph S3["3. 本地 PDF 提取管线 (主抽取 + 9引擎共识 + 3阶视觉AI)"]
-        ORI -->|仅 PDF 或在线漏表| PTE["本地 PDF 提取总控<br/>pdf_table_extractor.py"]
-        PTE --> INSP["多信号候选页挖掘与声明账本<br/>pdf-inspector + 表题 + 矢量网格 + 续表追溯"]
-        INSP --> TYPE{"PDF 类型"}
+    ROUTE -->|在线| ON
+    ROUTE -->|仅 PDF| PDF
+    ON -->|漏表 / 截断补全| PDF
 
-        TYPE -->|文本版 Native| FAST["快速通道与结构化主抽取<br/>1. Tagged PDF / PDF/UA 结构树<br/>2. MinerU (CLI+REST / flash-extract)<br/>3. 本地双向数值门禁 (table_validator.py)"]
-        FAST -->|全覆盖且通过| IR["Table IR 领域模型<br/>models.py (ExtractedTable)"]
-        FAST -->|未覆盖 / 门禁失败 / Legacy| VOTE["9 引擎多方投票仲裁<br/>pdf-inspector • PyMuPDF4LLM • find_tables<br/>GMFT • img2table • Camelot • pdfplumber<br/>RapidTable • text_alignment<br/>+ IBM TEDS 拓扑相似度计算"]
-        VOTE --> CHECK{"一致性与质量校验"}
-        CHECK -->|高置信共识| IR
-        CHECK -->|低置信 / 未覆盖页| STAGE1
-
-        TYPE -->|扫描版 Scanned| VLM_FULL["PaddleOCR-VL-1.6 整页解析<br/>(Docling 离线备用)"] --> IR
-        STAGE1["阶段1: RapidTable ONNX 快速挽救"] -->|未解决| STAGE2["阶段2: 版面集成 + 在线 VLM<br/>DocLayout-YOLO + PP-DocLayoutV3 / PP-StructureV3<br/>→ PaddleOCR-VL-1.6 / TeleOCR (vLLM)"]
-        STAGE2 -->|未解决 / 离线| STAGE3["阶段3: IBM Docling (TableFormer)<br/>本地 CPU / Metal 离线接管"]
-        STAGE1 -->|已覆盖| IR
-        STAGE2 -->|已覆盖| IR
-        STAGE3 --> IR
-    end
-
-    XML --> MERGE_ON["在线-PDF 完备性核验与<br/>主键无损互补合并"]
-    WEB --> MERGE_ON
-    PW --> MERGE_ON
-    TAIL --> MERGE_ON
-    IR --> MERGE_ON
-
-    subgraph S4["4. 后处理、续表拼接、导出与生态联动"]
-        MERGE_ON --> POST["7 阶轻量安全后处理 (table_postprocess.py)<br/>• MultiIndex 保护与 LaTeX 清洗 • SMART 表头展平<br/>• 挤压/多行展开 • 公式防注入与类型推断<br/>• olmOCR 2 尾注剥离 • 双语表题规范化"]
-        POST --> CONT["跨页续表与横向分块合并<br/>MinerU 4-Way + DeepDoc 单调 DP 列对齐"]
-        CONT --> LLM["可选 LLM 语义重构与等价门禁<br/>(arXiv 2603.18652 / 本地或云端 LLM)"]
-        LLM --> EXP["出版级 Excel 导出 (excel_export.py)<br/>• openpyxl CellRichText 上下标渲染<br/>• 自适应列宽 • Dublin Core • 防撞写入"]
-        EXP --> OUT["🎯 最终出版级 Excel 产物 (.xlsx)"]
-        OUT --> SYNC["🔄 可选 Zotero 生态联动 (zotero_sync.py)<br/>PyZotero 附件挂载 + Better-Notes 预览笔记"]
-    end
+    ON --> REFINE["后处理与拼接校验<br/>Table IR · 7 阶清洗<br/>单调 DP · LLM 语义门禁"]
+    PDF --> REFINE
+    REFINE --> EXPORT["导出与生态联动<br/>CellRichText .xlsx<br/>质量审计 · Zotero 挂载"]
 ```
 
 > **可编辑矢量架构图源文件**：由 `scripts/export_drawio_diagram.py` 维护并导出至 `figures/`：

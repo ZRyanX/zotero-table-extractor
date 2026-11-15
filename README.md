@@ -161,57 +161,29 @@ Every extracted table passes through a 7-stage pipeline (`table_postprocess.py`)
 ## 🏗 Architecture & Data Flow
 
 ```mermaid
-flowchart TD
-    subgraph S1["1. Entry, Pre-Check & Scheduling"]
-        IN["Inputs<br/>• Zotero Item / Local or Remote PDF<br/>• Directory / .txt Path List<br/>• Article URL / DOI"] --> CLI["Main CLI Dispatcher<br/>extract_zotero_table.py"]
-        BATCH["Full-Library Batch Runner<br/>batch_run.py"] -->|Subprocess Isolation| CLI
-        PLAN["Batch Pre-Planner<br/>batch_planner.py"] -->|Metadata & Year Gate| BATCH
-        CLI --> ORI["Tier-1 Lossless Orientation<br/>doc_orientation_detector.py<br/>(Vector Dir + TurboOCR doc_ori.onnx)"]
+flowchart LR
+    IN["Inputs & Pre-Check<br/>extract_zotero_table · batch_run<br/>TurboOCR doc_ori.onnx"] --> ROUTE{"Dual-Track<br/>Router"}
+
+    subgraph ON["Online HTML/XML Track (Tiered Race)"]
+        direction TB
+        ON1["Tier 1: arXiv · NCBI PMC JATS · Elsevier XOCS"]
+        ON2["Tier 2-4: Crawl4AI · Firecrawl(OA) · CDP · CNKI"]
     end
 
-    subgraph S2["2. Online HTML / XML Track (Tiered Race)"]
-        ORI -->|Online Enabled| DOI["Metadata & Link Probe<br/>doi_resolver.py (WAL / Crossref / chndoi)"]
-        DOI --> RACE{"Tiered Racing Router<br/>online/graph.py"}
-        RACE -->|Tier-1 Authoritative| XML["arXiv HTML / ar5iv<br/>NCBI PMC JATS XML<br/>Elsevier XOCS XML (+InstToken)"]
-        RACE -->|Tier-1/2 Web & OA| WEB["DirectHTTP / curl_cffi / Unpaywall<br/>Crawl4AI / OA-Gated Firecrawl / Scrapling"]
-        RACE -->|Tier-3 Shared Browser| PW["Playwright & CNKI Extractors<br/>DevToolsActivePort CDP + Port Guard<br/>6-Slot Tab Lock + BrowserSkill(bsk)"]
-        RACE -->|Tier-4 Tail| TAIL["Europe PMC / Crossref / PaperFetch<br/>BrowserAct + Supp Downloader"]
+    subgraph PDF["Local PDF Track (Primary → Voting → AI)"]
+        direction TB
+        PDF1["Primary: Tagged PDF · MinerU · Numeric Gate"]
+        PDF2["Fallback: 9-Engine TEDS · 3-Stage Visual AI"]
+        PDF1 -->|Uncovered| PDF2
     end
 
-    subgraph S3["3. Local PDF Track (Structured Primary + Consensus + Visual AI)"]
-        ORI -->|PDF-only or Incomplete Online| PTE["PDF Extraction Controller<br/>pdf_table_extractor.py"]
-        PTE --> INSP["Multi-Signal Mining & Ledger<br/>pdf-inspector + Captions + Vectors + Continuations"]
-        INSP --> TYPE{"PDF Type"}
+    ROUTE -->|Online| ON
+    ROUTE -->|PDF-only| PDF
+    ON -->|Missing / Incomplete| PDF
 
-        TYPE -->|Native| FAST["Fast-Path & Primary Extraction<br/>1. Tagged PDF / PDF-UA Structure Tree<br/>2. MinerU (CLI + REST / flash-extract)<br/>3. Local Numeric Gate (table_validator.py)"]
-        FAST -->|Pass & Complete| IR["Table IR Model<br/>models.py (ExtractedTable)"]
-        FAST -->|Uncovered / Gate Fail / Legacy| VOTE["9-Engine Consensus Voting<br/>pdf-inspector • PyMuPDF4LLM • find_tables<br/>GMFT • img2table • Camelot • pdfplumber<br/>RapidTable • text_alignment<br/>+ IBM TEDS Topology Arbitration"]
-        VOTE --> CHECK{"Consensus & Validation"}
-        CHECK -->|Valid| IR
-        CHECK -->|Low Confidence / Unresolved| STAGE1
-
-        TYPE -->|Scanned| VLM_FULL["PaddleOCR-VL-1.6 Full-Page<br/>(Docling Offline Fallback)"] --> IR
-        STAGE1["Stage 1: RapidTable ONNX Rescue"] -->|Unresolved| STAGE2["Stage 2: Layout Ensemble + VLM<br/>DocLayout-YOLO + PP-DocLayoutV3 / PP-StructureV3<br/>→ PaddleOCR-VL-1.6 / TeleOCR (vLLM)"]
-        STAGE2 -->|Unresolved / Offline| STAGE3["Stage 3: IBM Docling (TableFormer)<br/>Local CPU / Metal Takeover"]
-        STAGE1 -->|Resolved| IR
-        STAGE2 -->|Resolved| IR
-        STAGE3 --> IR
-    end
-
-    XML --> MERGE_ON["Online-PDF Completeness &<br/>Complementary Merge"]
-    WEB --> MERGE_ON
-    PW --> MERGE_ON
-    TAIL --> MERGE_ON
-    IR --> MERGE_ON
-
-    subgraph S4["4. Post-Processing, Stitching, Export & Sync"]
-        MERGE_ON --> POST["7-Stage Post-Processing (table_postprocess.py)<br/>• MultiIndex & LaTeX Cleaning • SMART Headers<br/>• Squeezed/Subrow Expansion • Formula Defense<br/>• olmOCR 2 Footnotes • Bilingual Captions"]
-        POST --> CONT["Continuation & Split Merging<br/>MinerU 4-Way + DeepDoc Monotone DP"]
-        CONT --> LLM["Optional LLM Reasoner & Equivalence Gate<br/>(arXiv 2603.18652 / Local or Cloud LLM)"]
-        LLM --> EXP["Excel Export (excel_export.py)<br/>• openpyxl CellRichText Sub/Superscripts<br/>• Autofit Widths • Dublin Core • Atomic Write"]
-        EXP --> OUT["🎯 Publication-Grade .xlsx Workbooks"]
-        OUT --> SYNC["🔄 Optional Zotero Sync (zotero_sync.py)<br/>PyZotero Attachment + Better-Notes Card"]
-    end
+    ON --> REFINE["Refine & Stitch<br/>Table IR · 7-Stage Clean<br/>Monotone DP · LLM Gate"]
+    PDF --> REFINE
+    REFINE --> EXPORT["Export & Sync<br/>CellRichText .xlsx<br/>QA Audit · Zotero Sync"]
 ```
 
 > **Editable Architecture Assets**: Maintained via `scripts/export_drawio_diagram.py` under `figures/`:
