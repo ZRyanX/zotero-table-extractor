@@ -151,46 +151,50 @@
 ## 🏗 架构设计与数据流转图
 
 ```mermaid
-flowchart LR
-    IN["输入与 CLI 调度<br/>extract_zotero_table / batch_run"] --> ORI["Tier-1 无损旋转自愈<br/>Native /Rotate · 扫描 150dpi"]
-    ORI --> ROUTE{"入口条件路由"}
-
-    subgraph ON["在线 HTML / XML 管线 (race=True / --sequential)"]
-        ON_SRC["Tier 1: arXiv · PMC JATS · Elsevier XOCS (礼让窗口)<br/>Tier 2-4: Unpaywall · Crawl4AI · Firecrawl(OA+403熔断) · CDP · CNKI"] --> ON_GATE{"覆盖全文表号?"}
+flowchart TB
+    subgraph S1["1. 入口预检、无损旋转与在线 HTML / XML 竞速"]
+        direction LR
+        IN["多态输入与 CLI 调度<br/>extract_zotero_table / batch_run"] --> ORI["Tier-1 无损旋转自愈<br/>Native /Rotate · 扫描 150dpi"]
+        ORI --> ROUTE{"入口条件路由"}
+        ROUTE -->|"默认开启在线"| ON["Tier 1: arXiv · PMC · Elsevier XOCS<br/>Tier 2-4: Unpaywall · Crawl4AI · Firecrawl(OA) · CDP · CNKI"]
+        ON --> ON_GATE{"覆盖全文<br/>表号?"}
+        ON_GATE -->|"完整 / --online-only"| ON_OK["高保真在线表格"]
+        ON_GATE -->|"缺失 / 截断"| ON_MISS["交由本地 PDF 补漏"]
+        ROUTE -->|"--pdf-only / 2020前中文"| PDF_DIRECT["直通本地 PDF"]
     end
 
-    subgraph PDF["本地 PDF 深度管线"]
-        LEDGER["声明账本 + pdf-inspector"] --> PTYPE{"PDF 类型"}
-        PTYPE -->|文本 / 混合| PRIM["主抽取: Tagged PDF → MinerU → 数值门禁"]
+    subgraph S2["2. 本地 PDF 深度提取管线 (主抽取 → 9 引擎投票 → 3 阶视觉 AI)"]
+        direction LR
+        LEDGER["声明账本<br/>+ pdf-inspector"] --> PTYPE{"PDF 类型"}
+        PTYPE -->|文本 / 混合| PRIM["Tagged PDF → MinerU<br/>→ 本地数值门禁"]
         PRIM --> NGATE{"全覆盖且通过?"}
-        NGATE -->|未覆盖 / 失败 / Legacy| VOTE["9 引擎 + IBM TEDS 投票"]
+        NGATE -->|未覆盖 / 失败 / Legacy| VOTE["9 引擎 +<br/>IBM TEDS 投票"]
         VOTE --> VGATE{"TEDS >= 0.75?"}
         PTYPE -->|纯扫描| AI["3 阶视觉 AI 接管<br/>① RapidTable → ② YOLO/PP-V3+VLM → ③ Docling"]
         VGATE -->|低置信 / 漏表| AI
         AI --> GUARD{"防劣退质检<br/>门禁"}
+        NGATE -->|通过| IR["Table IR<br/>(models.py)"]
+        VGATE -->|共识采纳| IR
+        GUARD -->|优则采纳/劣则回退| IR
     end
 
-    ROUTE -->|"默认开启在线"| ON_SRC
-    ROUTE -->|"--pdf-only / 2020前中文"| LEDGER
-    ON_GATE -->|"完整 / --online-only"| MERGE["在线-PDF 互补合并<br/>与 7 阶安全后处理"]
-    ON_GATE -->|"缺失 / 截断补漏"| LEDGER
+    subgraph S3["3. 互补合并、7 阶清洗、续表拼接与出版级导出"]
+        direction LR
+        MERGE["在线-PDF 合并与<br/>7 阶安全后处理"] --> CONT{"可对齐<br/>跨页续表?"}
+        CONT -->|是| DP["MinerU 4-Way +<br/>DeepDoc 单调 DP"]
+        CONT -->|否| FRAG["保留独立片段<br/>防盲目拼接"]
+        DP --> LLM_G{"--enable-llm?"}
+        FRAG --> LLM_G
+        LLM_G -->|是| LLM["LLM 修复 +<br/>语义等价门禁"]
+        LLM_G -->|否| EXP["出版级 Excel (.xlsx)<br/>CellRichText 上下标"]
+        LLM -->|通过 / 安全回退| EXP
+        EXP --> SYNC_G{"--sync-zotero?"}
+        SYNC_G -->|默认关闭·显式开启| ZSYNC["PyZotero + Better-Notes"]
+    end
 
-    NGATE -->|通过| IR["Table IR<br/>(models.py)"]
-    VGATE -->|共识采纳| IR
-    GUARD -->|优于原生| IR
-    GUARD -.->|拒绝劣退回退原生| IR
-    IR --> MERGE
-
-    MERGE --> CONT{"可对齐<br/>跨页续表?"}
-    CONT -->|是| DP["MinerU 4-Way + DeepDoc 单调 DP"]
-    CONT -->|否| FRAG["保留独立片段防误拼"]
-    DP --> LLM_G{"--enable-llm?"}
-    FRAG --> LLM_G
-    LLM_G -->|是| LLM["LLM 修复 + 语义等价门禁"]
-    LLM_G -->|否| EXP["出版级 Excel (.xlsx)<br/>CellRichText 上下标保真"]
-    LLM -->|通过 / 安全回退| EXP
-    EXP --> SYNC_G{"--sync-zotero?"}
-    SYNC_G -->|默认关闭·显式开启| ZSYNC["PyZotero + Better-Notes"]
+    S1 -->|"缺失 / --pdf-only / 2020前中文"| S2
+    S1 -->|"完整 / --online-only"| S3
+    S2 -->|"已校验 Table IR"| S3
 ```
 
 > **可编辑矢量架构图源文件**：由 `scripts/export_drawio_diagram.py` 维护并导出至 `figures/`：

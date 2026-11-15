@@ -161,46 +161,50 @@ Every extracted table passes through a 7-stage pipeline (`table_postprocess.py`)
 ## 🏗 Architecture & Data Flow
 
 ```mermaid
-flowchart LR
-    IN["Inputs & CLI<br/>extract_zotero_table / batch_run"] --> ORI["Tier-1 Orientation<br/>Native /Rotate · Scanned 150dpi"]
-    ORI --> ROUTE{"Pre-Check Gate"}
-
-    subgraph ON["Online HTML / XML Track (race=True / --sequential)"]
-        ON_SRC["Tier 1: arXiv · PMC JATS · Elsevier XOCS (Grace Window)<br/>Tier 2-4: Unpaywall · Crawl4AI · Firecrawl(OA+403 CB) · CDP · CNKI"] --> ON_GATE{"Match PDF Ledger?"}
+flowchart TB
+    subgraph S1["1. Entry, Orientation & Online HTML / XML Race"]
+        direction LR
+        IN["Inputs & CLI<br/>extract_zotero_table / batch_run"] --> ORI["Tier-1 Orientation<br/>Native /Rotate · Scan 150dpi"]
+        ORI --> ROUTE{"Pre-Check Gate"}
+        ROUTE -->|"--online (default)"| ON["Tier 1: arXiv · PMC · Elsevier XOCS<br/>Tier 2-4: Unpaywall · Crawl4AI · Firecrawl(OA) · CDP · CNKI"]
+        ON --> ON_GATE{"Match PDF<br/>Ledger?"}
+        ON_GATE -->|"Complete / --online-only"| ON_OK["Verified Online Tables"]
+        ON_GATE -->|"Missing / Truncated"| ON_MISS["Supplement via PDF"]
+        ROUTE -->|"--pdf-only / Pre-2020 CN"| PDF_DIRECT["Direct Local PDF"]
     end
 
-    subgraph PDF["Local PDF Track"]
-        LEDGER["Declaration Ledger + pdf-inspector"] --> PTYPE{"PDF Type"}
-        PTYPE -->|Native / Mixed| PRIM["Fast-Path: Tagged PDF → MinerU → Numeric Gate"]
+    subgraph S2["2. Local PDF Deep Pipeline (Primary → Voting → Visual AI)"]
+        direction LR
+        LEDGER["Declaration Ledger<br/>+ pdf-inspector"] --> PTYPE{"PDF Type"}
+        PTYPE -->|Native / Mixed| PRIM["Tagged PDF → MinerU<br/>→ Numeric Gate"]
         PRIM --> NGATE{"Covered & Pass?"}
-        NGATE -->|Uncovered / Fail / Legacy| VOTE["9-Engine + IBM TEDS Voting"]
+        NGATE -->|Uncovered / Fail / Legacy| VOTE["9-Engine +<br/>IBM TEDS Voting"]
         VOTE --> VGATE{"TEDS >= 0.75?"}
-        PTYPE -->|Scanned| AI["3-Stage Visual AI<br/>① RapidTable → ② YOLO/PP-V3 + VLM → ③ Docling"]
+        PTYPE -->|Scanned| AI["3-Stage Visual AI<br/>① RapidTable → ② YOLO/PP-V3+VLM → ③ Docling"]
         VGATE -->|Low Conf / Unresolved| AI
         AI --> GUARD{"Anti-Regression<br/>Guard"}
+        NGATE -->|Pass| IR["Table IR<br/>(models.py)"]
+        VGATE -->|Consensus| IR
+        GUARD -->|Accept / Reject Fallback| IR
     end
 
-    ROUTE -->|"--online (default)"| ON_SRC
-    ROUTE -->|"--pdf-only / Pre-2020 CN"| LEDGER
-    ON_GATE -->|"Complete / --online-only"| MERGE["Online–PDF Merge<br/>& 7-Stage Post-Process"]
-    ON_GATE -->|"Missing / Truncated"| LEDGER
+    subgraph S3["3. Merge, Post-Processing, Stitching & Publication Output"]
+        direction LR
+        MERGE["Online–PDF Merge<br/>& 7-Stage Post-Process"] --> CONT{"Alignable<br/>Continuation?"}
+        CONT -->|Yes| DP["MinerU 4-Way +<br/>DeepDoc Monotone DP"]
+        CONT -->|No| FRAG["Keep Separate<br/>Fragments"]
+        DP --> LLM_G{"--enable-llm?"}
+        FRAG --> LLM_G
+        LLM_G -->|Yes| LLM["LLM Repair +<br/>Semantic Gate"]
+        LLM_G -->|No| EXP["Excel Export (.xlsx)<br/>CellRichText Sub/Superscripts"]
+        LLM -->|Pass / Safe Fallback| EXP
+        EXP --> SYNC_G{"--sync-zotero?"}
+        SYNC_G -->|Opt-in True| ZSYNC["PyZotero + Better-Notes"]
+    end
 
-    NGATE -->|Pass| IR["Table IR<br/>(models.py)"]
-    VGATE -->|Consensus| IR
-    GUARD -->|Accepted| IR
-    GUARD -.->|Reject Empty/Degraded| IR
-    IR --> MERGE
-
-    MERGE --> CONT{"Alignable<br/>Continuation?"}
-    CONT -->|Yes| DP["MinerU 4-Way + DeepDoc DP Merge"]
-    CONT -->|No| FRAG["Keep Separate Fragments"]
-    DP --> LLM_G{"--enable-llm?"}
-    FRAG --> LLM_G
-    LLM_G -->|Yes| LLM["LLM Repair + Equivalence Gate"]
-    LLM_G -->|No| EXP["Excel Export (.xlsx)<br/>CellRichText Sub/Superscripts"]
-    LLM -->|Pass / Safe Fallback| EXP
-    EXP --> SYNC_G{"--sync-zotero?"}
-    SYNC_G -->|Opt-in True| ZSYNC["PyZotero + Better-Notes"]
+    S1 -->|"Missing / --pdf-only / Pre-2020 CN"| S2
+    S1 -->|"Complete / --online-only"| S3
+    S2 -->|"Verified Table IR"| S3
 ```
 
 > **Editable Architecture Assets**: Maintained via `scripts/export_drawio_diagram.py` under `figures/`:
