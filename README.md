@@ -18,6 +18,10 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-teal.svg" alt="License"></a>
 </p>
 
+<p align="center">
+  <a href="#-architecture--data-flow"><img src="figures/zotero_table_extractor_architecture.svg" alt="Zotero Table Extractor Architecture (v1.9.7)" width="100%" /></a>
+</p>
+
 ---
 
 ## 📑 Table of Contents
@@ -210,19 +214,10 @@ flowchart TD
     end
 ```
 
-> **Vector Architecture Source**: Editable draw.io source and high-resolution exports are stored under `figures/`:
+> **Editable Architecture Assets**: Maintained via `scripts/export_drawio_diagram.py` under `figures/`:
 > - 📄 [figures/zotero_table_extractor_architecture.drawio](figures/zotero_table_extractor_architecture.drawio)
 > - 🖼 [figures/zotero_table_extractor_architecture.svg](figures/zotero_table_extractor_architecture.svg)
 > - 🖼 [figures/zotero_table_extractor_architecture.png](figures/zotero_table_extractor_architecture.png)
->
-> <details>
-> <summary>Legacy v1.6.0 Reference Diagram (Chinese draw.io export — see the v1.9.7 Mermaid flowchart above for the latest architecture)</summary>
->
-> <p align="center">
->   <img src="figures/zotero_table_extractor_architecture.svg" alt="Zotero Table Extractor v1.6.0 Architecture Diagram" width="100%" />
-> </p>
->
-> </details>
 
 ---
 

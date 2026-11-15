@@ -75,28 +75,41 @@ class TestArchitectureDiagram(unittest.TestCase):
                 cls.edges.append((eid, src, tgt, pts))
 
     def test_xml_structure_and_counts(self):
-        """Verify XML is well-formed with 7 swimlanes, 35+ cards, and 35+ edges."""
-        self.assertEqual(len(self.swimlanes), 7, "Diagram must feature exactly 7 architectural swimlanes.")
-        self.assertGreaterEqual(len(self.boxes), 35, "Diagram must contain at least 35 functional component cards.")
-        self.assertGreaterEqual(len(self.edges), 38, "Diagram must contain at least 38 connectors.")
+        """Verify XML is well-formed with 5 swimlanes, 13+ cards, and 18+ edges."""
+        self.assertEqual(len(self.swimlanes), 5, "Diagram must feature exactly 5 architectural swimlanes.")
+        self.assertGreaterEqual(len(self.boxes), 13, "Diagram must contain at least 13 functional component cards.")
+        self.assertGreaterEqual(len(self.edges), 18, "Diagram must contain at least 18 connectors.")
 
-    def test_v1_6_0_architectural_components_present(self):
-        """Ensure all v1.6.0 core architectural upgrades are clearly documented."""
-        # 1. 7 PDF engines
-        for term in ["GMFT", "img2table", "Tagged PDF", "Camelot", "pdfplumber", "find_tables", "text_alignment"]:
+    def test_v1_9_7_architectural_components_present(self):
+        """Ensure core v1.9.7 dual-track architectural components are clearly documented."""
+        # 1. Online HTML/XML track
+        for term in ["arXiv", "Elsevier", "Firecrawl", "CDP", "CNKI"]:
+            self.assertIn(term, self.xml_str, f"Missing online track component: {term}")
+
+        # 2. Native PDF primary & 9-engine voting engines
+        for term in [
+            "MinerU",
+            "Tagged PDF",
+            "pdf-inspector",
+            "PyMuPDF4LLM",
+            "find_tables",
+            "GMFT",
+            "img2table",
+            "Camelot",
+            "pdfplumber",
+            "RapidTable",
+            "text_alignment",
+            "IBM TEDS",
+        ]:
             self.assertIn(term, self.xml_str, f"Missing native PDF engine component: {term}")
-        
-        # 2. Dual visual AI pipeline
-        for term in ["PP-StructureV3", "PaddleOCR-VL-1.6", "Docling", "TableFormer"]:
-            self.assertIn(term, self.xml_str, f"Missing dual AI pipeline component: {term}")
-            
-        # 3. Continuation DP merging
-        for term in ["DeepDoc", "MinerU", "单调", "DP"]:
-            self.assertIn(term, self.xml_str, f"Missing continuation DP merge component: {term}")
-            
-        # 4. Zotero & Better-Notes ecosystem
-        for term in ["zotero_sync.py", "Better-Notes", ".xlsx", "ZOTERO_SYNC_ENABLED"]:
-            self.assertIn(term, self.xml_str, f"Missing ecosystem integration component: {term}")
+
+        # 3. 3-Stage visual AI pipeline & orientation
+        for term in ["doc_ori.onnx", "DocLayout-YOLO", "PP-DocLayoutV3", "PaddleOCR-VL-1.6", "TeleOCR", "Docling", "TableFormer"]:
+            self.assertIn(term, self.xml_str, f"Missing visual AI / orientation component: {term}")
+
+        # 4. Post-processing, DP stitching, LLM gate & Excel / Zotero export
+        for term in ["SMART", "olmOCR", "Monotone DP", "arXiv 2603.18652", "CellRichText", "zotero_sync.py", "Better-Notes"]:
+            self.assertIn(term, self.xml_str, f"Missing post-processing / export component: {term}")
 
     def test_no_card_penetrations(self):
         """Mathematically prove that no edge penetrates any unrelated card."""

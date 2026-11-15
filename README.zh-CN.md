@@ -18,6 +18,10 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-teal.svg" alt="License"></a>
 </p>
 
+<p align="center">
+  <a href="#-架构设计与数据流转图"><img src="figures/zotero_table_extractor_architecture.svg" alt="Zotero Table Extractor 架构概览 (v1.9.7)" width="100%" /></a>
+</p>
+
 ---
 
 ## 📑 目录
@@ -200,19 +204,10 @@ flowchart TD
     end
 ```
 
-> **矢量架构图源文件**：`figures/` 目录提供了可用 draw.io 打开编辑的原文件与高清导出：
+> **可编辑矢量架构图源文件**：由 `scripts/export_drawio_diagram.py` 维护并导出至 `figures/`：
 > - 📄 [figures/zotero_table_extractor_architecture.drawio](figures/zotero_table_extractor_architecture.drawio)
 > - 🖼 [figures/zotero_table_extractor_architecture.svg](figures/zotero_table_extractor_architecture.svg)
 > - 🖼 [figures/zotero_table_extractor_architecture.png](figures/zotero_table_extractor_architecture.png)
->
-> <details>
-> <summary>历史 v1.6.0 架构图快照（draw.io 中文导出；最新 v1.9.7 架构见上方 Mermaid 流程图）</summary>
->
-> <p align="center">
->   <img src="figures/zotero_table_extractor_architecture.svg" alt="Zotero Table Extractor v1.6.0 架构图" width="100%" />
-> </p>
->
-> </details>
 
 ---
 
