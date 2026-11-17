@@ -597,14 +597,30 @@ def find_matching_cdp_page(browser: Any, target_url: str):
     return None
 
 
+def _carsi_configured() -> bool:
+    try:
+        from ..common import is_carsi_configured
+        return bool(is_carsi_configured())
+    except Exception:
+        try:
+            from common import is_carsi_configured
+            return bool(is_carsi_configured())
+        except Exception:
+            return (os.getenv("CARSI_ENABLED") or "").strip().lower() in ("true", "1", "yes")
+
+
 def looks_like_transient_challenge_shell(html_content: Optional[str], current_url: str = "") -> bool:
     """识别值得短时等待的瞬态风控/跳转壳（Turnstile、F5 /tspd/、Elsevier crasolve、Springer idp、AIP loading 等）。"""
     low_url = (current_url or "").lower()
     if (
         "crasolve=1" in low_url
         or "linkinghub.elsevier.com" in low_url
-        or "idp.springer.com" in low_url
+    ):
+        return True
+    if _carsi_configured() and (
+        "idp.springer.com" in low_url
         or "wayf.springernature.com" in low_url
+        or "carsi.edu.cn" in low_url
     ):
         return True
     if not html_content or not isinstance(html_content, str):
@@ -674,9 +690,11 @@ def wait_through_transient_challenge(page: Any, max_wait_s: float = 8.0) -> bool
                 except Exception:
                     pass
 
-        # 2. Springer idp.springer.com / wayf.springernature.com 跳转超时保护
-        if "idp.springer.com" in cur_url.lower() or "wayf.springernature.com" in cur_url.lower():
-            for _ in range(8):
+        # 2. Springer idp.springer.com / wayf.springernature.com / CARSI 跳转超时保护
+        if "idp.springer.com" in cur_url.lower() or "wayf.springernature.com" in cur_url.lower() or "carsi.edu.cn" in cur_url.lower():
+            carsi_on = _carsi_configured()
+            wait_iters = 8 if carsi_on else 0
+            for _ in range(wait_iters):
                 try:
                     page.wait_for_timeout(500)
                     new_url = getattr(page, "url", "") or ""
@@ -692,7 +710,8 @@ def wait_through_transient_challenge(page: Any, max_wait_s: float = 8.0) -> bool
                     redir_vals = qs.get("redirect_uri") or qs.get("target") or []
                     for rv in redir_vals:
                         if rv and rv.startswith(("http://", "https://")) and "idp.springer.com" not in rv.lower():
-                            print(f"[Springer IDP] 重定向等待超时，直接回落目标文章页: {rv}")
+                            msg = "[Springer IDP] 未配置 CARSI，跳过认证等待并直接回落目标文章页" if not carsi_on else "[Springer IDP] 重定向等待超时，直接回落目标文章页"
+                            print(f"{msg}: {rv}")
                             page.goto(rv, wait_until="domcontentloaded", timeout=20000)
                             page.wait_for_timeout(1500)
                             cur_url = getattr(page, "url", "") or rv

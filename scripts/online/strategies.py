@@ -564,7 +564,7 @@ def _parse_dom_wrappers_bs4(html_content, read_html_fn):
                     continue
                 df.columns = [clean_text(c) for c in df.columns]
                 for col_i in range(len(df.columns)):
-                    df.iloc[:, col_i] = df.iloc[:, col_i].astype(str).apply(clean_text)
+                    df.isetitem(col_i, df.iloc[:, col_i].astype(str).apply(clean_text))
                 if label_text:
                     df.attrs['label'] = label_text
                 if caption_text:
@@ -627,7 +627,7 @@ def parse_tables_from_html(html_content, table_idx="all"):
                 # Basic cleanup of columns (index by iloc so duplicate column names never fail)
                 df.columns = [clean_text(c) for c in df.columns]
                 for col_i in range(len(df.columns)):
-                    df.iloc[:, col_i] = df.iloc[:, col_i].astype(str).apply(clean_text)
+                    df.isetitem(col_i, df.iloc[:, col_i].astype(str).apply(clean_text))
 
                 # Extract caption from preceding text block
                 caption_text = ""

@@ -322,6 +322,8 @@ def load_config():
         data["ZOTERO_USER_ID"] = ""
     if "ZOTERO_LIBRARY_TYPE" not in data:
         data["ZOTERO_LIBRARY_TYPE"] = "user"
+    if "CARSI_ENABLED" not in data:
+        data["CARSI_ENABLED"] = False
 
     # 环境变量覆盖敏感配置
     env_overrides = {
@@ -351,6 +353,9 @@ def load_config():
         'ZOTERO_API_KEY': 'ZOTERO_API_KEY',
         'ZOTERO_USER_ID': 'ZOTERO_USER_ID',
         'ZOTERO_LIBRARY_TYPE': 'ZOTERO_LIBRARY_TYPE',
+        'CARSI_ENABLED': 'CARSI_ENABLED',
+        'CARSI_URL': 'CARSI_URL',
+        'CARSI_IDP': 'CARSI_IDP',
     }
     for config_key, env_key in env_overrides.items():
         env_val = os.getenv(env_key)
@@ -369,6 +374,22 @@ def load_config():
         data["MINERU_TOKEN"] = data["MINERU_API_KEY"]
 
     return data
+
+
+def is_carsi_configured(config=None) -> bool:
+    """Return True only when CARSI institutional SSO is explicitly configured."""
+    cfg = config if isinstance(config, dict) else load_config()
+    enabled = cfg.get("CARSI_ENABLED")
+    if isinstance(enabled, bool) and enabled:
+        return True
+    if isinstance(enabled, str) and enabled.strip().lower() in ("true", "1", "yes"):
+        return True
+    for key in ("CARSI_URL", "CARSI_IDP", "CARSI_SCHOOL"):
+        val = cfg.get(key) or os.getenv(key, "")
+        if isinstance(val, str) and val.strip():
+            return True
+    env_flag = (os.getenv("CARSI_ENABLED") or "").strip().lower()
+    return env_flag in ("true", "1", "yes")
 
 
 def build_elsevier_headers(config=None, accept="application/json"):
@@ -799,12 +820,13 @@ def clean_table_filename(raw_title, index):
 
 
 HYPHEN_CHARS = r'[\-\u2010\u2011\u2012\u2013\u2014\u2015—–._~]'
+TABLE_SUB_SEP = r'(?:\s*[\-\u2010\u2011\u2012\u2013\u2014\u2015—–_~]\s*|\.(?!\s))'
 CHINESE_DIGITS = r'[一二三四五六七八九十百千万零壹贰叁肆伍陆柒捌玖拾]'
 ROMAN_DIGITS = r'[\u2160-\u217fIVXLCDMivxlcdm]'
 FULLWIDTH_DIGITS = r'[\uff10-\uff19]'
 ROMAN_NUM_PATTERN = r'(?:[\u2160-\u217f]+|\b(?=[MDCLXVI])M*(?:C[MD]|D?C{0,3})(?:X[CL]|L?X{0,3})(?:I[XV]|V?I{0,3})(?<=[MDCLXVI])\b)'
 TABLE_NUM_PART = r'(?:[A-Za-z]?[0-9\uff10-\uff19]+|' + ROMAN_NUM_PATTERN + r'|' + CHINESE_DIGITS + r'+|\b[A-Za-z]\b)'
-TABLE_LABEL_PATTERN = r'(?:附表|附录表|补充表|表|Supplementary\s+Table|Supplemental\s+Table|Extended\s+Data\s+Table|Appendix\s+Table|TABLE|Table|Tab(?:\.|\b))\s*(?:' + TABLE_NUM_PART + r'(?:\s*' + HYPHEN_CHARS + r'\s*' + TABLE_NUM_PART + r')*(?:\([a-zA-Z0-9]\)|（[a-zA-Z0-9]）|[a-zA-Z]\b)?)'
+TABLE_LABEL_PATTERN = r'(?:附表|附录表|补充表|表|Supplementary\s+Table|Supplemental\s+Table|Extended\s+Data\s+Table|Appendix\s+Table|TABLE|Table|Tab(?:\.|\b))\s*(?:' + TABLE_NUM_PART + r'(?:' + TABLE_SUB_SEP + TABLE_NUM_PART + r')*(?:\([a-zA-Z0-9]\)|（[a-zA-Z0-9]）|[a-zA-Z]\b)?)'
 TABLE_LABEL_RE = re.compile(TABLE_LABEL_PATTERN, re.IGNORECASE)
 
 
@@ -819,7 +841,7 @@ def format_table_label(raw_label: str) -> str:
     s = raw_label.strip().replace('\xa0', ' ').replace('\u3000', ' ').translate(trans_fw)
     
     # 截断紧随在表号后面的标题部分（如 "Table 1. Description", "Table 1: Geological", "Table 1 - Summary", "Tab 1: Description"）
-    prefix_pat = r'^((?:Supplementary\s+Table|Supplemental\s+Table|Extended\s+Data\s+Table|Appendix\s+Table|TABLE|Table|Tab(?:\.|\b)|附表|附录表|补充表|表)\s*(?:' + TABLE_NUM_PART + r'(?:\s*' + HYPHEN_CHARS + r'\s*' + TABLE_NUM_PART + r')*(?:\([a-zA-Z0-9]\)|（[a-zA-Z0-9]）|[a-zA-Z]\b)?))(?:[\.\:\：\—\–\s]+.*)?$'
+    prefix_pat = r'^((?:Supplementary\s+Table|Supplemental\s+Table|Extended\s+Data\s+Table|Appendix\s+Table|TABLE|Table|Tab(?:\.|\b)|附表|附录表|补充表|表)\s*(?:' + TABLE_NUM_PART + r'(?:' + TABLE_SUB_SEP + TABLE_NUM_PART + r')*(?:\([a-zA-Z0-9]\)|（[a-zA-Z0-9]）|[a-zA-Z]\b)?))(?:[\.\:\：\—\–\s]+.*)?$'
     s = re.sub(prefix_pat, r'\1', s, flags=re.IGNORECASE).strip()
 
     # 1. 中文表号规范化

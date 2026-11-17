@@ -371,7 +371,7 @@ class ImpersonatedHTTPNode(ExtractionNode):
             
         print(f"[ImpersonatedHTTPNode] Fetching page using TLS impersonation (Chrome): {url}")
         try:
-            r = requests_impersonate.get(url, impersonate="chrome", timeout=15)
+            r = requests_impersonate.get(url, impersonate="chrome", timeout=10)
             if r.status_code == 200:
                 html = r.text
                 if html and not (hasattr(common, "is_anti_bot_blocked") and common.is_anti_bot_blocked("", html)):
@@ -863,6 +863,7 @@ def _race_candidates(candidates, cancel_event=None, authoritative_names=None, gr
         (ElsevierXML / NCBIPMC / ArxivHTML) 仍在执行，等待短窗口 grace_timeout，防止
         网页摘要/单表片段提前中断完整 XML/补充材料抽取。
     """
+    import queue as _q
     import time as _t
     if not candidates:
         return [], None
@@ -870,61 +871,68 @@ def _race_candidates(candidates, cancel_event=None, authoritative_names=None, gr
         return [], None
 
     auth_set = set(authoritative_names or ())
-    ex = concurrent.futures.ThreadPoolExecutor(max_workers=len(candidates))
-    try:
-        fut_map = {ex.submit(fn): name for name, fn in candidates}
-        pending = set(fut_map)
-        best_fast = None  # (dfs, name)
-        grace_deadline = None
+    result_queue = _q.Queue()
+    pending = {name for name, _ in candidates}
 
-        while pending:
-            if cancel_event is not None and cancel_event.is_set():
-                print("[Race] 收到取消信号，放弃剩余竞速渠道。")
-                break
-            wait_step = 0.5
-            if grace_deadline is not None:
-                rem = grace_deadline - _t.monotonic()
-                if rem <= 0:
-                    break
-                wait_step = min(0.5, rem)
-            done, pending = concurrent.futures.wait(
-                pending, timeout=wait_step, return_when=concurrent.futures.FIRST_COMPLETED
-            )
-            for fut in done:
-                name = fut_map[fut]
-                try:
-                    dfs = fut.result() or []
-                except Exception as e:
-                    print(f"[Race] 渠道 {name} 异常: {e}")
-                    dfs = []
-                if not dfs:
-                    continue
-                if name in auth_set or not any(fut_map[p] in auth_set for p in pending):
-                    if best_fast is not None and len(best_fast[0]) > len(dfs) and name not in auth_set:
-                        print(f"[Race] 渠道 {best_fast[1]} 保留更多表格 ({len(best_fast[0])} >= {len(dfs)})。")
-                        return best_fast
-                    print(f"[Race] 渠道 {name} 竞速获胜，提取到 {len(dfs)} 个表格。")
-                    return dfs, name
-                # 非权威渠道先到达且权威渠道仍在请求，记录兜底并短暂等待权威渠道完成
-                if best_fast is None or len(dfs) > len(best_fast[0]):
-                    best_fast = (dfs, name)
-                if grace_deadline is None:
-                    import time as _t
-                    grace_deadline = _t.monotonic() + float(grace_timeout)
-            if grace_deadline is not None:
-                import time as _t
-                if _t.monotonic() >= grace_deadline or not any(fut_map[p] in auth_set for p in pending):
-                    break
-
-        if best_fast is not None:
-            print(f"[Race] 渠道 {best_fast[1]} 竞速获胜，提取到 {len(best_fast[0])} 个表格。")
-            return best_fast
-        return [], None
-    finally:
+    def _run_candidate(c_name, c_fn):
         try:
-            ex.shutdown(wait=False, cancel_futures=True)
-        except TypeError:
-            ex.shutdown(wait=False)
+            c_dfs = c_fn() or []
+            result_queue.put((c_name, c_dfs, None))
+        except Exception as exc:
+            result_queue.put((c_name, [], exc))
+
+    for name, fn in candidates:
+        t = threading.Thread(target=_run_candidate, args=(name, fn), daemon=True, name=f"race-{name}")
+        t.start()
+
+    best_fast = None  # (dfs, name)
+    grace_deadline = None
+
+    while pending:
+        if cancel_event is not None and cancel_event.is_set():
+            print("[Race] 收到取消信号，放弃剩余竞速渠道。")
+            break
+        wait_step = 0.5
+        if grace_deadline is not None:
+            rem = grace_deadline - _t.monotonic()
+            if rem <= 0:
+                break
+            wait_step = min(0.5, rem)
+
+        done_items = []
+        try:
+            done_items.append(result_queue.get(timeout=wait_step))
+            while True:
+                done_items.append(result_queue.get_nowait())
+        except _q.Empty:
+            pass
+
+        for name, dfs, err in done_items:
+            pending.discard(name)
+            if err is not None:
+                print(f"[Race] 渠道 {name} 异常: {err}")
+                dfs = []
+            if not dfs:
+                continue
+            if name in auth_set or not any(p in auth_set for p in pending):
+                if best_fast is not None and len(best_fast[0]) > len(dfs) and name not in auth_set:
+                    print(f"[Race] 渠道 {best_fast[1]} 保留更多表格 ({len(best_fast[0])} >= {len(dfs)})。")
+                    return best_fast
+                print(f"[Race] 渠道 {name} 竞速获胜，提取到 {len(dfs)} 个表格。")
+                return dfs, name
+            # 非权威渠道先到达且权威渠道仍在请求，记录兜底并短暂等待权威渠道完成
+            if best_fast is None or len(dfs) > len(best_fast[0]):
+                best_fast = (dfs, name)
+            if grace_deadline is None:
+                grace_deadline = _t.monotonic() + float(grace_timeout)
+        if grace_deadline is not None:
+            if _t.monotonic() >= grace_deadline or not any(p in auth_set for p in pending):
+                break
+
+    if best_fast is not None:
+        print(f"[Race] 渠道 {best_fast[1]} 竞速获胜，提取到 {len(best_fast[0])} 个表格。")
+        return best_fast
+    return [], None
 
 
 def _run_node_locked(node, state):
@@ -977,7 +985,7 @@ def _race_extract(state, cancel_event=None):
         if cancel_event is not None and cancel_event.is_set():
             return []
         try:
-            r = requests_impersonate.get(url, impersonate="chrome", timeout=15)
+            r = requests_impersonate.get(url, impersonate="chrome", timeout=10)
             if cancel_event is not None and cancel_event.is_set():
                 return []
             if r.status_code == 200 and r.text:
@@ -993,13 +1001,13 @@ def _race_extract(state, cancel_event=None):
         return s.get("dfs") or []
 
     # ---- 学术搜索/开放获取尾流（两个分支共用） ----
-    def _tail_race():
+    def _tail_race(skip_firecrawl=False):
         candidates = []
         if doi or title:
             candidates.append(("AcademicSearch", _academic_search))
         if doi:
             candidates.append(("PaperFetch", lambda: extract_tables_via_paper_fetch(doi, table_idx, cancel_event=cancel_event)))
-        if url:
+        if url and not skip_firecrawl:
             candidates.append(("Firecrawl", lambda: extract_tables_via_firecrawl(url, api_key, table_idx, cancel_event=cancel_event, doi=doi)))
         return _race_candidates(candidates, cancel_event)
 
@@ -1137,8 +1145,8 @@ def _race_extract(state, cancel_event=None):
     if best_partial:
         return best_partial, history
 
-    # Tier-4: 学术搜索尾流 + BrowserAct
-    dfs, winner = _tail_race()
+    # Tier-4: 学术搜索尾流 + BrowserAct（Firecrawl 已在 Tier-2 竞速，此处跳过重复抓取）
+    dfs, winner = _tail_race(skip_firecrawl=True)
     history.append(f"general-tail:{winner or 'none'}")
     if dfs:
         return dfs, history

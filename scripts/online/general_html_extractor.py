@@ -740,7 +740,10 @@ def _inject_cookies_from_profile(context, user_data_dir, url=None):
     for cookies_json in cookie_files:
         try:
             with open(cookies_json, 'r', encoding='utf-8') as f:
-                data = json.load(f)
+                raw_cookies = f.read().strip()
+            if not raw_cookies:
+                continue
+            data = json.loads(raw_cookies)
             cookies = data.get("cookies", []) if isinstance(data, dict) else data
             if not isinstance(cookies, list) or not cookies:
                 continue
@@ -820,7 +823,10 @@ def _extract_local_heuristic_grids(page, table_idx="all"):
 
                     const role = container.getAttribute("role") || "";
                     const clsAndId = ((container.className && typeof container.className === "string" ? container.className : "") + " " + (container.id || "")).toLowerCase();
-                    if (role !== "grid" && /(author|byline|affil|correspond|contributor|citation|meta|header|footer|nav|sidebar|menu|toolbar|share|social)/.test(clsAndId)) {
+                    if (role !== "grid" && /(author|byline|affil|correspond|contributor|citation|meta|header|footer|nav|sidebar|menu|toolbar|share|social|related|cited|recommend|al-article)/.test(clsAndId)) {
+                        return;
+                    }
+                    if (role !== "grid" && container.closest && container.closest("aside, nav, header, footer, [class*='sidebar' i], [class*='related' i], [class*='cited' i], [class*='recommend' i], [class*='al-article' i], [id*='sidebar' i], [id*='related' i], [id*='cited' i]")) {
                         return;
                     }
                     const display = window.getComputedStyle(container).display;
@@ -880,7 +886,7 @@ def _extract_local_heuristic_grids(page, table_idx="all"):
                             
                             tableCount++;
                             results.push({
-                                title: label || `Heuristic Table ${tableCount}`,
+                                title: label || `Heuristic Grid ${tableCount}`,
                                 rows: matrix
                             });
                         }
@@ -919,6 +925,12 @@ def _extract_local_heuristic_grids(page, table_idx="all"):
                 df = pd.DataFrame(data_rows, columns=unique_header)
                 if is_metadata_table(df):
                     continue
+                if title.startswith("Heuristic Grid") and df.shape[1] <= 3 and df.shape[0] <= 12:
+                    all_cells = [str(v).strip() for v in list(df.columns) + list(df.values.flatten()) if pd.notna(v) and str(v).strip()]
+                    has_numeric_cell = any(re.match(r'^[-+]?\d+(?:[.,]\d+)?(?:\s*[±%‰])?$', c) for c in all_cells)
+                    avg_len = (sum(len(c) for c in all_cells) / len(all_cells)) if all_cells else 0
+                    if not has_numeric_cell and avg_len > 25:
+                        continue
                     
                 df.columns = [escape_formula(c) for c in df.columns]
                 df = df_map(df, escape_formula)
@@ -1544,21 +1556,34 @@ def _extract_general_html_tables_impl(url, table_idx="all", headed=False, user_d
     was_dead_http = False
     _effective_profile = user_data_dir
 
-    # Prefer configured OS-specific persistent profile (with cookies.json), then real Chrome user data
-    if not user_data_dir:
+    _cfg_early = {}
+    try:
+        _cfg_early = load_config() or {}
+    except Exception:
+        _cfg_early = {}
+    _carsi_on = False
+    try:
+        from ..common import is_carsi_configured as _is_carsi_cfg
+        _carsi_on = bool(_is_carsi_cfg(_cfg_early))
+    except Exception:
         try:
-            _cfg_prof = load_config().get("PLAYWRIGHT_USER_DATA_DIR")
-            if _cfg_prof and os.path.isdir(_cfg_prof):
-                user_data_dir = _cfg_prof
-                _effective_profile = _cfg_prof
+            from common import is_carsi_configured as _is_carsi_cfg
+            _carsi_on = bool(_is_carsi_cfg(_cfg_early))
         except Exception:
-            pass
+            _carsi_on = False
+
     if not user_data_dir:
+        _cfg_prof = _cfg_early.get("PLAYWRIGHT_USER_DATA_DIR")
+        if _cfg_prof and os.path.isdir(_cfg_prof):
+            user_data_dir = _cfg_prof
+            _effective_profile = _cfg_prof
+    # Only prioritize CARSI/personal Chrome session up front when CARSI is configured (or on headed fallback)
+    if not user_data_dir and (_carsi_on or headed):
         auto_detected = _try_real_chrome_user_data()
         if auto_detected:
             user_data_dir = auto_detected
             print(f"[通用自动化] 自动检测到 Chrome 用户数据目录: {user_data_dir}")
-            print(f"[通用自动化] 将复用已有的浏览器登录 Session（如 Springer 机构认证）。")
+            print(f"[通用自动化] 将复用已有的浏览器登录 Session（如 CARSI/机构认证）。")
 
     print(f"[通用自动化] 启动通用 HTML 阅读提取器 (headless={headless}, user_data_dir={user_data_dir or '(新建)'})...")
 
@@ -1566,8 +1591,11 @@ def _extract_general_html_tables_impl(url, table_idx="all", headed=False, user_d
     page_title = None
 
     is_gsw = "geoscienceworld.org" in url or "lyellcollection.org" in url or "10.1144" in url
-    if is_gsw:
-        print("[通用自动化] 检测到 GeoscienceWorld/Lyell 目标平台，自动激活 CDP 桥接调试浏览器...")
+    _url_low = url.lower()
+    _is_gated_domain = any(dom in _url_low for dom in _GATED_PUBLISHER_DOMAINS)
+
+    if is_gsw or (headed and _is_gated_domain):
+        print("[通用自动化] 检测到高风控目标平台，自动激活真实 Chrome CDP 桥接调试浏览器...")
         _ensure_chrome_debug_running()
 
     exec_path = find_playwright_chromium()
@@ -2178,10 +2206,9 @@ def _extract_general_html_tables_impl(url, table_idx="all", headed=False, user_d
         return [], page_title
 
     # Headless -> Headed everyday Chrome -> StealthyFetcher Turnstile escalation (outside sync_playwright)
-    _is_gated_domain = any(dom in url.lower() for dom in _GATED_PUBLISHER_DOMAINS)
     _is_cancelled = cancel_event is not None and cancel_event.is_set()
-    if not all_dfs and not was_dead_http and not _is_cancelled and _allow_headed_fallback and (was_blocked or (headless and _is_gated_domain and not (connected_via_cdp and is_gsw))):
-        if headless:
+    if not all_dfs and not was_dead_http and not _is_cancelled and _allow_headed_fallback and (was_blocked or (headless and _is_gated_domain and not connected_via_cdp)):
+        if headless and not connected_via_cdp:
             print(f"[通用自动化] 无头模式{'被反爬拦截' if was_blocked else '未发现表格'}，自动切换日常有头 Chrome 浏览器重试 (自动接受 Cookies)...")
             headed_dfs, headed_title = extract_general_html_tables(
                 url,

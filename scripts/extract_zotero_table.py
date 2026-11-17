@@ -91,6 +91,7 @@ def scan_pdf_table_expected_labels(pdf_path: str) -> Tuple[Set[str], int]:
     轻量级扫描 PDF 文本层，提取全文预期的标准表格标题声明与表号集合。
     支持长文献（全篇扫描，无 150 页人为截断），返回 (expected_labels, expected_count)。
     """
+    import re
     try:
         try:
             from .common import format_table_label, TABLE_LABEL_RE
@@ -98,7 +99,6 @@ def scan_pdf_table_expected_labels(pdf_path: str) -> Tuple[Set[str], int]:
             from common import format_table_label, TABLE_LABEL_RE
     except ImportError:
         format_table_label = lambda x: x
-        import re
         TABLE_LABEL_RE = re.compile(r'\b((?:TABLE|Table|表)\s*\d+(?:\.\d+)?)', re.IGNORECASE)
 
     try:
@@ -115,7 +115,19 @@ def scan_pdf_table_expected_labels(pdf_path: str) -> Tuple[Set[str], int]:
                     if lbl:
                         labels.add(format_table_label(lbl))
         if labels:
-            return labels, len(labels)
+            # 合并中英文双语同号声明（如同一篇论文同时出现“表1”与“Table 1”）
+            deduped = set()
+            cn_nums = set()
+            for lbl in labels:
+                m_cn = re.match(r'^表\s*([A-Za-z]?\d+(?:[-.]\d+)*[a-zA-Z]?)$', lbl)
+                if m_cn:
+                    cn_nums.add(m_cn.group(1).lower())
+            for lbl in labels:
+                m_en = re.match(r'^Table\s+([A-Za-z]?\d+(?:[-.]\d+)*[a-zA-Z]?)$', lbl, re.IGNORECASE)
+                if m_en and m_en.group(1).lower() in cn_nums:
+                    continue
+                deduped.add(lbl)
+            return deduped, len(deduped)
     except Exception:
         pass
 
@@ -1041,20 +1053,48 @@ def _do_process_single_pdf_impl(pdf_path, orig_pdf_path, args, is_batch=False, p
                 # 收集已获取的在线表格标签
                 online_labels = set()
                 online_skip_labels = set()
+                try:
+                    try:
+                        from .common import TABLE_LABEL_RE as _TBL_RE
+                    except ImportError:
+                        from common import TABLE_LABEL_RE as _TBL_RE
+                except ImportError:
+                    _TBL_RE = None
+
+                def _register_online_label(raw_lbl_str):
+                    if not raw_lbl_str:
+                        return
+                    candidates_lbl = [format_table_label(raw_lbl_str)]
+                    if _TBL_RE is not None:
+                        for m_emb in _TBL_RE.finditer(str(raw_lbl_str)):
+                            candidates_lbl.append(format_table_label(m_emb.group(0)))
+                    for check_lbl in candidates_lbl:
+                        if not check_lbl:
+                            continue
+                        online_labels.add(check_lbl)
+                        online_skip_labels.add(make_safe_filename(check_lbl))
+                        m_cn = re.match(r'^表\s*([A-Za-z]?\d+(?:[-.]\d+)*[a-zA-Z]?)$', check_lbl)
+                        if m_cn:
+                            en_equiv = f"Table {m_cn.group(1)}"
+                            online_labels.add(en_equiv)
+                            online_skip_labels.add(make_safe_filename(en_equiv))
+                        m_en = re.match(r'^Table\s+([A-Za-z]?\d+(?:[-.]\d+)*[a-zA-Z]?)$', check_lbl, re.IGNORECASE)
+                        if m_en:
+                            cn_equiv = f"表{m_en.group(1)}"
+                            online_labels.add(cn_equiv)
+                            online_skip_labels.add(make_safe_filename(cn_equiv))
+
                 for o_df in online_dfs:
-                    lbl = o_df.attrs.get('label') or o_df.attrs.get('table_title')
-                    if lbl:
-                        check_lbl = format_table_label(lbl)
-                        if check_lbl:
-                            online_labels.add(check_lbl)
-                            online_skip_labels.add(make_safe_filename(check_lbl))
+                    _register_online_label(o_df.attrs.get('label'))
+                    _register_online_label(o_df.attrs.get('table_title'))
 
                 missing_labels = (expected_labels - online_labels) if expected_labels else set()
 
                 # 检查本地 PDF 是否为扫描件/含扫描页，以及是否有潜在表格线框或矢量结构
+                # --online-only 模式下不回退本地 PDF，跳过昂贵的逐页 find_tables() 扫描
                 has_pdf_table_cues = False
                 has_scanned_page = False
-                if is_local_orig_pdf:
+                if is_local_orig_pdf and not online_only:
                     try:
                         try:
                             from .pdf_table_extractor import has_text_layer
@@ -1068,16 +1108,18 @@ def _do_process_single_pdf_impl(pdf_path, orig_pdf_path, args, is_batch=False, p
                     try:
                         import pymupdf as fitz
                         doc = fitz.open(orig_pdf_path)
+                        need_table_cues = (not expected_labels and expected_count == 0)
                         for page in doc:
                             txt = page.get_text("text").strip()
                             imgs = page.get_images()
                             # 扫描页缺少文本层，无法通过字符排查表格，属于“完整性未知”
                             if len(txt) <= 50 and (len(imgs) > 0 or not txt):
                                 has_scanned_page = True
-                            tabs = page.find_tables()
-                            text_tabs = page.find_tables(strategy="text") if not (tabs and tabs.tables) else None
-                            if (tabs and tabs.tables) or (text_tabs and text_tabs.tables) or len(page.get_drawings()) > 5:
-                                has_pdf_table_cues = True
+                            if need_table_cues and not has_pdf_table_cues:
+                                tabs = page.find_tables()
+                                text_tabs = page.find_tables(strategy="text") if not (tabs and tabs.tables) else None
+                                if (tabs and tabs.tables) or (text_tabs and text_tabs.tables) or len(page.get_drawings()) > 5:
+                                    has_pdf_table_cues = True
                         doc.close()
                     except Exception:
                         has_scanned_page = True
@@ -1102,8 +1144,12 @@ def _do_process_single_pdf_impl(pdf_path, orig_pdf_path, args, is_batch=False, p
                         print(f"[Online Warning] PDF 包含扫描页或无文本层，表格完整性未知，将由本地管线补充核查。")
                     elif missing_labels:
                         print(f"[Online Warning] 在线提取获得 {len(online_dfs)} 个表，缺失预期表号: {sorted(list(missing_labels))} (全文共检测到 {expected_count} 个表声明)。")
-                    else:
+                    elif len(online_dfs) < expected_count:
                         print(f"[Online Warning] 在线提取获得 {len(online_dfs)} 个表，少于全文预期数量 {expected_count} 个表。")
+                    elif has_sparse_or_truncated:
+                        print(f"[Online Warning] 在线提取获得 {len(online_dfs)} 个表，但检测到稀疏或截断表格，将由本地管线补充核查。")
+                    else:
+                        print(f"[Online Warning] 在线提取获得 {len(online_dfs)} 个表，但 PDF 中检测到矢量表格线索（未识别到明确表号声明），将由本地管线补充核查。")
                 else:
                     print(f"[Online] Got {len(online_dfs)} tables via online HTML source (覆盖全部 {len(online_labels)} 个预期表号). Saving...")
 

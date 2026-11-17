@@ -1517,6 +1517,173 @@ class TestRound2FixesRegression(unittest.TestCase):
         self.assertEqual(len(out_st.get("dfs") or []), 1)
         self.assertIsNone(next_node)
 
+    def test_expand_multiline_subrows_no_int_len_crash(self):
+        from scripts.table_postprocess import expand_multiline_subrows
+
+        df = pd.DataFrame({
+            "Sample": ["S1", "S2", None],
+            "Value": ["10\n20", "30\n40", "50"],
+        })
+        res = expand_multiline_subrows(df)
+        self.assertEqual(len(res), 5)
+        self.assertEqual(list(res["Value"]), ["10", "20", "30", "40", "50"])
+
+    def test_parse_tables_from_html_no_future_warning_on_numeric_cols(self):
+        import warnings
+        from scripts.online.strategies import parse_tables_from_html
+
+        html = """
+        <table>
+          <thead><tr><th>h k l</th><th>h k l</th><th>val</th></tr></thead>
+          <tbody>
+            <tr><td>0</td><td>3</td><td>1.5</td></tr>
+            <tr><td>1</td><td>2</td><td>2.5</td></tr>
+          </tbody>
+        </table>
+        """
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", FutureWarning)
+            dfs = parse_tables_from_html(html, "all")
+        future_warnings = [w for w in caught if issubclass(w.category, FutureWarning)]
+        self.assertEqual(future_warnings, [])
+        self.assertEqual(len(dfs), 1)
+        self.assertEqual(dfs[0].shape, (2, 3))
+
+    def test_format_table_label_period_space_not_subtable(self):
+        from scripts.common import format_table_label, TABLE_LABEL_RE
+
+        self.assertEqual(TABLE_LABEL_RE.search("Table 2. A summary of data").group(0), "Table 2")
+        self.assertEqual(format_table_label("Table 2. A summary of data"), "Table 2")
+        self.assertEqual(format_table_label("Table 2. Comparison of samples"), "Table 2")
+        self.assertEqual(format_table_label("Table 2.1"), "Table 2.1")
+        self.assertEqual(format_table_label("Table 2-1"), "Table 2-1")
+        self.assertEqual(format_table_label("Table 2.a"), "Table 2.a")
+
+    def test_empty_cookies_json_no_error_log(self):
+        import io
+        import tempfile
+        from contextlib import redirect_stdout
+        from scripts.online import general_html_extractor
+
+        class _DummyCtx:
+            def cookies(self):
+                return []
+
+            def add_cookies(self, cookies):
+                pass
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cookie_file = os.path.join(tmpdir, "cookies.json")
+            with open(cookie_file, "w", encoding="utf-8") as f:
+                f.write("")
+            buf = io.StringIO()
+            with patch("scripts.common.get_companion_cookie_paths", return_value=[]):
+                with redirect_stdout(buf):
+                    general_html_extractor._inject_cookies_from_profile(_DummyCtx(), tmpdir, url="https://example.com")
+        self.assertNotIn("载入 cookies.json 失败", buf.getvalue())
+
+    def test_race_candidates_uses_daemon_threads_and_returns_fast(self):
+        import threading
+        import time
+        from scripts.online.graph import _race_candidates
+
+        observed_daemon = []
+        started = threading.Event()
+
+        def slow_fn():
+            observed_daemon.append(threading.current_thread().daemon)
+            started.set()
+            time.sleep(5.0)
+            return []
+
+        def fast_fn():
+            started.wait(timeout=1.0)
+            return [pd.DataFrame({"A": [1, 2], "B": [3, 4]})]
+
+        t0 = time.monotonic()
+        dfs, winner = _race_candidates([("Slow", slow_fn), ("Fast", fast_fn)])
+        elapsed = time.monotonic() - t0
+        self.assertEqual(winner, "Fast")
+        self.assertEqual(len(dfs), 1)
+        self.assertLess(elapsed, 1.5)
+        self.assertEqual(observed_daemon, [True])
+
+    def test_heuristic_grid_rejects_related_articles_prose_list(self):
+        from scripts.online.general_html_extractor import _extract_local_heuristic_grids
+
+        class _FakePage:
+            def evaluate(self, script):
+                return [{
+                    "title": "Heuristic Grid 1",
+                    "rows": [
+                        [
+                            "Geology of Gold Deposits at the Marigold Mine, Battle Mountain District, Nevada",
+                            "Diversity in Carlin-Style Gold Deposits",
+                        ],
+                        [
+                            "Comparison of the Allchar Au-As-Sb-Tl Deposit with Carlin-Type Gold Deposits",
+                            "Diversity in Carlin-Style Gold Deposits",
+                        ],
+                        [
+                            "Ore Genesis Constraints on the Agdarreh and Zarshouran Gold Deposits",
+                            "Diversity in Carlin-Style Gold Deposits",
+                        ],
+                    ],
+                }]
+
+        dfs = _extract_local_heuristic_grids(_FakePage(), "all")
+        self.assertEqual(dfs, [])
+
+    def test_scan_pdf_dedups_bilingual_labels(self):
+        from scripts.extract_zotero_table import scan_pdf_table_expected_labels
+
+        fake_decls = {
+            1: [{"label": "表1", "is_continuation": False}, {"label": "Table 1", "is_continuation": False}],
+            2: [{"label": "表2", "is_continuation": False}, {"label": "Table 2", "is_continuation": False}],
+        }
+        with patch("scripts.table_validator.scan_pdf_table_declarations", return_value=fake_decls):
+            labels, count = scan_pdf_table_expected_labels("dummy.pdf")
+        self.assertEqual(count, 2)
+        self.assertEqual(labels, {"表1", "表2"})
+
+    def test_carsi_not_configured_puts_carsi_last_and_skips_idp_wait(self):
+        from scripts import common
+        from scripts.online import cdp_detector, general_html_extractor
+
+        self.assertFalse(common.is_carsi_configured({"CARSI_ENABLED": False}))
+        self.assertTrue(common.is_carsi_configured({"CARSI_ENABLED": True}))
+        self.assertTrue(common.is_carsi_configured({"CARSI_URL": "https://carsi.example.edu.cn"}))
+
+        # When CARSI is not configured:
+        # 1) idp.springer.com / carsi.edu.cn should not stall in looks_like_transient_challenge_shell
+        with patch.object(cdp_detector, "_carsi_configured", return_value=False):
+            self.assertFalse(
+                cdp_detector.looks_like_transient_challenge_shell(
+                    "<html><body>Sign in via CARSI</body></html>",
+                    "https://idp.springer.com/authorize?redirect_uri=https%3A%2F%2Flink.springer.com%2Farticle%2F10.1007%2Ftest",
+                )
+            )
+
+        # 2) headless general extractor should not invoke _try_real_chrome_user_data (CARSI session) up front
+        called_chrome_profile = {"count": 0}
+
+        def _fake_real_chrome():
+            called_chrome_profile["count"] += 1
+            return "C:/fake/chrome"
+
+        fake_pw_cm = MagicMock()
+        fake_pw_cm.__enter__.side_effect = RuntimeError("stop before playwright")
+        with patch.object(general_html_extractor, "_try_real_chrome_user_data", side_effect=_fake_real_chrome), \
+             patch.object(general_html_extractor, "sync_playwright", return_value=fake_pw_cm), \
+             patch.object(general_html_extractor, "load_config", return_value={"IS_CAMPUS_NETWORK": True, "CARSI_ENABLED": False}):
+            with self.assertRaises(RuntimeError):
+                general_html_extractor.extract_general_html_tables(
+                    "https://www.sciencedirect.com/science/article/pii/S0375674221001126",
+                    headed=False,
+                    _allow_headed_fallback=False,
+                )
+        self.assertEqual(called_chrome_profile["count"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

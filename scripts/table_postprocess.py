@@ -750,7 +750,7 @@ def expand_multiline_subrows(df):
             
             for cp, extra_vals in subsequent_col_values.items():
                 col_splits[cp].extend(extra_vals)
-            max_splits = max((len(v) for v in col_splits), default=max_splits)
+            max_splits = max((len(v) for v in col_splits.values()), default=max_splits)
 
             for k in range(max_splits):
                 row_list = []
