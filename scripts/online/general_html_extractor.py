@@ -1680,6 +1680,7 @@ def _extract_general_html_tables_impl(url, table_idx="all", headed=False, user_d
 
                 if target_page:
                     page = target_page
+                    context = getattr(target_page, "context", None) or (browser.contexts[0] if browser.contexts else None)
                     try:
                         page.bring_to_front()
                         page.wait_for_timeout(1000)
@@ -1692,7 +1693,8 @@ def _extract_general_html_tables_impl(url, table_idx="all", headed=False, user_d
                     skip_navigation = False
                 connected_via_cdp = True
                 print("[通用自动化] CDP 内存直连成功！零磁盘损耗继承当前 Chrome 登录态（校园网/CARSI 等）。")
-                _inject_cookies_from_profile(context, user_data_dir, url=url)
+                if context:
+                    _inject_cookies_from_profile(context, user_data_dir, url=url)
                 if install_cdp_port_guard:
                     if context:
                         install_cdp_port_guard(context, cdp_port=cdp_port)

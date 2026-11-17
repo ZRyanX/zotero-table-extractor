@@ -1684,6 +1684,46 @@ class TestRound2FixesRegression(unittest.TestCase):
                 )
         self.assertEqual(called_chrome_profile["count"], 0)
 
+    def test_cdp_matched_tab_sets_context_without_unbound_local_error(self):
+        from scripts.online import general_html_extractor, cdp_detector
+
+        fake_ctx = MagicMock()
+        fake_page = MagicMock()
+        fake_page.is_closed.return_value = False
+        fake_page.url = "https://onlinelibrary.wiley.com/doi/10.1111/1755-6724.12480"
+        fake_page.context = fake_ctx
+        fake_page.title.return_value = "Wiley Article"
+        fake_page.content.return_value = (
+            "<html><body><table>"
+            "<caption>Table 1</caption>"
+            "<thead><tr><th>Element</th><th>Value</th></tr></thead>"
+            "<tbody><tr><td>Sb</td><td>12.3</td></tr><tr><td>As</td><td>4.5</td></tr></tbody>"
+            "</table></body></html>"
+        )
+        fake_page.evaluate.return_value = ""
+
+        fake_browser = MagicMock()
+        fake_browser.contexts = [fake_ctx]
+        fake_pw = MagicMock()
+        fake_pw.chromium.connect_over_cdp.return_value = fake_browser
+        fake_pw_cm = MagicMock()
+        fake_pw_cm.__enter__.return_value = fake_pw
+
+        with patch.object(cdp_detector, "find_active_cdp_endpoint", return_value={"cdp_url": "http://127.0.0.1:9222", "port": 9222, "source": "config"}), \
+             patch.object(cdp_detector, "find_matching_cdp_page", return_value=fake_page), \
+             patch.object(cdp_detector, "install_cdp_port_guard"), \
+             patch.object(cdp_detector, "wait_through_transient_challenge", return_value=True), \
+             patch.object(general_html_extractor, "sync_playwright", return_value=fake_pw_cm), \
+             patch.object(general_html_extractor, "load_config", return_value={}), \
+             patch.object(general_html_extractor, "_inject_cookies_from_profile") as inj_mock:
+            dfs, title = general_html_extractor.extract_general_html_tables(
+                "https://onlinelibrary.wiley.com/doi/10.1111/1755-6724.12480",
+                _allow_headed_fallback=False,
+            )
+        inj_mock.assert_called_once()
+        self.assertEqual(inj_mock.call_args[0][0], fake_ctx)
+        self.assertIsInstance(dfs, list)
+
 
 if __name__ == "__main__":
     unittest.main()
