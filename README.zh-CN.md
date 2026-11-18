@@ -356,6 +356,11 @@ python scripts/batch_run.py --recheck --workers 2
 
 ### 结合 AI Agent / MCP 编排调用
 
+> **网络与 AI Agent 选择提示**
+> - **走机构 IP 时不要走代理**：机构订阅按出口 IP 识别。访问出版商时请直连机构 IP（校园网 / 机构 VPN），不要用全局代理，否则出口 IP 会变成代理 IP，机构权限随之失效。
+> - **AI Agent 按地区选**：中国大陆请用 DeepSeek Harness、Qwen Work、WorkBuddy、Kimi Code、ZCode 等；中国大陆以外请用 Claude Code、Codex、Antigravity、Cursor、OpenCode、Grok Code 等。
+> - **大陆 + 机构 IP + 境外 Agent**：如需同时保留机构 IP 又用境外 Agent，请用 Proxifier 做局部（分应用）代理，只让 AI Agent 走代理，本工具及浏览器下载流量仍直连机构 IP。
+
 在 Cursor、Claude Desktop、Antigravity 中，上层 Agent 通过 `ai4paper-zotero` MCP（`zotero_get_selected_items`）获取选中条目的物理 PDF 路径后直接调度：
 ```bash
 python scripts/extract_zotero_table.py --pdf "<Zotero物理路径>" --output "<目标路径>"

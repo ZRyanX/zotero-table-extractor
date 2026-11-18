@@ -462,6 +462,11 @@ python scripts/batch_run.py --recheck --workers 2
 
 ### AI Agent / MCP Orchestration
 
+> **Network & AI Agent Note**
+> - **Don't use a proxy when accessing via an institutional IP**: institutional subscription access is recognized by your egress IP. Connect directly via your institutional IP (campus network / institutional VPN) and don't route through a global proxy — otherwise your egress IP becomes the proxy's IP and institutional access will be lost.
+> - **Choose your AI agent by region**: in mainland China, use DeepSeek Harness, Qwen Work, WorkBuddy, Kimi Code, ZCode, etc.; outside mainland China, use Claude Code, Codex, Antigravity, Cursor, OpenCode, Grok Code, etc.
+> - **Mainland China + institutional IP + overseas agent**: if you need both, use Proxifier for per-app (split) proxying — route only the AI agent through the proxy, and keep this tool and browser download traffic on the direct institutional IP.
+
 In Cursor, Claude Desktop, or Antigravity:
 1. The host agent retrieves the selected Zotero item's physical PDF path (and metadata) via `ai4paper-zotero` MCP (`zotero_get_selected_items`).
 2. The agent invokes the CLI:
