@@ -1724,6 +1724,158 @@ class TestRound2FixesRegression(unittest.TestCase):
         self.assertEqual(inj_mock.call_args[0][0], fake_ctx)
         self.assertIsInstance(dfs, list)
 
+    def test_setup_env_check_and_dry_run(self):
+        import setup_env
+
+        report = setup_env.check_readiness()
+        self.assertIn("os", report)
+        self.assertIn("modules", report)
+        self.assertIn("onnxruntime", report["modules"])
+        res = setup_env.install_python_deps(with_all=True, dry_run=True)
+        self.assertEqual(res["failed"], [])
+        self.assertGreaterEqual(len(res["installed"]), 10)
+
+    def test_mineru_usable_unverified_table_skips_rapidtable_and_step2(self):
+        import tempfile
+        from scripts import pdf_table_extractor as pte
+        import fitz
+        import pandas as pd
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pdf_path = os.path.join(tmpdir, "scanned_mineru.pdf")
+            doc = fitz.open()
+            p0 = doc.new_page(width=595, height=842)
+            p0.insert_text((50, 60), "Introduction\nThis study reports trace element compositions of stibnite.")
+            page = doc.new_page(width=595, height=842)
+            # 10x10 PNG image so page 1 looks like a scanned/image page with no text layer
+            pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 10, 10), False)
+            pix.clear_with(255)
+            page.insert_image(fitz.Rect(50, 50, 500, 400), pixmap=pix)
+            doc.save(pdf_path)
+            doc.close()
+
+            df_m = pd.DataFrame(
+                [["S1", "12.3", "45.6"], ["S2", "23.4", "56.7"]],
+                columns=["Sample", "Sb_ppm", "As_ppm"],
+            )
+            df_m.attrs = {
+                "page_idx": 1,
+                "label": "Table 1",
+                "table_title": "Table 1. Trace elements",
+                "extractor": "mineru_api",
+            }
+
+            with patch.object(pte.ocr_client, "is_mineru_available", return_value=True), \
+                 patch.object(pte.ocr_client, "call_mineru_structured_api", return_value=[df_m]), \
+                 patch.object(pte, "extract_via_rapid_table") as mock_rapid, \
+                 patch.object(pte, "extract_via_paddleocr_crops") as mock_crops, \
+                 patch.object(pte, "extract_via_find_tables") as mock_ft:
+                results, _logs = pte.extract_tables_from_pdf(pdf_path, candidate_pages=[1])
+
+            self.assertEqual(len(results), 1)
+            mock_rapid.assert_not_called()
+            mock_crops.assert_not_called()
+            mock_ft.assert_not_called()
+
+    def test_mineru_figure_only_scanned_pages_skip_rapidtable_ocr(self):
+        import tempfile
+        from scripts import pdf_table_extractor as pte
+        import fitz
+        import pandas as pd
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pdf_path = os.path.join(tmpdir, "mineru_with_figure_page.pdf")
+            doc = fitz.open()
+            p0 = doc.new_page(width=595, height=842)
+            p0.insert_text((50, 60), "Table 1. Major elements\nSample SiO2 Al2O3\nA1 65.2 14.1\nA2 66.8 13.9")
+            p1 = doc.new_page(width=595, height=842)
+            pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 10, 10), False)
+            pix.clear_with(200)
+            p1.insert_image(fitz.Rect(50, 80, 500, 600), pixmap=pix)
+            p1.insert_text((50, 630), "Fig. 1. Geological sketch map of the ore deposit.")
+            doc.save(pdf_path)
+            doc.close()
+
+            df_m = pd.DataFrame(
+                [["A1", "65.2", "14.1"], ["A2", "66.8", "13.9"]],
+                columns=["Sample", "SiO2", "Al2O3"],
+            )
+            df_m.attrs = {
+                "page_idx": 0,
+                "label": "Table 1",
+                "table_title": "Table 1. Major elements",
+                "extractor": "mineru_api",
+            }
+
+            with patch.object(pte.ocr_client, "is_mineru_available", return_value=True), \
+                 patch.object(pte.ocr_client, "call_mineru_structured_api", return_value=[df_m]), \
+                 patch.object(pte, "extract_via_rapid_table") as mock_rapid, \
+                 patch.object(pte, "extract_via_paddleocr_crops") as mock_crops, \
+                 patch.object(pte, "extract_via_ocr") as mock_ocr:
+                results, logs = pte.extract_tables_from_pdf(pdf_path)
+
+            self.assertEqual(len(results), 1)
+            mock_rapid.assert_not_called()
+            mock_crops.assert_not_called()
+            mock_ocr.assert_not_called()
+            self.assertTrue(any("跳过冗余 OCR 复扫" in l for l in logs))
+
+    def test_aistudio_semaphore_offloads_overflow_to_mineru_in_parallel(self):
+        import tempfile
+        from scripts import ocr_client
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dummy_pdf = os.path.join(tmpdir, "sample.pdf")
+            with open(dummy_pdf, "wb") as f:
+                f.write(b"%PDF-1.4\n%dummy\n")
+
+            cfg = {
+                "PADDLEOCR_ACCESS_TOKEN": "fake_aistudio_token",
+                "MINERU_API_KEY": "fake_mineru_token",
+                "AISTUDIO_MAX_CONCURRENCY": 1,
+                "OCR_ENGINE": "auto",
+            }
+            sem, cap = ocr_client._get_aistudio_semaphore(cfg)
+            self.assertEqual(cap, 1)
+            self.assertTrue(sem.acquire(blocking=False))
+            try:
+                with patch.object(ocr_client, "is_mineru_available", return_value=True), \
+                     patch.object(ocr_client, "call_mineru_api", return_value="| A | B |\n|---|---|\n| 1 | 2 |") as mock_mineru, \
+                     patch.object(ocr_client, "_call_paddleocr_job_unlocked") as mock_http:
+                    res = ocr_client.call_paddleocr_job(dummy_pdf, model="PaddleOCR-VL-1.6", config=cfg)
+                self.assertTrue(res["success"])
+                self.assertTrue(res.get("failover"))
+                self.assertEqual(res.get("model"), "mineru")
+                mock_mineru.assert_called_once()
+                mock_http.assert_not_called()
+            finally:
+                sem.release()
+
+    def test_adaptive_ocr_timeout_relaxes_for_dissertations(self):
+        import tempfile
+        import fitz
+        from scripts import ocr_client
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            short_pdf = os.path.join(tmpdir, "short.pdf")
+            long_pdf = os.path.join(tmpdir, "thesis.pdf")
+            d1 = fitz.open()
+            for _ in range(10):
+                d1.new_page()
+            d1.save(short_pdf)
+            d1.close()
+
+            d2 = fitz.open()
+            for _ in range(80):
+                d2.new_page()
+            d2.save(long_pdf)
+            d2.close()
+
+            self.assertEqual(ocr_client.compute_adaptive_ocr_timeout(short_pdf, base_timeout=600), 600)
+            self.assertEqual(ocr_client.compute_adaptive_ocr_timeout(long_pdf, base_timeout=600, page_ranges=[0, 1]), 600)
+            self.assertEqual(ocr_client.compute_adaptive_ocr_timeout(long_pdf, base_timeout=600), 1350)
+            self.assertEqual(ocr_client.compute_adaptive_ocr_timeout(long_pdf, base_timeout=180), 180)
+
 
 if __name__ == "__main__":
     unittest.main()

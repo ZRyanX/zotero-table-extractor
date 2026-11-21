@@ -38,6 +38,11 @@ pdf_table_extractor.py — 三方投票 PDF 表格提取引擎。
 """
 from __future__ import annotations
 
+try:
+    import onnxruntime  # noqa: F401  # Preload before torch/gmft to avoid Windows DLL init access violation (0xC0000005)
+except Exception:
+    pass
+
 import os
 import re
 import io
@@ -3874,7 +3879,7 @@ def extract_via_paddleocr_fullpage(pdf_path: str, pages: Optional[List[int]] = N
     return results
 
 
-def extract_via_paddleocr_crops(pdf_path: str, pages: Optional[List[int]] = None, cancel_event=None) -> List[Dict[str, Any]]:
+def extract_via_paddleocr_crops(pdf_path: str, pages: Optional[List[int]] = None, cancel_event=None, allow_fullpage_fallback: bool = True) -> List[Dict[str, Any]]:
     """
     针对待精细识别/救助页面，优先利用本地 DocLayout-YOLO 裁剪出表格主体区域 (Table Crop)，
     仅将目标切图提交给 PaddleOCR-VL-1.6 进行精细多模态解析，大幅节省 75%+ Token 并防止长表截断；
@@ -3937,8 +3942,24 @@ def extract_via_paddleocr_crops(pdf_path: str, pages: Optional[List[int]] = None
         doc_for_crops = None
 
     try:
+        import time as _t_crops
+        _crops_t0 = _t_crops.time()
+        try:
+            _crops_budget_s = float(os.getenv("PADDLEOCR_CROPS_BUDGET_SEC", "240"))
+        except Exception:
+            _crops_budget_s = 240.0
+        try:
+            _crops_max_count = int(os.getenv("PADDLEOCR_MAX_CROPS", "12"))
+        except Exception:
+            _crops_max_count = 12
+        _crops_submitted = 0
+        _crops_budget_hit = False
         for page_idx in pages:
             if cancel_event is not None and cancel_event.is_set():
+                break
+            if _crops_submitted >= _crops_max_count or (_t_crops.time() - _crops_t0) > _crops_budget_s:
+                _crops_budget_hit = True
+                print(f"[PaddleOCR-VL Crops] 达到切图配额/预算上限 (已提交 {_crops_submitted}/{_crops_max_count}, 耗时 {int(_t_crops.time()-_crops_t0)}s/{int(_crops_budget_s)}s)，提前结束切图提交")
                 break
             page_crops = crops_by_page.get(page_idx, [])
             if not page_crops:
@@ -3947,6 +3968,9 @@ def extract_via_paddleocr_crops(pdf_path: str, pages: Optional[List[int]] = None
             page_success = False
             for t_idx, crop in enumerate(page_crops):
                 if cancel_event is not None and cancel_event.is_set():
+                    break
+                if _crops_submitted >= _crops_max_count or (_t_crops.time() - _crops_t0) > _crops_budget_s:
+                    _crops_budget_hit = True
                     break
                 img = crop.get("image")
                 if img is None:
@@ -3983,6 +4007,7 @@ def extract_via_paddleocr_crops(pdf_path: str, pages: Optional[List[int]] = None
                     img.save(temp_img_path, format="PNG")
 
                     print(f"[PaddleOCR-VL Crops] 正在提交第 {page_idx+1} 页 Table Crop #{t_idx+1} (尺寸: {img.size}) 至 VLM...")
+                    _crops_submitted += 1
                     crop_md = ocr_client.call_paddleocr_vl_online_api(temp_img_path, config=config, timeout=180, cancel_event=cancel_event)
                     if not crop_md:
                         continue
@@ -4043,9 +4068,12 @@ def extract_via_paddleocr_crops(pdf_path: str, pages: Optional[List[int]] = None
             except Exception:
                 pass
 
-    # 2. 检查哪些页面未能通过切图获得表格，对这些页面平滑回退至整页 extract_via_paddleocr_fullpage
+    # 2. 检查哪些页面未能通过切图获得表格，对这些页面平滑回退至整页 extract_via_paddleocr_fullpage（若切图已触发配额/时间预算上限或已禁用意图回退则跳过）
     unresolved_pages = [p for p in pages if p not in pages_resolved]
-    if unresolved_pages:
+    if unresolved_pages and allow_fullpage_fallback and not _crops_budget_hit:
+        if len(unresolved_pages) > 8:
+            print(f"[PaddleOCR-VL Crops] 未解决页较多 ({len(unresolved_pages)} 页 > 8)，仅对前 8 页执行整页回退识别...")
+            unresolved_pages = unresolved_pages[:8]
         print(f"[PaddleOCR-VL Crops] 页面 {[p+1 for p in unresolved_pages]} 未检出有效切图或切图解析未果，平滑回退至整页 PaddleOCR-VL 识别...")
         fallback_results = extract_via_paddleocr_fullpage(pdf_path, unresolved_pages)
         results.extend(fallback_results)
@@ -5072,10 +5100,67 @@ def _do_extract_tables_from_pdf(
         src_summary = {p + 1: sorted(list(candidate_sources[p])) for p in target_pages}
         logs.append(f"  候选表格页面: {[p+1 for p in target_pages]} (来源分布: {src_summary})")
 
+    def _try_mineru_scanned_primary(pages_arg):
+        try:
+            from common import load_config
+            _scfg = load_config()
+        except Exception:
+            _scfg = {}
+        try:
+            try:
+                from . import ocr_client as _ocr_c
+            except ImportError:
+                import ocr_client as _ocr_c
+        except Exception:
+            return []
+        try:
+            try:
+                m_ok = _ocr_c.is_mineru_available(config=_scfg, file_path=pdf_path, pages=pages_arg)
+            except TypeError:
+                m_ok = _ocr_c.is_mineru_available(config=_scfg, file_path=pdf_path)
+            if not m_ok:
+                return []
+            logs.append(f"  扫描/无候选页优先调用 MinerU 结构化主抽取 (页码: {[p+1 for p in pages_arg] if pages_arg else 'all'})")
+            m_dfs = _ocr_c.call_mineru_structured_api(pdf_path, config=_scfg, page_ranges=pages_arg)
+            if not m_dfs:
+                return []
+            if pages_arg and hasattr(_ocr_c, '_remap_mineru_subset_dfs'):
+                try:
+                    m_dfs = _ocr_c._remap_mineru_subset_dfs(m_dfs, pages_arg, file_path=pdf_path)
+                except Exception:
+                    pass
+            res_list = []
+            for idx_m, m_df in enumerate(m_dfs):
+                if m_df is None or getattr(m_df, 'empty', True):
+                    continue
+                p_i = m_df.attrs.get('page_idx', 0) if hasattr(m_df, 'attrs') else 0
+                if pages_arg and p_i not in pages_arg and 0 <= idx_m < len(pages_arg):
+                    p_i = pages_arg[0]
+                if hasattr(m_df, 'attrs'):
+                    m_df.attrs['page_idx'] = p_i
+                    m_df.attrs['extractor'] = 'mineru_api'
+                item_m = {
+                    'df': m_df,
+                    'page_idx': p_i,
+                    'table_idx': idx_m,
+                    'bbox': m_df.attrs.get('bbox') if hasattr(m_df, 'attrs') else None,
+                    'extractor': 'mineru_api',
+                }
+                if not _is_table_low_quality_after_clean(item_m):
+                    res_list.append(item_m)
+            if res_list:
+                logs.append(f"  MinerU 扫描件主抽取成功返回 {len(res_list)} 个高质量表格")
+            return res_list
+        except Exception as _e_ms:
+            logs.append(f"  MinerU 扫描件主抽取跳过: {_e_ms}")
+            return []
+
     if not target_pages:
-        logs.append("→ 未检测到候选表格页面，尝试整页高精 PaddleOCR-VL 全文识别")
+        logs.append("→ 未检测到候选表格页面，优先尝试 MinerU / PaddleOCR-VL 全文识别")
         if use_ocr_fallback:
-            ocr_results = extract_via_paddleocr_fullpage(pdf_path, pages=None)
+            ocr_results = _try_mineru_scanned_primary(None)
+            if not ocr_results:
+                ocr_results = extract_via_paddleocr_fullpage(pdf_path, pages=None)
             if not ocr_results:
                 ocr_results = extract_via_ocr(pdf_path)
             all_results.extend(ocr_results)
@@ -5102,9 +5187,11 @@ def _do_extract_tables_from_pdf(
     is_native = pdf_type in ('text_based', 'mixed') and inspector_result['confidence'] >= 0.5
 
     if not is_native:
-        # ── 扫描版 PDF → 直接整页 PaddleOCR-VL ──
-        logs.append("→ Step 2: 扫描版 PDF，整页提交 PaddleOCR-VL-1.6 识别")
-        ocr_results = extract_via_paddleocr_fullpage(pdf_path, target_pages)
+        # ── 扫描版 PDF → 优先 MinerU 结构化主抽取，失败再回落 PaddleOCR-VL / Docling ──
+        logs.append("→ Step 2: 扫描版 PDF，优先 MinerU 结构化主抽取，兜底 PaddleOCR-VL-1.6")
+        ocr_results = _try_mineru_scanned_primary(target_pages) if use_ocr_fallback else []
+        if not ocr_results:
+            ocr_results = extract_via_paddleocr_fullpage(pdf_path, target_pages)
         if not ocr_results:
             try:
                 import ocr_client
@@ -5214,12 +5301,23 @@ def _do_extract_tables_from_pdf(
                     primary_succeeded = True
 
             # 2. 若快速通道未完全覆盖，启动 MinerU 结构化主抽取 (with page_ranges)
+            mineru_did_run = False
+            mineru_ran_pages = None
             if not primary_succeeded and ocr_client:
                 pdf_p = Path(pdf_path)
                 cache_zip = pdf_p.parent / "mineru_cache" / f"{pdf_p.stem}.zip"
                 cache_dir = pdf_p.parent / "mineru_cache" / pdf_p.stem
                 mineru_dfs = []
                 mineru_pages = target_pages if target_pages is not None else native_target_pages
+                if total_pages > 100 and (not mineru_pages or len(mineru_pages) > 80):
+                    focused = set(page_decls.keys()) | set(inspector_table_pages)
+                    if focused:
+                        expanded = set(focused)
+                        for _fp in focused:
+                            if _fp + 1 < total_pages:
+                                expanded.add(_fp + 1)
+                        mineru_pages = sorted(expanded)
+                        logs.append(f"  超大篇幅文档 ({total_pages} 页)，收敛 MinerU 扫描页至强线索表页 ({len(mineru_pages)} 页)")
                 mineru_from_cache = False
                 if cache_dir.exists() and cache_dir.is_dir():
                     logs.append(f"  发现本地 MinerU 结构化缓存目录: {cache_dir.name}")
@@ -5267,6 +5365,8 @@ def _do_extract_tables_from_pdf(
                             mineru_dfs = []
 
                 if mineru_dfs:
+                    mineru_did_run = True
+                    mineru_ran_pages = set(mineru_pages) if (mineru_pages and not mineru_from_cache) else None
                     if not mineru_from_cache and mineru_pages and hasattr(ocr_client, '_remap_mineru_subset_dfs'):
                         try:
                             mineru_dfs = ocr_client._remap_mineru_subset_dfs(mineru_dfs, mineru_pages, file_path=pdf_path)
@@ -5276,6 +5376,7 @@ def _do_extract_tables_from_pdf(
                     logs.append(f"  MinerU 结构化主抽取解析出 {len(mineru_dfs)} 个表格，启动本地数值一致性门禁核验...")
                     accepted_mineru = []
                     unverified_mineru = []
+                    usable_unverified_mineru = []
                     for i_m, m_df in enumerate(mineru_dfs):
                         p_idx = m_df.attrs.get('page_idx') if hasattr(m_df, 'attrs') else None
                         if p_idx is None or (valid_m_pages and p_idx not in valid_m_pages):
@@ -5327,30 +5428,44 @@ def _do_extract_tables_from_pdf(
                                 'extractor': 'mineru_api',
                             })
                         else:
-                            pages_requiring_ocr.add(p_idx)
                             if info.get('status') == 'unverified':
-                                logs.append(f"  Table #{i_m+1} (Page {p_idx+1}) 位于扫描区域或无文本层 (unverified)，保留候选待视觉复核")
-                                unverified_mineru.append({
+                                u_item = {
                                     'df': m_df,
                                     'page_idx': p_idx,
                                     'table_idx': i_m,
                                     'bbox': converted_bbox,
                                     'extractor': 'mineru_api',
                                     'unverified': True,
-                                })
+                                }
+                                is_usable_unverified = (
+                                    m_df is not None
+                                    and not getattr(m_df, 'empty', True)
+                                    and not _is_table_low_quality_after_clean(u_item)
+                                )
+                                if is_usable_unverified:
+                                    usable_unverified_mineru.append(u_item)
+                                    logs.append(f"  Table #{i_m+1} (Page {p_idx+1}) 位于扫描区域或无文本层 (unverified)，结构完整，直接采信 MinerU VLM 结果")
+                                else:
+                                    pages_requiring_ocr.add(p_idx)
+                                    logs.append(f"  Table #{i_m+1} (Page {p_idx+1}) 位于扫描区域或无文本层 (unverified) 且质量偏低，保留候选待视觉复核")
+                                    unverified_mineru.append(u_item)
+                            else:
+                                pages_requiring_ocr.add(p_idx)
+
+                    trusted_mineru = list(accepted_mineru) + list(usable_unverified_mineru)
 
                     # 保留并合并部分覆盖的已校验结构树表格 (valid_struct_tables)，以及前置探测与矢量探测候选表
                     supp_candidates = list(valid_struct_tables) + list(inspector_tables)
-                    if accepted_mineru:
+                    if trusted_mineru:
                         try:
-                            covered_pages_now = sorted(list(set(t['page_idx'] for t in accepted_mineru if t.get('page_idx') is not None)))
+                            covered_pages_now = sorted(list(set(t['page_idx'] for t in trusted_mineru if t.get('page_idx') is not None)))
                             if covered_pages_now:
                                 supp_candidates.extend(extract_via_find_tables(pdf_path, pages=covered_pages_now))
                         except Exception:
                             pass
 
                     supp_pdf_doc = None
-                    if supp_candidates and accepted_mineru and pdf_path and isinstance(pdf_path, str) and os.path.isfile(pdf_path):
+                    if supp_candidates and trusted_mineru and pdf_path and isinstance(pdf_path, str) and os.path.isfile(pdf_path):
                         try:
                             supp_pdf_doc = fitz.open(pdf_path)
                         except Exception:
@@ -5376,7 +5491,7 @@ def _do_extract_tables_from_pdf(
                         )
 
                         is_covered = False
-                        for m_item in accepted_mineru:
+                        for m_item in trusted_mineru:
                             m_p = m_item.get('page_idx')
                             m_df = m_item.get('df')
                             m_box = m_item.get('bbox') or (m_df.attrs.get('bbox') if m_df is not None and hasattr(m_df, 'attrs') else None)
@@ -5448,8 +5563,7 @@ def _do_extract_tables_from_pdf(
                                         m_df.attrs['table_title'] = c_title
                                 break
                         if not is_covered:
-                            pages_requiring_ocr.add(c_p)
-                            logs.append(f"  前置/结构树候选表格区域在 Page {c_p+1} 未被 MinerU 覆盖 (bbox={c_box})，触发补漏救助")
+                            c_ok = False
                             if c_df is not None and not c_df.empty:
                                 c_ok = cand in valid_struct_tables
                                 if not c_ok:
@@ -5467,6 +5581,14 @@ def _do_extract_tables_from_pdf(
                                         if not c_df.attrs.get('extractor'):
                                             c_df.attrs['extractor'] = 'pdf_inspector'
                                     accepted_mineru.append(cand_copy)
+                                    trusted_mineru.append(cand_copy)
+                                    logs.append(f"  前置/结构树候选表格区域在 Page {c_p+1} 未被 MinerU 覆盖，已直接由前置校验表补全 (bbox={c_box})")
+                            if not c_ok:
+                                # 若 MinerU 已在同页产出有效表格且该页无声明漏表，避免仅因 find_tables 框噪点触发全页 VLM 切图
+                                has_m_on_p = any(t.get('page_idx') == c_p for t in trusted_mineru)
+                                if not (has_m_on_p and c_p not in page_decls):
+                                    pages_requiring_ocr.add(c_p)
+                                    logs.append(f"  前置/结构树候选表格区域在 Page {c_p+1} 未被 MinerU 覆盖 (bbox={c_box})，触发补漏救助")
                     finally:
                       if supp_pdf_doc is not None:
                           try:
@@ -5475,33 +5597,60 @@ def _do_extract_tables_from_pdf(
                               pass
 
                     # 交叉核对全文声明漏表与扫描页覆盖未知
+                    _missed_cc_pages = set()
                     try:
-                        report = table_validator.cross_check_missed_tables([t['df'] for t in accepted_mineru], pdf_path)
+                        report = table_validator.cross_check_missed_tables([t['df'] for t in trusted_mineru], pdf_path)
                         if not report.get("is_complete", True) or report.get("coverage_unknown", False):
                             for missed in report.get("missed_tables", []):
                                 p_m = missed.get("page_idx")
                                 if p_m is not None:
+                                    _missed_cc_pages.add(p_m)
                                     pages_requiring_ocr.add(p_m)
                                     logs.append(f"  交叉核验发现未覆盖声明表 {missed.get('label')} (Page {p_m+1})")
+                            mineru_scanned_pages = set(mineru_pages) if (mineru_pages and not mineru_from_cache) else None
                             for p_scan in report.get("uncovered_scanned_pages", []):
+                                if mineru_scanned_pages is None or p_scan in mineru_scanned_pages:
+                                    logs.append(f"  扫描/图像页 {p_scan+1} 已由 MinerU 完成版面解析且无声明漏表，跳过冗余 OCR 复扫")
+                                    continue
                                 pages_requiring_ocr.add(p_scan)
                                 logs.append(f"  扫描页 {p_scan+1} 覆盖未知，加入定向修复")
                     except Exception as e_cc:
                         logger.debug(f"Cross check error: {e_cc}")
 
-                    covered_m_pages = set(t['page_idx'] for t in accepted_mineru)
+                    _mineru_non_image_cues = {'vector_find_tables', 'text_find_tables', 'probe_disjoint_native', 'structure_tree', 'caption', 'pdf_inspector', 'inspector_table', 'caller_candidate'}
+                    covered_m_pages = set(t['page_idx'] for t in trusted_mineru)
                     for p_req in (target_pages or []):
                         if p_req not in covered_m_pages:
+                            if mineru_did_run and (mineru_ran_pages is None or p_req in mineru_ran_pages):
+                                has_real_cue = (
+                                    p_req in page_decls
+                                    or p_req in inspector_table_pages
+                                    or bool(candidate_sources.get(p_req, set()) & _mineru_non_image_cues)
+                                )
+                                if not has_real_cue:
+                                    continue
                             pages_requiring_ocr.add(p_req)
                         else:
                             # 同页多表核对：若该页声明表数大于已通过表数，仍需加入待修复页
                             decls_on_p = [d for d in page_decls.get(p_req, []) if not d.get('is_continuation')]
-                            acc_on_p = [t for t in accepted_mineru if t.get('page_idx') == p_req]
+                            acc_on_p = [t for t in trusted_mineru if t.get('page_idx') == p_req]
                             if len(decls_on_p) > len(acc_on_p):
                                 pages_requiring_ocr.add(p_req)
 
-                    if accepted_mineru:
-                        all_results = list(accepted_mineru)
+                    if trusted_mineru:
+                        # 清理初始化时因 pure_image_pages 预置、但已被 MinerU 扫描且无任何表线索的纯插图页
+                        if mineru_did_run:
+                            for p_ocr in list(pages_requiring_ocr):
+                                if p_ocr in pure_image_pages and (mineru_ran_pages is None or p_ocr in mineru_ran_pages):
+                                    has_real_cue = (
+                                        p_ocr in _missed_cc_pages
+                                        or p_ocr in page_decls
+                                        or p_ocr in inspector_table_pages
+                                        or bool(candidate_sources.get(p_ocr, set()) & _mineru_non_image_cues)
+                                    )
+                                    if not has_real_cue:
+                                        pages_requiring_ocr.discard(p_ocr)
+                        all_results = list(trusted_mineru)
                         for u_item in unverified_mineru:
                             if not any(id(a.get('df')) == id(u_item.get('df')) for a in all_results):
                                 all_results.append(u_item)
@@ -5518,10 +5667,17 @@ def _do_extract_tables_from_pdf(
                             logs.append("  MinerU 提取的所有表格均未通过数值门禁，平滑降级进入原生多方投票备用管线")
 
         # 3. 若未启用主抽取或主抽取未产出/仅部分覆盖有效表格，平滑降级进入原生多方投票备用管线 (Legacy Fallback)
+        _extracted_m_pages = {t.get('page_idx') for t in all_results if t.get('page_idx') is not None}
+        _missed_cc_set = locals().get('_missed_cc_pages', set())
         step3_uncovered_pages = (
             sorted(
                 p for p in (native_target_pages or [])
-                if p not in {t.get('page_idx') for t in all_results if t.get('page_idx') is not None}
+                if p not in _extracted_m_pages and (
+                    not mineru_did_run
+                    or (mineru_ran_pages is not None and p not in mineru_ran_pages)
+                    or p in page_decls
+                    or p in _missed_cc_set
+                )
             )
             if primary_succeeded else []
         )
@@ -5547,13 +5703,13 @@ def _do_extract_tables_from_pdf(
 
             ft_results = extract_via_find_tables(pdf_path, pages=step3_pages)
             plumber_results = extract_via_pdfplumber(pdf_path, pages=step3_pages)
-            camelot_results = extract_via_camelot(pdf_path, pages=step3_pages)
+            camelot_results = [] if (is_partial_step3 and len(step3_pages or []) > 10) else extract_via_camelot(pdf_path, pages=step3_pages)
             img2table_results = extract_via_img2table(pdf_path, pages=step3_pages)
             gmft_results = extract_via_gmft(pdf_path, pages=step3_pages)
             pymupdf4llm_results = extract_via_pymupdf4llm(pdf_path, pages=step3_pages)
             if pymupdf4llm_results:
                 logs.append(f"  PyMuPDF4LLM 提取到 {len(pymupdf4llm_results)} 个表格 (LLM-ready Markdown)")
-            rapid_table_results = extract_via_rapid_table(pdf_path, pages=step3_pages) if is_rapid_table_available() else []
+            rapid_table_results = [] if (is_partial_step3 and mineru_did_run) else (extract_via_rapid_table(pdf_path, pages=step3_pages) if is_rapid_table_available() else [])
             if rapid_table_results:
                 logs.append(f"  RapidTable 提取到 {len(rapid_table_results)} 个表格 (ONNX 结构识别)")
             align_results = extract_via_text_alignment(pdf_path, pages=step3_pages)
@@ -5684,42 +5840,84 @@ def _do_extract_tables_from_pdf(
                     if has_repair and _page_covered(p, list(valid_fused) + ocr_results):
                         unresolved_ocr_pages.discard(p)
 
-            # 阶段 1: 优先尝试 RapidTable ONNX 结构识别快速挽救
-            if is_rapid_table_available() and unresolved_ocr_pages:
-                try:
-                    rapid_pages = sorted(list(unresolved_ocr_pages))
-                    rapid_res = extract_via_rapid_table(pdf_path, pages=rapid_pages)
-                    valid_rapid = [r for r in (rapid_res or []) if not _is_table_low_quality_after_clean(r)]
-                    if valid_rapid:
-                        logs.append(f"  RapidTable 本地中间层试跑成功提取到 {len(valid_rapid)} 个表格 (免调用在线 VLM)")
-                        ocr_results.extend(valid_rapid)
-                        _update_unresolved_pages()
-                except Exception as e_rr:
-                    logger.debug(f"[RapidTable] 本地中间层接管试跑跳过: {e_rr}")
+            # 阶段 1: 优先尝试 RapidTable ONNX 结构识别快速挽救（MinerU 已运行过时跳过，避免 CPU 守护线程死磕）
+            if not mineru_did_run and is_rapid_table_available() and unresolved_ocr_pages:
+                rapid_pages = sorted(list(unresolved_ocr_pages))
+                if len(rapid_pages) > 6:
+                    logs.append(f"  待修复页较多 ({len(rapid_pages)} 页 > 6)，跳过 CPU RapidTable 阶段，直接交由云端 VLM 接管")
+                else:
+                    try:
+                        import threading as _th_rt
+                        _rt_box: Dict[str, Any] = {"res": None, "err": None}
+                        _rt_budget = min(90.0, 45.0 * max(1, len(rapid_pages)))
+
+                        def _run_rt_stage1():
+                            try:
+                                _rt_box["res"] = extract_via_rapid_table(pdf_path, pages=rapid_pages)
+                            except Exception as _e_rt_inner:
+                                _rt_box["err"] = _e_rt_inner
+
+                        _rt_thread = _th_rt.Thread(target=_run_rt_stage1, daemon=True)
+                        _rt_thread.start()
+                        _rt_thread.join(timeout=_rt_budget)
+                        if _rt_thread.is_alive():
+                            logs.append(f"  RapidTable 本地中间层超时 ({int(_rt_budget)}s)，立即熔断转入云端 VLM 接管")
+                        elif _rt_box["err"] is not None:
+                            logger.debug(f"[RapidTable] 本地中间层接管试跑跳过: {_rt_box['err']}")
+                        else:
+                            rapid_res = _rt_box["res"]
+                            valid_rapid = [r for r in (rapid_res or []) if not _is_table_low_quality_after_clean(r)]
+                            if valid_rapid:
+                                logs.append(f"  RapidTable 本地中间层试跑成功提取到 {len(valid_rapid)} 个表格 (免调用在线 VLM)")
+                                ocr_results.extend(valid_rapid)
+                                _update_unresolved_pages()
+                    except Exception as e_rr:
+                        logger.debug(f"[RapidTable] 本地中间层接管试跑跳过: {e_rr}")
 
             # 阶段 2: 对仍未覆盖的页面，通过 DocLayout-YOLO 切图送入 PaddleOCR-VL-1.6 独立接管提取
             if unresolved_ocr_pages:
                 crop_pages = sorted(list(unresolved_ocr_pages))
                 logs.append(f"  优先通过 DocLayout-YOLO 切图送入 PaddleOCR-VL-1.6 独立接管提取 (待修复页: {[p+1 for p in crop_pages]})")
-                crop_res = extract_via_paddleocr_crops(pdf_path, crop_pages)
+                try:
+                    crop_res = extract_via_paddleocr_crops(pdf_path, crop_pages, allow_fullpage_fallback=(not mineru_did_run))
+                except TypeError:
+                    crop_res = extract_via_paddleocr_crops(pdf_path, crop_pages)
                 valid_crops = [r for r in (crop_res or []) if not _is_table_low_quality_after_clean(r)]
                 if valid_crops:
                     ocr_results.extend(valid_crops)
                     _update_unresolved_pages()
 
-            # 阶段 3: 若切图提取后仍有未解决页面，尝试 Docling (TableFormer) 离线接管
-            if unresolved_ocr_pages:
-                try:
-                    import ocr_client
-                    docling_pages = sorted(list(unresolved_ocr_pages))
-                    docling_results = ocr_client.extract_via_docling(pdf_path, pages=docling_pages)
-                    valid_docling = [r for r in (docling_results or []) if not _is_table_low_quality_after_clean(r)]
-                    if valid_docling:
-                        logs.append(f"  Docling (TableFormer) 离线接管提取到 {len(valid_docling)} 个表格")
-                        ocr_results.extend(valid_docling)
-                        _update_unresolved_pages()
-                except Exception:
-                    pass
+            # 阶段 3: 若切图提取后仍有未解决页面，尝试 Docling (TableFormer) 离线接管（MinerU 已运行过时跳过，避免 CPU 阻塞）
+            if not mineru_did_run and unresolved_ocr_pages:
+                docling_pages = sorted(list(unresolved_ocr_pages))
+                if len(docling_pages) > 6:
+                    logs.append(f"  待修复页较多 ({len(docling_pages)} 页 > 6)，跳过 CPU Docling 离线接管，避免长时间阻塞")
+                else:
+                    try:
+                        import threading as _th_dl
+                        import ocr_client
+                        _dl_box: Dict[str, Any] = {"res": None, "err": None}
+                        _dl_budget = min(120.0, 45.0 * max(1, len(docling_pages)))
+
+                        def _run_dl_stage3():
+                            try:
+                                _dl_box["res"] = ocr_client.extract_via_docling(pdf_path, pages=docling_pages)
+                            except Exception as _e_dl_inner:
+                                _dl_box["err"] = _e_dl_inner
+
+                        _dl_thread = _th_dl.Thread(target=_run_dl_stage3, daemon=True)
+                        _dl_thread.start()
+                        _dl_thread.join(timeout=_dl_budget)
+                        if _dl_thread.is_alive():
+                            logs.append(f"  Docling (TableFormer) 离线接管超时 ({int(_dl_budget)}s)，立即熔断")
+                        elif _dl_box["err"] is None:
+                            valid_docling = [r for r in (_dl_box["res"] or []) if not _is_table_low_quality_after_clean(r)]
+                            if valid_docling:
+                                logs.append(f"  Docling (TableFormer) 离线接管提取到 {len(valid_docling)} 个表格")
+                                ocr_results.extend(valid_docling)
+                                _update_unresolved_pages()
+                    except Exception:
+                        pass
 
             if ocr_results:
                 logs.append(f"  独立接管提取到 {len(ocr_results)} 个表格，启动表级精细对齐与安全替换...")
@@ -5734,7 +5932,18 @@ def _do_extract_tables_from_pdf(
 
         # Step 3c: 仍未覆盖且未在 OCR 中成功产出表格的页面 → text_alignment
         extracted_pages = set(r.get('page_idx', -1) for r in all_results if r.get('page_idx') is not None and not _is_table_low_quality_after_clean(r))
-        still_missing = sorted(p for p in target_pages if not _page_covered(p, all_results))
+        _step3c_cue_set = {'vector_find_tables', 'text_find_tables', 'probe_disjoint_native', 'structure_tree', 'caption', 'pdf_inspector', 'inspector_table', 'caller_candidate'}
+        still_missing = sorted(
+            p for p in target_pages
+            if not _page_covered(p, all_results) and not (
+                primary_succeeded
+                and mineru_did_run
+                and (mineru_ran_pages is None or p in mineru_ran_pages)
+                and p not in page_decls
+                and p not in inspector_table_pages
+                and not bool(candidate_sources.get(p, set()) & _step3c_cue_set)
+            )
+        )
         if still_missing:
             logs.append(f"→ Step 3c: 对仍未覆盖/表数不足的 {[p+1 for p in still_missing]} 页尝试文本对齐提取")
             text_align_results = extract_via_text_alignment(pdf_path, pages=still_missing)
@@ -5812,16 +6021,26 @@ def _do_extract_tables_from_pdf(
         'inspector_table',
         'caller_candidate',
     }
-    uncovered_must_pages = [
-        p for p in (target_pages or [])
-        if p not in extracted_pages_all and (
-            p in pure_image_pages
-            or p in image_table_pages
-            or p in page_decls
-            or p in inspector_table_pages
-            or bool(candidate_sources.get(p, set()) & _strong_table_cues)
+    _is_primary_ok = bool(locals().get('primary_succeeded', False))
+    _did_mineru_run = bool(locals().get('mineru_did_run', False))
+    _ran_mineru_pages = locals().get('mineru_ran_pages', None)
+    _non_image_table_cues = _strong_table_cues - {'image_scan'}
+    uncovered_must_pages = []
+    for p in (target_pages or []):
+        if p in extracted_pages_all:
+            continue
+        mineru_already_checked_p = bool(
+            _is_primary_ok
+            and _did_mineru_run
+            and (_ran_mineru_pages is None or p in _ran_mineru_pages)
         )
-    ]
+        has_explicit_table_cue = (
+            p in page_decls
+            or p in inspector_table_pages
+            or bool(candidate_sources.get(p, set()) & _non_image_table_cues)
+        )
+        if has_explicit_table_cue or (not mineru_already_checked_p and (p in pure_image_pages or p in image_table_pages or 'image_scan' in candidate_sources.get(p, set()))):
+            uncovered_must_pages.append(p)
     remaining_unresolved = set(locals().get('unresolved_ocr_pages', set())) - extracted_pages_all
     can_early_exit = bool(all_results) and (
         not use_ocr_fallback
@@ -5843,7 +6062,13 @@ def _do_extract_tables_from_pdf(
     logs.append(f"→ Step 5: 结构化提取表数 ({len(all_results)}) 少于声明表数 ({total_expected_tables})、为空或存在未覆盖候选页 ({len(uncovered_must_pages) + len(remaining_unresolved)} 页)，回退到 OCR")
     if use_ocr_fallback:
         targeted_missing = sorted(set(uncovered_must_pages) | set(remaining_unresolved))
-        if all_results and len(all_results) >= total_expected_tables and targeted_missing:
+        if _is_primary_ok and _did_mineru_run:
+            if targeted_missing:
+                ocr_results = extract_via_ocr(pdf_path, pages=targeted_missing[:8])
+            else:
+                logs.append("  MinerU 已完成整本解析且无明确漏页，跳过 Step 5 整本 OCR 重扫")
+                ocr_results = []
+        elif all_results and len(all_results) >= total_expected_tables and targeted_missing:
             ocr_results = extract_via_ocr(pdf_path, pages=targeted_missing)
         else:
             ocr_results = extract_via_ocr(pdf_path)

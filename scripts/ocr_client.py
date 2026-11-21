@@ -17,6 +17,7 @@ import glob
 import time
 import shutil
 import tempfile
+import threading
 import zipfile
 import subprocess
 import collections
@@ -2064,6 +2065,59 @@ class MinerUCLIClient:
 mineru_cli_client = MinerUCLIClient()
 
 
+_AISTUDIO_SEMAPHORE_LOCK = threading.Lock()
+_AISTUDIO_SEMAPHORE_CAP: Optional[int] = None
+_AISTUDIO_SEMAPHORE: Optional[threading.BoundedSemaphore] = None
+
+
+def _get_aistudio_semaphore(config: Optional[dict] = None) -> Tuple[threading.BoundedSemaphore, int]:
+    """Return process-wide BoundedSemaphore limiting concurrent Baidu AIStudio jobs."""
+    global _AISTUDIO_SEMAPHORE_CAP, _AISTUDIO_SEMAPHORE
+    raw_cap = (config or {}).get("AISTUDIO_MAX_CONCURRENCY") or os.getenv("AISTUDIO_MAX_CONCURRENCY")
+    try:
+        cap = max(1, int(raw_cap)) if raw_cap else 2
+    except Exception:
+        cap = 2
+    with _AISTUDIO_SEMAPHORE_LOCK:
+        if _AISTUDIO_SEMAPHORE is None or _AISTUDIO_SEMAPHORE_CAP != cap:
+            _AISTUDIO_SEMAPHORE = threading.BoundedSemaphore(cap)
+            _AISTUDIO_SEMAPHORE_CAP = cap
+        return _AISTUDIO_SEMAPHORE, cap
+
+
+def compute_adaptive_ocr_timeout(
+    file_path: str,
+    base_timeout: int = 600,
+    page_ranges: Optional[Union[str, List[int]]] = None,
+    config: Optional[dict] = None,
+) -> int:
+    """Relax OCR/MinerU polling timeout for large PDFs and dissertations (>=40 pages)."""
+    if base_timeout != 600:
+        return base_timeout
+    if page_ranges is not None:
+        if isinstance(page_ranges, (list, tuple, set)) and 0 < len(page_ranges) < 40:
+            return base_timeout
+        if isinstance(page_ranges, str) and page_ranges.strip():
+            return base_timeout
+    if not isinstance(file_path, str) or not file_path.lower().endswith(".pdf") or not os.path.isfile(file_path):
+        return base_timeout
+    raw_cap = (config or {}).get("LARGE_PDF_MAX_TIMEOUT") or os.getenv("LARGE_PDF_MAX_TIMEOUT")
+    try:
+        max_timeout = max(base_timeout, int(raw_cap)) if raw_cap else 2400
+    except Exception:
+        max_timeout = 2400
+    page_count = 0
+    try:
+        import fitz
+        with fitz.open(file_path) as doc:
+            page_count = len(doc)
+    except Exception:
+        page_count = 0
+    if page_count >= 40:
+        return min(max_timeout, max(base_timeout, 600 + (page_count - 30) * 15))
+    return base_timeout
+
+
 def call_mineru_api(
     file_path: str,
     config: Optional[dict] = None,
@@ -2082,6 +2136,7 @@ def call_mineru_api(
     explicit_config = config if isinstance(config, dict) else None
     if config is None:
         config = load_config()
+    timeout = compute_adaptive_ocr_timeout(file_path, base_timeout=timeout, page_ranges=page_ranges, config=config)
 
     token = resolve_mineru_token(config)
     api_base = config.get("MINERU_API_BASE", "https://mineru.net") or "https://mineru.net"
@@ -2207,6 +2262,7 @@ def call_mineru_structured_api(
     explicit_config = config if isinstance(config, dict) else None
     if config is None:
         config = load_config()
+    timeout = compute_adaptive_ocr_timeout(file_path, base_timeout=timeout, page_ranges=page_ranges, config=config)
 
     token = resolve_mineru_token(config)
     api_base = config.get("MINERU_API_BASE", "https://mineru.net") or "https://mineru.net"
@@ -2605,6 +2661,12 @@ def call_paddleocr_job(
 
     if config is None:
         config = load_config()
+    timeout = compute_adaptive_ocr_timeout(
+        file_path,
+        base_timeout=timeout,
+        page_ranges=page_ranges if page_ranges is not None else pages,
+        config=config,
+    )
 
     token = (
         os.getenv("PADDLEOCR_ACCESS_TOKEN")
@@ -2648,6 +2710,53 @@ def call_paddleocr_job(
         print(f"[{model}] 错误: 未配置 Token (PADDLEOCR_ACCESS_TOKEN 环境变量或 config.json)")
         return {"success": False, "model": model, "error": "no_token", "combined_markdown": "", "pages": []}
 
+    engine_pref = (config.get("OCR_ENGINE") or os.environ.get("OCR_ENGINE") or "auto").lower()
+    can_mineru_failover = _can_mineru_for_target() and engine_pref in ("auto", "mineru")
+
+    aistudio_sem, aistudio_cap = _get_aistudio_semaphore(config)
+    acquired = aistudio_sem.acquire(blocking=False)
+    if not acquired:
+        if can_mineru_failover:
+            print(f"[{model}] 百度 AIStudio 并发槽位已满 (上限={aistudio_cap})，并行分流至 MinerU API 减轻云端压力...")
+            mineru_md = _call_mineru_failover()
+            if mineru_md:
+                return _make_failover_result(mineru_md)
+        while not acquired:
+            if cancel_event is not None and cancel_event.is_set():
+                return {"success": False, "model": model, "error": "cancelled", "combined_markdown": "", "pages": []}
+            acquired = aistudio_sem.acquire(timeout=0.5)
+
+    try:
+        return _call_paddleocr_job_unlocked(
+            file_path=file_path,
+            model=model,
+            config=config,
+            timeout=timeout,
+            cancel_event=cancel_event,
+            token=token,
+            target_ranges=target_ranges,
+            can_mineru_failover=can_mineru_failover,
+            _make_failover_result=_make_failover_result,
+            _call_mineru_failover=_call_mineru_failover,
+        )
+    finally:
+        if acquired:
+            aistudio_sem.release()
+
+
+def _call_paddleocr_job_unlocked(
+    file_path: str,
+    model: str,
+    config: dict,
+    timeout: int,
+    cancel_event,
+    token: str,
+    target_ranges,
+    can_mineru_failover: bool,
+    _make_failover_result,
+    _call_mineru_failover,
+) -> Dict[str, Any]:
+
     headers = {
         "Authorization": f"bearer {token}",
     }
@@ -2659,9 +2768,6 @@ def call_paddleocr_job(
     if not is_url and not os.path.exists(file_path):
         print(f"[{model}] 文件不存在: {file_path}")
         return {"success": False, "model": model, "error": "file_not_found", "combined_markdown": "", "pages": []}
-
-    engine_pref = (config.get("OCR_ENGINE") or os.environ.get("OCR_ENGINE") or "auto").lower()
-    can_mineru_failover = _can_mineru_for_target() and engine_pref in ("auto", "mineru")
 
     # 提交作业（支持指数退避与满队列重试，并在队列爆满或超时时无缝熔断至 MinerU）
     retry_waits = [5, 15, 30, 60, 90]
@@ -3210,6 +3316,12 @@ def run_paddleocr_vl(
     if cancel_event is not None and cancel_event.is_set():
         return ""
 
+    _vl_t0 = time.time()
+    try:
+        _vl_budget_s = float(os.getenv("PADDLEOCR_VL_BUDGET_SEC", "300"))
+    except Exception:
+        _vl_budget_s = 300.0
+
     # 0. 若显式指定了页面列表，按连续页码切片为多页子 PDF 提交（完整保留跨页上下文）
     if pages is not None:
         try:
@@ -3233,6 +3345,9 @@ def run_paddleocr_vl(
                 for block in page_blocks:
                     if cancel_event is not None and cancel_event.is_set():
                         break
+                    if (time.time() - _vl_t0) > _vl_budget_s:
+                        print(f"[OCR] PaddleOCR-VL 分块总耗时已超 {int(_vl_budget_s)}s 预算，提前结束剩余分块提交")
+                        break
                     # 生成连续子 PDF
                     doc_sub = fitz.open()
                     for p in block:
@@ -3254,8 +3369,10 @@ def run_paddleocr_vl(
                 doc_full.close()
                 if block_mds:
                     joined_blocks = "\n\n".join(block_mds)
-                    if _has_structured_tables_in_md(joined_blocks):
+                    if _has_structured_tables_in_md(joined_blocks) or (time.time() - _vl_t0) > _vl_budget_s:
                         return joined_blocks
+                if (time.time() - _vl_t0) > _vl_budget_s:
+                    return ""
             else:
                 doc_full.close()
         except Exception as e:

@@ -145,6 +145,7 @@ zotero-table-extractor/
 ├── README.zh-CN.md                   # 简体中文完整说明文档
 ├── SKILL.md                          # AI 技能协议定义与架构/CLI 参考（本文件）
 ├── LICENSE                           # Apache License 2.0 开源协议
+├── setup_env.py                      # 🚀 跨平台一键环境与全量依赖安装/就绪自检脚本 (Win/macOS/Linux)
 ├── update.py                         # 🔄 技能在线更新与个人配置绝对防护主入口
 ├── setup_paths.py                    # 🛠 跨平台路径、环境配置与模型校验下载向导
 ├── requirements.txt                  # Python 核心与可选依赖清单

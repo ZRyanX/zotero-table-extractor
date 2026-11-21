@@ -19,6 +19,10 @@ def main():
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     if args.worker:
+        try:
+            import onnxruntime  # noqa: F401
+        except Exception:
+            pass
         from offline_guard import enable
         enable()
         os.chdir(root)

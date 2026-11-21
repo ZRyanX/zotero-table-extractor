@@ -8,6 +8,11 @@ extract_zotero_table.py — 主入口（CLI）：Zotero/本地 PDF 表格提取�
 from __future__ import annotations
 
 try:
+    import onnxruntime  # noqa: F401  # Preload before numpy/pandas/torch on Windows to avoid DLL init 0xC0000005
+except Exception:
+    pass
+
+try:
     from .system_detector import (
         IS_MACOS, IS_WINDOWS, get_paper_tables_dir, get_zotero_db_path,
         get_zotero_storage_dir, get_journal_downloader_script,
@@ -1265,8 +1270,8 @@ def _do_process_single_pdf_impl(pdf_path, orig_pdf_path, args, is_batch=False, p
         except Exception as e:
             print(f"[PDF] 管线异常: {e}，尝试 OCR/切图备用管线...")
 
-    # 当原生结构化管线不可用、未提取到表格或异常失败时，触发 OCR / 切图兜底回退
-    if not pdf_extracted:
+    # 当原生结构化管线不可用时，触发 OCR / 切图兜底回退（若 extract_tables_from_pdf 已带 OCR 兜底运行过则不再整本重复提交）
+    if not pdf_extracted and extract_tables_from_pdf is None:
         print("[PDF] 正在进入 PaddleOCR / PP-StructureV3 兜底切图回退管线...")
         if ocr_client:
             try:

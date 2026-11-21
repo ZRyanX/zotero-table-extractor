@@ -217,18 +217,23 @@ flowchart TB
 - **Ubuntu / Debian**：`sudo apt update && sudo apt install -y ghostscript libgl1-mesa-glx tesseract-ocr`
 - **Windows**：安装 [Ghostscript](https://ghostscript.com/releases/gsdnld.html) 并将其 `bin` 目录加入系统 `PATH`。
 
-### 3. 安装 Python 依赖
+### 3. 一键跨平台环境与依赖安装（`setup_env.py`，推荐）
 
 ```bash
 git clone https://github.com/ZRyanX/zotero-table-extractor.git
 cd zotero-table-extractor
 
-uv pip install -r requirements.txt
-# 或使用 pip
-pip install -r requirements.txt
+# 一键安装核心依赖、本地 PDF 多引擎、在线爬虫、Playwright Chromium 与 ONNX 模型
+python setup_env.py
+
+# 额外安装重量级离线兜底引擎（IBM Docling + Camelot）
+python setup_env.py --all
+
+# 仅检查当前环境就绪状态（模块导入、Chromium、ONNX 模型、config.json）
+python setup_env.py --check
 ```
 
-`requirements.txt` 中还列出了可选增强包（`gmft`、`img2table`、`pymupdf4llm`、`rapid-table`、`rapidocr`、`table-structure-rec`、`pyzotero`、`scrapling`、`crawl4ai`），未安装时运行期会自动平滑降级。
+也可从 `requirements.txt` 手动安装（`uv pip install -r requirements.txt` / `pip install -r requirements.txt`）；未安装的可选增强包（`gmft`、`img2table`、`pymupdf4llm`、`rapid-table`、`rapidocr`、`pyzotero`、`scrapling`、`crawl4ai`）会在运行期自动平滑降级。
 
 ### 4. 安装 Playwright 浏览器内核（用于动态期刊渲染）
 ```bash

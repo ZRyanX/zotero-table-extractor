@@ -233,19 +233,23 @@ Needed only if you want `Camelot` or `tesseract`-backed OCR fallbacks (`img2tabl
   ```
 - **Windows**: Install [Ghostscript](https://ghostscript.com/releases/gsdnld.html) and add its `bin` directory to `PATH`.
 
-### 3. Install Python Dependencies
+### 3. One-Command Cross-Platform Environment Setup (`setup_env.py`, Recommended)
 
 ```bash
 git clone https://github.com/ZRyanX/zotero-table-extractor.git
 cd zotero-table-extractor
 
-# Core dependencies (recommended with uv)
-uv pip install -r requirements.txt
-# Or standard pip
-pip install -r requirements.txt
+# Install core + local PDF engines + online scrapers + Playwright Chromium + ONNX models
+python setup_env.py
+
+# Include heavy optional engines too (IBM Docling + Camelot)
+python setup_env.py --all
+
+# Check environment readiness (imports, Chromium, models, config.json)
+python setup_env.py --check
 ```
 
-Optional enhanced engines commented in `requirements.txt` (`gmft`, `img2table`, `pymupdf4llm`, `rapid-table`, `rapidocr`, `table-structure-rec`, `pyzotero`, `scrapling`, `crawl4ai`) can be installed as needed—the pipeline degrades gracefully if any optional package is absent.
+Or install manually from `requirements.txt` (`uv pip install -r requirements.txt` / `pip install -r requirements.txt`). Optional enhanced engines (`gmft`, `img2table`, `pymupdf4llm`, `rapid-table`, `rapidocr`, `pyzotero`, `scrapling`, `crawl4ai`) degrade gracefully if any package is absent.
 
 ### 4. Install Playwright Browser Runtime (for Dynamic Publisher Pages)
 
