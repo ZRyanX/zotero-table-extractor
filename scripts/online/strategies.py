@@ -25,12 +25,28 @@ except ImportError:
     requests_impersonate = None
 
 try:
-    from ..playwright_utils import find_playwright_chromium
+    from ..playwright_utils import (
+        find_playwright_chromium,
+        resolve_sync_playwright,
+        extract_browser_pid,
+        close_browser_safely,
+        get_thread_browser_pool,
+    )
 except ImportError:
     try:
-        from playwright_utils import find_playwright_chromium
+        from playwright_utils import (
+            find_playwright_chromium,
+            resolve_sync_playwright,
+            extract_browser_pid,
+            close_browser_safely,
+            get_thread_browser_pool,
+        )
     except ImportError:
         find_playwright_chromium = lambda: None
+        resolve_sync_playwright = None
+        extract_browser_pid = lambda **kwargs: None
+        close_browser_safely = lambda **kwargs: None
+        get_thread_browser_pool = None
 
 
 # Aliases to shared helpers (kept as bare names so call sites are unchanged)
@@ -38,6 +54,7 @@ get_cnki_cookies_path = common.get_cnki_cookies_path
 get_crawl4ai_cookies_path = common.get_crawl4ai_cookies_path
 load_config = common.load_config
 load_cookies_from_file = common.load_cookies_from_file
+get_requests_proxies = getattr(common, "get_requests_proxies", lambda config=None: None)
 build_elsevier_headers = getattr(
     common,
     "build_elsevier_headers",
@@ -237,7 +254,11 @@ def interactive_cnki_cookie_capture():
     captures the cookies upon closing, and saves them to the home directory.
     """
     try:
-        from playwright.sync_api import sync_playwright
+        if resolve_sync_playwright:
+            _cnki_sync_pw, _cnki_eng = resolve_sync_playwright(prefer_patchright=True)
+        else:
+            from playwright.sync_api import sync_playwright as _cnki_sync_pw
+            _cnki_eng = "playwright"
         import json
         
         cookies_path = get_cnki_cookies_path()
@@ -249,12 +270,13 @@ def interactive_cnki_cookie_capture():
         print("  程序会自动获取并保存您的登录 Cookies 到本地用户文件夹下。")
         print("==================================================\n")
         
-        with sync_playwright() as p:
+        with _cnki_sync_pw() as p:
             # Launch headed browser
             exec_path = find_playwright_chromium()
             if exec_path:
                 print(f"[Playwright] 使用自动识别的 Chromium 路径: {exec_path}")
             browser = p.chromium.launch(headless=False, executable_path=exec_path)
+            _cnki_pid = extract_browser_pid(browser=browser, playwright_obj=p)
             context = browser.new_context(
                 viewport={"width": 1280, "height": 800},
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
@@ -821,14 +843,114 @@ def extract_tables_via_paper_fetch(doi_or_url, table_idx="all", cancel_event=Non
     return []
 
 
-def extract_tables_via_elsevier_api(doi, table_idx="all"):
+def _elsevier_api_get(url, headers, params=None, timeout=20, proxies=None, cancel_event=None, max_retries=2):
+    """Elsevier API GET helper with 429 Retry-After/exponential backoff and optional proxy passthrough."""
+    req_kwargs = {"headers": headers, "timeout": timeout}
+    if params is not None:
+        req_kwargs["params"] = params
+    if proxies:
+        req_kwargs["proxies"] = proxies
+
+    resp = None
+    for attempt in range(max_retries + 1):
+        if cancel_event is not None and cancel_event.is_set():
+            return None
+        resp = requests.get(url, **req_kwargs)
+        if resp.status_code != 429 or attempt >= max_retries:
+            return resp
+        hdrs = getattr(resp, "headers", None) or {}
+        retry_after = hdrs.get("Retry-After") or hdrs.get("retry-after")
+        try:
+            wait_s = min(max(0.5, float(retry_after)), 30.0) if retry_after else min(2.0 * (2 ** attempt), 30.0)
+        except (TypeError, ValueError):
+            wait_s = min(2.0 * (2 ** attempt), 30.0)
+        print(f"[Elsevier API] 触发 429 限流，{wait_s:.1f}s 后重试 ({attempt + 1}/{max_retries})...")
+        if cancel_event is not None:
+            if cancel_event.wait(wait_s):
+                return None
+        else:
+            time.sleep(wait_s)
+    return resp
+
+
+def _extract_elsevier_status_text(resp):
+    """Extract <statusCode>/<statusText> (XML/JSON) or X-ELS-Status header from an Elsevier API response."""
+    if resp is None:
+        return "", ""
+    hdrs = getattr(resp, "headers", None) or {}
+    els_hdr = str(hdrs.get("X-ELS-Status") or hdrs.get("x-els-status") or "").strip()
+    body = str(getattr(resp, "text", "") or "")
+    status_code = ""
+    status_text = ""
+
+    m_code = re.search(r"<statusCode[^>]*>(.*?)</statusCode>", body, re.IGNORECASE | re.DOTALL)
+    m_text = re.search(r"<statusText[^>]*>(.*?)</statusText>", body, re.IGNORECASE | re.DOTALL)
+    if m_code:
+        status_code = re.sub(r"\s+", " ", m_code.group(1)).strip()
+    if m_text:
+        status_text = re.sub(r"\s+", " ", m_text.group(1)).strip()
+
+    if not status_code and not status_text:
+        try:
+            jdata = resp.json()
+            if isinstance(jdata, dict):
+                st = (jdata.get("service-error") or {}).get("status") or {}
+                status_code = str(st.get("statusCode") or "").strip()
+                status_text = str(st.get("statusText") or "").strip()
+        except Exception:
+            pass
+
+    if not status_text and els_hdr:
+        status_text = els_hdr
+    return status_code, status_text
+
+
+def _diagnose_elsevier_403(resp, doi, headers, proxies=None, cancel_event=None):
+    """On Elsevier HTTP 403, extract or probe view=META <statusText> for actionable entitlement/auth diagnostics."""
+    code, text = _extract_elsevier_status_text(resp)
+    if not text and doi and (cancel_event is None or not cancel_event.is_set()):
+        try:
+            meta_url = f"https://api.elsevier.com/content/article/doi/{doi}"
+            meta_resp = _elsevier_api_get(
+                meta_url,
+                headers=headers,
+                params={"view": "META"},
+                timeout=10,
+                proxies=proxies,
+                cancel_event=cancel_event,
+                max_retries=0,
+            )
+            m_code, m_text = _extract_elsevier_status_text(meta_resp)
+            code = code or m_code
+            text = text or m_text
+        except Exception:
+            pass
+
+    diag = " / ".join(p for p in (code, text) if p)
+    hint = ""
+    low_diag = diag.lower()
+    if any(k in low_diag for k in ("entitlement", "authorization", "insttoken", "subscriber", "not entitled")):
+        hint = "（提示：需配置机构 X-ELS-InstToken 或在校园网 IP 下访问全文权限）"
+    elif "authentication" in low_diag or "api key" in low_diag:
+        hint = "（提示：请检查 ELSEVIER_API_KEY 是否有效）"
+    if diag:
+        print(f"[Elsevier API] HTTP 403 诊断: {diag}{hint}")
+    else:
+        print("[Elsevier API] HTTP 403 诊断: 无详细 statusText（可能缺少机构订阅权限或 X-ELS-InstToken）")
+    return diag
+
+
+def extract_tables_via_elsevier_api(doi, table_idx="all", cancel_event=None):
     """
     Extracts tables from Elsevier articles using the Elsevier Full-Text Retrieval API.
     Always uses the DOI endpoint (/content/article/doi/{DOI}) which has proper auth.
     Returns XOCS XML containing <ce:table> elements — no browser needed.
     Requires ELSEVIER_API_KEY in config.json, companion config, or environment.
     Automatically attaches X-ELS-InstToken when ELSEVIER_INSTTOKEN is configured.
+    Supports 429 Retry-After backoff, NETWORK_PROXY passthrough, and 403 view=META diagnostics.
     """
+    if cancel_event is not None and cancel_event.is_set():
+        return []
     try:
         config = load_config()
         headers = build_elsevier_headers(config, accept="text/xml")
@@ -836,23 +958,38 @@ def extract_tables_via_elsevier_api(doi, table_idx="all"):
             return []
         els_key = headers["X-ELS-APIKey"]
         insttoken = headers.get("X-ELS-InstToken", "")
+        proxies = get_requests_proxies(config)
 
         api_url = f"https://api.elsevier.com/content/article/doi/{doi}"
         print(f"[Elsevier API] \u6b63\u5728\u83b7\u53d6 XOCS XML: {doi}")
-        resp = requests.get(api_url, headers=headers, timeout=20)
+        resp = _elsevier_api_get(
+            api_url,
+            headers=headers,
+            timeout=20,
+            proxies=proxies,
+            cancel_event=cancel_event,
+        )
+        if resp is None:
+            return []
         if resp.status_code != 200:
             print(f"[Elsevier API] \u8bf7\u6c42\u5931\u8d25: HTTP {resp.status_code}")
+            if resp.status_code == 403:
+                _diagnose_elsevier_403(resp, doi, headers, proxies=proxies, cancel_event=cancel_event)
             return []
         
         tables = _parse_elsevier_xocs_tables(resp.text, table_idx)
-        tables.extend(extract_elsevier_supplementary_tables(doi, els_key, insttoken=insttoken))
+        tables.extend(
+            extract_elsevier_supplementary_tables(
+                doi, els_key, insttoken=insttoken, proxies=proxies, cancel_event=cancel_event
+            )
+        )
         return tables
     except Exception as e:
         print(f"[Elsevier API] \u63d0\u53d6\u5931\u8d25: {e}")
         return []
 
 
-def extract_elsevier_supplementary_tables(doi, api_key, insttoken=""):
+def extract_elsevier_supplementary_tables(doi, api_key, insttoken="", proxies=None, cancel_event=None):
     """
     Finds and extracts tables from all non-image supplementary attachments
     associated with an Elsevier article using the Elsevier Object API.
@@ -867,13 +1004,18 @@ def extract_elsevier_supplementary_tables(doi, api_key, insttoken=""):
         fitz = None
         
     supplementary_dfs = []
-    if not api_key:
+    if not api_key or (cancel_event is not None and cancel_event.is_set()):
         return supplementary_dfs
-    if not insttoken:
+    cfg = None
+    if not insttoken or proxies is None:
         try:
-            insttoken = str((load_config() or {}).get("ELSEVIER_INSTTOKEN") or os.environ.get("ELSEVIER_INSTTOKEN") or "").strip()
+            cfg = load_config() or {}
         except Exception:
-            insttoken = str(os.environ.get("ELSEVIER_INSTTOKEN") or "").strip()
+            cfg = {}
+    if not insttoken:
+        insttoken = str((cfg or {}).get("ELSEVIER_INSTTOKEN") or os.environ.get("ELSEVIER_INSTTOKEN") or "").strip()
+    if proxies is None:
+        proxies = get_requests_proxies(cfg)
 
     try:
         # Step 1: Fetch attachment metadata using DOI
@@ -888,9 +1030,17 @@ def extract_elsevier_supplementary_tables(doi, api_key, insttoken=""):
             "view": "META"
         }
         print(f"[Elsevier API] Fetching supplementary metadata for DOI: {doi}")
-        resp = requests.get(api_url, headers=headers, params=params, timeout=20)
-        if resp.status_code != 200:
-            print(f"[Elsevier API] Supplementary metadata request failed: HTTP {resp.status_code}")
+        resp = _elsevier_api_get(
+            api_url,
+            headers=headers,
+            params=params,
+            timeout=20,
+            proxies=proxies,
+            cancel_event=cancel_event,
+        )
+        if resp is None or resp.status_code != 200:
+            if resp is not None:
+                print(f"[Elsevier API] Supplementary metadata request failed: HTTP {resp.status_code}")
             return supplementary_dfs
             
         data = resp.json()
@@ -902,6 +1052,8 @@ def extract_elsevier_supplementary_tables(doi, api_key, insttoken=""):
         print(f"[Elsevier API] Found {len(attachments)} total attachments. Filtering for non-image files...")
         
         for att in attachments:
+            if cancel_event is not None and cancel_event.is_set():
+                break
             mimetype = (att.get("mimetype") or "").lower()
             filename = (att.get("filename") or "").lower()
             ref = att.get("ref") or ""
@@ -925,9 +1077,16 @@ def extract_elsevier_supplementary_tables(doi, api_key, insttoken=""):
             dl_headers = {"X-ELS-APIKey": api_key}
             if insttoken:
                 dl_headers["X-ELS-InstToken"] = insttoken
-            dl_resp = requests.get(dl_url, headers=dl_headers, timeout=30)
-            if dl_resp.status_code != 200:
-                print(f"[Elsevier API] Failed to download {filename}: HTTP {dl_resp.status_code}")
+            dl_resp = _elsevier_api_get(
+                dl_url,
+                headers=dl_headers,
+                timeout=30,
+                proxies=proxies,
+                cancel_event=cancel_event,
+            )
+            if dl_resp is None or dl_resp.status_code != 200:
+                if dl_resp is not None:
+                    print(f"[Elsevier API] Failed to download {filename}: HTTP {dl_resp.status_code}")
                 continue
                 
             content_bytes = dl_resp.content
@@ -1012,10 +1171,439 @@ def extract_elsevier_supplementary_tables(doi, api_key, insttoken=""):
     return supplementary_dfs
 
 
-def extract_general_supplementary_tables(url, cancel_event=None, max_timeout=30):
+_SUPP_STRONG_URL_RE = re.compile(
+    r"(?:/mediaobjects/|/action/downloadsupplement|/suppl(?:ement(?:ary)?)?/|/suppdata/|/suppinfo/"
+    r"|/esm\d*|moesm\d*|mmc\d+|table[_-]?s\d+|supplementary[_-]?table|additional[_-]?file"
+    r"|extdata|supporting[_-]?info|source[_-]?data|appendix[_-]?table)",
+    re.IGNORECASE,
+)
+_SUPP_WEAK_TEXT_RE = re.compile(
+    r"(?:supplementary|supplemental|supporting\s+info(?:rmation)?|additional\s+file"
+    r"|extended\s+data|electronic\s+supplementary|source\s+data|appendix\s+table"
+    r"|table\s*s\d+|dataset|esm\s*\d+|附表|补充材料|补充表|附件)",
+    re.IGNORECASE,
+)
+_SUPP_ALLOWED_EXTS = (".xlsx", ".xls", ".csv", ".tsv", ".docx", ".zip", ".pdf")
+_SUPP_TABULAR_EXTS = (".xlsx", ".xls", ".csv", ".tsv", ".docx", ".zip")
+_SUPP_IGNORED_EXTS = (
+    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".tif", ".tiff", ".bmp", ".webp",
+    ".mp4", ".mov", ".avi", ".webm", ".mp3", ".wav",
+    ".bib", ".ris", ".enw", ".css", ".js", ".ico", ".woff", ".woff2",
+)
+_SUPP_MAIN_PDF_RE = re.compile(
+    r"(?:/doi/e?pdf/|/content/pdf/|/pdfdirect/|/(?:am|main|article|fulltext)\.pdf(?:\?|$)|download=fulltext)",
+    re.IGNORECASE,
+)
+_SUPP_REJECT_CTYPES = (
+    "text/html",
+    "application/xhtml",
+    "image/",
+    "video/",
+    "audio/",
+    "text/css",
+    "javascript",
+)
+
+
+def _parse_supplementary_bytes(content_bytes, filename, content_type="", _depth=0):
+    """Parse supplementary attachment bytes (.xlsx/.xls/.csv/.tsv/.docx/.pdf/.zip) into DataFrames."""
+    import zipfile
+    import xml.etree.ElementTree as ET
+
+    try:
+        import fitz
+    except ImportError:
+        fitz = None
+
+    if not content_bytes:
+        return []
+    fname = (filename or "supplementary").strip()
+    low_name = fname.lower()
+    ctype = (content_type or "").lower()
+    filename_no_ext = os.path.splitext(os.path.basename(fname))[0] or "supplementary"
+    dfs = []
+
+    # Magic byte / content-type format detection
+    is_zip_magic = content_bytes[:4] == b"PK\x03\x04"
+    is_pdf_magic = content_bytes[:5] == b"%PDF-"
+    is_ole_magic = content_bytes[:4] == b"\xd0\xcf\x11\xe0"
+
+    # 1. Excel (.xlsx / .xls)
+    if (
+        low_name.endswith((".xlsx", ".xls"))
+        or "spreadsheetml" in ctype
+        or "ms-excel" in ctype
+        or (is_ole_magic and not low_name.endswith(".doc"))
+    ):
+        try:
+            excel_data = pd.read_excel(io.BytesIO(content_bytes), sheet_name=None)
+            for sheet_name, df in excel_data.items():
+                if not df.empty and df.shape[0] >= 1 and df.shape[1] >= 1:
+                    tbl_label = (
+                        f"Supplementary Table {filename_no_ext}_{sheet_name}"
+                        if len(excel_data) > 1
+                        else f"Supplementary Table {filename_no_ext}"
+                    )
+                    df.attrs["label"] = tbl_label
+                    df.attrs["table_title"] = f"Supplementary Table from sheet '{sheet_name}' in file '{fname}'"
+                    df.attrs["extractor"] = "builtin_supplementary"
+                    dfs.append(df)
+            return dfs
+        except Exception as ex:
+            print(f"  -> [Built-in Supp] 解析 Excel 失败 {fname}: {ex}")
+            return []
+
+    # 2. CSV / TSV
+    if low_name.endswith((".csv", ".tsv")) or "text/csv" in ctype or "tab-separated-values" in ctype:
+        try:
+            sep = "\t" if (low_name.endswith(".tsv") or "tab-separated" in ctype) else ","
+            text_val = content_bytes.decode("utf-8-sig", errors="replace")
+            if text_val.lstrip().lower().startswith(("<!doctype", "<html")):
+                return []
+            df = pd.read_csv(io.StringIO(text_val), sep=sep, dtype=str, keep_default_na=False)
+            if not df.empty and df.shape[0] >= 1 and df.shape[1] >= 2:
+                df.attrs["label"] = f"Supplementary Table {filename_no_ext}"
+                df.attrs["table_title"] = f"Supplementary Table from file '{fname}'"
+                df.attrs["extractor"] = "builtin_supplementary"
+                dfs.append(df)
+            return dfs
+        except Exception as ex:
+            print(f"  -> [Built-in Supp] 解析 CSV/TSV 失败 {fname}: {ex}")
+            return []
+
+    # 3. Word (.docx)
+    if low_name.endswith(".docx") or "wordprocessingml" in ctype:
+        try:
+            with zipfile.ZipFile(io.BytesIO(content_bytes)) as zf:
+                xml_content = zf.read("word/document.xml")
+            ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+            root = ET.fromstring(xml_content)
+            tables = root.findall(".//w:tbl", ns)
+            for t_idx, tbl in enumerate(tables):
+                rows_data = []
+                for row in tbl.findall(".//w:tr", ns):
+                    row_data = []
+                    for cell in row.findall(".//w:tc", ns):
+                        cell_text = "".join(t.text for t in cell.findall(".//w:t", ns) if t.text)
+                        row_data.append(cell_text.strip())
+                    if row_data:
+                        rows_data.append(row_data)
+                if rows_data:
+                    df = _rows_to_dataframe(rows_data)
+                    if not df.empty:
+                        tbl_label = (
+                            f"Supplementary Table {filename_no_ext}"
+                            if len(tables) == 1
+                            else f"Supplementary Table {filename_no_ext}_T{t_idx + 1}"
+                        )
+                        df.attrs["label"] = tbl_label
+                        df.attrs["table_title"] = f"Supplementary Table {t_idx + 1} from file '{fname}'"
+                        df.attrs["extractor"] = "builtin_supplementary"
+                        dfs.append(df)
+            return dfs
+        except Exception as ex:
+            print(f"  -> [Built-in Supp] 解析 Word 失败 {fname}: {ex}")
+            return []
+
+    # 4. ZIP archive (bounded single-level expansion with zip-bomb guard)
+    if (low_name.endswith(".zip") or "application/zip" in ctype or is_zip_magic) and _depth == 0:
+        try:
+            with zipfile.ZipFile(io.BytesIO(content_bytes)) as zf:
+                names = zf.namelist()
+                # Distinguish OOXML (.xlsx / .docx) packaged without file extension
+                if "xl/workbook.xml" in names:
+                    return _parse_supplementary_bytes(content_bytes, f"{filename_no_ext}.xlsx", _depth=1)
+                if "word/document.xml" in names:
+                    return _parse_supplementary_bytes(content_bytes, f"{filename_no_ext}.docx", _depth=1)
+                total_uncompressed = 0
+                parsed_count = 0
+                for info in zf.infolist():
+                    if info.is_dir() or info.filename.startswith("__MACOSX/"):
+                        continue
+                    inner_low = info.filename.lower()
+                    if not inner_low.endswith((".xlsx", ".xls", ".csv", ".tsv", ".docx")):
+                        continue
+                    if info.file_size > 20 * 1024 * 1024 or total_uncompressed + info.file_size > 50 * 1024 * 1024:
+                        continue
+                    total_uncompressed += info.file_size
+                    inner_bytes = zf.read(info.filename)
+                    dfs.extend(_parse_supplementary_bytes(inner_bytes, os.path.basename(info.filename), _depth=1))
+                    parsed_count += 1
+                    if parsed_count >= 10:
+                        break
+            return dfs
+        except Exception as ex:
+            print(f"  -> [Built-in Supp] 解析 ZIP 失败 {fname}: {ex}")
+            return []
+
+    # 5. PDF
+    if low_name.endswith(".pdf") or "application/pdf" in ctype or is_pdf_magic:
+        if fitz is None:
+            return []
+        try:
+            with fitz.open(stream=content_bytes, filetype="pdf") as pdf_doc:
+                for p_idx in range(min(len(pdf_doc), 30)):
+                    page = pdf_doc[p_idx]
+                    try:
+                        finder = page.find_tables()
+                        tbl_list = list(finder.tables) if finder and finder.tables else []
+                    except Exception:
+                        tbl_list = []
+                    if not tbl_list:
+                        try:
+                            finder = page.find_tables(strategy="text")
+                            tbl_list = list(finder.tables) if finder and finder.tables else []
+                        except Exception:
+                            tbl_list = []
+                    for t_idx, table in enumerate(tbl_list):
+                        rows = table.extract()
+                        if rows and len(rows) >= 2 and len(rows[0]) >= 2:
+                            df = _rows_to_dataframe(rows)
+                            if not df.empty:
+                                tbl_label = (
+                                    f"Supplementary Table {filename_no_ext}_P{p_idx + 1}"
+                                    if len(tbl_list) == 1
+                                    else f"Supplementary Table {filename_no_ext}_P{p_idx + 1}_T{t_idx + 1}"
+                                )
+                                df.attrs["label"] = tbl_label
+                                df.attrs["table_title"] = f"Supplementary Table from page {p_idx + 1} of file '{fname}'"
+                                df.attrs["extractor"] = "builtin_supplementary"
+                                dfs.append(df)
+            return dfs
+        except Exception as ex:
+            print(f"  -> [Built-in Supp] 解析 PDF 失败 {fname}: {ex}")
+            return []
+
+    return dfs
+
+
+def _discover_supplementary_links(base_url, html_content, max_links=6):
+    """
+    从文章 HTML 中零依赖发现补充材料表格下载链接（强/弱特征分级 + 过滤正文 PDF 与图像/引文链接）。
+    返回按优先级排序的 [{"url": str, "score": int, "filename": str, "marker": "strong"|"weak"}, ...]。
+    """
+    if not html_content:
+        return []
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        return []
+
+    try:
+        soup = BeautifulSoup(html_content, "html.parser")
+    except Exception:
+        return []
+
+    scored = {}
+    for a in soup.find_all("a", href=True):
+        raw_href = (a.get("href") or "").strip()
+        if not raw_href or raw_href.startswith(("#", "javascript:", "mailto:", "tel:")):
+            continue
+        abs_url = urllib.parse.urljoin(base_url or "", raw_href)
+        parsed = urllib.parse.urlparse(abs_url)
+        if parsed.scheme not in ("http", "https"):
+            continue
+
+        path_low = (parsed.path or "").lower()
+        full_low = abs_url.lower()
+        if any(path_low.endswith(ext) for ext in _SUPP_IGNORED_EXTS):
+            continue
+        if _SUPP_MAIN_PDF_RE.search(full_low):
+            continue
+
+        anchor_text = " ".join((a.get_text(" ", strip=True) or "").split())
+        title_attr = str(a.get("title") or a.get("aria-label") or a.get("data-track-label") or "")
+        parent_text = ""
+        if a.parent is not None:
+            parent_text = " ".join((a.parent.get_text(" ", strip=True) or "")[:240].split())
+        context_text = f"{anchor_text} {title_attr} {parent_text}"
+
+        has_tabular_ext = any(path_low.endswith(ext) for ext in _SUPP_TABULAR_EXTS)
+        has_pdf_ext = path_low.endswith(".pdf")
+        has_strong_url = bool(_SUPP_STRONG_URL_RE.search(full_low))
+        has_weak_text = bool(_SUPP_WEAK_TEXT_RE.search(context_text))
+
+        score = 0
+        marker = ""
+        if has_strong_url and has_tabular_ext:
+            score = 100
+            marker = "strong"
+        elif has_strong_url:
+            score = 80 if not has_pdf_ext else 70
+            marker = "strong"
+        elif has_tabular_ext and has_weak_text:
+            score = 75
+            marker = "strong"
+        elif has_tabular_ext:
+            # 裸 .xlsx/.xls/.csv/.tsv 链接（非引文）亦具较高表格概率
+            if any(path_low.endswith(e) for e in (".xlsx", ".xls", ".csv", ".tsv")):
+                score = 65
+                marker = "strong"
+            else:
+                continue
+        elif has_pdf_ext and has_weak_text:
+            score = 45
+            marker = "weak"
+        else:
+            continue
+
+        # 轻微加权优先电子表格（Excel/CSV）高于 PDF
+        if any(path_low.endswith(e) for e in (".xlsx", ".xls", ".csv", ".tsv")):
+            score += 15
+        elif path_low.endswith(".docx"):
+            score += 8
+
+        fname = os.path.basename(urllib.parse.unquote(parsed.path)) or "supplementary"
+        prev = scored.get(abs_url)
+        if prev is None or score > prev["score"]:
+            scored[abs_url] = {
+                "url": abs_url,
+                "score": score,
+                "filename": fname,
+                "marker": marker,
+            }
+
+    ranked = sorted(scored.values(), key=lambda x: (-x["score"], x["url"]))
+    return ranked[:max_links]
+
+
+def _build_requests_cookie_jar(cookies_list, url=None):
+    """Convert Playwright/companion cookie dicts into a requests CookieJar."""
+    jar = requests.cookies.RequestsCookieJar()
+    for c in cookies_list or []:
+        if not isinstance(c, dict) or not c.get("name") or c.get("value") is None:
+            continue
+        dom = c.get("domain")
+        if not dom and url:
+            dom = urllib.parse.urlparse(url).hostname
+        try:
+            jar.set(
+                str(c["name"]),
+                str(c["value"]),
+                domain=dom,
+                path=c.get("path") or "/",
+            )
+        except Exception:
+            pass
+    return jar
+
+
+def extract_builtin_supplementary_tables(
+    url,
+    html_content=None,
+    cookies=None,
+    cancel_event=None,
+    max_files=6,
+    max_timeout=25,
+):
+    """
+    零外部依赖的内置补充材料表格发现与解析回退通道（当外部 journal-supp-downloader 不可用时启用）。
+    特点：
+    - 复用浏览器/伴生工具 Cookie 与可选 NETWORK_PROXY；
+    - 强/弱特征链接分级筛选，严格过滤正文 PDF 与图像/引文链接；
+    - 下载前校验 Content-Type 与 HTML 软拦截响应，25MB 体积上限与 cancel_event 协作取消。
+    """
+    if not url or (cancel_event is not None and cancel_event.is_set()):
+        return []
+
+    deadline = time.monotonic() + max(5.0, float(max_timeout or 25))
+    config = load_config() if callable(load_config) else {}
+    proxies = get_requests_proxies(config)
+    fetch_base_url = url
+    try:
+        from .proxy_rewriter import maybe_rewrite_institutional_url
+    except Exception:
+        maybe_rewrite_institutional_url = None
+    if maybe_rewrite_institutional_url and (config.get("EZPROXY_ENABLED") or config.get("WEBVPN_ENABLED")):
+        fetch_base_url = maybe_rewrite_institutional_url(url, config=config)
+    cookie_list = cookies if cookies is not None else _collect_domain_cookies_for_scrapling(fetch_base_url)
+    cookie_jar = _build_requests_cookie_jar(cookie_list, url=fetch_base_url)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "Accept": "*/*",
+        "Referer": fetch_base_url,
+    }
+
+    def _get(target_u, timeout_s):
+        req_kw = {
+            "headers": headers,
+            "cookies": cookie_jar,
+            "timeout": max(3.0, min(timeout_s, 15.0)),
+            "allow_redirects": True,
+        }
+        if proxies:
+            req_kw["proxies"] = proxies
+        return requests.get(target_u, **req_kw)
+
+    page_html = html_content
+    if not page_html:
+        rem = deadline - time.monotonic()
+        if rem <= 1.0:
+            return []
+        try:
+            resp = _get(fetch_base_url, rem)
+            if resp.status_code == 200 and resp.text and not is_anti_bot_blocked("", resp.text[:4000]):
+                page_html = resp.text
+        except Exception as e:
+            print(f"[Built-in Supp] 获取文章主页 HTML 失败: {e}")
+            return []
+
+    if not page_html:
+        return []
+
+    candidates = _discover_supplementary_links(fetch_base_url, page_html, max_links=max_files)
+    if not candidates:
+        return []
+
+    print(f"[Built-in Supp] 发现 {len(candidates)} 个候选补充材料链接，开始校验下载并解析...")
+    all_dfs = []
+    max_bytes = 25 * 1024 * 1024
+
+    for item in candidates:
+        if cancel_event is not None and cancel_event.is_set():
+            break
+        rem = deadline - time.monotonic()
+        if rem <= 1.0:
+            break
+        dl_url = item["url"]
+        try:
+            r = _get(dl_url, rem)
+            if r.status_code != 200:
+                continue
+            r_hdrs = getattr(r, "headers", None) or {}
+            ctype = str(r_hdrs.get("Content-Type") or "").lower()
+            if any(bad in ctype for bad in _SUPP_REJECT_CTYPES):
+                continue
+            content_bytes = getattr(r, "content", None) or b""
+            if not content_bytes or len(content_bytes) > max_bytes:
+                continue
+            head_low = content_bytes[:512].lstrip().lower()
+            if head_low.startswith((b"<!doctype html", b"<html")):
+                continue
+
+            fname = item["filename"]
+            cd = str(r_hdrs.get("Content-Disposition") or "")
+            m_cd = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";\r\n]+)"?', cd, re.IGNORECASE)
+            if m_cd:
+                fname = urllib.parse.unquote(m_cd.group(1).strip())
+
+            parsed_dfs = _parse_supplementary_bytes(content_bytes, fname, content_type=ctype)
+            if parsed_dfs:
+                all_dfs.extend(parsed_dfs)
+        except Exception as ex:
+            print(f"[Built-in Supp] 下载/解析 {dl_url} 跳过: {ex}")
+
+    if all_dfs:
+        print(f"[Built-in Supp] 内置补充材料通道成功提取 {len(all_dfs)} 张补充表格。")
+    return all_dfs
+
+
+def extract_general_supplementary_tables(url, cancel_event=None, max_timeout=30, html_content=None):
     """
     Calls the journal-supp-downloader script to download supplementary files,
     then parses tables from them in-memory or from temp files.
+    When the external journal-supp-downloader skill is unavailable, automatically falls back
+    to the zero-dependency built-in supplementary table link discovery extractor.
     Supports cooperative cancellation via cancel_event and terminates the child
     process tree immediately on cancel or timeout.
     """
@@ -1038,14 +1626,27 @@ def extract_general_supplementary_tables(url, cancel_event=None, max_timeout=30)
 
     supplementary_dfs = []
     
-    # Locate the journal_downloader.py script in the workspace
-    skill_dir = common.get_skill_root()
-    skills_root = os.path.dirname(skill_dir)
-    downloader_script = os.path.join(skills_root, "journal-supp-downloader", "scripts", "journal_downloader.py")
+    # Locate the journal_downloader.py script (configured path first, then sibling skill dir)
+    downloader_script = ""
+    try:
+        cfg_dl = (load_config() or {}).get("SUPP_DOWNLOADER_SCRIPT")
+        if cfg_dl and os.path.exists(cfg_dl):
+            downloader_script = cfg_dl
+    except Exception:
+        pass
+    if not downloader_script:
+        skill_dir = common.get_skill_root()
+        skills_root = os.path.dirname(skill_dir)
+        downloader_script = os.path.join(skills_root, "journal-supp-downloader", "scripts", "journal_downloader.py")
     
     if not os.path.exists(downloader_script):
-        print(f"[在线提取] 找不到 journal-supp-downloader 技能脚本: {downloader_script}")
-        return supplementary_dfs
+        print(f"[在线提取] 找不到 journal-supp-downloader 技能脚本 ({downloader_script})，启用内置零依赖补充材料发现回退...")
+        return extract_builtin_supplementary_tables(
+            url,
+            html_content=html_content,
+            cancel_event=cancel_event,
+            max_timeout=max_timeout,
+        )
         
     temp_dir = tempfile.mkdtemp(prefix="supp_dl_")
     try:
@@ -1403,9 +2004,9 @@ def _parse_elsevier_xocs_tables(xml_content, table_idx="all"):
         return []
 
 
-def _parse_jats_xml_tables(xml_content, table_idx="all"):
+def _parse_jats_xml_tables(xml_content, table_idx="all", source="ncbi_pmc_jats", log_prefix="[NCBI PMC JATS]"):
     """
-    解析 NCBI PMC / NISO JATS XML 中的 <table-wrap> 表格元素为 DataFrames。
+    解析 NISO JATS XML（NCBI PMC / Europe PMC / Springer Nature TDM / Copernicus 等）中的 <table-wrap> 表格元素为 DataFrames。
     支持 XHTML table 规范 (thead, tbody, tr, th, td) 与 CALS 规范 (oasis:table, tgroup)。
     完美保留 rowspan, colspan 拓扑结构、caption 标题以及 table-wrap-foot 尾注。
     保真度 100%，无 OCR 误差。
@@ -1414,7 +2015,7 @@ def _parse_jats_xml_tables(xml_content, table_idx="all"):
     try:
         root = ET.fromstring(xml_content)
     except Exception as e:
-        print(f"[NCBI PMC JATS] XML 解析失败: {e}")
+        print(f"{log_prefix} XML 解析失败: {e}")
         return []
 
     tables_found = []
@@ -1499,8 +2100,8 @@ def _parse_jats_xml_tables(xml_content, table_idx="all"):
                             df.attrs['table_title'] = f"{label_text} {caption_text}".strip()
                         elif label_text:
                             df.attrs['table_title'] = label_text
-                        df.attrs['extractor'] = 'ncbi_pmc_jats'
-                        df.attrs['source'] = 'ncbi_pmc_jats'
+                        df.attrs['extractor'] = source
+                        df.attrs['source'] = source
                         if footnotes:
                             df.attrs['footnotes'] = footnotes
                         tables_found.append(df)
@@ -1514,17 +2115,17 @@ def _parse_jats_xml_tables(xml_content, table_idx="all"):
                     c_df.attrs['label'] = label_text
                 if caption_text:
                     c_df.attrs['table_title'] = f"{label_text} {caption_text}".strip()
-                c_df.attrs['extractor'] = 'ncbi_pmc_jats'
-                c_df.attrs['source'] = 'ncbi_pmc_jats'
+                c_df.attrs['extractor'] = source
+                c_df.attrs['source'] = source
                 if footnotes:
                     c_df.attrs['footnotes'] = footnotes
                 tables_found.append(c_df)
 
     if not tables_found:
-        print("[NCBI PMC JATS] XML 中未找到可解析的表格。")
+        print(f"{log_prefix} XML 中未找到可解析的表格。")
         return []
 
-    print(f"[NCBI PMC JATS] 从 JATS XML 中提取到 {len(tables_found)} 张高保真表格。")
+    print(f"{log_prefix} 从 JATS XML 中提取到 {len(tables_found)} 张高保真表格。")
     if table_idx == "all":
         return tables_found
     elif table_idx == "first":
@@ -1535,6 +2136,164 @@ def _parse_jats_xml_tables(xml_content, table_idx="all"):
             return [tables_found[idx]] if idx < len(tables_found) else tables_found
         except ValueError:
             return tables_found
+
+
+_SPRINGER_NATURE_DOI_PREFIXES = (
+    "10.1007/",
+    "10.1186/",
+    "10.1038/",
+    "10.1023/",
+    "10.1057/",
+    "10.1140/",
+    "10.1365/",
+    "10.1065/",
+    "10.1557/",
+    "10.1134/",
+    "10.1245/",
+    "10.2165/",
+    "10.3758/",
+)
+
+_SPRINGER_NATURE_DOMAINS = (
+    "springer.com",
+    "springernature.com",
+    "nature.com",
+    "biomedcentral.com",
+    "springeropen.com",
+    "palgrave.com",
+)
+
+
+def is_springer_nature_target(doi=None, url=None) -> bool:
+    """Return True if DOI prefix or publisher URL belongs to Springer Nature / BMC / Palgrave / Nature."""
+    if doi:
+        clean = str(doi).strip().lower()
+        if clean.startswith("doi:"):
+            clean = clean[4:].strip()
+        clean = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", clean)
+        if any(clean.startswith(p) for p in _SPRINGER_NATURE_DOI_PREFIXES):
+            return True
+    if url:
+        low_u = str(url).strip().lower()
+        if any(dom in low_u for dom in _SPRINGER_NATURE_DOMAINS):
+            return True
+    return False
+
+
+def extract_tables_via_springer_tdm(doi, table_idx="all", api_key=None, cancel_event=None):
+    """
+    通过 Springer Nature TDM JATS XML API 直接提取高保真表格。
+    Endpoint: https://api.springernature.com/xmldata/jats?q=doi:"{doi}"&p=1&s=1&api_key={key}
+    支持 Springer / BMC / Nature / Kluwer / Palgrave / EPJ 等前缀（10.1007, 10.1186, 10.1038, 10.1023, 10.1057, 10.1140 等）。
+    """
+    if not doi or (cancel_event is not None and cancel_event.is_set()):
+        return []
+
+    cfg = load_config() if callable(load_config) else {}
+    if not cfg.get("SPRINGER_TDM_ENABLED", True):
+        return []
+
+    key = str(api_key or cfg.get("SPRINGER_API_KEY") or os.environ.get("SPRINGER_API_KEY") or "").strip()
+    if not key:
+        return []
+
+    clean_doi = str(doi).strip()
+    if clean_doi.lower().startswith("doi:"):
+        clean_doi = clean_doi[4:].strip()
+    clean_doi = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", clean_doi, flags=re.IGNORECASE).strip()
+    if not clean_doi:
+        return []
+
+    proxies = get_requests_proxies(cfg)
+    query_val = urllib.parse.quote(f'doi:"{clean_doi}"', safe=':"/')
+    api_url = (
+        f"https://api.springernature.com/xmldata/jats"
+        f"?q={query_val}&p=1&s=1&api_key={urllib.parse.quote(key, safe='')}"
+    )
+    headers = {
+        "Accept": "application/xml, text/xml",
+        "User-Agent": "zotero-table-extractor/1.6.0",
+    }
+    req_kwargs = {"headers": headers, "timeout": 20}
+    if proxies:
+        req_kwargs["proxies"] = proxies
+
+    print(f"[Springer TDM JATS] 正在获取 JATS XML: {clean_doi}")
+    try:
+        for attempt in range(2):
+            if cancel_event is not None and cancel_event.is_set():
+                return []
+            resp = requests.get(api_url, **req_kwargs)
+            if resp.status_code == 429 and attempt == 0:
+                hdrs = getattr(resp, "headers", None) or {}
+                retry_after = hdrs.get("Retry-After") or hdrs.get("retry-after")
+                try:
+                    wait_s = min(max(1.0, float(retry_after)), 20.0) if retry_after else 3.0
+                except (TypeError, ValueError):
+                    wait_s = 3.0
+                print(f"[Springer TDM JATS] 触发 429 限流，{wait_s:.1f}s 后重试一次...")
+                if cancel_event is not None:
+                    if cancel_event.wait(wait_s):
+                        return []
+                else:
+                    time.sleep(wait_s)
+                continue
+            if resp.status_code == 200 and resp.text:
+                low_xml = resp.text.lower()
+                if "table-wrap" in low_xml or "<table" in low_xml or ":table" in low_xml:
+                    return _parse_jats_xml_tables(
+                        resp.text,
+                        table_idx=table_idx,
+                        source="springer_tdm_jats",
+                        log_prefix="[Springer TDM JATS]",
+                    )
+            print(f"[Springer TDM JATS] 获取失败或无正文表格: HTTP {resp.status_code}")
+            break
+    except Exception as e:
+        safe_err = str(e).replace(key, "***").replace(urllib.parse.quote(key, safe=""), "***")
+        print(f"[Springer TDM JATS] 获取 JATS XML 异常: {safe_err}")
+    return []
+
+
+def extract_tables_via_europepmc_xml(pmcid, table_idx="all", cancel_event=None):
+    """
+    通过 Europe PMC REST API 直接获取全文 JATS XML (/{pmcid}/fullTextXML) 提取高保真表格。
+    """
+    if not pmcid or (cancel_event is not None and cancel_event.is_set()):
+        return []
+    from .doi_resolver import extract_pmcid
+
+    clean_pmc = (extract_pmcid(pmcid) or str(pmcid).strip().upper())
+    if not clean_pmc.startswith("PMC"):
+        return []
+
+    cfg = load_config() if callable(load_config) else {}
+    proxies = get_requests_proxies(cfg)
+    xml_url = f"https://www.ebi.ac.uk/europepmc/webservices/rest/{clean_pmc}/fullTextXML"
+    headers = {
+        "Accept": "application/xml, text/xml",
+        "User-Agent": "zotero-table-extractor/1.6.0",
+    }
+    req_kwargs = {"headers": headers, "timeout": 15}
+    if proxies:
+        req_kwargs["proxies"] = proxies
+
+    print(f"[Europe PMC JATS] 正在直取全文 JATS XML: {clean_pmc}")
+    try:
+        r = requests.get(xml_url, **req_kwargs)
+        if r.status_code == 200 and r.text:
+            low_xml = r.text.lower()
+            if "table-wrap" in low_xml or "<table" in low_xml or ":table" in low_xml:
+                return _parse_jats_xml_tables(
+                    r.text,
+                    table_idx=table_idx,
+                    source="europepmc_jats",
+                    log_prefix="[Europe PMC JATS]",
+                )
+        print(f"[Europe PMC JATS] 获取失败或无正文表格: HTTP {r.status_code}")
+    except Exception as e:
+        print(f"[Europe PMC JATS] 获取全文 JATS XML 异常: {e}")
+    return []
 
 
 def extract_tables_via_ncbi_pmc(pmcid_or_doi, table_idx="all"):
@@ -1764,7 +2523,12 @@ def _follow_table_subpages(base_url, html_text, fetch_html_fn, table_idx="all", 
             xml_url = urllib.parse.urljoin(base_url, xml_m.group(1))
             xml_text = fetch_html_fn(xml_url)
             if xml_text and "<table-wrap" in xml_text:
-                xml_dfs = _parse_jats_xml_tables(xml_text, table_idx=table_idx)
+                xml_dfs = _parse_jats_xml_tables(
+                    xml_text,
+                    table_idx=table_idx,
+                    source="copernicus_jats",
+                    log_prefix="[Copernicus JATS]",
+                )
                 if xml_dfs:
                     return xml_dfs
 
@@ -1786,7 +2550,7 @@ def _follow_table_subpages(base_url, html_text, fetch_html_fn, table_idx="all", 
     return _select_tables(all_dfs, table_idx) or []
 
 
-def extract_tables_via_direct_http(url, table_idx="all", cancel_event=None):
+def extract_tables_via_direct_http(url, table_idx="all", cancel_event=None, doi=None):
 
     """
     Attempts to fetch HTML directly via requests from the local network/IP.
@@ -1798,6 +2562,39 @@ def extract_tables_via_direct_http(url, table_idx="all", cancel_event=None):
     if cancel_event is not None and cancel_event.is_set():
         return []
     try:
+        from .negative_cache import is_negatively_cached, record_negative_cache, clear_negative_cache
+    except Exception:
+        is_negatively_cached = None
+        record_negative_cache = None
+        clear_negative_cache = None
+    try:
+        from .proxy_rewriter import (
+            is_institutional_proxy_url,
+            maybe_rewrite_institutional_url,
+            validate_institutional_session,
+        )
+    except Exception:
+        is_institutional_proxy_url = None
+        maybe_rewrite_institutional_url = None
+        validate_institutional_session = None
+
+    config = load_config() if callable(load_config) else {}
+    if is_negatively_cached:
+        hit = is_negatively_cached("direct_http", url=url, doi=doi, config=config)
+        if hit:
+            print(f"[DirectHTTP] 命中跨进程负缓存 ({hit.get('target_key')}, {hit.get('reason')})，跳过请求。")
+            return []
+
+    try:
+        proxies = get_requests_proxies(config)
+        fetch_url = url
+        inst_proxy_active = False
+        if maybe_rewrite_institutional_url and (config.get("EZPROXY_ENABLED") or config.get("WEBVPN_ENABLED")):
+            fetch_url = maybe_rewrite_institutional_url(url, config=config)
+            inst_proxy_active = (fetch_url != url) or (
+                callable(is_institutional_proxy_url) and is_institutional_proxy_url(fetch_url, config=config)
+            )
+
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
@@ -1808,39 +2605,63 @@ def extract_tables_via_direct_http(url, table_idx="all", cancel_event=None):
 
         def _fetch_one(target_url):
             if cancel_event is not None and cancel_event.is_set():
-                return None, ""
+                return None, "", target_url
             if requests_impersonate is not None:
-                resp = requests_impersonate.get(target_url, impersonate="chrome110", timeout=12, allow_redirects=True)
-                return resp.status_code, resp.text
-            resp = requests.get(target_url, headers=headers, timeout=12, allow_redirects=True)
-            return resp.status_code, resp.text
+                kw = {"impersonate": "chrome110", "timeout": 12, "allow_redirects": True}
+                if proxies:
+                    kw["proxies"] = proxies
+                resp = requests_impersonate.get(target_url, **kw)
+                return resp.status_code, resp.text, str(getattr(resp, "url", "") or target_url)
+            kw = {"headers": headers, "timeout": 12, "allow_redirects": True}
+            if proxies:
+                kw["proxies"] = proxies
+            resp = requests.get(target_url, **kw)
+            return resp.status_code, resp.text, str(getattr(resp, "url", "") or target_url)
 
         if requests_impersonate is not None:
-            print(f"尝试本地直接 HTTP 请求网页 (机构 IP 直连 + TLS Chrome 模拟): {url} ...")
+            print(f"尝试本地直接 HTTP 请求网页 (机构 IP 直连 + TLS Chrome 模拟): {fetch_url} ...")
         else:
-            print(f"尝试本地直接 HTTP 请求网页 (机构 IP 直连 + 标头伪装): {url} ...")
-        status_code, text = _fetch_one(url)
+            print(f"尝试本地直接 HTTP 请求网页 (机构 IP 直连 + 标头伪装): {fetch_url} ...")
+        status_code, text, final_url = _fetch_one(fetch_url)
         if cancel_event is not None and cancel_event.is_set():
             return []
+
+        if inst_proxy_active and validate_institutional_session:
+            sess = validate_institutional_session(
+                html_text=text or "",
+                final_url=final_url,
+                status_code=status_code,
+            )
+            if not sess.get("valid") and sess.get("needs_relogin"):
+                print(
+                    f"[DirectHTTP] 机构代理会话已失效 ({sess.get('reason')})，请先刷新 EZProxy/WebVPN 登录态后重试（不写入反爬负缓存）。"
+                )
+                return []
 
         if status_code == 200 and text:
             if is_anti_bot_blocked("", text):
                 print("本地直接 HTTP 请求被反爬拦截 (Cloudflare / Access Denied / Radware)。")
+                if record_negative_cache:
+                    record_negative_cache("direct_http", url=url, doi=doi, status_code=200, html_snippet=text, config=config)
                 return []
 
             dfs = parse_tables_from_html(text, table_idx)
             if not dfs:
                 def _fetch_ok_html(su):
-                    sc, body = _fetch_one(su)
+                    sc, body, _fu = _fetch_one(su)
                     return body if sc == 200 else ""
-                dfs = _follow_table_subpages(url, text, _fetch_ok_html, table_idx, cancel_event=cancel_event)
+                dfs = _follow_table_subpages(fetch_url, text, _fetch_ok_html, table_idx, cancel_event=cancel_event)
             if dfs:
+                if clear_negative_cache:
+                    clear_negative_cache("direct_http", url=url, doi=doi, config=config)
                 print(f"本地直接 HTTP 提取成功，解析到 {len(dfs)} 个表格。")
                 return dfs
             else:
                 print("本地直接 HTTP 提取未解析到任何表格。")
         else:
             print(f"本地直接 HTTP 请求返回状态码: {status_code}")
+            if record_negative_cache and status_code in (403, 429, 503):
+                record_negative_cache("direct_http", url=url, doi=doi, status_code=status_code, html_snippet=text or "", config=config)
     except Exception as e:
         print(f"本地直接 HTTP 请求发生异常: {e}")
     return []
@@ -1890,14 +2711,35 @@ def _extract_doi_from_url(url: str) -> str:
     if not url:
         return ""
     decoded = urllib.parse.unquote(str(url))
-    m = re.search(r"(10\.\d{4,9}/[-._;()/:A-Za-z0-9]+)", decoded)
+    m = re.search(r"(?<![0-9A-Za-z])(10\.\d{4,9}/[-._;()/:A-Za-z0-9]+)", decoded)
     if not m:
         return ""
     doi = m.group(1).rstrip(".,;:/")
-    for suffix in ("/full", "/abstract", "/pdf", "/epdf", "/meta"):
-        if doi.lower().endswith(suffix):
-            doi = doi[: -len(suffix)]
-    doi = re.sub(r"/tables?/\d+$", "", doi, flags=re.IGNORECASE)
+    doi = re.sub(r"/suppl_file/.*$", "", doi, flags=re.IGNORECASE)
+    doi = re.sub(r"/xml(?:/[A-Za-z0-9_-]+)?$", "", doi, flags=re.IGNORECASE)
+    _suffixes = (
+        "/fulltext.html",
+        "/full",
+        "/abstract",
+        "/pdf",
+        "/epdf",
+        "/meta",
+        "/html",
+        "/references",
+        "/metrics",
+        ".pdf",
+        ".html",
+        ".htm",
+    )
+    while True:
+        prev = doi
+        for suffix in _suffixes:
+            if doi.lower().endswith(suffix):
+                doi = doi[: -len(suffix)]
+        doi = re.sub(r"/(?:tables?|figures?)/\d+$", "", doi, flags=re.IGNORECASE)
+        doi = doi.rstrip(".,;:/")
+        if doi == prev:
+            break
     return doi
 
 
@@ -2695,6 +3537,20 @@ def extract_tables_via_scrapling(url, table_idx="all", force_headed=False, cance
     if cancel_event is not None and cancel_event.is_set():
         return []
     try:
+        from .negative_cache import is_negatively_cached, record_negative_cache, clear_negative_cache
+    except Exception:
+        is_negatively_cached = None
+        record_negative_cache = None
+        clear_negative_cache = None
+
+    _scr_cfg = load_config() if callable(load_config) else {}
+    if is_negatively_cached and not force_headed:
+        hit = is_negatively_cached("scrapling", url=url, config=_scr_cfg)
+        if hit:
+            print(f"[Scrapling] 命中跨进程负缓存 ({hit.get('target_key')}, {hit.get('reason')})，跳过抓取。")
+            return []
+
+    try:
         from .cdp_detector import has_system_chrome, try_fetch_html_via_browserskill
     except ImportError:
         try:
@@ -2747,7 +3603,14 @@ def extract_tables_via_scrapling(url, table_idx="all", force_headed=False, cance
             if cancel_event is not None and cancel_event.is_set():
                 return []
 
+        if html and is_anti_bot_blocked("", html):
+            if record_negative_cache:
+                record_negative_cache("scrapling", url=url, status_code=403, html_snippet=html, config=_scr_cfg)
+            return []
+
         if html and not is_anti_bot_blocked("", html):
+            if clear_negative_cache:
+                clear_negative_cache("scrapling", url=url, config=_scr_cfg)
             dfs = parse_tables_from_html(html, table_idx)
             if not dfs and "tandfonline.com" in url.lower():
                 dfs = _extract_tf_csvs_from_scrapling_html(url, html, headless=used_headless)
@@ -2770,11 +3633,11 @@ def extract_tables_via_scrapling(url, table_idx="all", force_headed=False, cance
 
 def extract_tables_via_playwright(url, table_idx="all"):
     """
-    Invokes Playwright directly, reusing an active CDP browser tab when available,
-    blocking hanging third-party trackers, and waiting out transient anti-bot shells.
+    Invokes Playwright/Patchright directly, reusing an active CDP browser tab when available,
+    preferring Patchright stealth engine for self-launched browsers, blocking hanging third-party trackers,
+    and waiting out transient anti-bot shells.
     """
     try:
-        from playwright.sync_api import sync_playwright
         try:
             from .cdp_detector import (
                 find_active_cdp_endpoint,
@@ -2794,13 +3657,51 @@ def extract_tables_via_playwright(url, table_idx="all"):
                 wait_through_transient_challenge,
             )
 
-        print(f"Querying Playwright browser for {url}...")
-        with sync_playwright() as p:
-            cdp_ep = find_active_cdp_endpoint(timeout=1.0)
+        cdp_ep = find_active_cdp_endpoint(timeout=1.0)
+        if resolve_sync_playwright:
+            _pw_factory, _pw_engine = resolve_sync_playwright(prefer_patchright=not bool(cdp_ep))
+        else:
+            from playwright.sync_api import sync_playwright as _pw_factory
+            _pw_engine = "playwright"
+
+        print(f"Querying Playwright browser ({_pw_engine}) for {url}...")
+        use_pool = (
+            not cdp_ep
+            and get_thread_browser_pool is not None
+            and (os.environ.get("ZTE_DISABLE_THREAD_BROWSER_POOL") or "").strip().lower() not in ("1", "true", "yes")
+        )
+        if use_pool:
+            exec_path = find_playwright_chromium()
+            pool = get_thread_browser_pool()
+            with pool.acquire_context(
+                _pw_factory,
+                engine_name=_pw_engine,
+                headless=True,
+                exec_path=exec_path,
+                context_kwargs={
+                    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+                },
+            ) as (_browser, context):
+                page = context.new_page()
+                install_cdp_port_guard(page)
+                install_slow_tracker_route_blocker(page, url)
+                page.goto(url, wait_until="domcontentloaded", timeout=35000)
+                wait_through_transient_challenge(page, max_wait_s=8.0)
+                try:
+                    page.wait_for_selector(get_publisher_table_wait_selector(url), timeout=6000)
+                except Exception:
+                    pass
+                html = page.content()
+                if html:
+                    return parse_tables_from_html(html, table_idx)
+                return []
+
+        with _pw_factory() as p:
             browser = None
             page = None
             connected_cdp = False
             reused_tab = False
+            _self_pid = None
 
             if cdp_ep:
                 try:
@@ -2823,6 +3724,7 @@ def extract_tables_via_playwright(url, table_idx="all"):
                 if exec_path:
                     print(f"[Playwright] 使用自动识别的 Chromium 路径: {exec_path}")
                 browser = p.chromium.launch(headless=True, executable_path=exec_path)
+                _self_pid = extract_browser_pid(browser=browser, playwright_obj=p)
                 page = browser.new_page(
                     user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
                 )
@@ -2846,7 +3748,7 @@ def extract_tables_via_playwright(url, table_idx="all"):
                     except Exception:
                         pass
             elif browser:
-                browser.close()
+                close_browser_safely(browser=browser, proc_pid=_self_pid)
 
             if html:
                 return parse_tables_from_html(html, table_idx)
@@ -3111,8 +4013,18 @@ def extract_tables_via_crawl4ai(url, table_idx="all", cancel_event=None):
     if _crawl4ai_domain_blocked(url):
         print(f"[Crawl4AI] 域名 {_crawl4ai_domain_key(url)} 连续失败过多，已熔断跳过。")
         return []
-
+    try:
+        from .negative_cache import is_negatively_cached, record_negative_cache, clear_negative_cache
+    except Exception:
+        is_negatively_cached = None
+        record_negative_cache = None
+        clear_negative_cache = None
     config = load_config()
+    if is_negatively_cached:
+        hit = is_negatively_cached("crawl4ai", url=url, config=config)
+        if hit:
+            print(f"[Crawl4AI] 命中跨进程负缓存 ({hit.get('target_key')}, {hit.get('reason')})，跳过抓取。")
+            return []
     try:
         page_timeout_ms = int(config.get("CRAWL4AI_PAGE_TIMEOUT_MS") or 45000)
     except (TypeError, ValueError):
@@ -3297,8 +4209,14 @@ def extract_tables_via_crawl4ai(url, table_idx="all", cancel_event=None):
             return []
 
         if html or c4_tables:
+            if html and is_anti_bot_blocked("", html):
+                if record_negative_cache:
+                    record_negative_cache("crawl4ai", url=url, status_code=403, html_snippet=html, config=config)
+                return []
             # 抓取成功（无论是否解析到表格）都清零该域失败计数
             _crawl4ai_record(url, hard_failure=False)
+            if clear_negative_cache:
+                clear_negative_cache("crawl4ai", url=url, config=config)
             if html:
                 dfs = parse_tables_from_html(html, table_idx)
                 if not dfs and sub_htmls:

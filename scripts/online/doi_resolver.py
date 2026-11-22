@@ -3,6 +3,7 @@
 import os
 import re
 import sqlite3
+import unicodedata
 import urllib.parse
 import urllib.request
 import uuid
@@ -42,6 +43,92 @@ build_elsevier_headers = getattr(
     ),
 )
 get_polite_email = getattr(common, "get_polite_email", lambda config=None, service="crossref": "supp_downloader@academic-research.org")
+get_requests_proxies = getattr(common, "get_requests_proxies", lambda config=None: None)
+
+_ZERO_WIDTH_RE = re.compile(r"[\u200b\u200c\u200d\u2060\ufeff\u00ad]")
+_UNICODE_DASH_RE = re.compile(r"[\u2010-\u2015\u2212]")
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+_CHINESE_DOI_PREFIXES = (
+    "10.16539/", "10.18654/", "10.3799/", "10.13722/", "10.16111/",
+    "10.19658/", "10.19762/", "10.3969/", "10.7524/", "10.11743/",
+    "10.11867/", "10.11885/", "10.11907/", "10.11928/", "10.12029/",
+    "10.13278/", "10.13347/", "10.13544/", "10.13646/", "10.13718/",
+    "10.13870/", "10.14027/", "10.16028/", "10.16400/", "10.16509/",
+    "10.16562/", "10.19388/", "10.19509/", "10.19657/", "10.19700/",
+    "10.19767/", "10.3724/", "10.3866/", "10.3975/", "10.6038/",
+    "10.7498/", "10.7500/", "10.12017/", "10.12090/", "10.12119/",
+)
+
+_CHINESE_DOI_MARKERS = (
+    "cnki",
+    "j.issn.",
+    ".issn.",
+    "/cn.",
+)
+
+_CN_JOURNAL_LANDING_MARKERS = (
+    ".ac.cn",
+    ".edu.cn",
+    "sciengine.com",
+    "geojournals.cn",
+    "earth-science.net",
+    "cgejournal.com",
+    "dzxb.org",
+    "ysxb.ac.cn",
+    "/article/doi/",
+    "/cn/10.",
+    "/cn/article/",
+    "magtech",
+)
+
+
+def normalize_title(title: str) -> str:
+    """
+    归一化论文标题：NFKC 兼容分解（全角转半角）、剥离零宽字符与 HTML 标签、
+    统一连字符与空白，提高中英文标题检索与相似度匹配的召回率。
+    """
+    if not title:
+        return ""
+    s = unicodedata.normalize("NFKC", str(title))
+    s = _ZERO_WIDTH_RE.sub("", s)
+    s = _HTML_TAG_RE.sub("", s)
+    s = _UNICODE_DASH_RE.sub("-", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def compute_title_similarity(title1: str, title2: str) -> float:
+    """基于归一化标题计算 Jaccard 相似度（中文按字符、英文按词）。"""
+    n1 = normalize_title(title1)
+    n2 = normalize_title(title2)
+    if not n1 or not n2:
+        return 0.0
+    is_chinese = bool(re.search(r"[\u4e00-\u9fff]", n1 + n2))
+    t1_clean = re.sub(r"[^\w\s]", "", n1.lower())
+    t2_clean = re.sub(r"[^\w\s]", "", n2.lower())
+    if is_chinese:
+        s1 = set(t1_clean.replace(" ", ""))
+        s2 = set(t2_clean.replace(" ", ""))
+    else:
+        s1 = set(t1_clean.split())
+        s2 = set(t2_clean.split())
+    if not s1 or not s2:
+        return 0.0
+    return len(s1.intersection(s2)) / len(s1.union(s2))
+
+
+def is_chinese_doi(doi: str) -> bool:
+    """判断 DOI 是否属于中国大陆中文期刊/知网/万方注册前缀或典型特征。"""
+    if not doi:
+        return False
+    clean = str(doi).strip().lower()
+    if clean.startswith("doi:"):
+        clean = clean[4:].strip()
+    clean = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", clean)
+    if any(m in clean for m in _CHINESE_DOI_MARKERS):
+        return True
+    return any(clean.startswith(p) for p in _CHINESE_DOI_PREFIXES)
 
 def get_doi_from_zotero_db(pdf_path, db_path=None):
     """
@@ -212,10 +299,11 @@ def get_doi_by_title(title):
     """
     Queries Crossref API to find DOI by title and validates title similarity.
     """
-    if not title or len(title) < 10:
+    norm_title = normalize_title(title)
+    if not norm_title or len(norm_title) < 10:
         return None
     polite_email = get_polite_email(load_config(), service="crossref")
-    url = f"https://api.crossref.org/works?query.title={urllib.parse.quote(title)}&rows=1&mailto={urllib.parse.quote(polite_email)}"
+    url = f"https://api.crossref.org/works?query.title={urllib.parse.quote(norm_title)}&rows=1&mailto={urllib.parse.quote(polite_email)}"
     try:
         response = requests.get(
             url,
@@ -229,22 +317,7 @@ def get_doi_by_title(title):
                 best_match = items[0]
                 ref_title = best_match.get("title", [""])[0]
                 if ref_title:
-                    # Compute Jaccard similarity (character-level for Chinese, word-level for English)
-                    is_chinese = bool(re.search(r'[\u4e00-\u9fff]', title + ref_title))
-                    t1_clean = re.sub(r'[^\w\s]', '', title.lower())
-                    t2_clean = re.sub(r'[^\w\s]', '', ref_title.lower())
-                    
-                    if is_chinese:
-                        s1 = set(t1_clean.replace(' ', ''))
-                        s2 = set(t2_clean.replace(' ', ''))
-                    else:
-                        s1 = set(t1_clean.split())
-                        s2 = set(t2_clean.split())
-                        
-                    similarity = 0.0
-                    if s1 and s2:
-                        similarity = len(s1.intersection(s2)) / len(s1.union(s2))
-                        
+                    similarity = compute_title_similarity(norm_title, ref_title)
                     if similarity >= 0.6:
                         doi = best_match.get("DOI")
                         print(f"DOI resolved from Crossref via title: {doi} (Similarity: {similarity:.2f})")
@@ -260,7 +333,8 @@ def get_doi_by_title_firecrawl(title, api_key=None):
     """
     Queries Firecrawl Research Index API to find DOI by title and validates title similarity.
     """
-    if not title or len(title) < 10:
+    norm_title = normalize_title(title)
+    if not norm_title or len(norm_title) < 10:
         return None
     try:
         from . import strategies as _fc_strategies
@@ -276,13 +350,13 @@ def get_doi_by_title_firecrawl(title, api_key=None):
     if not key:
         return None
         
-    print(f"Querying Firecrawl Research Index to resolve DOI for title: {title}...")
+    print(f"Querying Firecrawl Research Index to resolve DOI for title: {norm_title}...")
     headers = {
         "Authorization": f"Bearer {key}",
         "Content-Type": "application/json"
     }
     params = {
-        "query": title,
+        "query": norm_title,
         "k": 5
     }
     try:
@@ -302,22 +376,7 @@ def get_doi_by_title_firecrawl(title, api_key=None):
                 if not ref_title:
                     continue
                 
-                # Jaccard title similarity check (matching Crossref method)
-                is_chinese = bool(re.search(r'[\u4e00-\u9fff]', title + ref_title))
-                t1_clean = re.sub(r'[^\w\s]', '', title.lower())
-                t2_clean = re.sub(r'[^\w\s]', '', ref_title.lower())
-                
-                if is_chinese:
-                    s1 = set(t1_clean.replace(' ', ''))
-                    s2 = set(t2_clean.replace(' ', ''))
-                else:
-                    s1 = set(t1_clean.split())
-                    s2 = set(t2_clean.split())
-                    
-                similarity = 0.0
-                if s1 and s2:
-                    similarity = len(s1.intersection(s2)) / len(s1.union(s2))
-                    
+                similarity = compute_title_similarity(norm_title, ref_title)
                 if similarity >= 0.6:
                     # 1. Try ids.doi list first
                     doi_list = paper.get("ids", {}).get("doi", [])
@@ -356,9 +415,13 @@ def _resolve_pii_to_doi(pii):
         config = load_config()
         headers = build_elsevier_headers(config, accept="application/json")
         if headers:
+            proxies = get_requests_proxies(config)
             # Use Elsevier abstract/metadata endpoint with field=doi
             url = f"https://api.elsevier.com/content/abstract/pii/{pii}?field=doi&httpAccept=application/json"
-            r = requests.get(url, headers=headers, timeout=10)
+            req_kw = {"headers": headers, "timeout": 10}
+            if proxies:
+                req_kw["proxies"] = proxies
+            r = requests.get(url, **req_kw)
             if r.status_code == 200:
                 data = r.json()
                 doi_val = (data.get("abstracts-retrieval-response", {})
@@ -481,6 +544,31 @@ def resolve_chinese_doi(url):
                     low_href = abs_href.lower()
                     if 'oversea' not in low_href and any(dom in low_href for dom in ('wanfangdata.', 'cqvip.', 'cnki.net', 'cnki.com.cn')):
                         print(f"[在线提取] 成功从 China DOI 页面解析出国内链接: {abs_href}")
+                        return abs_href
+
+                # 3.5 匹配中文期刊官网落地页（如 Magtech / SciEngine / 学会官网 HTML 全文页）
+                # 排除 chndoi 运营方站点（如 istic.ac.cn）与仅指向根域名首页的页脚链接
+                _ignored_hosts = ("chndoi.org", "chinadoi.cn", "istic.ac.cn", "beian.miit.gov.cn", "miit.gov.cn")
+                for a in soup.find_all('a'):
+                    href = (a.get('href') or '').strip()
+                    if not href or href.startswith(('#', 'javascript:', 'mailto:')):
+                        continue
+                    abs_href = urllib.parse.urljoin(base_url, href)
+                    low_href = abs_href.lower()
+                    if 'oversea' in low_href or not low_href.startswith(('http://', 'https://')):
+                        continue
+                    parsed_cand = urllib.parse.urlparse(abs_href)
+                    cand_host = (parsed_cand.hostname or '').lower()
+                    cand_path = (parsed_cand.path or '').strip('/')
+                    if any(bad in cand_host for bad in _ignored_hosts):
+                        continue
+                    # 要求包含非首页路径或查询参数，避免误选机构/期刊根主页
+                    if not cand_path and not parsed_cand.query:
+                        continue
+                    if cand_path.lower() in ('index.html', 'index.htm', 'index.shtml', 'index.jsp', 'index.aspx'):
+                        continue
+                    if any(m in low_href for m in _CN_JOURNAL_LANDING_MARKERS):
+                        print(f"[在线提取] 成功从 China DOI 页面解析出中文期刊官网链接: {abs_href}")
                         return abs_href
 
                 # 4. 匹配 meta refresh / JS 跳转至境内 CNKI 或国内数据库

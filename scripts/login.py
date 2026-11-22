@@ -38,12 +38,15 @@ get_cnki_cookies_path = common.get_cnki_cookies_path
 get_crawl4ai_cookies_path = common.get_crawl4ai_cookies_path
 
 try:
-    from .playwright_utils import find_playwright_chromium
+    from .playwright_utils import find_playwright_chromium, resolve_sync_playwright, extract_browser_pid, close_browser_safely
 except ImportError:
     try:
-        from playwright_utils import find_playwright_chromium
+        from playwright_utils import find_playwright_chromium, resolve_sync_playwright, extract_browser_pid, close_browser_safely
     except ImportError:
         find_playwright_chromium = lambda: None
+        resolve_sync_playwright = None
+        extract_browser_pid = lambda **kwargs: None
+        close_browser_safely = lambda **kwargs: None
 
 try:
     from .online.cdp_detector import find_active_cdp_endpoint
@@ -353,88 +356,108 @@ def publishers_main():
     print("  3. 确认完成后，直接【关闭浏览器窗口】。")
     print("==================================================\n")
 
-    with sync_playwright() as p:
+    if resolve_sync_playwright:
+        _login_sync_pw, _login_engine = resolve_sync_playwright(
+            module_sync_pw=sync_playwright,
+            default_playwright_sync=sync_playwright,
+            prefer_patchright=True,
+        )
+    else:
+        _login_sync_pw, _login_engine = sync_playwright, "playwright"
+    if _login_engine == "patchright":
+        print("[验证向导] 使用 Patchright Stealth 引擎启动独立登录窗口。")
+
+    with _login_sync_pw() as p:
+        _login_pid = None
+        context = None
         try:
-            context = p.chromium.launch_persistent_context(
-                default_profile_dir,
-                headless=False,
-                executable_path=exec_path,
-                args=_STEALTH_ARGS,
-                ignore_default_args=["--enable-automation"],
-                viewport={"width": 1280, "height": 800},
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
-            )
-        except Exception as e:
-            print(f"启动失败: {e}")
-            print("尝试不使用缓存目录启动...")
-            context = p.chromium.launch_persistent_context(
-                "",
-                headless=False,
-                executable_path=exec_path,
-                args=_STEALTH_ARGS,
-                ignore_default_args=["--enable-automation"],
-                viewport={"width": 1280, "height": 800},
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
-            )
-
-        # Inject cookies from cookies.json if present
-        cookies_json = os.path.join(default_profile_dir, "cookies.json")
-        if os.path.exists(cookies_json):
             try:
-                with open(cookies_json, 'r', encoding='utf-8') as f:
-                    c_list = json.load(f)
-                if c_list:
-                    for c in c_list:
-                        try:
-                            context.add_cookies([c])
-                        except Exception:
-                            pass
-                    print(f"[验证向导] 已从 cookies.json 恢复并注入了 {len(c_list)} 个会话 Cookies 到 Chrome Testing 中！")
+                context = p.chromium.launch_persistent_context(
+                    default_profile_dir,
+                    headless=False,
+                    executable_path=exec_path,
+                    args=_STEALTH_ARGS,
+                    ignore_default_args=["--enable-automation"],
+                    viewport={"width": 1280, "height": 800},
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+                )
+                _login_pid = extract_browser_pid(context=context, playwright_obj=p)
             except Exception as e:
-                print(f"警告：载入 Cookies 失败: {e}")
+                print(f"启动失败: {e}")
+                print("尝试不使用缓存目录启动...")
+                context = p.chromium.launch_persistent_context(
+                    "",
+                    headless=False,
+                    executable_path=exec_path,
+                    args=_STEALTH_ARGS,
+                    ignore_default_args=["--enable-automation"],
+                    viewport={"width": 1280, "height": 800},
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+                )
+                _login_pid = extract_browser_pid(context=context, playwright_obj=p)
 
-        # Open pages
-        for i, url in enumerate(urls):
-            try:
-                if i == 0:
-                    page = context.pages[0] if context.pages else context.new_page()
-                    page.add_init_script(_STEALTH_INIT_SCRIPT)
-                    page.goto(url)
-                else:
-                    page = context.new_page()
-                    page.add_init_script(_STEALTH_INIT_SCRIPT)
-                    page.goto(url)
-            except Exception as e:
-                print(f"警告：载入网站 {url} 失败: {e}，将继续打开其余网站。")
+            # Inject cookies from cookies.json if present
+            cookies_json = os.path.join(default_profile_dir, "cookies.json")
+            if os.path.exists(cookies_json):
+                try:
+                    c_list = common.load_cookies_from_file(cookies_json)
+                    if c_list:
+                        for c in c_list:
+                            try:
+                                context.add_cookies([c])
+                            except Exception:
+                                pass
+                        print(f"[验证向导] 已从 cookies.json 恢复并注入了 {len(c_list)} 个会话 Cookies 到 Chrome Testing 中！")
+                except Exception as e:
+                    print(f"警告：载入 Cookies 失败: {e}")
 
-        # Wait for context close
-        closed = [False]
-        def on_close(ctx):
-            closed[0] = True
-        context.on("close", on_close)
+            # Open pages
+            for i, url in enumerate(urls):
+                try:
+                    if i == 0:
+                        page = context.pages[0] if context.pages else context.new_page()
+                        if _login_engine != "patchright":
+                            page.add_init_script(_STEALTH_INIT_SCRIPT)
+                        page.goto(url)
+                    else:
+                        page = context.new_page()
+                        if _login_engine != "patchright":
+                            page.add_init_script(_STEALTH_INIT_SCRIPT)
+                        page.goto(url)
+                except Exception as e:
+                    print(f"警告：载入网站 {url} 失败: {e}，将继续打开其余网站。")
 
-        last_valid_cookies = []
-        while not closed[0]:
-            try:
-                cookies = context.cookies()
-                if cookies:
-                    last_valid_cookies = cookies
-                time.sleep(0.5)
-            except Exception:
-                break
+            # Wait for context close
+            closed = [False]
+            def on_close(ctx):
+                closed[0] = True
+            context.on("close", on_close)
 
-        # Export CNKI cookies if found
-        cnki_cookies = [c for c in last_valid_cookies if "cnki.net" in c.get("domain", "") or "cnki.com.cn" in c.get("domain", "")]
-        if cnki_cookies:
-            cnki_path = get_cnki_cookies_path()
-            try:
-                with open(cnki_path, "w", encoding="utf-8") as f:
-                    json.dump(cnki_cookies, f, indent=2, ensure_ascii=False)
-                print(f"\n[知网适配] 已单独导出 {len(cnki_cookies)} 个知网 Cookies 到：{cnki_path}")
-            except Exception as e:
-                print(f"\n[知网适配] 导出知网 Cookies 失败: {e}")
+            last_valid_cookies = []
+            while not closed[0]:
+                try:
+                    cookies = context.cookies()
+                    if cookies:
+                        last_valid_cookies = cookies
+                    time.sleep(0.5)
+                except Exception:
+                    break
 
-        print("\n浏览器已关闭，登录会话已成功保存。")
+            # Export CNKI cookies if found
+            cnki_cookies = [c for c in last_valid_cookies if "cnki.net" in c.get("domain", "") or "cnki.com.cn" in c.get("domain", "")]
+            if cnki_cookies:
+                cnki_path = get_cnki_cookies_path()
+                try:
+                    with open(cnki_path, "w", encoding="utf-8") as f:
+                        json.dump(cnki_cookies, f, indent=2, ensure_ascii=False)
+                    print(f"\n[知网适配] 已单独导出 {len(cnki_cookies)} 个知网 Cookies 到：{cnki_path}")
+                except Exception as e:
+                    print(f"\n[知网适配] 导出知网 Cookies 失败: {e}")
+
+            print("\n浏览器已关闭，登录会话已成功保存。")
+        finally:
+            if context is not None:
+                close_browser_safely(context=context, proc_pid=_login_pid)
 
 
 # ---------------------------------------------------------------------------

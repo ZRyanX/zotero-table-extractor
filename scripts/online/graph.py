@@ -45,6 +45,7 @@ except ImportError:
 get_cnki_cookies_path = common.get_cnki_cookies_path
 load_config = common.load_config
 get_polite_email = getattr(common, "get_polite_email", lambda config=None, service="crossref": "supp_downloader@academic-research.org")
+get_requests_proxies = getattr(common, "get_requests_proxies", lambda config=None: None)
 browser_extraction_lock = common.browser_extraction_lock
 
 
@@ -83,6 +84,8 @@ from .doi_resolver import (
     get_doi_by_title_firecrawl,
     get_doi_from_pdf_content,
     get_doi_from_zotero_db,
+    is_chinese_doi,
+    normalize_title,
     resolve_chinese_doi,
     resolve_doi_canonical_url,
     extract_arxiv_id,
@@ -91,21 +94,43 @@ from .doi_resolver import (
 )
 
 from .strategies import (
+    _extract_doi_from_url,
     extract_cnki_tables_via_playwright,
     extract_cnki_tables_via_scrapling,
     extract_general_supplementary_tables,
     extract_tables_via_crawl4ai,
     extract_tables_via_direct_http,
     extract_tables_via_elsevier_api,
+    extract_tables_via_europepmc_xml,
     extract_tables_via_firecrawl,
     extract_tables_via_paper_fetch,
     extract_tables_via_scrapling,
+    extract_tables_via_springer_tdm,
     extract_tables_via_unpaywall,
     extract_tables_via_arxiv_html,
     extract_tables_via_ncbi_pmc,
     get_domain_profile_dir,
+    is_springer_nature_target,
     parse_tables_from_html,
 )
+
+try:
+    from .negative_cache import is_negatively_cached, record_negative_cache, clear_negative_cache
+except ImportError:
+    is_negatively_cached = None
+    record_negative_cache = None
+    clear_negative_cache = None
+
+try:
+    from .proxy_rewriter import (
+        is_institutional_proxy_url,
+        maybe_rewrite_institutional_url,
+        validate_institutional_session,
+    )
+except ImportError:
+    is_institutional_proxy_url = None
+    maybe_rewrite_institutional_url = None
+    validate_institutional_session = None
 
 
 class ExtractionNode:
@@ -208,14 +233,32 @@ class ResolveMetadataNode(ExtractionNode):
             url = _normalize_publisher_url(pdf_path)
             url, is_cnki = _resolve_chinese_doi_and_classify(url, False)
             doi = None
-            if "doi.org/" in url:
-                _doi_match = re.search(r'doi\.org/(10\.\d{4,9}/[-._;()/:A-Z0-9]+)', url, re.IGNORECASE)
+            low_url = url.lower()
+            if "doi.org/" in low_url:
+                _doi_match = re.search(r'doi\.org/(10\.\d{4,9}/[-._;()/:A-Z0-9]+)', urllib.parse.unquote(url), re.IGNORECASE)
                 if _doi_match:
-                    doi = _doi_match.group(1)
+                    doi = _doi_match.group(1).rstrip(".,;:/")
             elif "chndoi.org" in pdf_path.lower() or "chinadoi.cn" in pdf_path.lower():
-                _doi_match = re.search(r'[?&]doi=(10\.\d{4,9}/[^\s&]+)', pdf_path, re.IGNORECASE)
+                _doi_match = re.search(
+                    r'[?&]doi=(10\.\d{4,9}/[^\s&#]+)',
+                    urllib.parse.unquote(pdf_path),
+                    re.IGNORECASE,
+                )
                 if _doi_match:
-                    doi = urllib.parse.unquote(_doi_match.group(1))
+                    doi = _doi_match.group(1).rstrip(".,;:/")
+            if not doi:
+                extracted_doi = _extract_doi_from_url(url) or _extract_doi_from_url(pdf_path)
+                if extracted_doi:
+                    doi = extracted_doi
+            if doi and not is_cnki and is_chinese_doi(doi):
+                parsed_host = (urllib.parse.urlparse(url).hostname or "").lower()
+                if parsed_host in ("doi.org", "dx.doi.org", "hdl.handle.net"):
+                    chndoi_url = f"https://www.chndoi.org/Resolution/Handler?doi={doi}"
+                    resolved = resolve_chinese_doi(chndoi_url)
+                    if resolved and resolved != chndoi_url:
+                        url = resolved
+                        low_res = resolved.lower()
+                        is_cnki = ("cnki.net" in low_res or "cnki.com.cn" in low_res)
             state["url"] = url
             state["doi"] = doi
             state["is_cnki"] = is_cnki
@@ -254,14 +297,20 @@ class ResolveMetadataNode(ExtractionNode):
                 is_cnki = True
                 url = cnki_url
             elif doi:
-                if "cnki" in doi.lower() or any(x in doi for x in ["10.16539", "10.18654", "10.3799", "10.13722", "10.16111"]):
-                    is_cnki = True
+                if is_chinese_doi(doi):
                     chndoi_url = f"https://www.chndoi.org/Resolution/Handler?doi={doi}"
                     resolved = resolve_chinese_doi(chndoi_url)
-                    if resolved != chndoi_url:
+                    if resolved and resolved != chndoi_url:
                         url = resolved
+                        low_res = resolved.lower()
+                        is_cnki = ("cnki.net" in low_res or "cnki.com.cn" in low_res)
                     else:
-                        url = f"https://doi.org/{doi}"
+                        canonical = resolve_doi_canonical_url(doi)
+                        if canonical:
+                            url, is_cnki = _resolve_chinese_doi_and_classify(canonical, False)
+                        else:
+                            url = f"https://doi.org/{doi}"
+                            is_cnki = ("cnki" in doi.lower())
                 else:
                     # Handle API 一次拿 canonical URL：免 302 重定向链、免落地页整页下载
                     canonical = resolve_doi_canonical_url(doi)
@@ -270,6 +319,8 @@ class ResolveMetadataNode(ExtractionNode):
                             resolved = resolve_chinese_doi(canonical)
                             if "cnki.net" in resolved or "cnki.com.cn" in resolved:
                                 is_cnki = True
+                                url = resolved
+                            elif resolved and resolved != canonical:
                                 url = resolved
                             else:
                                 url = canonical
@@ -302,6 +353,10 @@ class ResolveMetadataNode(ExtractionNode):
                 return state, self.fallback_node
 
             state["url"] = _normalize_publisher_url(url)
+            if not state.get("doi"):
+                extracted_doi = _extract_doi_from_url(state["url"])
+                if extracted_doi:
+                    state["doi"] = extracted_doi
             state["is_cnki"] = is_cnki
 
         # 检查 arXiv 与 PMC
@@ -335,14 +390,19 @@ class DirectHTTPNode(ExtractionNode):
 
     def execute(self, state):
         url = state.get("url")
+        doi = state.get("doi")
         table_idx = state.get("table_idx", "all")
-        
-        dfs = extract_tables_via_direct_http(url, table_idx)
+
+        dfs = extract_tables_via_direct_http(
+            url,
+            table_idx,
+            cancel_event=state.get("cancel_event"),
+            doi=doi,
+        )
         if dfs:
             state["dfs"] = dfs
             return state, None
-            
-        doi = state.get("doi")
+
         _is_elsevier = (
             url and ("sciencedirect.com" in url or "elsevier.com" in url)
         ) or (
@@ -353,8 +413,103 @@ class DirectHTTPNode(ExtractionNode):
         )
         if _is_elsevier:
             return state, "ElsevierXMLNode"
-        else:
-            return state, self.fallback_node
+        if is_springer_nature_target(doi=doi, url=url):
+            return state, "SpringerTDMNode"
+        return state, self.fallback_node
+
+
+def _fetch_tables_via_impersonated_http(
+    url,
+    table_idx="all",
+    doi=None,
+    cancel_event=None,
+    config=None,
+    log_prefix="[ImpersonatedHTTP]",
+):
+    """Fetch HTML via curl_cffi TLS impersonation with negative-cache, proxy/institutional rewrite, and anti-bot checks."""
+    if not url or requests_impersonate is None:
+        return []
+    if cancel_event is not None and cancel_event.is_set():
+        return []
+
+    cfg = config if isinstance(config, dict) else (load_config() if callable(load_config) else {})
+    if callable(is_negatively_cached):
+        hit = is_negatively_cached("direct_http", url=url, doi=doi, config=cfg)
+        if hit:
+            print(
+                f"{log_prefix} 命中跨进程负缓存 ({hit.get('target_key')}, {hit.get('reason')})，跳过 TLS 模拟请求。"
+            )
+            return []
+
+    proxies = get_requests_proxies(cfg) if callable(get_requests_proxies) else None
+    fetch_url = url
+    inst_proxy_active = False
+    if callable(maybe_rewrite_institutional_url) and (cfg.get("EZPROXY_ENABLED") or cfg.get("WEBVPN_ENABLED")):
+        fetch_url = maybe_rewrite_institutional_url(url, config=cfg)
+        inst_proxy_active = (fetch_url != url) or (
+            callable(is_institutional_proxy_url) and is_institutional_proxy_url(fetch_url, config=cfg)
+        )
+
+    print(f"{log_prefix} Fetching page using TLS impersonation (Chrome): {fetch_url}")
+    try:
+        kw = {"impersonate": "chrome", "timeout": 10, "allow_redirects": True}
+        if proxies:
+            kw["proxies"] = proxies
+        r = requests_impersonate.get(fetch_url, **kw)
+        if cancel_event is not None and cancel_event.is_set():
+            return []
+
+        status_code = getattr(r, "status_code", None)
+        html = getattr(r, "text", "") or ""
+        final_url = str(getattr(r, "url", "") or fetch_url)
+
+        if inst_proxy_active and callable(validate_institutional_session):
+            sess = validate_institutional_session(
+                html_text=html,
+                final_url=final_url,
+                status_code=status_code,
+            )
+            if not sess.get("valid") and sess.get("needs_relogin"):
+                print(
+                    f"{log_prefix} 机构代理会话已失效 ({sess.get('reason')})，请先刷新 EZProxy/WebVPN 登录态后重试（不写入反爬负缓存）。"
+                )
+                return []
+
+        if status_code == 200:
+            if html:
+                if hasattr(common, "is_anti_bot_blocked") and common.is_anti_bot_blocked("", html):
+                    print(f"{log_prefix} 请求被反爬拦截 (Cloudflare / Access Denied / Radware)。")
+                    if callable(record_negative_cache):
+                        record_negative_cache(
+                            "direct_http",
+                            url=url,
+                            doi=doi,
+                            status_code=200,
+                            html_snippet=html,
+                            config=cfg,
+                        )
+                    return []
+                dfs = parse_tables_from_html(html, table_idx)
+                if dfs:
+                    if callable(clear_negative_cache):
+                        clear_negative_cache("direct_http", url=url, doi=doi, config=cfg)
+                    print(f"{log_prefix} Successfully extracted {len(dfs)} tables via TLS impersonation.")
+                    return dfs
+        elif status_code is not None:
+            print(f"{log_prefix} Request returned status code: {status_code}")
+            if callable(record_negative_cache) and status_code in (403, 429, 503):
+                record_negative_cache(
+                    "direct_http",
+                    url=url,
+                    doi=doi,
+                    status_code=status_code,
+                    html_snippet=html,
+                    config=cfg,
+                )
+    except Exception as e:
+        print(f"{log_prefix} Warning: TLS impersonation request failed: {e}")
+
+    return []
 
 
 class ImpersonatedHTTPNode(ExtractionNode):
@@ -363,28 +518,24 @@ class ImpersonatedHTTPNode(ExtractionNode):
 
     def execute(self, state):
         url = state.get("url")
+        doi = state.get("doi")
         table_idx = state.get("table_idx", "all")
-        
+
         if requests_impersonate is None:
             print("[ImpersonatedHTTPNode] curl_cffi is not installed. Bypassing node...")
             return state, self.fallback_node
-            
-        print(f"[ImpersonatedHTTPNode] Fetching page using TLS impersonation (Chrome): {url}")
-        try:
-            r = requests_impersonate.get(url, impersonate="chrome", timeout=10)
-            if r.status_code == 200:
-                html = r.text
-                if html and not (hasattr(common, "is_anti_bot_blocked") and common.is_anti_bot_blocked("", html)):
-                    dfs = parse_tables_from_html(html, table_idx)
-                    if dfs:
-                        print(f"[ImpersonatedHTTPNode] Successfully extracted {len(dfs)} tables via TLS impersonation.")
-                        state["dfs"] = dfs
-                        return state, None
-            else:
-                print(f"[ImpersonatedHTTPNode] Request returned status code: {r.status_code}")
-        except Exception as e:
-            print(f"[ImpersonatedHTTPNode Warning] TLS impersonation request failed: {e}")
-            
+
+        dfs = _fetch_tables_via_impersonated_http(
+            url,
+            table_idx=table_idx,
+            doi=doi,
+            cancel_event=state.get("cancel_event"),
+            log_prefix="[ImpersonatedHTTPNode]",
+        )
+        if dfs:
+            state["dfs"] = dfs
+            return state, None
+
         return state, self.fallback_node
 
 
@@ -405,11 +556,26 @@ class ElsevierXMLNode(ExtractionNode):
                 _els_doi = _resolve_pii_to_doi(_pii)
                 
         if _els_doi:
-            dfs = extract_tables_via_elsevier_api(_els_doi, table_idx)
+            dfs = extract_tables_via_elsevier_api(_els_doi, table_idx, cancel_event=state.get("cancel_event"))
             if dfs:
                 state["dfs"] = dfs
                 return state, None
                 
+        return state, self.fallback_node
+
+
+class SpringerTDMNode(ExtractionNode):
+    def __init__(self, fallback_node=None):
+        super().__init__("SpringerTDMNode", fallback_node)
+
+    def execute(self, state):
+        doi = state.get("doi")
+        table_idx = state.get("table_idx", "all")
+        if doi:
+            dfs = extract_tables_via_springer_tdm(doi, table_idx, cancel_event=state.get("cancel_event"))
+            if dfs:
+                state["dfs"] = dfs
+                return state, None
         return state, self.fallback_node
 
 
@@ -596,9 +762,20 @@ class PlaywrightGeneralNode(ExtractionNode):
                 state["dfs"] = dfs
             return state, None
             
+        def _run_supp(timeout_s):
+            _pw_html = _pw_meta.get("html_content")
+            if _pw_html:
+                try:
+                    return extract_general_supplementary_tables(
+                        url, cancel_event=cancel_event, max_timeout=timeout_s, html_content=_pw_html
+                    )
+                except TypeError:
+                    pass
+            return extract_general_supplementary_tables(url, cancel_event=cancel_event, max_timeout=timeout_s)
+
         if dfs:
             # Also attempt to download and parse general supplementary tables via journal-supp-downloader
-            supp_dfs = extract_general_supplementary_tables(url, cancel_event=cancel_event, max_timeout=30)
+            supp_dfs = _run_supp(30)
             if supp_dfs:
                 dfs.extend(supp_dfs)
                 print(f"[在线提取] 成功获取并追加了 {len(supp_dfs)} 个补充表格。")
@@ -611,7 +788,7 @@ class PlaywrightGeneralNode(ExtractionNode):
 
         # If no main tables found, still try bounded supplementary extraction
         _supp_timeout = 20 if _pw_meta.get("was_blocked") else 30
-        supp_dfs = extract_general_supplementary_tables(url, cancel_event=cancel_event, max_timeout=_supp_timeout)
+        supp_dfs = _run_supp(_supp_timeout)
         if supp_dfs:
             state["dfs"] = supp_dfs
             print(f"[在线提取] 成功提取并载入 {len(supp_dfs)} 个补充表格。")
@@ -708,8 +885,23 @@ class AcademicSearchGraphNode(ExtractionNode):
                     if results:
                         pmcid = results[0].get("pmcid")
                         if pmcid:
+                            print(f"[AcademicSearchGraph] Found Europe PMC PMCID: {pmcid}，优先直取 JATS XML...")
+                            dfs = extract_tables_via_ncbi_pmc(pmcid, table_idx)
+                            if dfs:
+                                state["dfs"] = dfs
+                                return state, None
+                            if cancel_event is not None and cancel_event.is_set():
+                                return state, None
+
+                            dfs = extract_tables_via_europepmc_xml(pmcid, table_idx, cancel_event=cancel_event)
+                            if dfs:
+                                state["dfs"] = dfs
+                                return state, None
+                            if cancel_event is not None and cancel_event.is_set():
+                                return state, None
+
                             pmc_landing = f"https://www.ncbi.nlm.nih.gov/pmc/articles/{pmcid}/"
-                            print(f"[AcademicSearchGraph] Found PMC version: {pmc_landing}")
+                            print(f"[AcademicSearchGraph] JATS XML 未命中表格，回退 PMC HTML 落地页: {pmc_landing}")
                             
                             dfs = extract_tables_via_direct_http(pmc_landing, table_idx, cancel_event=cancel_event)
                             if dfs:
@@ -736,13 +928,14 @@ class AcademicSearchGraphNode(ExtractionNode):
             return state, None
                 
         # 3. Title-based Crossref preprint search
+        norm_title = normalize_title(title) if title else ""
         _bogus_title_kws = ("cnki原文下载服务", "中国知网", "access denied", "just a moment", "attention required", "page not found")
-        if title and not any(k in title.lower() for k in _bogus_title_kws):
-            print(f"[AcademicSearchGraph] Searching alternative open-access repositories by title: {title}")
+        if norm_title and not any(k in norm_title.lower() for k in _bogus_title_kws):
+            print(f"[AcademicSearchGraph] Searching alternative open-access repositories by title: {norm_title}")
             try:
                 polite_email = get_polite_email(load_config(), service="crossref")
                 crossref_url = (
-                    f"https://api.crossref.org/works?query.title={urllib.parse.quote(title)}"
+                    f"https://api.crossref.org/works?query.title={urllib.parse.quote(norm_title)}"
                     f"&rows=3&mailto={urllib.parse.quote(polite_email)}"
                 )
                 r = requests.get(
@@ -935,6 +1128,89 @@ def _race_candidates(candidates, cancel_event=None, authoritative_names=None, gr
     return [], None
 
 
+def _hedged_race_candidates(primary_candidates, hedged_candidates, hedge_delay_s=4.0, cancel_event=None):
+    """
+    Hedged Cascade 竞速调度器（用于 Tier-2）：
+    1. 先启动低成本本地渠道（primary_candidates，如 Crawl4AI / Scrapling）；
+    2. 若在 hedge_delay_s 内任意本地渠道成功提取表格，直接返回，零云端额度开销；
+    3. 若所有本地渠道在 hedge_delay_s 之前即快速失败（或被负缓存全部跳过），立即触发 hedged_candidates（Firecrawl），绝不空等；
+    4. 若达到 hedge_delay_s 本地渠道仍未成功，则并发触发 hedged_candidates，谁先出表谁获胜。
+    """
+    import queue as _q
+    import time as _t
+
+    prim = list(primary_candidates or ())
+    hedged = list(hedged_candidates or ())
+    if not prim and not hedged:
+        return [], None
+    if cancel_event is not None and cancel_event.is_set():
+        return [], None
+    if not prim:
+        return _race_candidates(hedged, cancel_event=cancel_event)
+    if not hedged or float(hedge_delay_s or 0.0) <= 0.0:
+        return _race_candidates(prim + hedged, cancel_event=cancel_event)
+
+    result_queue = _q.Queue()
+    pending = set()
+
+    def _spawn(items):
+        for c_name, c_fn in items:
+            pending.add(c_name)
+
+            def _run(n=c_name, f=c_fn):
+                try:
+                    c_dfs = f() or []
+                    result_queue.put((n, c_dfs, None))
+                except Exception as exc:
+                    result_queue.put((n, [], exc))
+
+            t = threading.Thread(target=_run, daemon=True, name=f"hedged-{c_name}")
+            t.start()
+
+    _spawn(prim)
+    hedged_launched = False
+    hedge_deadline = _t.monotonic() + float(hedge_delay_s)
+
+    while pending or not hedged_launched:
+        if cancel_event is not None and cancel_event.is_set():
+            print("[HedgedRace] 收到取消信号，放弃剩余竞速渠道。")
+            break
+
+        if not hedged_launched:
+            now = _t.monotonic()
+            if not pending or now >= hedge_deadline:
+                trigger_reason = "本地渠道已全部快速失败" if not pending else f"等待 {hedge_delay_s:.1f}s 触发对冲"
+                print(f"[HedgedRace] {trigger_reason}，启动云端对冲渠道: {[n for n, _ in hedged]}")
+                _spawn(hedged)
+                hedged_launched = True
+                if not pending:
+                    break
+                wait_step = 0.5
+            else:
+                wait_step = min(0.25, max(0.01, hedge_deadline - now))
+        else:
+            wait_step = 0.5
+
+        done_items = []
+        try:
+            done_items.append(result_queue.get(timeout=wait_step))
+            while True:
+                done_items.append(result_queue.get_nowait())
+        except _q.Empty:
+            pass
+
+        for name, dfs, err in done_items:
+            pending.discard(name)
+            if err is not None:
+                print(f"[HedgedRace] 渠道 {name} 异常: {err}")
+                dfs = []
+            if dfs:
+                print(f"[HedgedRace] 渠道 {name} 竞速获胜，提取到 {len(dfs)} 个表格。")
+                return dfs, name
+
+    return [], None
+
+
 def _run_node_locked(node, state):
     """执行共享浏览器类节点（Playwright 系列）。
 
@@ -976,23 +1252,18 @@ def _race_extract(state, cancel_event=None):
             if _pii_match:
                 _els_doi = _resolve_pii_to_doi(_pii_match.group(1).upper())
         if _els_doi:
-            return extract_tables_via_elsevier_api(_els_doi, table_idx)
+            return extract_tables_via_elsevier_api(_els_doi, table_idx, cancel_event=cancel_event)
         return []
 
-    def _impersonated():
-        if requests_impersonate is None:
-            return []
-        if cancel_event is not None and cancel_event.is_set():
-            return []
-        try:
-            r = requests_impersonate.get(url, impersonate="chrome", timeout=10)
-            if cancel_event is not None and cancel_event.is_set():
-                return []
-            if r.status_code == 200 and r.text:
-                return parse_tables_from_html(r.text, table_idx) or []
-        except Exception as e:
-            print(f"[Race] ImpersonatedHTTP 失败: {e}")
-        return []
+    def _impersonated(config=None):
+        return _fetch_tables_via_impersonated_http(
+            url,
+            table_idx=table_idx,
+            doi=doi,
+            cancel_event=cancel_event,
+            config=config,
+            log_prefix="[Race][ImpersonatedHTTP]",
+        )
 
     def _academic_search():
         if cancel_event is not None and cancel_event.is_set():
@@ -1076,22 +1347,31 @@ def _race_extract(state, cancel_event=None):
         tier1.append(("NCBIPMC", lambda: extract_tables_via_ncbi_pmc(pmc_cand or doi, table_idx)))
     if url:
         def _direct_then_impersonated():
-            res = extract_tables_via_direct_http(url, table_idx, cancel_event=cancel_event)
+            res = extract_tables_via_direct_http(url, table_idx, cancel_event=cancel_event, doi=doi)
             if res:
                 return res
             if cancelled():
                 return []
-            return _impersonated()
+            if callable(is_negatively_cached):
+                hit = is_negatively_cached("direct_http", url=url, doi=doi, config=cfg)
+                if hit:
+                    print(
+                        f"[Race] DirectHTTP 已命中负缓存 ({hit.get('target_key')}, {hit.get('reason')})，跳过 ImpersonatedHTTP 重试。"
+                    )
+                    return []
+            return _impersonated(config=cfg)
 
         tier1.append(("DirectHTTP", _direct_then_impersonated))
     if _is_elsevier():
         tier1.append(("ElsevierXML", _elsevier_xml))
+    if doi and is_springer_nature_target(doi=doi, url=url):
+        tier1.append(("SpringerTDM", lambda: extract_tables_via_springer_tdm(doi, table_idx, cancel_event=cancel_event)))
     if doi:
         tier1.append(("Unpaywall", lambda: extract_tables_via_unpaywall(doi, table_idx, cancel_event=cancel_event)))
     dfs, winner = _race_candidates(
         tier1,
         cancel_event,
-        authoritative_names={"ArxivHTML", "NCBIPMC", "ElsevierXML"},
+        authoritative_names={"ArxivHTML", "NCBIPMC", "ElsevierXML", "SpringerTDM"},
     )
 
     history.append(f"general-tier1:{winner or 'none'}")
@@ -1099,7 +1379,7 @@ def _race_extract(state, cancel_event=None):
     _tier1_incomplete_hint = (
         dfs
         and table_idx == "all"
-        and winner not in ("ArxivHTML", "NCBIPMC", "ElsevierXML", "Unpaywall")
+        and winner not in ("ArxivHTML", "NCBIPMC", "ElsevierXML", "SpringerTDM", "Unpaywall")
         and len(dfs) == 1
         and len(dfs[0]) <= 2
         and bool(url and any(dom in url.lower() for dom in (
@@ -1115,13 +1395,37 @@ def _race_extract(state, cancel_event=None):
     if cancelled():
         return best_partial, history
 
-    # Tier-2: 独立浏览器 / 云抓取渠道并发竞速
-    tier2 = []
+    # Tier-2: Hedged Cascade（先启动低成本本地渠道 Crawl4AI/Scrapling；延迟或快速全失败后再对冲触发云端 Firecrawl）
+    tier2_primary = []
+    tier2_hedged = []
     if url:
-        tier2.append(("Crawl4AI", lambda: extract_tables_via_crawl4ai(url, table_idx, cancel_event=cancel_event)))
-        tier2.append(("Firecrawl", lambda: extract_tables_via_firecrawl(url, api_key, table_idx, cancel_event=cancel_event, doi=doi)))
-        tier2.append(("Scrapling", lambda: extract_tables_via_scrapling(url, table_idx, cancel_event=cancel_event)))
-    dfs, winner = _race_candidates(tier2, cancel_event)
+        def _not_neg_cached(ch_name):
+            if not callable(is_negatively_cached):
+                return True
+            hit = is_negatively_cached(ch_name, url=url, doi=doi, config=cfg)
+            if hit:
+                print(f"[Race] Tier-2 跳过负缓存渠道 {ch_name} ({hit.get('target_key')}, {hit.get('reason')})")
+                return False
+            return True
+
+        if _not_neg_cached("crawl4ai"):
+            tier2_primary.append(("Crawl4AI", lambda: extract_tables_via_crawl4ai(url, table_idx, cancel_event=cancel_event)))
+        if _not_neg_cached("scrapling"):
+            tier2_primary.append(("Scrapling", lambda: extract_tables_via_scrapling(url, table_idx, cancel_event=cancel_event)))
+        if _not_neg_cached("firecrawl"):
+            tier2_hedged.append(("Firecrawl", lambda: extract_tables_via_firecrawl(url, api_key, table_idx, cancel_event=cancel_event, doi=doi)))
+
+    try:
+        hedge_delay_s = max(0.0, float(cfg.get("TIER2_HEDGE_DELAY_S", 4.0)))
+    except (TypeError, ValueError):
+        hedge_delay_s = 4.0
+
+    dfs, winner = _hedged_race_candidates(
+        tier2_primary,
+        tier2_hedged,
+        hedge_delay_s=hedge_delay_s,
+        cancel_event=cancel_event,
+    )
     history.append(f"general-tier2:{winner or 'none'}")
     if dfs and len(dfs) > len(best_partial):
         return dfs, history
@@ -1191,9 +1495,23 @@ def extract_tables_online(pdf_path, table_idx="all", db_path=None, api_key=None,
         state["is_cnki"] = pre_resolved.get("is_cnki", False)
 
     if state.get("url"):
-        resolved_u, resolved_cnki = _resolve_chinese_doi_and_classify(state["url"], bool(state.get("is_cnki")))
-        state["url"] = resolved_u
+        orig_url = state["url"]
+        resolved_u, resolved_cnki = _resolve_chinese_doi_and_classify(orig_url, bool(state.get("is_cnki")))
+        state["url"] = _normalize_publisher_url(resolved_u)
         state["is_cnki"] = resolved_cnki
+        if not state.get("doi"):
+            extracted_doi = _extract_doi_from_url(state["url"]) or _extract_doi_from_url(orig_url)
+            if extracted_doi:
+                state["doi"] = extracted_doi
+        if state.get("doi") and not state.get("is_cnki") and is_chinese_doi(state["doi"]):
+            parsed_host = (urllib.parse.urlparse(state["url"]).hostname or "").lower()
+            if parsed_host in ("doi.org", "dx.doi.org", "hdl.handle.net"):
+                chndoi_url = f"https://www.chndoi.org/Resolution/Handler?doi={state['doi']}"
+                resolved = resolve_chinese_doi(chndoi_url)
+                if resolved and resolved != chndoi_url:
+                    state["url"] = _normalize_publisher_url(resolved)
+                    low_res = resolved.lower()
+                    state["is_cnki"] = ("cnki.net" in low_res or "cnki.com.cn" in low_res)
 
     if race:
         # 并行竞速管线（url 缺失时仍进解析节点做 URL 解析；节点对已有 doi 幂等）
@@ -1218,6 +1536,7 @@ def extract_tables_online(pdf_path, table_idx="all", db_path=None, api_key=None,
     graph.add_node("DirectHTTPNode", DirectHTTPNode(fallback_node="ImpersonatedHTTPNode"))
     graph.add_node("ImpersonatedHTTPNode", ImpersonatedHTTPNode(fallback_node="Crawl4AIGeneralNode"))
     graph.add_node("ElsevierXMLNode", ElsevierXMLNode(fallback_node="Crawl4AIGeneralNode"))
+    graph.add_node("SpringerTDMNode", SpringerTDMNode(fallback_node="ImpersonatedHTTPNode"))
 
 
     graph.add_node("Crawl4AICNKINode", Crawl4AICNKINode(fallback_node="PlaywrightCNKINode"))

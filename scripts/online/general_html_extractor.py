@@ -3,15 +3,31 @@ import re
 import urllib.parse
 import urllib.request
 import pandas as pd
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright as _default_sync_playwright
+sync_playwright = _default_sync_playwright
 
 try:
-    from ..playwright_utils import find_playwright_chromium
+    from ..playwright_utils import (
+        find_playwright_chromium,
+        resolve_sync_playwright,
+        extract_browser_pid,
+        close_browser_safely,
+    )
 except ImportError:
     try:
-        from playwright_utils import find_playwright_chromium
+        from playwright_utils import (
+            find_playwright_chromium,
+            resolve_sync_playwright,
+            extract_browser_pid,
+            close_browser_safely,
+        )
     except ImportError:
         find_playwright_chromium = lambda: None
+        resolve_sync_playwright = lambda module_sync_pw=None, default_playwright_sync=None, prefer_patchright=True: (module_sync_pw or _default_sync_playwright, "playwright")
+        extract_browser_pid = lambda **kwargs: None
+        close_browser_safely = lambda browser=None, context=None, proc_pid=None, force_kill_on_error=True: (
+            browser.close() if browser is not None else (context.close() if context is not None else None)
+        )
 
 # Shared helpers (text cleaning, table filtering, config)
 try:
@@ -739,12 +755,16 @@ def _inject_cookies_from_profile(context, user_data_dir, url=None):
     import json
     for cookies_json in cookie_files:
         try:
-            with open(cookies_json, 'r', encoding='utf-8') as f:
-                raw_cookies = f.read().strip()
-            if not raw_cookies:
-                continue
-            data = json.loads(raw_cookies)
-            cookies = data.get("cookies", []) if isinstance(data, dict) else data
+            cookies = []
+            if _common_mod and callable(getattr(_common_mod, "load_cookies_from_file", None)):
+                cookies = _common_mod.load_cookies_from_file(cookies_json) or []
+            if not cookies:
+                with open(cookies_json, 'r', encoding='utf-8') as f:
+                    raw_cookies = f.read().strip()
+                if not raw_cookies:
+                    continue
+                data = json.loads(raw_cookies)
+                cookies = data.get("cookies", []) if isinstance(data, dict) else data
             if not isinstance(cookies, list) or not cookies:
                 continue
             prepared = []
@@ -1465,8 +1485,13 @@ def _extract_copernicus_xml_tables(page, table_idx="all"):
             resp = page.request.fetch(xml_url, timeout=15000)
             if resp.status == 200:
                 xml_text = resp.text()
-                if "<table-wrap" in xml_text:
-                    return _parse_jats_xml_tables(xml_text, table_idx=table_idx) or []
+                if "<table-wrap" in xml_text or "table-wrap" in xml_text.lower():
+                    return _parse_jats_xml_tables(
+                        xml_text,
+                        table_idx=table_idx,
+                        source="copernicus_jats",
+                        log_prefix="[Copernicus JATS]",
+                    ) or []
     except Exception as e:
         print(f"[通用自动化] Copernicus JATS XML 提取警告: {e}")
     return []
@@ -1598,20 +1623,45 @@ def _extract_general_html_tables_impl(url, table_idx="all", headed=False, user_d
         print("[通用自动化] 检测到高风控目标平台，自动激活真实 Chrome CDP 桥接调试浏览器...")
         _ensure_chrome_debug_running()
 
+    # 可选机构代理重写（仅在显式开启 EZPROXY_ENABLED / WEBVPN_ENABLED 时生效）
+    try:
+        from .proxy_rewriter import maybe_rewrite_institutional_url, validate_institutional_session
+    except ImportError:
+        try:
+            from proxy_rewriter import maybe_rewrite_institutional_url, validate_institutional_session
+        except ImportError:
+            maybe_rewrite_institutional_url = None
+            validate_institutional_session = None
+
+    _inst_proxy_rewritten = False
+    _needs_relogin = False
+    _captured_page_html = None
+    if maybe_rewrite_institutional_url and (_cfg_early.get("EZPROXY_ENABLED") or _cfg_early.get("WEBVPN_ENABLED")):
+        rewritten = maybe_rewrite_institutional_url(url_no_fragment, config=_cfg_early)
+        if rewritten and rewritten != url_no_fragment:
+            print(f"[通用自动化] 已应用机构代理 URL 重写: {rewritten}")
+            url_no_fragment = rewritten
+            _inst_proxy_rewritten = True
+
     exec_path = find_playwright_chromium()
     if exec_path:
         print(f"[Playwright] 使用自动识别的 Chromium 路径: {exec_path}")
-    with sync_playwright() as p:
-        _tmp_profile = None  # track temp profile for cleanup
-        browser = None       # track browser reference for non-persistent cleanup
 
-        # Strategy 0: Dynamic CDP Auto-discovery (DevToolsActivePort + 9222 fallback)
-        connected_via_cdp = False
-        skip_navigation = False
-        cdp_port = None
-        cdp_endpoint = None
+    # Strategy 0: Dynamic CDP Auto-discovery (before engine selection so self-launched browsers can prefer Patchright)
+    cdp_port = None
+    cdp_endpoint = None
+    try:
+        from .cdp_detector import (
+            find_active_cdp_endpoint,
+            find_matching_cdp_page,
+            get_publisher_table_wait_selector,
+            install_cdp_port_guard,
+            install_slow_tracker_route_blocker,
+            wait_through_transient_challenge,
+        )
+    except ImportError:
         try:
-            from .cdp_detector import (
+            from cdp_detector import (
                 find_active_cdp_endpoint,
                 find_matching_cdp_page,
                 get_publisher_table_wait_selector,
@@ -1620,41 +1670,74 @@ def _extract_general_html_tables_impl(url, table_idx="all", headed=False, user_d
                 wait_through_transient_challenge,
             )
         except ImportError:
-            try:
-                from cdp_detector import (
-                    find_active_cdp_endpoint,
-                    find_matching_cdp_page,
-                    get_publisher_table_wait_selector,
-                    install_cdp_port_guard,
-                    install_slow_tracker_route_blocker,
-                    wait_through_transient_challenge,
-                )
-            except ImportError:
-                find_active_cdp_endpoint = None
-                find_matching_cdp_page = None
-                get_publisher_table_wait_selector = lambda _u: "table"
-                install_cdp_port_guard = None
-                install_slow_tracker_route_blocker = None
-                wait_through_transient_challenge = None
+            find_active_cdp_endpoint = None
+            find_matching_cdp_page = None
+            get_publisher_table_wait_selector = lambda _u: "table"
+            install_cdp_port_guard = None
+            install_slow_tracker_route_blocker = None
+            wait_through_transient_challenge = None
 
-        if find_active_cdp_endpoint:
-            cfg = None
+    if find_active_cdp_endpoint:
+        cfg = None
+        try:
+            cfg = load_config()
+        except Exception:
             try:
-                cfg = load_config()
+                import common
+                cfg = common.load_config()
             except Exception:
+                cfg = None
+        cdp_endpoint = find_active_cdp_endpoint(timeout=1.5, user_data_dir=user_data_dir, config=cfg)
+    else:
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:9222/json/version", timeout=1.2) as response:
+                if response.status == 200:
+                    cdp_endpoint = {"cdp_url": "http://127.0.0.1:9222", "port": 9222, "source": "default_9222"}
+        except Exception:
+            cdp_endpoint = None
+
+    _active_sync_pw, _pw_engine = resolve_sync_playwright(
+        module_sync_pw=sync_playwright,
+        default_playwright_sync=_default_sync_playwright,
+        prefer_patchright=not bool(cdp_endpoint),
+    )
+    if _pw_engine == "patchright":
+        print("[通用自动化] 未接入外部 CDP 浏览器，优先使用 Patchright Stealth 引擎启动独立实例。")
+
+    import contextlib as _ctxlib
+    with _active_sync_pw() as p, _ctxlib.ExitStack() as _cleanup_stack:
+        _tmp_profile = None  # track temp profile for cleanup
+        browser = None       # track browser reference for non-persistent cleanup
+        context = None
+        page = None
+        _self_launched_pid = None
+
+        connected_via_cdp = False
+        skip_navigation = False
+
+        def _cleanup_browser_resources():
+            try:
+                if connected_via_cdp:
+                    # 保护用户物理浏览器：CDP 模式下绝不调用 browser.close()，仅在新建标签页时关闭该标签页
+                    if not skip_navigation and page:
+                        try:
+                            page.close()
+                        except Exception:
+                            pass
+                elif browser:
+                    close_browser_safely(browser=browser, proc_pid=_self_launched_pid)
+                elif context and (user_data_dir or _tmp_profile):
+                    close_browser_safely(context=context, proc_pid=_self_launched_pid)
+            except Exception:
+                pass
+            if _tmp_profile and os.path.isdir(_tmp_profile):
                 try:
-                    import common
-                    cfg = common.load_config()
+                    import shutil
+                    shutil.rmtree(_tmp_profile, ignore_errors=True)
                 except Exception:
-                    cfg = None
-            cdp_endpoint = find_active_cdp_endpoint(timeout=1.5, user_data_dir=user_data_dir, config=cfg)
-        else:
-            try:
-                with urllib.request.urlopen("http://127.0.0.1:9222/json/version", timeout=1.2) as response:
-                    if response.status == 200:
-                        cdp_endpoint = {"cdp_url": "http://127.0.0.1:9222", "port": 9222, "source": "default_9222"}
-            except Exception:
-                cdp_endpoint = None
+                    pass
+
+        _cleanup_stack.callback(_cleanup_browser_resources)
 
         if cdp_endpoint:
             try:
@@ -1709,10 +1792,12 @@ def _extract_general_html_tables_impl(url, table_idx="all", headed=False, user_d
 
         if not connected_via_cdp:
             browser, context = _launch_context_or_browser(p, user_data_dir, headless, exec_path)
+            _self_launched_pid = extract_browser_pid(browser=browser, context=context, playwright_obj=p)
             if browser is not None:
                 user_data_dir = None
             page = context.pages[0] if context.pages else context.new_page()
-            page.add_init_script(_STEALTH_INIT_SCRIPT)
+            if _pw_engine != "patchright":
+                page.add_init_script(_STEALTH_INIT_SCRIPT)
             _inject_cookies_from_profile(context, user_data_dir, url=url)
             if install_cdp_port_guard:
                 install_cdp_port_guard(context)
@@ -1943,6 +2028,31 @@ def _extract_general_html_tables_impl(url, table_idx="all", headed=False, user_d
             was_dead_http = False
         _skip_dom_extract = _cancelled_early or _page_closed or was_dead_http or _is_page_closed(page) or (cancel_event is not None and cancel_event.is_set())
 
+        # 保守机构会话校验与 HTML 快照捕获（供内置补充材料回退复用）
+        if not _skip_dom_extract:
+            try:
+                _html_snap = page.content() or ""
+            except Exception:
+                _html_snap = ""
+            if _html_snap and not was_blocked and len(_html_snap) <= 2_000_000:
+                _captured_page_html = _html_snap
+            if _inst_proxy_rewritten and validate_institutional_session:
+                try:
+                    _cur_u = getattr(page, "url", "") or url_no_fragment
+                    _sess = validate_institutional_session(
+                        html_text=_html_snap,
+                        final_url=_cur_u,
+                        status_code=getattr(_main_resp, "status", 200) if "_main_resp" in locals() and _main_resp is not None else 200,
+                    )
+                    if not _sess.get("valid") and _sess.get("needs_relogin"):
+                        _needs_relogin = True
+                        print(
+                            f"[通用自动化] 检测到机构代理会话失效 ({_sess.get('reason')})，"
+                            f"请先在调试 Chrome 中重新登录 EZProxy/WebVPN 或运行 `python scripts/login.py publishers`。"
+                        )
+                except Exception:
+                    pass
+
         # ── Special Taylor & Francis Direct CSV Download Pipeline ──
         try:
             _cur_page_url = (page.url or url_no_fragment) if not _skip_dom_extract else url_no_fragment
@@ -2160,28 +2270,7 @@ def _extract_general_html_tables_impl(url, table_idx="all", headed=False, user_d
 
 
                     
-        # Close context and clean up
-        try:
-            if connected_via_cdp:
-                # 保护用户物理浏览器：CDP 模式下绝不调用 browser.close()，仅在新建标签页时关闭该标签页
-                if not skip_navigation and page:
-                    try:
-                        page.close()
-                    except Exception:
-                        pass
-            elif browser:
-                browser.close()
-            elif user_data_dir or _tmp_profile:
-                context.close()
-        except Exception:
-            pass
-        # Clean up temp profile dir
-        if _tmp_profile and os.path.isdir(_tmp_profile):
-            try:
-                import shutil
-                shutil.rmtree(_tmp_profile, ignore_errors=True)
-            except Exception:
-                pass
+        # Cleanup is guaranteed by _cleanup_stack (_cleanup_browser_resources) on all exit paths.
 
             
     # Clean paper title
@@ -2193,6 +2282,9 @@ def _extract_general_html_tables_impl(url, table_idx="all", headed=False, user_d
     if isinstance(meta_out, dict):
         meta_out["was_dead_http"] = was_dead_http
         meta_out["was_blocked"] = was_blocked
+        meta_out["needs_relogin"] = _needs_relogin
+        if _captured_page_html:
+            meta_out["html_content"] = _captured_page_html
 
     # Standalone dynamic reroute to CNKI dedicated extractor when called without graph meta_out
     if _reroute_cnki_url and meta_out is None:

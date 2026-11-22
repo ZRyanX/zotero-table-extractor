@@ -87,8 +87,34 @@ _COMPANION_KEY_MAP = {
     "elsevier_api_key": "ELSEVIER_API_KEY",
     "ELSEVIER_INSTTOKEN": "ELSEVIER_INSTTOKEN",
     "elsevier_insttoken": "ELSEVIER_INSTTOKEN",
+    "SPRINGER_API_KEY": "SPRINGER_API_KEY",
+    "springer_api_key": "SPRINGER_API_KEY",
     "IS_CAMPUS_NETWORK": "IS_CAMPUS_NETWORK",
     "is_campus_network": "IS_CAMPUS_NETWORK",
+    "NETWORK_PROXY": "NETWORK_PROXY",
+    "network_proxy": "NETWORK_PROXY",
+    "PROXY_URL": "NETWORK_PROXY",
+    "proxy_url": "NETWORK_PROXY",
+    "EZPROXY_ENABLED": "EZPROXY_ENABLED",
+    "ezproxy_enabled": "EZPROXY_ENABLED",
+    "EZPROXY_LOGIN_URL": "EZPROXY_LOGIN_URL",
+    "ezproxy_login_url": "EZPROXY_LOGIN_URL",
+    "EZPROXY_URL": "EZPROXY_LOGIN_URL",
+    "ezproxy_url": "EZPROXY_LOGIN_URL",
+    "WEBVPN_ENABLED": "WEBVPN_ENABLED",
+    "webvpn_enabled": "WEBVPN_ENABLED",
+    "WEBVPN_BASE_URL": "WEBVPN_BASE_URL",
+    "webvpn_base_url": "WEBVPN_BASE_URL",
+    "WEBVPN_KEY": "WEBVPN_KEY",
+    "webvpn_key": "WEBVPN_KEY",
+    "WEBVPN_IV": "WEBVPN_IV",
+    "webvpn_iv": "WEBVPN_IV",
+    "CARSI_ENABLED": "CARSI_ENABLED",
+    "carsi_enabled": "CARSI_ENABLED",
+    "CARSI_IDP": "CARSI_IDP",
+    "carsi_idp": "CARSI_IDP",
+    "CARSI_IDP_NAME": "CARSI_IDP",
+    "carsi_idp_name": "CARSI_IDP",
     "UNPAYWALL_EMAIL": "UNPAYWALL_EMAIL",
     "unpaywall_email": "UNPAYWALL_EMAIL",
     "CROSSREF_EMAIL": "CROSSREF_EMAIL",
@@ -105,6 +131,13 @@ _COMPANION_KEY_MAP = {
     "ZOTERO_LIBRARY_TYPE": "ZOTERO_LIBRARY_TYPE",
     "zotero_library_type": "ZOTERO_LIBRARY_TYPE",
 }
+
+_COMPANION_BOOL_KEYS = frozenset({
+    "IS_CAMPUS_NETWORK",
+    "EZPROXY_ENABLED",
+    "WEBVPN_ENABLED",
+    "CARSI_ENABLED",
+})
 
 
 def _parse_bool_flag(val):
@@ -196,7 +229,7 @@ def _load_companion_academic_credentials():
         mapped = _COMPANION_KEY_MAP.get(raw_key)
         if not mapped:
             return
-        if mapped == "IS_CAMPUS_NETWORK":
+        if mapped in _COMPANION_BOOL_KEYS:
             merged[mapped] = _parse_bool_flag(raw_val)
         else:
             val_str = str(raw_val).strip()
@@ -300,8 +333,26 @@ def load_config():
         data["IMG2TABLE_ENABLED"] = True
     if "ELSEVIER_INSTTOKEN" not in data:
         data["ELSEVIER_INSTTOKEN"] = ""
+    if "SPRINGER_API_KEY" not in data:
+        data["SPRINGER_API_KEY"] = ""
+    if "SPRINGER_TDM_ENABLED" not in data:
+        data["SPRINGER_TDM_ENABLED"] = True
     if "IS_CAMPUS_NETWORK" not in data:
         data["IS_CAMPUS_NETWORK"] = False
+    if "NETWORK_PROXY" not in data:
+        data["NETWORK_PROXY"] = ""
+    if "EZPROXY_ENABLED" not in data:
+        data["EZPROXY_ENABLED"] = False
+    if "EZPROXY_LOGIN_URL" not in data:
+        data["EZPROXY_LOGIN_URL"] = ""
+    if "WEBVPN_ENABLED" not in data:
+        data["WEBVPN_ENABLED"] = False
+    if "WEBVPN_BASE_URL" not in data:
+        data["WEBVPN_BASE_URL"] = ""
+    if "WEBVPN_KEY" not in data:
+        data["WEBVPN_KEY"] = ""
+    if "WEBVPN_IV" not in data:
+        data["WEBVPN_IV"] = ""
     if "UNPAYWALL_EMAIL" not in data:
         data["UNPAYWALL_EMAIL"] = ""
     if "CROSSREF_EMAIL" not in data:
@@ -324,13 +375,30 @@ def load_config():
         data["ZOTERO_LIBRARY_TYPE"] = "user"
     if "CARSI_ENABLED" not in data:
         data["CARSI_ENABLED"] = False
+    if "CARSI_IDP" not in data:
+        data["CARSI_IDP"] = ""
+    if "TIER2_HEDGE_DELAY_S" not in data:
+        data["TIER2_HEDGE_DELAY_S"] = 4.0
+    if "NEGATIVE_CACHE_ENABLED" not in data:
+        data["NEGATIVE_CACHE_ENABLED"] = True
+    if "NEGATIVE_CACHE_TTL_S" not in data:
+        data["NEGATIVE_CACHE_TTL_S"] = 1800
 
     # 环境变量覆盖敏感配置
     env_overrides = {
         'FIRECRAWL_API_KEY': 'FIRECRAWL_API_KEY',
         'ELSEVIER_API_KEY': 'ELSEVIER_API_KEY',
         'ELSEVIER_INSTTOKEN': 'ELSEVIER_INSTTOKEN',
+        'SPRINGER_API_KEY': 'SPRINGER_API_KEY',
+        'SPRINGER_TDM_ENABLED': 'SPRINGER_TDM_ENABLED',
         'IS_CAMPUS_NETWORK': 'IS_CAMPUS_NETWORK',
+        'NETWORK_PROXY': 'NETWORK_PROXY',
+        'EZPROXY_ENABLED': 'EZPROXY_ENABLED',
+        'EZPROXY_LOGIN_URL': 'EZPROXY_LOGIN_URL',
+        'WEBVPN_ENABLED': 'WEBVPN_ENABLED',
+        'WEBVPN_BASE_URL': 'WEBVPN_BASE_URL',
+        'WEBVPN_KEY': 'WEBVPN_KEY',
+        'WEBVPN_IV': 'WEBVPN_IV',
         'UNPAYWALL_EMAIL': 'UNPAYWALL_EMAIL',
         'CROSSREF_EMAIL': 'CROSSREF_EMAIL',
         'OPENALEX_API_KEY': 'OPENALEX_API_KEY',
@@ -356,6 +424,7 @@ def load_config():
         'CARSI_ENABLED': 'CARSI_ENABLED',
         'CARSI_URL': 'CARSI_URL',
         'CARSI_IDP': 'CARSI_IDP',
+        'NEGATIVE_CACHE_ENABLED': 'NEGATIVE_CACHE_ENABLED',
     }
     for config_key, env_key in env_overrides.items():
         env_val = os.getenv(env_key)
@@ -366,6 +435,17 @@ def load_config():
                 data[config_key] = False
             else:
                 data[config_key] = env_val
+
+    if not data.get("CARSI_IDP") and os.getenv("CARSI_IDP_NAME"):
+        data["CARSI_IDP"] = os.getenv("CARSI_IDP_NAME").strip()
+
+    for _num_key, _cast in (("TIER2_HEDGE_DELAY_S", float), ("NEGATIVE_CACHE_TTL_S", int)):
+        _env_num = os.getenv(_num_key)
+        if _env_num is not None and _env_num.strip() != "":
+            try:
+                data[_num_key] = _cast(_env_num.strip())
+            except (TypeError, ValueError):
+                pass
 
     # 自动同步 MINERU_TOKEN 与 MINERU_API_KEY
     if data.get("MINERU_TOKEN") and not data.get("MINERU_API_KEY"):
@@ -384,12 +464,23 @@ def is_carsi_configured(config=None) -> bool:
         return True
     if isinstance(enabled, str) and enabled.strip().lower() in ("true", "1", "yes"):
         return True
-    for key in ("CARSI_URL", "CARSI_IDP", "CARSI_SCHOOL"):
+    for key in ("CARSI_URL", "CARSI_IDP", "CARSI_IDP_NAME", "CARSI_SCHOOL"):
         val = cfg.get(key) or os.getenv(key, "")
         if isinstance(val, str) and val.strip():
             return True
     env_flag = (os.getenv("CARSI_ENABLED") or "").strip().lower()
     return env_flag in ("true", "1", "yes")
+
+
+def get_requests_proxies(config=None):
+    """返回 requests 兼容的 proxies 字典（仅当显式配置了 NETWORK_PROXY 时），否则返回 None。"""
+    cfg = config if isinstance(config, dict) else load_config()
+    proxy = str(cfg.get("NETWORK_PROXY") or os.getenv("NETWORK_PROXY") or "").strip()
+    if not proxy:
+        return None
+    if "://" not in proxy:
+        proxy = f"http://{proxy}"
+    return {"http": proxy, "https": proxy}
 
 
 def build_elsevier_headers(config=None, accept="application/json"):
@@ -499,16 +590,27 @@ def get_crawl4ai_cookies_path():
 
 def get_companion_cookie_paths():
     """Return existing publisher/institutional cookie files shared with companion tools."""
+    import glob
+
     home = os.path.expanduser("~")
+    scansci_cache = os.path.join(home, ".scansci-pdf", "cache")
     candidates = [
         get_crawl4ai_cookies_path(),
         os.path.join(home, ".journal_supp_downloader_profile", "cookies.json"),
-        os.path.join(home, ".scansci-pdf", "cache", "vpnsci-cookies.json"),
-        os.path.join(home, ".scansci-pdf", "cache", "vpnsci_cookies.json"),
-        os.path.join(home, ".scansci-pdf", "cache", "ezproxy_cookies.json"),
+        os.path.join(scansci_cache, "publisher_cookies.json"),
+        os.path.join(scansci_cache, "instsci-cookies.json"),
+        os.path.join(scansci_cache, "instsci_cookies.json"),
+        os.path.join(scansci_cache, "vpnsci-cookies.json"),
+        os.path.join(scansci_cache, "vpnsci_cookies.json"),
+        os.path.join(scansci_cache, "ezproxy_cookies.json"),
+        os.path.join(home, ".scansci-pdf", "instsci-cookies.json"),
     ]
+    carsi_dir = os.path.join(scansci_cache, "carsi_cookies")
+    if os.path.isdir(carsi_dir):
+        candidates.extend(sorted(glob.glob(os.path.join(carsi_dir, "*.json"))))
     for root in _discover_companion_downloader_roots():
         candidates.append(os.path.join(root, "cookies.json"))
+        candidates.append(os.path.join(root, "instsci-cookies.json"))
     seen = set()
     existing = []
     for p in candidates:
@@ -519,11 +621,47 @@ def get_companion_cookie_paths():
     return existing
 
 
+def _normalize_same_site(raw_val):
+    """Normalize browser/extension sameSite values to Playwright-accepted ('Strict'|'Lax'|'None')."""
+    if not raw_val or not isinstance(raw_val, str):
+        return None
+    low = raw_val.strip().lower()
+    if low == "strict":
+        return "Strict"
+    if low == "lax":
+        return "Lax"
+    if low in ("none", "no_restriction"):
+        return "None"
+    # 'unspecified' or unknown values must be omitted for Playwright add_cookies()
+    return None
+
+
+def _extract_cookie_dicts_from_json(data):
+    """Flatten JSON cookie payloads: list, {'cookies': [...]}, or domain/publisher-keyed dicts."""
+    if isinstance(data, list):
+        return [c for c in data if isinstance(c, dict)]
+    if isinstance(data, dict):
+        if isinstance(data.get("cookies"), list):
+            return [c for c in data["cookies"] if isinstance(c, dict)]
+        collected = []
+        for val in data.values():
+            if isinstance(val, list):
+                collected.extend(c for c in val if isinstance(c, dict) and c.get("name"))
+            elif isinstance(val, dict) and isinstance(val.get("cookies"), list):
+                collected.extend(c for c in val["cookies"] if isinstance(c, dict) and c.get("name"))
+        if collected:
+            return collected
+    return []
+
+
 def load_cookies_from_file(file_path):
     """
     Parses cookies from a Netscape cookie file or JSON cookie file.
+    Supports list, {'cookies': [...]}, and publisher/domain-keyed JSON stores.
     Returns a list of dicts suitable for Playwright's context.add_cookies().
     """
+    import math
+
     cookies = []
     if not file_path or not os.path.exists(file_path):
         return cookies
@@ -534,22 +672,43 @@ def load_cookies_from_file(file_path):
         # Try JSON first
         try:
             data = json.loads(content)
-            if isinstance(data, dict) and isinstance(data.get("cookies"), list):
-                data = data["cookies"]
-            if isinstance(data, list):
-                for c in data:
+            raw_list = _extract_cookie_dicts_from_json(data)
+            if isinstance(data, (list, dict)):
+                for c in raw_list:
+                    name = c.get("name")
+                    if not name:
+                        continue
+                    domain = c.get("domain")
+                    url_val = c.get("url")
+                    if not domain and not url_val:
+                        continue
+                    val = c.get("value")
                     cookie = {
-                        "name": c.get("name"),
-                        "value": c.get("value"),
-                        "domain": c.get("domain"),
-                        "path": c.get("path", "/"),
-                        "secure": c.get("secure", False),
-                        "httpOnly": c.get("httpOnly", False)
+                        "name": str(name),
+                        "value": "" if val is None else str(val),
+                        "secure": bool(c.get("secure", False)),
+                        "httpOnly": bool(c.get("httpOnly", False)),
                     }
-                    if "expirationDate" in c:
-                        cookie["expires"] = int(c["expirationDate"])
-                    elif "expires" in c:
-                        cookie["expires"] = int(c["expires"])
+                    if domain:
+                        cookie["domain"] = str(domain)
+                        cookie["path"] = str(c.get("path") or "/")
+                    else:
+                        cookie["url"] = str(url_val)
+
+                    raw_exp = c.get("expirationDate")
+                    if raw_exp is None:
+                        raw_exp = c.get("expires")
+                    if raw_exp is not None and raw_exp != "":
+                        try:
+                            exp_f = float(raw_exp)
+                            if math.isfinite(exp_f):
+                                cookie["expires"] = int(exp_f)
+                        except (TypeError, ValueError):
+                            pass
+
+                    norm_ss = _normalize_same_site(c.get("sameSite"))
+                    if norm_ss:
+                        cookie["sameSite"] = norm_ss
                     cookies.append(cookie)
                 return cookies
         except Exception:
@@ -1429,15 +1588,27 @@ _ANTI_BOT_MARKERS = (
     "attention required",
     "cf-browser-verification",
     "cf-challenge",
+    "cf-turnstile",
+    "challenges.cloudflare.com",
+    "__cf_chl_",
     "challenge-platform",
     "cf_styles",
+    "checking your browser",
     "access denied",
     "are you a robot",
+    "verify you are human",
     "there was a problem",
     "enable javascript and cookies to continue",
     "radware bot manager",
+    "bot manager",
     "validate.perfdrive.com",
-    "bm-verify=",
+    "bm-verify",
+    "datadome",
+    "perimeterx",
+    "incapsula",
+    "imperva",
+    "/tspd/",
+    "apm_do_not_touch",
     "安全验证",
     "your privacy, your choice",
 )

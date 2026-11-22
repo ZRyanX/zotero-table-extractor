@@ -1,16 +1,33 @@
 import os
 import random
 import time
+import urllib.request
 import pandas as pd
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright as _default_sync_playwright
+sync_playwright = _default_sync_playwright
 
 try:
-    from ..playwright_utils import find_playwright_chromium
+    from ..playwright_utils import (
+        find_playwright_chromium,
+        resolve_sync_playwright,
+        extract_browser_pid,
+        close_browser_safely,
+    )
 except ImportError:
     try:
-        from playwright_utils import find_playwright_chromium
+        from playwright_utils import (
+            find_playwright_chromium,
+            resolve_sync_playwright,
+            extract_browser_pid,
+            close_browser_safely,
+        )
     except ImportError:
         find_playwright_chromium = lambda: None
+        resolve_sync_playwright = lambda module_sync_pw=None, default_playwright_sync=None, prefer_patchright=True: (module_sync_pw or _default_sync_playwright, "playwright")
+        extract_browser_pid = lambda **kwargs: None
+        close_browser_safely = lambda browser=None, context=None, proc_pid=None, force_kill_on_error=True: (
+            browser.close() if browser is not None else (context.close() if context is not None else None)
+        )
 
 
 # Shared helpers (text cleaning, table filtering, cookie parsing)
@@ -234,38 +251,52 @@ def extract_cnki_html_tables(url, cookies_path=None, table_idx="all", headed=Fal
     exec_path = find_playwright_chromium()
     if exec_path:
         print(f"[Playwright] 使用自动识别的 Chromium 路径: {exec_path}")
-    connected_via_cdp = False
-    with sync_playwright() as p:
-        cdp_endpoint = None
-        cdp_port = None
-        try:
-            from .cdp_detector import find_active_cdp_endpoint, install_cdp_port_guard
-        except ImportError:
-            try:
-                from cdp_detector import find_active_cdp_endpoint, install_cdp_port_guard
-            except ImportError:
-                find_active_cdp_endpoint = None
-                install_cdp_port_guard = None
 
-        if find_active_cdp_endpoint:
-            cfg = None
+    cdp_endpoint = None
+    cdp_port = None
+    try:
+        from .cdp_detector import find_active_cdp_endpoint, install_cdp_port_guard
+    except ImportError:
+        try:
+            from cdp_detector import find_active_cdp_endpoint, install_cdp_port_guard
+        except ImportError:
+            find_active_cdp_endpoint = None
+            install_cdp_port_guard = None
+
+    if find_active_cdp_endpoint:
+        cfg = None
+        try:
+            from . import load_config
+            cfg = load_config()
+        except Exception:
             try:
-                from . import load_config
-                cfg = load_config()
+                import common
+                cfg = common.load_config()
             except Exception:
-                try:
-                    import common
-                    cfg = common.load_config()
-                except Exception:
-                    cfg = None
-            cdp_endpoint = find_active_cdp_endpoint(timeout=1.5, user_data_dir=user_data_dir, config=cfg)
-        else:
-            try:
-                with urllib.request.urlopen("http://127.0.0.1:9222/json/version", timeout=1.2) as response:
-                    if response.status == 200:
-                        cdp_endpoint = {"cdp_url": "http://127.0.0.1:9222", "port": 9222, "source": "default_9222"}
-            except Exception:
-                cdp_endpoint = None
+                cfg = None
+        cdp_endpoint = find_active_cdp_endpoint(timeout=1.5, user_data_dir=user_data_dir, config=cfg)
+    else:
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:9222/json/version", timeout=1.2) as response:
+                if response.status == 200:
+                    cdp_endpoint = {"cdp_url": "http://127.0.0.1:9222", "port": 9222, "source": "default_9222"}
+        except Exception:
+            cdp_endpoint = None
+
+    _active_sync_pw, _pw_engine = resolve_sync_playwright(
+        module_sync_pw=sync_playwright,
+        default_playwright_sync=_default_sync_playwright,
+        prefer_patchright=not bool(cdp_endpoint),
+    )
+    if _pw_engine == "patchright":
+        print("[知网自动化] 未接入外部 CDP 浏览器，优先使用 Patchright Stealth 引擎启动独立实例。")
+
+    connected_via_cdp = False
+    with _active_sync_pw() as p:
+        browser = None
+        context = None
+        page = None
+        _self_launched_pid = None
 
         if cdp_endpoint:
             try:
@@ -294,6 +325,7 @@ def extract_cnki_html_tables(url, cookies_path=None, table_idx="all", headed=Fal
                     user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
                     viewport={"width": 1280, "height": 800}
                 )
+                _self_launched_pid = extract_browser_pid(context=context, playwright_obj=p)
                 page = context.pages[0] if context.pages else context.new_page()
                 if install_cdp_port_guard:
                     install_cdp_port_guard(context)
@@ -301,9 +333,7 @@ def extract_cnki_html_tables(url, cookies_path=None, table_idx="all", headed=Fal
                 cookies_json = os.path.join(user_data_dir, "cookies.json")
                 if os.path.exists(cookies_json):
                     try:
-                        import json
-                        with open(cookies_json, 'r', encoding='utf-8') as f:
-                            c_list = json.load(f)
+                        c_list = load_cookies_from_file(cookies_json)
                         if c_list:
                             context.add_cookies(c_list)
                             print(f"[知网自动化] 从 cookies.json 注入了 {len(c_list)} 个会话 Cookies。")
@@ -311,6 +341,7 @@ def extract_cnki_html_tables(url, cookies_path=None, table_idx="all", headed=Fal
                         pass
             else:
                 browser = p.chromium.launch(headless=headless, executable_path=exec_path)
+                _self_launched_pid = extract_browser_pid(browser=browser, playwright_obj=p)
                 context = browser.new_context(
                     user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
                     viewport={"width": 1280, "height": 800}
@@ -436,13 +467,7 @@ def extract_cnki_html_tables(url, cookies_path=None, table_idx="all", headed=Fal
                         pass
             elif not user_data_dir:
                 if browser:
-                    try:
-                        browser.close()
-                    except Exception:
-                        pass
+                    close_browser_safely(browser=browser, proc_pid=_self_launched_pid)
             else:
                 if context:
-                    try:
-                        context.close()
-                    except Exception:
-                        pass
+                    close_browser_safely(context=context, proc_pid=_self_launched_pid)
