@@ -21,7 +21,8 @@ except ImportError:
 
 
 DEFAULT_NEGATIVE_CACHE_TTL_S = 1800
-DEFAULT_RATE_LIMIT_TTL_S = 600
+DEFAULT_RATE_LIMIT_TTL_S = 120
+DEFAULT_TRANSIENT_CHALLENGE_TTL_S = 120
 
 _REDIRECTOR_HOSTS = frozenset({
     "doi.org",
@@ -186,9 +187,21 @@ def should_negative_cache(
     if status_code == 403:
         return True, "http_403_antibot"
 
+    # Full academic article 200 pages (with citation_doi/citation_title) must never pollute negative cache
+    if status_code == 200 and html_low and (
+        'name="citation_doi"' in html_low
+        or "name='citation_doi'" in html_low
+        or 'name="citation_title"' in html_low
+        or "name='citation_title'" in html_low
+        or 'name="dc.identifier"' in html_low
+    ):
+        return False, ""
+
     if html_snippet and hasattr(common, "is_anti_bot_blocked"):
         try:
             if common.is_anti_bot_blocked("", html_snippet[:12000]):
+                if "bm-verify" in html_low:
+                    return True, "antibot_akamai"
                 return True, "antibot_challenge"
         except Exception:
             pass
@@ -343,6 +356,8 @@ def record_negative_cache(
             ttl_s = DEFAULT_NEGATIVE_CACHE_TTL_S
         if status_code == 429 or matched_reason == "http_429":
             ttl_s = min(ttl_s, DEFAULT_RATE_LIMIT_TTL_S)
+        elif status_code == 200 and matched_reason in ("antibot_akamai", "antibot_challenge"):
+            ttl_s = min(ttl_s, DEFAULT_TRANSIENT_CHALLENGE_TTL_S)
 
     if ttl_s <= 0:
         return False

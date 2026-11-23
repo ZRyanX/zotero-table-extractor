@@ -68,6 +68,47 @@ def simulate_human_drag(page, handler_selector, distance):
     page.mouse.up()
     print("[知网滑块模拟] 拖动模拟完成，等待验证结果。")
 
+def _wait_for_cnki_lazy_tables(page, max_wait_s=4.5):
+    """Scroll CNKI HTML Reader page and wait until dynamically rendered table count stabilizes."""
+    # Note: deliberately avoid wait_for_load_state("networkidle") on CNKI (long-lived beacons stall it)
+    try:
+        page.evaluate("""
+            async () => {
+                const delay = ms => new Promise(r => setTimeout(r, ms));
+                const step = Math.max(400, Math.floor(window.innerHeight * 0.85));
+                let lastH = 0;
+                for (let i = 0; i < 25; i++) {
+                    window.scrollBy(0, step);
+                    await delay(120);
+                    const newH = document.body ? document.body.scrollHeight : 0;
+                    if (window.scrollY + window.innerHeight >= newH && newH === lastH) break;
+                    lastH = newH;
+                }
+                window.scrollTo(0, 0);
+            }
+        """)
+    except Exception:
+        pass
+    # Poll until table count stabilizes for >=1.0s (prevents grabbing only Table 1 before Table 2/3 render)
+    deadline = time.monotonic() + max(1.5, float(max_wait_s or 4.5))
+    last_count = -1
+    stable_since = None
+    while time.monotonic() < deadline:
+        try:
+            cur_count = len(page.query_selector_all("table") or [])
+        except Exception:
+            break
+        if cur_count != last_count:
+            last_count = cur_count
+            stable_since = time.monotonic()
+        elif cur_count > 0 and stable_since is not None and (time.monotonic() - stable_since) >= 1.0:
+            break
+        try:
+            page.wait_for_timeout(350)
+        except Exception:
+            time.sleep(0.35)
+
+
 def extract_tables_from_page(page, table_idx="all"):
     """Extracts tables from the current page and converts them to DataFrames."""
     tables = page.query_selector_all("table")
@@ -317,29 +358,28 @@ def extract_cnki_html_tables(url, cookies_path=None, table_idx="all", headed=Fal
                 print(f"[知网自动化] CDP 内存直连失败: {e}")
 
         if not connected_via_cdp:
+            _persistent_ok = False
             if user_data_dir:
-                context = p.chromium.launch_persistent_context(
-                    user_data_dir,
-                    headless=headless,
-                    executable_path=exec_path,
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-                    viewport={"width": 1280, "height": 800}
-                )
-                _self_launched_pid = extract_browser_pid(context=context, playwright_obj=p)
-                page = context.pages[0] if context.pages else context.new_page()
-                if install_cdp_port_guard:
-                    install_cdp_port_guard(context)
-                    install_cdp_port_guard(page)
-                cookies_json = os.path.join(user_data_dir, "cookies.json")
-                if os.path.exists(cookies_json):
-                    try:
-                        c_list = load_cookies_from_file(cookies_json)
-                        if c_list:
-                            context.add_cookies(c_list)
-                            print(f"[知网自动化] 从 cookies.json 注入了 {len(c_list)} 个会话 Cookies。")
-                    except Exception:
-                        pass
-            else:
+                try:
+                    context = p.chromium.launch_persistent_context(
+                        user_data_dir,
+                        headless=headless,
+                        executable_path=exec_path,
+                        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                        viewport={"width": 1280, "height": 800}
+                    )
+                    _self_launched_pid = extract_browser_pid(context=context, playwright_obj=p)
+                    page = context.pages[0] if context.pages else context.new_page()
+                    if install_cdp_port_guard:
+                        install_cdp_port_guard(context)
+                        install_cdp_port_guard(page)
+                    _persistent_ok = True
+                except Exception as _lock_err:
+                    print(f"[知网自动化] 用户数据目录已被锁定 ({type(_lock_err).__name__})，平滑降级为独立隔离浏览器实例并注入会话 Cookie。")
+                    context = None
+                    page = None
+
+            if not _persistent_ok:
                 browser = p.chromium.launch(headless=headless, executable_path=exec_path)
                 _self_launched_pid = extract_browser_pid(browser=browser, playwright_obj=p)
                 context = browser.new_context(
@@ -350,6 +390,17 @@ def extract_cnki_html_tables(url, cookies_path=None, table_idx="all", headed=Fal
                 if install_cdp_port_guard:
                     install_cdp_port_guard(context)
                     install_cdp_port_guard(page)
+
+            if user_data_dir:
+                cookies_json = os.path.join(user_data_dir, "cookies.json")
+                if os.path.exists(cookies_json):
+                    try:
+                        c_list = load_cookies_from_file(cookies_json)
+                        if c_list:
+                            context.add_cookies(c_list)
+                            print(f"[知网自动化] 从 cookies.json 注入了 {len(c_list)} 个会话 Cookies。")
+                    except Exception:
+                        pass
 
         # 拦截 mailto:, tel: 等外部系统协议，防止 macOS 弹出系统 Mail.app 邮件应用
         try:
@@ -399,10 +450,10 @@ def extract_cnki_html_tables(url, cookies_path=None, table_idx="all", headed=Fal
                 except Exception:
                     pass
 
-            # Click HTML Reading button
-            html_button = page.locator("a:has-text('HTML阅读')").first
+            # Click HTML Reading button (also check alternative CNKI online-read selectors)
+            html_button = page.locator("a:has-text('HTML阅读'), a:has-text('在线阅读'), a[href*='xmlread'], a[href*='htmlread']").first
             if not html_button.is_visible(timeout=5000):
-                print("[知网自动化] 未找到 'HTML阅读' 按钮，可能未登录或无阅读权限。")
+                print("[知网自动化] 未找到 'HTML阅读' 按钮，可能未登录、无阅读权限或为纯PDF/硕博论文。")
                 return [], None
                 
             print("[知网自动化] 发现 'HTML阅读' 按钮，正在跳转至阅读页面...")
@@ -417,26 +468,57 @@ def extract_cnki_html_tables(url, cookies_path=None, table_idx="all", headed=Fal
                 pass
             new_page.wait_for_timeout(1500)
             
-            # Check for slider verification
+            # Check for slider verification (with pass verification & up to 2 attempts)
+            slider_passed = True
             wrapper = new_page.query_selector(".slider-wrapper")
             if wrapper:
-                print("[知网自动化] 检测到滑动验证，正在启动自动滑块模拟...")
-                wrapper_box = wrapper.bounding_box()
-                handler = new_page.query_selector("#js-handler")
-                handler_box = handler.bounding_box() if handler else None
-                
-                if wrapper_box and handler_box:
-                    drag_distance = wrapper_box["width"] - handler_box["width"] + 10
-                    try:
-                        simulate_human_drag(new_page, "#js-handler", drag_distance)
-                        new_page.wait_for_timeout(5000) # Wait for page contents to render
-                    except Exception as e:
-                        print(f"【错误】模拟滑动失败: {e}")
-                else:
-                    print("【错误】未能获取滑块的布局尺寸，跳过滑动。")
+                slider_passed = False
+                for attempt in range(2):
+                    print(f"[知网自动化] 检测到滑动验证，正在启动自动滑块模拟 (尝试 {attempt + 1}/2)...")
+                    wrapper = new_page.query_selector(".slider-wrapper")
+                    wrapper_box = wrapper.bounding_box() if wrapper else None
+                    handler = new_page.query_selector("#js-handler")
+                    handler_box = handler.bounding_box() if handler else None
+
+                    if wrapper_box and handler_box:
+                        drag_distance = wrapper_box["width"] - handler_box["width"] + 10
+                        try:
+                            simulate_human_drag(new_page, "#js-handler", drag_distance)
+                            try:
+                                new_page.wait_for_load_state("domcontentloaded", timeout=8000)
+                            except Exception:
+                                pass
+                            try:
+                                new_page.wait_for_selector("table, .content, .article-content, .chapter-list", timeout=6000)
+                            except Exception:
+                                new_page.wait_for_timeout(2000)
+                            still_wrapper = new_page.query_selector(".slider-wrapper")
+                            still_visible = False
+                            if still_wrapper:
+                                try:
+                                    still_visible = bool(still_wrapper.is_visible())
+                                except Exception:
+                                    still_visible = False
+                            if not still_visible:
+                                slider_passed = True
+                                print("[知网自动化] 滑动验证已通过，正文页面加载完成。")
+                                break
+                            print(f"[知网自动化] 第 {attempt + 1} 次滑动后验证条仍可见，等待重试...")
+                            new_page.wait_for_timeout(1200)
+                        except Exception as e:
+                            print(f"【错误】模拟滑动失败: {e}")
+                            break
+                    else:
+                        print("【错误】未能获取滑块的布局尺寸，跳过滑动。")
+                        break
+                if not slider_passed:
+                    print("[知网自动化] 滑动验证未通过，页面仍停留在验证拦截页（非正文无表）。")
             else:
                 print("[知网自动化] 无需滑动验证，直接提取表格。")
                 
+            if slider_passed:
+                _wait_for_cnki_lazy_tables(new_page, max_wait_s=4.5)
+
             # Parse tables and get paper title from the page title
             try:
                 page_title = new_page.title()

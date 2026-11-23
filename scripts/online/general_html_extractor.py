@@ -1,5 +1,6 @@
 import os
 import re
+import threading
 import urllib.parse
 import urllib.request
 import pandas as pd
@@ -441,7 +442,7 @@ def _expand_silverchair_gsw_tables(page):
     3. 模拟点击 .link-reveal.link-table 等懒加载触发器与展开全部数据按钮。
     """
     try:
-        clicked_lazy = page.evaluate("""
+        res = page.evaluate("""
             () => {
                 // 1. 展开所有 Silverchair 折叠的表格和模态框
                 const gswTableContainers = document.querySelectorAll(
@@ -463,12 +464,15 @@ def _expand_silverchair_gsw_tables(page):
                 expandBtns.forEach(b => {
                     try { b.click(); clicks++; } catch(e) {}
                 });
-                return clicks;
+                return { containers: gswTableContainers.length, clicks };
             }
         """)
+        clicked_lazy = (res.get("clicks", 0) if isinstance(res, dict) else int(res or 0))
+        container_cnt = (res.get("containers", 0) if isinstance(res, dict) else 0)
         if clicked_lazy:
             page.wait_for_timeout(1500)
-        print("[GeoScienceWorld 适配] 已成功激活 Silverchair/GSW 深度展开与无损渲染")
+        if container_cnt > 0 or clicked_lazy > 0:
+            print(f"[GeoScienceWorld 适配] 已成功激活 Silverchair/GSW 深度展开与无损渲染 (containers={container_cnt}, clicks={clicked_lazy})")
     except Exception:
         pass
 
@@ -798,11 +802,14 @@ def _inject_cookies_from_profile(context, user_data_dir, url=None):
 def _purge_boilerplate_dom(page):
     """
     Purges boilerplate nodes (nav, footer, ads, sidebar, etc.) from the page to clean
-    the DOM and prevent extracting noise tables.
+    the DOM and prevent extracting noise tables, while preserving table caption headers
+    and table footnote containers.
     """
     try:
         page.evaluate("""
             () => {
+                const preserveRe = /(?:table|caption|footnote|legend|article-fulltext-label|u-mb-16|c-article-table)/i;
+                const tableTitleRe = /^\\s*(?:supplementary\\s+table|supplemental\\s+table|appendix\\s+table|extended\\s+data\\s+table|table|tab\\.|附表|附录表|补充表|表)\\s*[A-Za-z]?\\d/i;
                 const boilerplateSelectors = [
                     "nav", "footer", "header", "aside", 
                     ".ad", ".ads", ".sidebar", ".widget", 
@@ -814,9 +821,13 @@ def _purge_boilerplate_dom(page):
                     try {
                         const elements = document.querySelectorAll(selector);
                         elements.forEach(el => {
-                            if (!el.querySelector("table") && !el.querySelector("[role='grid']")) {
-                                el.remove();
-                            }
+                            if (el.querySelector("table") || el.querySelector("[role='grid']")) return;
+                            const clsId = ((typeof el.className === "string" ? el.className : "") + " " + (el.id || ""));
+                            if (preserveRe.test(clsId)) return;
+                            if (el.closest && el.closest("figure, .table-wrap, .c-article-table-container, .article-table-content, .tables, [class*='table-wrap' i]")) return;
+                            const txt = (el.innerText || el.textContent || "").trim().slice(0, 120);
+                            if (tableTitleRe.test(txt)) return;
+                            el.remove();
                         });
                     } catch (e) {}
                 });
@@ -1106,6 +1117,16 @@ def _extract_custom_grid_tables(page, url, api_key=None):
     return []
 
 _OWNED_DEBUG_CHROME_PROCS = []
+_OWNED_DEBUG_CHROME_TEMP_DIRS = {}
+_THREAD_OWNED_CDP = threading.local()
+
+
+def _alloc_free_local_port() -> int:
+    """Allocate an ephemeral unused loopback TCP port for an owned debug Chrome instance."""
+    import socket as _sock
+    with _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
 
 
 def _cleanup_owned_debug_chrome(min_index=0):
@@ -1139,8 +1160,19 @@ def _cleanup_owned_debug_chrome(min_index=0):
                         pass
         except Exception:
             pass
+        tmp_dir = _OWNED_DEBUG_CHROME_TEMP_DIRS.pop(id(proc), None)
+        if tmp_dir and os.path.isdir(tmp_dir):
+            try:
+                import shutil as _shutil
+                _shutil.rmtree(tmp_dir, ignore_errors=True)
+            except Exception:
+                pass
     _OWNED_DEBUG_CHROME_PROCS = kept
     if targets:
+        try:
+            _THREAD_OWNED_CDP.endpoint = None
+        except Exception:
+            pass
         try:
             from . import strategies as _strat_mod
             if hasattr(_strat_mod, "_CRAWL4AI_CDP_CACHE"):
@@ -1161,18 +1193,22 @@ def _ensure_chrome_debug_running():
     import time
     import os
 
+    _THREAD_OWNED_CDP.endpoint = None
+
     try:
-        from .cdp_detector import find_active_cdp_endpoint
+        from .cdp_detector import find_active_cdp_endpoint, check_cdp_endpoint_alive
     except ImportError:
         try:
-            from cdp_detector import find_active_cdp_endpoint
+            from cdp_detector import find_active_cdp_endpoint, check_cdp_endpoint_alive
         except ImportError:
             find_active_cdp_endpoint = None
+            check_cdp_endpoint_alive = None
 
     if find_active_cdp_endpoint:
         existing = find_active_cdp_endpoint(timeout=0.8)
         if existing:
             print(f"[通用自动化] 检测到已有活动 CDP 调试端点: {existing['cdp_url']} (来源: {existing.get('source')})，直接复用。")
+            _THREAD_OWNED_CDP.endpoint = existing
             return True
 
     os_type = platform.system().lower()
@@ -1213,39 +1249,53 @@ def _ensure_chrome_debug_running():
         print("[通用自动化] 未能自动识别到 Google Chrome 浏览器的可执行文件路径。")
         return False
 
-    persistent_debug_profile = os.path.join(os.path.expanduser("~"), ".zotero_chrome_debug_profile")
-    if os.path.isdir(persistent_debug_profile):
-        profile_dir = persistent_debug_profile
-    else:
-        profile_dir = os.path.join(tempfile.gettempdir(), "chrome_debug_profile")
-        os.makedirs(profile_dir, exist_ok=True)
+    # Use an ephemeral port and a process-private temp profile directory so concurrent
+    # workers / Crawl4AI never discover or attach to this process's temporary debug Chrome
+    # (preventing cross-process mutual-kill on 127.0.0.1:9222).
+    debug_port = _alloc_free_local_port()
+    profile_dir = tempfile.mkdtemp(prefix=f"zte_owned_cdp_{os.getpid()}_")
 
-    print(f"[通用自动化] 自动启动调试版 Chrome: {chrome_path}")
-    print(f"[通用自动化] 调试会话独立隔离用户目录: {profile_dir} (零 SQLite 拷贝)")
+    print(f"[通用自动化] 自动启动进程私有调试版 Chrome (port={debug_port}): {chrome_path}")
+    print(f"[通用自动化] 调试会话独立隔离用户目录: {profile_dir} (零 SQLite 拷贝，防跨进程互杀)")
 
     cmd = [
         chrome_path,
-        "--remote-debugging-port=9222",
-        f"--user-data-dir={profile_dir}"
+        f"--remote-debugging-port={debug_port}",
+        f"--user-data-dir={profile_dir}",
+        "--no-first-run",
+        "--no-default-browser-check",
     ]
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         _OWNED_DEBUG_CHROME_PROCS.append(proc)
+        _OWNED_DEBUG_CHROME_TEMP_DIRS[id(proc)] = profile_dir
         for _ in range(30):
             time.sleep(0.5)
-            if find_active_cdp_endpoint:
-                endpoint = find_active_cdp_endpoint(timeout=0.5, user_data_dir=profile_dir)
+            if proc.poll() is not None:
+                break
+            if check_cdp_endpoint_alive:
+                endpoint = check_cdp_endpoint_alive(port=debug_port, timeout=0.5)
                 if endpoint:
-                    print(f"[通用自动化] 调试版 Chrome 启动成功，CDP 端点已就绪: {endpoint['cdp_url']}！")
+                    endpoint["source"] = "owned_ephemeral"
+                    endpoint["user_data_dir"] = profile_dir
+                    _THREAD_OWNED_CDP.endpoint = endpoint
+                    print(f"[通用自动化] 私有调试版 Chrome 启动成功，CDP 端点已就绪: {endpoint['cdp_url']}！")
                     return True
             else:
                 try:
                     import socket
                     s = socket.socket()
                     s.settimeout(0.5)
-                    s.connect(('127.0.0.1', 9222))
+                    s.connect(('127.0.0.1', debug_port))
                     s.close()
-                    print("[通用自动化] 调试版 Chrome 启动并成功启用 9222 端口！")
+                    _THREAD_OWNED_CDP.endpoint = {
+                        "host": "127.0.0.1",
+                        "port": debug_port,
+                        "cdp_url": f"http://127.0.0.1:{debug_port}",
+                        "source": "owned_ephemeral",
+                        "user_data_dir": profile_dir,
+                    }
+                    print(f"[通用自动化] 私有调试版 Chrome 启动并成功启用 {debug_port} 端口！")
                     return True
                 except Exception:
                     pass
@@ -1547,6 +1597,10 @@ def extract_general_html_tables(url, table_idx="all", headed=False, user_data_di
             meta_out=meta_out,
         )
     finally:
+        try:
+            _THREAD_OWNED_CDP.endpoint = None
+        except Exception:
+            pass
         if len(_OWNED_DEBUG_CHROME_PROCS) > _owned_chrome_count_before:
             _cleanup_owned_debug_chrome(min_index=_owned_chrome_count_before)
 
@@ -1677,7 +1731,10 @@ def _extract_general_html_tables_impl(url, table_idx="all", headed=False, user_d
             install_slow_tracker_route_blocker = None
             wait_through_transient_challenge = None
 
-    if find_active_cdp_endpoint:
+    owned_ep = getattr(_THREAD_OWNED_CDP, "endpoint", None)
+    if owned_ep:
+        cdp_endpoint = owned_ep
+    elif find_active_cdp_endpoint:
         cfg = None
         try:
             cfg = load_config()
@@ -1952,10 +2009,12 @@ def _extract_general_html_tables_impl(url, table_idx="all", headed=False, user_d
                     print(f"[通用自动化] 页面加载警告: {e}")
 
         if not _cancelled_early and not was_dead_http and not _is_page_closed(page):
-            # Auto-dismiss GDPR cookie consent and expand GeoScienceWorld/Silverchair tables
+            # Auto-dismiss GDPR cookie consent and expand GeoScienceWorld/Silverchair tables (gated by domain)
             try:
                 _dismiss_cookie_consent(page)
-                _expand_silverchair_gsw_tables(page)
+                _cur_sc_url = (getattr(page, "url", "") or url_no_fragment).lower()
+                if is_gsw or any(d in _cur_sc_url for d in ("geoscienceworld.org", "lyellcollection.org", "silverchair", "academic.oup.com")):
+                    _expand_silverchair_gsw_tables(page)
             except Exception as e:
                 print(f"[通用自动化] 页面交互预处理警告: {e}")
 
@@ -1966,12 +2025,12 @@ def _extract_general_html_tables_impl(url, table_idx="all", headed=False, user_d
                     page.evaluate("""
                 async () => {
                     const delay = ms => new Promise(r => setTimeout(r, ms));
-                    const scrollStep = Math.floor(window.innerHeight * 0.8);
+                    const scrollStep = Math.floor(window.innerHeight * 0.85);
                     let lastH = 0;
                     let steps = 0;
-                    while (steps < 40) {
+                    while (steps < 24) {
                         window.scrollBy(0, scrollStep);
-                        await delay(250);  // reduced from 400ms
+                        await delay(150);
                         const newH = document.body.scrollHeight;
                         if (window.scrollY + window.innerHeight >= newH && newH === lastH) break;
                         lastH = newH;
@@ -1980,7 +2039,7 @@ def _extract_general_html_tables_impl(url, table_idx="all", headed=False, user_d
                     window.scrollTo(0, 0);
                 }
                 """)
-                    page.wait_for_timeout(1500)
+                    page.wait_for_timeout(1000)
                 except Exception:
                     pass
 
@@ -2237,7 +2296,9 @@ def _extract_general_html_tables_impl(url, table_idx="all", headed=False, user_d
                     page.wait_for_timeout(1200)  # reduced from 2000ms
                     # Still try to dismiss any consent banner, just in case
                     _dismiss_cookie_consent(page)
-                    _expand_silverchair_gsw_tables(page)
+                    _sub_low = (sub_url or "").lower()
+                    if is_gsw or any(d in _sub_low for d in ("geoscienceworld.org", "lyellcollection.org", "silverchair", "academic.oup.com")):
+                        _expand_silverchair_gsw_tables(page)
 
                     # Scrape subpage heading for title
                     sub_title = ""
@@ -2268,8 +2329,39 @@ def _extract_general_html_tables_impl(url, table_idx="all", headed=False, user_d
                 except Exception as e:
                     print(f"  Warning: 抓取子页面 {sub_url} 失败: {e}")
 
+        # 3. Download strong supplementary links using the authenticated browser context (solves Akamai/Cloudflare)
+        _browser_supp_extracted = False
+        if (
+            not _skip_dom_extract
+            and not _cancelled_early
+            and not was_dead_http
+            and not was_blocked
+            and not _is_page_closed(page)
+            and str(table_idx).lower() == "all"
+            and _captured_page_html
+            and context is not None
+            and getattr(context, "request", None) is not None
+        ):
+            try:
+                try:
+                    from .strategies import _download_supp_via_browser_context as _dl_browser_supp
+                except ImportError:
+                    from strategies import _download_supp_via_browser_context as _dl_browser_supp
+                _bsupp_dfs = _dl_browser_supp(
+                    context.request,
+                    _cur_page_url,
+                    _captured_page_html,
+                    cancel_event=cancel_event,
+                    max_files=4,
+                    max_timeout=15.0,
+                    strong_only=True,
+                )
+                if _bsupp_dfs:
+                    all_dfs.extend(_bsupp_dfs)
+                    _browser_supp_extracted = True
+            except Exception as _bsupp_err:
+                print(f"[Browser Supp] Playwright 补充材料会话下载跳过: {_bsupp_err}")
 
-                    
         # Cleanup is guaranteed by _cleanup_stack (_cleanup_browser_resources) on all exit paths.
 
             
@@ -2285,6 +2377,8 @@ def _extract_general_html_tables_impl(url, table_idx="all", headed=False, user_d
         meta_out["needs_relogin"] = _needs_relogin
         if _captured_page_html:
             meta_out["html_content"] = _captured_page_html
+        if _browser_supp_extracted:
+            meta_out["supp_already_extracted"] = True
 
     # Standalone dynamic reroute to CNKI dedicated extractor when called without graph meta_out
     if _reroute_cnki_url and meta_out is None:
@@ -2301,7 +2395,16 @@ def _extract_general_html_tables_impl(url, table_idx="all", headed=False, user_d
 
     # Headless -> Headed everyday Chrome -> StealthyFetcher Turnstile escalation (outside sync_playwright)
     _is_cancelled = cancel_event is not None and cancel_event.is_set()
-    if not all_dfs and not was_dead_http and not _is_cancelled and _allow_headed_fallback and (was_blocked or (headless and _is_gated_domain and not connected_via_cdp)):
+    _headless_got_full_clean_page = (
+        not was_blocked
+        and not _needs_relogin
+        and not _carsi_on
+        and bool(_captured_page_html and len(_captured_page_html) >= 15000)
+        and bool(locals().get("_body_sample") and len(locals().get("_body_sample", "")) >= 500)
+    )
+    if not all_dfs and not was_dead_http and not _is_cancelled and _allow_headed_fallback and (
+        was_blocked or (headless and _is_gated_domain and not connected_via_cdp and not _headless_got_full_clean_page)
+    ):
         if headless and not connected_via_cdp:
             print(f"[通用自动化] 无头模式{'被反爬拦截' if was_blocked else '未发现表格'}，自动切换日常有头 Chrome 浏览器重试 (自动接受 Cookies)...")
             headed_dfs, headed_title = extract_general_html_tables(

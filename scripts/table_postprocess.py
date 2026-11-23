@@ -18,9 +18,9 @@ import numpy as np
 import pandas as pd
 
 try:
-    from .common import format_table_label, TABLE_LABEL_PATTERN, TABLE_LABEL_RE, is_markdown_separator, df_map
+    from .common import format_table_label, TABLE_LABEL_PATTERN, TABLE_LABEL_RE, is_markdown_separator, df_map, is_supplementary
 except ImportError:
-    from common import format_table_label, TABLE_LABEL_PATTERN, TABLE_LABEL_RE, is_markdown_separator, df_map
+    from common import format_table_label, TABLE_LABEL_PATTERN, TABLE_LABEL_RE, is_markdown_separator, df_map, is_supplementary
 
 
 def clean_text(val):
@@ -2419,6 +2419,7 @@ def merge_continuation_tables(dfs):
         if not lbl:
             return None
         s = str(lbl).strip()
+        is_supp_s = is_supplementary(s)
         m = TABLE_LABEL_RE.search(s)
         target = m.group(0) if m else s
         fmt = format_table_label(target)
@@ -2427,6 +2428,8 @@ def merge_continuation_tables(dfs):
         clean = re.sub(r'^(table|表)\s*([0-9a-zA-Z]+)', r'\1 \2', clean, flags=re.IGNORECASE)
         clean = re.sub(r'[:.\-–—\s]+$', '', clean)
         clean = re.sub(r'\s+', ' ', clean).strip()
+        if is_supp_s and clean and not is_supplementary(clean):
+            clean = f"Supplementary {clean}"
         return clean if clean else None
 
 

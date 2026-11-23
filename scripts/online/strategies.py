@@ -413,7 +413,35 @@ def _extract_normalized_table_label(text: str) -> str:
         num_part = m.group(2)
         if any(k in raw_prefix for k in ("附表", "附录表", "补充表", "表")):
             return f"{raw_prefix}{num_part}"
+        if raw_prefix.upper() in ("TABLE", "TAB.", "TABLEAU", "TABLEAUX"):
+            return _fmt(f"Table {num_part}")
         return _fmt(f"{m.group(1).strip()} {num_part}")
+    return ""
+
+
+def _infer_label_from_dom_id(el) -> str:
+    """Infer normalized table label from DOM id/data-table attributes (e.g. 'tbl-0001' -> 'Table 1')."""
+    if el is None:
+        return ""
+    for attr in ("id", "data-table", "aria-label"):
+        val = str(el.get(attr) or "").strip()
+        if not val:
+            continue
+        m_id = re.match(r'^(?:tbl|table|tab)[-_]?([sa])?0*(\d+(?:[-.]\d+)?)$', val, re.IGNORECASE)
+        if m_id:
+            kind = (m_id.group(1) or "").upper()
+            num = m_id.group(2)
+            if kind == "S":
+                return f"Table S{num}"
+            if kind == "A":
+                return f"Table A{num}"
+            return f"Table {num}"
+        m_short = re.match(r'^t0*(\d+)$', val, re.IGNORECASE)
+        if m_short:
+            return f"Table {m_short.group(1)}"
+        lbl = _extract_normalized_table_label(val)
+        if lbl:
+            return lbl
     return ""
 
 
@@ -496,6 +524,8 @@ def _extract_caption_and_label_from_wrapper(wrapper):
         caption_text = re.sub(r"\s+", " ", caption_text.replace("\xa0", " ")).strip()
     if not label_text and caption_text:
         label_text = _extract_normalized_table_label(caption_text)
+    if not label_text:
+        label_text = _infer_label_from_dom_id(wrapper)
     return caption_text, label_text
 
 
@@ -528,6 +558,18 @@ def _is_dom_noise_table(table_el, check_nested: bool = True) -> bool:
         first_cols = len(trs[0].find_all(["th", "td"])) if trs else 0
         if len(trs) <= 2 and first_cols <= 1:
             return True
+    # 过滤单行两列公式排版表（如 China Geology / MathJax: [LaTeX/MathML 公式, "(1)"]）
+    trs_eq = table_el.find_all("tr")
+    if len(trs_eq) == 1:
+        eq_cells = trs_eq[0].find_all(["td", "th"])
+        if len(eq_cells) == 2:
+            c0 = (eq_cells[0].get_text(" ", strip=True) or "")
+            c1 = (eq_cells[1].get_text(" ", strip=True) or "").strip()
+            if re.match(r"^[\(\[（]\s*\d+[a-zA-Z]?\s*[\)\]）]$", c1) and (
+                table_el.find("math") is not None
+                or any(tok in c0 for tok in ("\\math", "\\frac", "\\Delta", "\\delta", "\\approx", "\\times", "="))
+            ):
+                return True
     return False
 
 
@@ -581,14 +623,15 @@ def _parse_dom_wrappers_bs4(html_content, read_html_fn):
                 sub_dfs = read_html_fn(str(tbl_copy))
             except (ValueError, IndexError):
                 continue
+            tbl_label_text = label_text or _infer_label_from_dom_id(tbl)
             for df in sub_dfs:
                 if df.empty or len(df.columns) < 1 or len(df) < 1:
                     continue
                 df.columns = [clean_text(c) for c in df.columns]
                 for col_i in range(len(df.columns)):
                     df.isetitem(col_i, df.iloc[:, col_i].astype(str).apply(clean_text))
-                if label_text:
-                    df.attrs['label'] = label_text
+                if tbl_label_text:
+                    df.attrs['label'] = tbl_label_text
                 if caption_text:
                     df.attrs['table_title'] = caption_text
                 if footnote_text:
@@ -596,7 +639,7 @@ def _parse_dom_wrappers_bs4(html_content, read_html_fn):
                 if is_metadata_table(df):
                     continue
                 first_row_sig = tuple(str(v) for v in df.iloc[0].tolist()) if len(df) else ()
-                sig = (label_text.lower() if label_text else "", df.shape, tuple(df.columns), first_row_sig)
+                sig = (tbl_label_text.lower() if tbl_label_text else "", df.shape, tuple(df.columns), first_row_sig)
                 if sig in seen_signatures:
                     continue
                 seen_signatures.add(sig)
@@ -621,6 +664,7 @@ def parse_tables_from_html(html_content, table_idx="all"):
 
         if not valid_dfs:
             filtered_html = html_content
+            bs4_table_meta = []
             try:
                 from bs4 import BeautifulSoup
                 _soup = BeautifulSoup(html_content, "html.parser")
@@ -631,6 +675,15 @@ def parse_tables_from_html(html_content, table_idx="all"):
                         _tbl.decompose()
                     elif _tbl.find("table") is not None:
                         _tbl.unwrap()
+                for _tbl in _soup.find_all("table"):
+                    _cap = _tbl.find("caption")
+                    _cap_txt = clean_text(_cap.get_text(" ", strip=True)) if _cap else ""
+                    _lbl_txt = _extract_normalized_table_label(_cap_txt) if _cap_txt else ""
+                    if not _lbl_txt:
+                        _lbl_txt = _infer_label_from_dom_id(_tbl)
+                    if not _lbl_txt and getattr(_tbl, "parent", None) is not None:
+                        _lbl_txt = _infer_label_from_dom_id(_tbl.parent)
+                    bs4_table_meta.append((_lbl_txt, _cap_txt))
                 filtered_html = str(_soup)
             except Exception:
                 filtered_html = html_content
@@ -651,10 +704,12 @@ def parse_tables_from_html(html_content, table_idx="all"):
                 for col_i in range(len(df.columns)):
                     df.isetitem(col_i, df.iloc[:, col_i].astype(str).apply(clean_text))
 
-                # Extract caption from preceding text block
+                # Extract caption from BS4 <caption> / DOM id first, then preceding text block
                 caption_text = ""
                 label_text = ""
-                if idx < len(parts):
+                if idx < len(bs4_table_meta):
+                    label_text, caption_text = bs4_table_meta[idx]
+                if not label_text and idx < len(parts):
                     preceding_text = parts[idx]
                     lines = preceding_text.split('\n')
                     for line in reversed(lines[-15:]):
@@ -665,7 +720,7 @@ def parse_tables_from_html(html_content, table_idx="all"):
                         line_stripped = re.sub(r'^[#*_\-\s\(\)\:\.\,\»]+', '', line_no_html).strip()
                         lbl_cand = _extract_normalized_table_label(line_stripped)
                         if lbl_cand:
-                            caption_text = line_stripped
+                            caption_text = caption_text or line_stripped
                             label_text = lbl_cand
                             break
 
@@ -1099,9 +1154,9 @@ def extract_elsevier_supplementary_tables(doi, api_key, insttoken="", proxies=No
                     excel_data = pd.read_excel(io.BytesIO(content_bytes), sheet_name=None)
                     for s_name, df in excel_data.items():
                         if not df.empty and df.shape[0] >= 1 and df.shape[1] >= 2:
-                            tbl_label = f"Supplementary Table {filename_no_ext}_{s_name}" if len(excel_data) > 1 else f"Supplementary Table {filename_no_ext}"
+                            tbl_label = _format_supp_excel_label(filename_no_ext, s_name, len(excel_data) > 1)
                             df.attrs['label'] = tbl_label
-                            df.attrs['table_title'] = f"Supplementary Table from sheet '{s_name}' of file '{filename}'"
+                            df.attrs['table_title'] = f"Supplementary Table ({tbl_label}) from sheet '{s_name}' of file '{filename}'"
                             supplementary_dfs.append(df)
                 except Exception as ex:
                     print(f"  -> Error parsing Excel {filename}: {ex}")
@@ -1171,10 +1226,52 @@ def extract_elsevier_supplementary_tables(doi, api_key, insttoken="", proxies=No
     return supplementary_dfs
 
 
+def _clean_supp_filename_stem(filename_no_ext: str) -> str:
+    """Strip Springer/Nature numeric journal-year-id prefixes (e.g. '126_2019_937_MOESM1_ESM' -> 'MOESM1_ESM')
+    so TABLE_LABEL_RE does not truncate multi-sheet supplementary filenames to '126-2019-937'."""
+    stem = str(filename_no_ext or "supplementary").strip()
+    m_sp = re.match(r'^\d+[_-]\d{4}[_-]\d+[_-]((?:MOESM|ESM)\d+.*)$', stem, re.IGNORECASE)
+    if m_sp:
+        return m_sp.group(1)
+    return stem
+
+
+def _ensure_supp_label_prefix(stem: str) -> str:
+    """Prefix a supplementary label with 'Supplementary Table ' only if it does not already carry one."""
+    s = str(stem or "supplementary").strip()
+    if re.match(
+        r'^(?:supplementary\s+table|supplemental\s+table|extended\s+data\s+table|appendix\s+table|table\s+s\d|附表|附录表|补充表)',
+        s,
+        re.IGNORECASE,
+    ):
+        return s
+    return f"Supplementary Table {s}"
+
+
+def _format_supp_excel_label(filename_no_ext: str, sheet_name: str, multi_sheet: bool) -> str:
+    """Format a supplementary Excel sheet label while preserving supplementary semantics."""
+    s_clean = str(sheet_name or "").strip()
+    m_st = re.match(
+        r'^(?:supplementary\s+table|supplemental\s+table|table|tab\.?|附表|补充表|表)?\s*(s?\d+(?:[-.]\d+)?[a-z]?)$',
+        s_clean,
+        re.IGNORECASE,
+    )
+    if m_st and not re.match(r'^sheet\s*\d+$', s_clean, re.IGNORECASE):
+        num = m_st.group(1)
+        if num.lower().startswith("s"):
+            return f"Supplementary Table S{num[1:]}"
+        return f"Supplementary Table {num}"
+    stem = _clean_supp_filename_stem(filename_no_ext)
+    if multi_sheet:
+        return _ensure_supp_label_prefix(f"{stem}_{s_clean}")
+    return _ensure_supp_label_prefix(stem)
+
+
 _SUPP_STRONG_URL_RE = re.compile(
     r"(?:/mediaobjects/|/action/downloadsupplement|/suppl(?:ement(?:ary)?)?/|/suppdata/|/suppinfo/"
     r"|/esm\d*|moesm\d*|mmc\d+|table[_-]?s\d+|supplementary[_-]?table|additional[_-]?file"
-    r"|extdata|supporting[_-]?info|source[_-]?data|appendix[_-]?table)",
+    r"|extdata|supporting[_-]?info|source[_-]?data|appendix[_-]?table"
+    r"|mdpi\.com/.+/s\d+(?:[/?#]|$))",
     re.IGNORECASE,
 )
 _SUPP_WEAK_TEXT_RE = re.compile(
@@ -1205,7 +1302,7 @@ _SUPP_REJECT_CTYPES = (
 )
 
 
-def _parse_supplementary_bytes(content_bytes, filename, content_type="", _depth=0):
+def _parse_supplementary_bytes(content_bytes, filename, content_type="", _depth=0, deadline=None, cancel_event=None):
     """Parse supplementary attachment bytes (.xlsx/.xls/.csv/.tsv/.docx/.pdf/.zip) into DataFrames."""
     import zipfile
     import xml.etree.ElementTree as ET
@@ -1220,7 +1317,7 @@ def _parse_supplementary_bytes(content_bytes, filename, content_type="", _depth=
     fname = (filename or "supplementary").strip()
     low_name = fname.lower()
     ctype = (content_type or "").lower()
-    filename_no_ext = os.path.splitext(os.path.basename(fname))[0] or "supplementary"
+    filename_no_ext = _clean_supp_filename_stem(os.path.splitext(os.path.basename(fname))[0] or "supplementary")
     dfs = []
 
     # Magic byte / content-type format detection
@@ -1239,13 +1336,9 @@ def _parse_supplementary_bytes(content_bytes, filename, content_type="", _depth=
             excel_data = pd.read_excel(io.BytesIO(content_bytes), sheet_name=None)
             for sheet_name, df in excel_data.items():
                 if not df.empty and df.shape[0] >= 1 and df.shape[1] >= 1:
-                    tbl_label = (
-                        f"Supplementary Table {filename_no_ext}_{sheet_name}"
-                        if len(excel_data) > 1
-                        else f"Supplementary Table {filename_no_ext}"
-                    )
+                    tbl_label = _format_supp_excel_label(filename_no_ext, sheet_name, len(excel_data) > 1)
                     df.attrs["label"] = tbl_label
-                    df.attrs["table_title"] = f"Supplementary Table from sheet '{sheet_name}' in file '{fname}'"
+                    df.attrs["table_title"] = f"Supplementary Table ({tbl_label}) from sheet '{sheet_name}' in file '{fname}'"
                     df.attrs["extractor"] = "builtin_supplementary"
                     dfs.append(df)
             return dfs
@@ -1262,7 +1355,7 @@ def _parse_supplementary_bytes(content_bytes, filename, content_type="", _depth=
                 return []
             df = pd.read_csv(io.StringIO(text_val), sep=sep, dtype=str, keep_default_na=False)
             if not df.empty and df.shape[0] >= 1 and df.shape[1] >= 2:
-                df.attrs["label"] = f"Supplementary Table {filename_no_ext}"
+                df.attrs["label"] = _ensure_supp_label_prefix(filename_no_ext)
                 df.attrs["table_title"] = f"Supplementary Table from file '{fname}'"
                 df.attrs["extractor"] = "builtin_supplementary"
                 dfs.append(df)
@@ -1292,9 +1385,9 @@ def _parse_supplementary_bytes(content_bytes, filename, content_type="", _depth=
                     df = _rows_to_dataframe(rows_data)
                     if not df.empty:
                         tbl_label = (
-                            f"Supplementary Table {filename_no_ext}"
+                            _ensure_supp_label_prefix(filename_no_ext)
                             if len(tables) == 1
-                            else f"Supplementary Table {filename_no_ext}_T{t_idx + 1}"
+                            else _ensure_supp_label_prefix(f"{filename_no_ext}_T{t_idx + 1}")
                         )
                         df.attrs["label"] = tbl_label
                         df.attrs["table_title"] = f"Supplementary Table {t_idx + 1} from file '{fname}'"
@@ -1343,6 +1436,10 @@ def _parse_supplementary_bytes(content_bytes, filename, content_type="", _depth=
         try:
             with fitz.open(stream=content_bytes, filetype="pdf") as pdf_doc:
                 for p_idx in range(min(len(pdf_doc), 30)):
+                    if cancel_event is not None and cancel_event.is_set():
+                        break
+                    if deadline is not None and time.monotonic() >= deadline:
+                        break
                     page = pdf_doc[p_idx]
                     try:
                         finder = page.find_tables()
@@ -1361,9 +1458,9 @@ def _parse_supplementary_bytes(content_bytes, filename, content_type="", _depth=
                             df = _rows_to_dataframe(rows)
                             if not df.empty:
                                 tbl_label = (
-                                    f"Supplementary Table {filename_no_ext}_P{p_idx + 1}"
+                                    _ensure_supp_label_prefix(f"{filename_no_ext}_P{p_idx + 1}")
                                     if len(tbl_list) == 1
-                                    else f"Supplementary Table {filename_no_ext}_P{p_idx + 1}_T{t_idx + 1}"
+                                    else _ensure_supp_label_prefix(f"{filename_no_ext}_P{p_idx + 1}_T{t_idx + 1}")
                                 )
                                 df.attrs["label"] = tbl_label
                                 df.attrs["table_title"] = f"Supplementary Table from page {p_idx + 1} of file '{fname}'"
@@ -1394,6 +1491,13 @@ def _discover_supplementary_links(base_url, html_content, max_links=6):
     except Exception:
         return []
 
+    base_parsed = urllib.parse.urlparse(base_url or "")
+    base_sig = (
+        (base_parsed.netloc or "").lower(),
+        (base_parsed.path or "").rstrip("/"),
+        base_parsed.query or "",
+    )
+
     scored = {}
     for a in soup.find_all("a", href=True):
         raw_href = (a.get("href") or "").strip()
@@ -1403,6 +1507,17 @@ def _discover_supplementary_links(base_url, html_content, max_links=6):
         parsed = urllib.parse.urlparse(abs_url)
         if parsed.scheme not in ("http", "https"):
             continue
+        # 过滤指向当前文章页面自身的页内锚点（例如 Springer https://link.springer.com/article/...#MOESM1）
+        cand_sig = (
+            (parsed.netloc or "").lower(),
+            (parsed.path or "").rstrip("/"),
+            parsed.query or "",
+        )
+        if base_sig[0] and cand_sig == base_sig:
+            continue
+        if parsed.fragment:
+            abs_url = urllib.parse.urlunparse(parsed._replace(fragment=""))
+            parsed = urllib.parse.urlparse(abs_url)
 
         path_low = (parsed.path or "").lower()
         full_low = abs_url.lower()
@@ -1495,6 +1610,7 @@ def extract_builtin_supplementary_tables(
     cancel_event=None,
     max_files=6,
     max_timeout=25,
+    prefetched_candidates=None,
 ):
     """
     零外部依赖的内置补充材料表格发现与解析回退通道（当外部 journal-supp-downloader 不可用时启用）。
@@ -1524,40 +1640,100 @@ def extract_builtin_supplementary_tables(
         "Referer": fetch_base_url,
     }
 
-    def _get(target_u, timeout_s):
+    def _get(target_u, timeout_s, stream=False):
+        per_req_to = max(2.0, min(float(timeout_s), 10.0))
         req_kw = {
             "headers": headers,
             "cookies": cookie_jar,
-            "timeout": max(3.0, min(timeout_s, 15.0)),
+            "timeout": (min(per_req_to, 5.0), per_req_to),
             "allow_redirects": True,
         }
+        if stream:
+            req_kw["stream"] = True
         if proxies:
             req_kw["proxies"] = proxies
-        return requests.get(target_u, **req_kw)
+        resp = requests.get(target_u, **req_kw)
+        if getattr(resp, "status_code", 200) in (403, 429) and requests_impersonate is not None:
+            try:
+                if hasattr(resp, "close"):
+                    resp.close()
+            except Exception:
+                pass
+            try:
+                imp_kw = {
+                    "impersonate": "chrome110",
+                    "timeout": per_req_to,
+                    "allow_redirects": True,
+                }
+                if proxies:
+                    imp_kw["proxies"] = proxies
+                imp_resp = requests_impersonate.get(target_u, **imp_kw)
+                if getattr(imp_resp, "status_code", 0) == 200:
+                    return imp_resp
+            except Exception:
+                pass
+        return resp
 
-    page_html = html_content
-    if not page_html:
-        rem = deadline - time.monotonic()
-        if rem <= 1.0:
-            return []
+    def _read_bounded_bytes(resp):
+        """Read response body while strictly enforcing wall-clock `deadline`, `cancel_event`, and `max_bytes`."""
         try:
-            resp = _get(fetch_base_url, rem)
-            if resp.status_code == 200 and resp.text and not is_anti_bot_blocked("", resp.text[:4000]):
-                page_html = resp.text
-        except Exception as e:
-            print(f"[Built-in Supp] 获取文章主页 HTML 失败: {e}")
+            iter_fn = getattr(resp, "iter_content", None)
+            if callable(iter_fn) and not getattr(resp, "_content_consumed", False):
+                try:
+                    buf = bytearray()
+                    for chunk in iter_fn(chunk_size=65536):
+                        if cancel_event is not None and cancel_event.is_set():
+                            return b""
+                        if time.monotonic() >= deadline:
+                            return b""
+                        if not chunk:
+                            continue
+                        buf.extend(chunk)
+                        if len(buf) > max_bytes:
+                            return b""
+                    return bytes(buf)
+                except (TypeError, RuntimeError):
+                    pass
+            raw = getattr(resp, "content", None) or b""
+            return raw if len(raw) <= max_bytes else b""
+        finally:
+            try:
+                if hasattr(resp, "close"):
+                    resp.close()
+            except Exception:
+                pass
+
+    if prefetched_candidates is not None:
+        candidates = list(prefetched_candidates)[:max(1, int(max_files or 6))]
+    else:
+        page_html = html_content
+        if not page_html:
+            rem = deadline - time.monotonic()
+            if rem <= 1.0:
+                return []
+            try:
+                resp = _get(fetch_base_url, rem)
+                if resp.status_code == 200 and resp.text and not is_anti_bot_blocked("", resp.text[:4000]):
+                    page_html = resp.text
+            except Exception as e:
+                print(f"[Built-in Supp] 获取文章主页 HTML 失败: {e}")
+                return []
+
+        if not page_html:
             return []
 
-    if not page_html:
-        return []
-
-    candidates = _discover_supplementary_links(fetch_base_url, page_html, max_links=max_files)
+        candidates = _discover_supplementary_links(fetch_base_url, page_html, max_links=max_files)
     if not candidates:
         return []
 
     print(f"[Built-in Supp] 发现 {len(candidates)} 个候选补充材料链接，开始校验下载并解析...")
     all_dfs = []
+    blocked_strong_items = []
     max_bytes = 25 * 1024 * 1024
+
+    def _is_akamai_browser_supp_candidate(item_dict):
+        u_low = str(item_dict.get("url") or "").lower()
+        return item_dict.get("marker") == "strong" and "mdpi.com/" in u_low and bool(re.search(r"/s\d+(?:[/?#]|$)", u_low))
 
     for item in candidates:
         if cancel_event is not None and cancel_event.is_set():
@@ -1567,18 +1743,34 @@ def extract_builtin_supplementary_tables(
             break
         dl_url = item["url"]
         try:
-            r = _get(dl_url, rem)
+            r = _get(dl_url, rem, stream=True)
             if r.status_code != 200:
+                if r.status_code in (403, 429) and _is_akamai_browser_supp_candidate(item):
+                    blocked_strong_items.append(item)
+                try:
+                    if hasattr(r, "close"):
+                        r.close()
+                except Exception:
+                    pass
                 continue
             r_hdrs = getattr(r, "headers", None) or {}
             ctype = str(r_hdrs.get("Content-Type") or "").lower()
             if any(bad in ctype for bad in _SUPP_REJECT_CTYPES):
+                if "text/html" in ctype and _is_akamai_browser_supp_candidate(item):
+                    blocked_strong_items.append(item)
+                try:
+                    if hasattr(r, "close"):
+                        r.close()
+                except Exception:
+                    pass
                 continue
-            content_bytes = getattr(r, "content", None) or b""
+            content_bytes = _read_bounded_bytes(r)
             if not content_bytes or len(content_bytes) > max_bytes:
                 continue
             head_low = content_bytes[:512].lstrip().lower()
             if head_low.startswith((b"<!doctype html", b"<html")):
+                if _is_akamai_browser_supp_candidate(item):
+                    blocked_strong_items.append(item)
                 continue
 
             fname = item["filename"]
@@ -1587,25 +1779,251 @@ def extract_builtin_supplementary_tables(
             if m_cd:
                 fname = urllib.parse.unquote(m_cd.group(1).strip())
 
-            parsed_dfs = _parse_supplementary_bytes(content_bytes, fname, content_type=ctype)
+            parsed_dfs = _parse_supplementary_bytes(
+                content_bytes,
+                fname,
+                content_type=ctype,
+                deadline=deadline,
+                cancel_event=cancel_event,
+            )
             if parsed_dfs:
                 all_dfs.extend(parsed_dfs)
         except Exception as ex:
             print(f"[Built-in Supp] 下载/解析 {dl_url} 跳过: {ex}")
+
+    if not all_dfs and blocked_strong_items and not (cancel_event is not None and cancel_event.is_set()):
+        browser_dfs = _download_blocked_supp_via_browser(
+            fetch_base_url,
+            blocked_strong_items,
+            max_timeout=18.0,
+            cancel_event=cancel_event,
+        )
+        if browser_dfs:
+            all_dfs.extend(browser_dfs)
 
     if all_dfs:
         print(f"[Built-in Supp] 内置补充材料通道成功提取 {len(all_dfs)} 张补充表格。")
     return all_dfs
 
 
+def _download_blocked_supp_via_browser(base_url, blocked_items, max_timeout=18.0, cancel_event=None):
+    """
+    当强特征补充材料链接（如 MDPI /s1 ZIP）在纯 HTTP 下触发 Akamai 403 / bm-verify HTML 壳时，
+    使用无头有界 StealthySession 通过验证并复用该浏览器会话直接下载解析附件。
+    """
+    if not base_url or not blocked_items:
+        return []
+    if cancel_event is not None and cancel_event.is_set():
+        return []
+    if os.environ.get("ZTE_DISABLE_BROWSER_SUPP_FALLBACK") == "1":
+        return []
+
+    collected = []
+    cap_ms = max(8000, min(int(float(max_timeout or 18.0) * 1000), 20000))
+    dl_deadline = time.monotonic() + float(max_timeout or 18.0)
+
+    def _fetch_supp_action(page):
+        if cancel_event is not None and cancel_event.is_set():
+            return
+        try:
+            _scrapling_page_action(page)
+        except Exception:
+            pass
+        req_api = getattr(getattr(page, "context", None), "request", None) or getattr(page, "request", None)
+        if req_api is None:
+            return
+        max_bytes = 25 * 1024 * 1024
+        for item in blocked_items[:2]:
+            if cancel_event is not None and cancel_event.is_set():
+                break
+            rem_s = dl_deadline - time.monotonic()
+            if rem_s <= 1.5:
+                break
+            dl_url = item["url"]
+            try:
+                resp = req_api.get(dl_url, timeout=min(12000, max(3000, int(rem_s * 1000))))
+                if getattr(resp, "status", 0) != 200:
+                    continue
+                hdrs = {str(k).lower(): str(v) for k, v in (getattr(resp, "headers", None) or {}).items()}
+                ctype = hdrs.get("content-type", "").lower()
+                if any(bad in ctype for bad in _SUPP_REJECT_CTYPES):
+                    continue
+                body = resp.body()
+                if not body or len(body) > max_bytes:
+                    continue
+                head_low = body[:512].lstrip().lower()
+                if head_low.startswith((b"<!doctype html", b"<html")):
+                    continue
+                fname = item.get("filename") or "supplementary"
+                cd = hdrs.get("content-disposition", "")
+                m_cd = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";\r\n]+)"?', cd, re.IGNORECASE)
+                if m_cd:
+                    fname = urllib.parse.unquote(m_cd.group(1).strip())
+                parsed_dfs = _parse_supplementary_bytes(
+                    body,
+                    fname,
+                    content_type=ctype,
+                    deadline=dl_deadline,
+                    cancel_event=cancel_event,
+                )
+                if parsed_dfs:
+                    collected.extend(parsed_dfs)
+            except Exception as ex:
+                print(f"[Browser Supp Fallback] 下载/解析 {dl_url} 跳过: {ex}")
+
+    print(f"[Built-in Supp] 检测到 {len(blocked_items)} 个强特征补充链接遭反爬拦截，启动无头浏览器会话回退下载...")
+    try:
+        _scrapling_fetch_html(
+            base_url,
+            {
+                "headless": True,
+                "solve_cloudflare": False,
+                "network_idle": False,
+                "wait": 1500,
+                "timeout": cap_ms,
+                "page_action": _fetch_supp_action,
+            },
+        )
+    except Exception as ex:
+        print(f"[Browser Supp Fallback] 会话回退跳过: {ex}")
+    if collected:
+        print(f"[Browser Supp Fallback] 无头浏览器会话成功补提 {len(collected)} 张补充表格。")
+    return collected
+
+
+def _download_supp_via_browser_context(
+    request_api,
+    base_url,
+    html_text,
+    cancel_event=None,
+    max_files=4,
+    max_timeout=15.0,
+    strong_only=True,
+):
+    """
+    Download and parse supplementary attachments using an active authenticated browser
+    context (Playwright/Scrapling `page.context.request.get`), inheriting solved
+    Akamai `bm-verify` / Cloudflare cookies (critical for MDPI `/s1` & gated supp links).
+    Zero network requests when no matching supplementary links exist in `html_text`.
+    """
+    if request_api is None or not base_url or not html_text:
+        return []
+    if cancel_event is not None and cancel_event.is_set():
+        return []
+    try:
+        candidates = _discover_supplementary_links(base_url, html_text, max_links=max(max_files, 6))
+        if strong_only:
+            candidates = [c for c in candidates if c.get("marker") == "strong"]
+        candidates = candidates[:max(1, int(max_files or 4))]
+    except Exception:
+        return []
+    if not candidates:
+        return []
+
+    deadline = time.monotonic() + max(4.0, float(max_timeout or 15.0))
+    all_dfs = []
+    max_bytes = 25 * 1024 * 1024
+    print(f"[Browser Supp] 发现 {len(candidates)} 个强特征补充材料链接，复用当前浏览器会话下载解析...")
+    for item in candidates:
+        if cancel_event is not None and cancel_event.is_set():
+            break
+        rem = deadline - time.monotonic()
+        if rem <= 1.0:
+            break
+        dl_url = item["url"]
+        try:
+            resp = request_api.get(
+                dl_url,
+                headers={"Referer": base_url},
+                timeout=int(min(rem, 12.0) * 1000),
+            )
+            status = getattr(resp, "status", 0)
+            if status != 200:
+                continue
+            hdrs = getattr(resp, "headers", None) or {}
+            ctype = str(hdrs.get("content-type") or hdrs.get("Content-Type") or "").lower()
+            if any(bad in ctype for bad in _SUPP_REJECT_CTYPES):
+                continue
+            body = resp.body() if callable(getattr(resp, "body", None)) else b""
+            if not body or len(body) > max_bytes:
+                continue
+            head_low = body[:512].lstrip().lower()
+            if head_low.startswith((b"<!doctype html", b"<html")):
+                continue
+            fname = item["filename"]
+            cd = str(hdrs.get("content-disposition") or hdrs.get("Content-Disposition") or "")
+            m_cd = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";\r\n]+)"?', cd, re.IGNORECASE)
+            if m_cd:
+                fname = urllib.parse.unquote(m_cd.group(1).strip())
+            parsed = _parse_supplementary_bytes(body, fname, content_type=ctype)
+            if parsed:
+                all_dfs.extend(parsed)
+        except Exception as ex:
+            print(f"[Browser Supp] 下载/解析 {dl_url} 跳过: {ex}")
+    if all_dfs:
+        print(f"[Browser Supp] 复用浏览器会话成功提取 {len(all_dfs)} 张补充表格。")
+    return all_dfs
+
+
+def _append_builtin_supp_if_any(
+    dfs,
+    base_url,
+    html_text,
+    table_idx="all",
+    cancel_event=None,
+    max_timeout=12,
+    main_present_cap=6.0,
+):
+    """
+    Fast in-memory supplementary link check on already-fetched article HTML.
+    Zero network requests if no matching supplementary links exist; when strong
+    supplementary links (e.g. Springer MOESM .xlsx/.docx, MDPI /s1) are discovered,
+    downloads and appends them directly during Tier-1/Tier-2 extraction.
+    When main `dfs` are already present, caps supplementary download using
+    `main_present_cap` (default 6.0s for slow browser/cloud channels; Tier-1 fast
+    HTTP callers can pass a larger cap like 12-15s) so slow/large attachments never
+    blow the online budget and discard main tables.
+    """
+    if str(table_idx).lower() != "all" or not base_url or not html_text:
+        return dfs
+    if cancel_event is not None and cancel_event.is_set():
+        return dfs
+    try:
+        candidates = _discover_supplementary_links(base_url, html_text, max_links=6)
+        if dfs:
+            candidates = [c for c in candidates if c.get("marker") == "strong"]
+        if not candidates:
+            return dfs
+        base_timeout = float(max_timeout or 12)
+        if dfs and main_present_cap is not None:
+            eff_timeout = min(base_timeout, float(main_present_cap))
+        else:
+            eff_timeout = base_timeout
+        supp_dfs = extract_builtin_supplementary_tables(
+            base_url,
+            html_content=html_text,
+            cancel_event=cancel_event,
+            max_files=len(candidates),
+            max_timeout=eff_timeout,
+            prefetched_candidates=candidates,
+        )
+        if supp_dfs:
+            result = list(dfs) if dfs else []
+            result.extend(supp_dfs)
+            return result
+    except Exception as ex:
+        print(f"[Built-in Supp] 自动追加补充材料跳过: {ex}")
+    return dfs
+
+
 def extract_general_supplementary_tables(url, cancel_event=None, max_timeout=30, html_content=None):
     """
     Calls the journal-supp-downloader script to download supplementary files,
     then parses tables from them in-memory or from temp files.
-    When the external journal-supp-downloader skill is unavailable, automatically falls back
-    to the zero-dependency built-in supplementary table link discovery extractor.
-    Supports cooperative cancellation via cancel_event and terminates the child
-    process tree immediately on cancel or timeout.
+    When already-fetched html_content is provided, tries the zero-dependency
+    built-in supplementary link discovery FIRST (sub-second, no subprocess overhead),
+    and also falls back to built-in discovery if the external script is unavailable,
+    times out, or downloads zero files.
     """
     import subprocess
     import tempfile
@@ -1625,6 +2043,22 @@ def extract_general_supplementary_tables(url, cancel_event=None, max_timeout=30,
         return []
 
     supplementary_dfs = []
+    builtin_tried_with_html = False
+
+    # Fast path: when article HTML is already fetched in-memory, run zero-subprocess
+    # built-in supplementary link discovery first (handles Springer MOESM, MDPI /s1, etc. in ~1-2s).
+    if html_content:
+        builtin_tried_with_html = True
+        builtin_dfs = extract_builtin_supplementary_tables(
+            url,
+            html_content=html_content,
+            cancel_event=cancel_event,
+            max_timeout=min(15, max(5, int(max_timeout or 30))),
+        )
+        if builtin_dfs:
+            return builtin_dfs
+        if cancel_event is not None and cancel_event.is_set():
+            return []
     
     # Locate the journal_downloader.py script (configured path first, then sibling skill dir)
     downloader_script = ""
@@ -1640,6 +2074,8 @@ def extract_general_supplementary_tables(url, cancel_event=None, max_timeout=30,
         downloader_script = os.path.join(skills_root, "journal-supp-downloader", "scripts", "journal_downloader.py")
     
     if not os.path.exists(downloader_script):
+        if builtin_tried_with_html:
+            return []
         print(f"[在线提取] 找不到 journal-supp-downloader 技能脚本 ({downloader_script})，启用内置零依赖补充材料发现回退...")
         return extract_builtin_supplementary_tables(
             url,
@@ -1649,6 +2085,8 @@ def extract_general_supplementary_tables(url, cancel_event=None, max_timeout=30,
         )
         
     temp_dir = tempfile.mkdtemp(prefix="supp_dl_")
+    timed_out = False
+    was_cancelled = False
     try:
         print(f"[在线提取] 调用 journal-supp-downloader 脚本获取补充文件: {url}")
         cmd = [sys.executable, downloader_script, url, "-o", temp_dir]
@@ -1660,7 +2098,9 @@ def extract_general_supplementary_tables(url, cancel_event=None, max_timeout=30,
         deadline = time.monotonic() + max(5.0, float(max_timeout or 30))
         while proc.poll() is None:
             if (cancel_event is not None and cancel_event.is_set()) or time.monotonic() >= deadline:
-                reason = "取消信号" if (cancel_event is not None and cancel_event.is_set()) else f"{max_timeout}s 超时"
+                was_cancelled = bool(cancel_event is not None and cancel_event.is_set())
+                timed_out = not was_cancelled
+                reason = "取消信号" if was_cancelled else f"{max_timeout}s 超时"
                 print(f"[在线提取] journal-supp-downloader 收到{reason}，终止子进程。")
                 try:
                     if os.name == "nt":
@@ -1679,109 +2119,81 @@ def extract_general_supplementary_tables(url, cancel_event=None, max_timeout=30,
                     proc.wait(timeout=3)
                 except Exception:
                     pass
-                return supplementary_dfs
+                break
             time.sleep(0.25)
-        try:
-            proc.communicate(timeout=2)
-        except Exception:
-            pass
-        
-        # Search the temp_dir recursively for downloaded files
-        downloaded_files = []
-        for root_dir, dirs, files in os.walk(temp_dir):
-            for file in files:
-                downloaded_files.append(os.path.join(root_dir, file))
-                
-        if not downloaded_files:
-            print("[在线提取] 未能通过 journal-supp-downloader 下载到任何补充文件。")
-            return supplementary_dfs
-            
-        print(f"[在线提取] 成功下载 {len(downloaded_files)} 个补充文件。开始解析表格...")
-        for filepath in downloaded_files:
-            filename = os.path.basename(filepath)
-            filename_no_ext = os.path.splitext(filename)[0]
-            
-            # Read file bytes
+
+        if not timed_out and not was_cancelled:
             try:
-                with open(filepath, "rb") as f:
-                    content_bytes = f.read()
-            except Exception as e:
-                print(f"  -> 无法读取文件 {filename}: {e}")
-                continue
-                
-            # Parse based on file type
-            # Excel
-            if filename.lower().endswith((".xlsx", ".xls")):
-                try:
-                    excel_data = pd.read_excel(io.BytesIO(content_bytes), sheet_name=None)
-                    print(f"  -> 成功解析 Excel 补充文件 {filename}。")
-                    for sheet_name, df in excel_data.items():
-                        if not df.empty:
-                            df.attrs['label'] = f"Supplementary Table {filename_no_ext}_{sheet_name}"
-                            df.attrs['table_title'] = f"Supplementary Table from sheet '{sheet_name}' in file '{filename}'"
-                            supplementary_dfs.append(df)
-                except Exception as ex:
-                    print(f"  -> 解析 Excel 失败 {filename}: {ex}")
-                    
-            # Word docx
-            elif filename.lower().endswith(".docx"):
-                try:
-                    with zipfile.ZipFile(io.BytesIO(content_bytes)) as z:
-                        xml_content = z.read("word/document.xml")
-                    ns = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
-                    root = ET.fromstring(xml_content)
-                    tables = root.findall('.//w:tbl', ns)
-                    print(f"  -> 成功解析 Word 补充文件 {filename}。发现 {len(tables)} 张表格。")
-                    for t_idx, tbl in enumerate(tables):
-                        rows_data = []
-                        for row in tbl.findall('.//w:tr', ns):
-                            row_data = []
-                            for cell in row.findall('.//w:tc', ns):
-                                cell_text = "".join(text_elem.text for text_elem in cell.findall('.//w:t', ns) if text_elem.text)
-                                row_data.append(cell_text.strip())
-                            if row_data:
-                                rows_data.append(row_data)
-                        if rows_data:
-                            df = _rows_to_dataframe(rows_data)
-                            tbl_label = f"Supplementary Table {filename_no_ext}" if len(tables) == 1 else f"Supplementary Table {filename_no_ext}_T{t_idx+1}"
-                            df.attrs['label'] = tbl_label
-                            df.attrs['table_title'] = f"Supplementary Table {t_idx+1} from file '{filename}'"
-                            supplementary_dfs.append(df)
-                except Exception as ex:
-                    print(f"  -> 解析 Word 失败 {filename}: {ex}")
-                    
-            # PDF
-            elif filename.lower().endswith(".pdf"):
-                if fitz is None:
-                    continue
-                try:
-                    pdf_doc = fitz.open(stream=content_bytes, filetype="pdf")
-                    print(f"  -> 成功解析 PDF 补充文件 {filename}。")
-                    for p_idx in range(len(pdf_doc)):
-                        page = pdf_doc[p_idx]
+                proc.communicate(timeout=2)
+            except Exception:
+                pass
+
+            # Search the temp_dir recursively for downloaded files
+            downloaded_files = []
+            for root_dir, dirs, files in os.walk(temp_dir):
+                for file in files:
+                    downloaded_files.append(os.path.join(root_dir, file))
+
+            if not downloaded_files:
+                print("[在线提取] 未能通过 journal-supp-downloader 下载到任何补充文件。")
+            else:
+                print(f"[在线提取] 成功下载 {len(downloaded_files)} 个补充文件。开始解析表格...")
+                for filepath in downloaded_files:
+                    filename = os.path.basename(filepath)
+                    filename_no_ext = os.path.splitext(filename)[0]
+                    try:
+                        with open(filepath, "rb") as f:
+                            content_bytes = f.read()
+                    except Exception as e:
+                        print(f"  -> 无法读取文件 {filename}: {e}")
+                        continue
+
+                    if filename.lower().endswith((".xlsx", ".xls")):
                         try:
-                            tbl_finder = page.find_tables(strategy="text")
-                            tbl_list = tbl_finder.tables if tbl_finder else []
-                        except Exception:
-                            tbl_list = []
-                        for t_idx, table in enumerate(tbl_list):
-                            rows = table.extract()
-                            if rows and len(rows) >= 2:
-                                df = _rows_to_dataframe(rows)
-                                tbl_label = f"Supplementary Table {filename_no_ext}_P{p_idx+1}" if len(tbl_list) == 1 else f"Supplementary Table {filename_no_ext}_P{p_idx+1}_T{t_idx+1}"
-                                df.attrs['label'] = tbl_label
-                                df.attrs['table_title'] = f"Supplementary Table from page {p_idx+1} of file '{filename}'"
-                                supplementary_dfs.append(df)
-                except Exception as ex:
-                    print(f"  -> 解析 PDF 失败 {filename}: {ex}")
+                            excel_data = pd.read_excel(io.BytesIO(content_bytes), sheet_name=None)
+                            print(f"  -> 成功解析 Excel 补充文件 {filename}。")
+                            for sheet_name, df in excel_data.items():
+                                if not df.empty:
+                                    tbl_lbl = _format_supp_excel_label(filename_no_ext, sheet_name, len(excel_data) > 1)
+                                    df.attrs['label'] = tbl_lbl
+                                    df.attrs['table_title'] = f"Supplementary Table ({tbl_lbl}) from sheet '{sheet_name}' of file '{filename}'"
+                                    supplementary_dfs.append(df)
+                        except Exception as ex:
+                            print(f"  -> 解析 Excel 失败 {filename}: {ex}")
+                    elif filename.lower().endswith(".docx"):
+                        try:
+                            parsed_doc = _parse_supplementary_bytes(content_bytes, filename)
+                            if parsed_doc:
+                                supplementary_dfs.extend(parsed_doc)
+                        except Exception as ex:
+                            print(f"  -> 解析 Word 失败 {filename}: {ex}")
+                    elif filename.lower().endswith((".csv", ".tsv", ".zip", ".pdf")):
+                        try:
+                            parsed_other = _parse_supplementary_bytes(content_bytes, filename)
+                            if parsed_other:
+                                supplementary_dfs.extend(parsed_other)
+                        except Exception as ex:
+                            print(f"  -> 解析补充文件失败 {filename}: {ex}")
     except Exception as e:
-        print(f"[在线提取] 调用 journal-supp-downloader 遇到异常: {e}")
+        print(f"[在线提取] 调用 journal-supp-downloader 失败: {e}")
     finally:
         try:
-            shutil.rmtree(temp_dir)
+            shutil.rmtree(temp_dir, ignore_errors=True)
         except Exception:
             pass
-            
+
+    if not supplementary_dfs and not was_cancelled and not builtin_tried_with_html:
+        if timed_out:
+            print("[在线提取] journal-supp-downloader 超时，自动回退内置零依赖补充材料发现通道...")
+        else:
+            print("[在线提取] journal-supp-downloader 未获取到有效补充表，自动回退内置零依赖补充材料发现通道...")
+        return extract_builtin_supplementary_tables(
+            url,
+            html_content=html_content,
+            cancel_event=cancel_event,
+            max_timeout=min(12, max(5, int(max_timeout or 12))),
+        )
+
     return supplementary_dfs
 
 
@@ -1885,10 +2297,20 @@ def _parse_elsevier_xocs_tables(xml_content, table_idx="all"):
         thead = tgroup.find('.//thead')
         if thead is None:
             thead = parent_elem.find('.//thead')
-        thead_rows_count = len(thead.findall('.//row')) if thead is not None else 0
-        if thead_rows_count == 0:
-            thead_rows_count = 1
-            
+        raw_thead_rows = len(thead.findall('.//row')) if thead is not None else 0
+
+        # Preserve single-row headerless tables (e.g., older Elsevier XOCS XML with thead=0, tbody=1 row)
+        if raw_thead_rows == 0 and num_rows == 1:
+            row0 = [c if c is not None else "" for c in grid[0]]
+            if not any(str(c).strip() for c in row0):
+                return None
+            unique_headers = [
+                (col_names[c] if c < len(col_names) and col_names[c] else f"Col_{c + 1}")
+                for c in range(num_cols)
+            ]
+            return pd.DataFrame([row0], columns=unique_headers)
+
+        thead_rows_count = raw_thead_rows if raw_thead_rows > 0 else 1
         if num_rows <= thead_rows_count:
             return None
             
@@ -1955,6 +2377,16 @@ def _parse_elsevier_xocs_tables(xml_content, table_idx="all"):
                     part_dfs.append(df_part)
 
             if not part_dfs:
+                has_img_ref = (
+                    elem.find('.//link') is not None
+                    or elem.find('.//graphic') is not None
+                    or elem.find('.//object') is not None
+                )
+                if has_img_ref:
+                    print(
+                        f"[Elsevier API Warning] {label_text or 'Table'} 在 XOCS XML 中以图片引用 (<ce:link>) 存储，"
+                        f"无结构化文本表格，需由本地 PDF/OCR 补漏。"
+                    )
                 continue
 
             if len(part_dfs) == 1:
@@ -2539,8 +2971,25 @@ def _follow_table_subpages(base_url, html_text, fetch_html_fn, table_idx="all", 
     for sub_u in sub_urls:
         if cancel_event is not None and cancel_event.is_set():
             break
-        sub_html = fetch_html_fn(sub_u)
-        if not sub_html or is_anti_bot_blocked("", sub_html):
+        sub_html = ""
+        for _attempt in range(2):
+            if cancel_event is not None and cancel_event.is_set():
+                break
+            try:
+                cand_html = fetch_html_fn(sub_u)
+            except Exception:
+                cand_html = ""
+            if cand_html and not is_anti_bot_blocked("", cand_html):
+                sub_html = cand_html
+                break
+            if _attempt == 0:
+                if cancel_event is not None:
+                    if cancel_event.wait(0.5):
+                        break
+                else:
+                    time.sleep(0.5)
+        if not sub_html:
+            print(f"[Subpage Warning] 表格子页抓取失败（重试后仍为空或被拦截）: {sub_u}")
             continue
         sub_dfs = parse_tables_from_html(sub_html, "all")
         if sub_dfs:
@@ -2550,7 +2999,7 @@ def _follow_table_subpages(base_url, html_text, fetch_html_fn, table_idx="all", 
     return _select_tables(all_dfs, table_idx) or []
 
 
-def extract_tables_via_direct_http(url, table_idx="all", cancel_event=None, doi=None):
+def extract_tables_via_direct_http(url, table_idx="all", cancel_event=None, doi=None, meta_out=None):
 
     """
     Attempts to fetch HTML directly via requests from the local network/IP.
@@ -2603,6 +3052,10 @@ def extract_tables_via_direct_http(url, table_idx="all", cancel_event=None, doi=
             "Upgrade-Insecure-Requests": "1"
         }
 
+        used_impersonate = requests_impersonate is not None
+        if isinstance(meta_out, dict):
+            meta_out["used_impersonate"] = used_impersonate
+
         def _fetch_one(target_url):
             if cancel_event is not None and cancel_event.is_set():
                 return None, "", target_url
@@ -2618,13 +3071,18 @@ def extract_tables_via_direct_http(url, table_idx="all", cancel_event=None, doi=
             resp = requests.get(target_url, **kw)
             return resp.status_code, resp.text, str(getattr(resp, "url", "") or target_url)
 
-        if requests_impersonate is not None:
+        if used_impersonate:
             print(f"尝试本地直接 HTTP 请求网页 (机构 IP 直连 + TLS Chrome 模拟): {fetch_url} ...")
         else:
             print(f"尝试本地直接 HTTP 请求网页 (机构 IP 直连 + 标头伪装): {fetch_url} ...")
         status_code, text, final_url = _fetch_one(fetch_url)
         if cancel_event is not None and cancel_event.is_set():
             return []
+
+        if isinstance(meta_out, dict):
+            meta_out["status_code"] = status_code
+            meta_out["final_url"] = final_url
+            meta_out["was_dead_http"] = status_code in (404, 410)
 
         if inst_proxy_active and validate_institutional_session:
             sess = validate_institutional_session(
@@ -2638,19 +3096,55 @@ def extract_tables_via_direct_http(url, table_idx="all", cancel_event=None, doi=
                 )
                 return []
 
+        # Follow Akamai bm-verify meta-refresh once before declaring blocked (e.g., MDPI)
+        if status_code == 200 and text and "bm-verify=" in text[:4000].lower():
+            m_bm = re.search(
+                r'<meta[^>]+http-equiv=["\']?refresh["\']?[^>]+content=["\'][^"\']*url=([^"\'>\s]+)',
+                text[:4000],
+                re.IGNORECASE,
+            )
+            if m_bm:
+                bm_url = urllib.parse.urljoin(final_url or fetch_url, m_bm.group(1).strip("'\""))
+                try:
+                    sc2, txt2, fu2 = _fetch_one(bm_url)
+                    if sc2 == 200 and txt2 and not is_anti_bot_blocked("", txt2):
+                        status_code, text, final_url = sc2, txt2, fu2
+                        if isinstance(meta_out, dict):
+                            meta_out["final_url"] = final_url
+                except Exception:
+                    pass
+
         if status_code == 200 and text:
             if is_anti_bot_blocked("", text):
+                if isinstance(meta_out, dict):
+                    meta_out["was_blocked"] = True
                 print("本地直接 HTTP 请求被反爬拦截 (Cloudflare / Access Denied / Radware)。")
                 if record_negative_cache:
                     record_negative_cache("direct_http", url=url, doi=doi, status_code=200, html_snippet=text, config=config)
                 return []
 
+            base_u = final_url or fetch_url
             dfs = parse_tables_from_html(text, table_idx)
             if not dfs:
                 def _fetch_ok_html(su):
-                    sc, body, _fu = _fetch_one(su)
-                    return body if sc == 200 else ""
-                dfs = _follow_table_subpages(fetch_url, text, _fetch_ok_html, table_idx, cancel_event=cancel_event)
+                    try:
+                        sc, body, _fu = _fetch_one(su)
+                        return body if sc == 200 else ""
+                    except Exception:
+                        return ""
+                dfs = _follow_table_subpages(base_u, text, _fetch_ok_html, table_idx, cancel_event=cancel_event)
+
+            # Fast in-memory check for strong supplementary links (Springer MOESM, MDPI /s1, etc.)
+            # Tier-1 DirectHTTP finishes quickly with ample budget left, so allow up to 12s wall-clock for multi-ESM papers.
+            dfs = _append_builtin_supp_if_any(
+                dfs,
+                base_u,
+                text,
+                table_idx=table_idx,
+                cancel_event=cancel_event,
+                max_timeout=12,
+                main_present_cap=12.0,
+            )
             if dfs:
                 if clear_negative_cache:
                     clear_negative_cache("direct_http", url=url, doi=doi, config=config)
@@ -3002,10 +3496,27 @@ def extract_tables_via_firecrawl(url, api_key=None, table_idx="all", cancel_even
     if not key:
         return _finish([])
 
+    def _resolve_fc_base_url(data_dict, fallback_url):
+        """Prefer Firecrawl's final redirected publisher URL over dx.doi.org/doi.org for relative supp links."""
+        meta = (data_dict.get("metadata") or {}) if isinstance(data_dict, dict) else {}
+        if isinstance(meta, dict):
+            for k in ("url", "ogUrl", "sourceURL"):
+                cand = str(meta.get(k) or "").strip()
+                if cand.startswith(("http://", "https://")):
+                    host = (urllib.parse.urlparse(cand).hostname or "").lower()
+                    if host not in ("doi.org", "dx.doi.org", "hdl.handle.net"):
+                        return cand
+        return fallback_url
+
     # 1) 本地磁盘缓存（24h TTL）
     cached = _firecrawl_read_cache(url)
     if cached is not None:
-        return _finish(_firecrawl_parse_response(cached, table_idx))
+        fc_dfs = _firecrawl_parse_response(cached, table_idx)
+        fc_html = (cached.get("html") or "") if isinstance(cached, dict) else ""
+        if fc_html:
+            fc_base = _resolve_fc_base_url(cached, url)
+            fc_dfs = _append_builtin_supp_if_any(fc_dfs, fc_base, fc_html, table_idx=table_idx, cancel_event=cancel_event, max_timeout=12)
+        return _finish(fc_dfs)
 
     formats = ["html", "markdown"]
     if bool(config.get("FIRECRAWL_ENABLE_JSON_EXTRACT")):
@@ -3087,7 +3598,12 @@ def extract_tables_via_firecrawl(url, api_key=None, table_idx="all", cancel_even
                 payload_data = {}
             if payload_data:
                 _firecrawl_write_cache(url, payload_data)
-            return _finish(_firecrawl_parse_response(payload_data, table_idx))
+            fc_dfs = _firecrawl_parse_response(payload_data, table_idx)
+            fc_html = (payload_data.get("html") or "") if isinstance(payload_data, dict) else ""
+            if fc_html:
+                fc_base = _resolve_fc_base_url(payload_data, url)
+                fc_dfs = _append_builtin_supp_if_any(fc_dfs, fc_base, fc_html, table_idx=table_idx, cancel_event=cancel_event, max_timeout=12)
+            return _finish(fc_dfs)
 
         if response.status_code in (401, 402, 403):
             err_msg = ""
@@ -3343,12 +3859,19 @@ def _scrapling_fetch_html(url, extra_kwargs=None):
     if is_real_stealth and os.environ.get("ZTE_DISABLE_SCRAPLING_BOUNDED") != "1":
         try:
             res = _scrapling_bounded_session_fetch(url, filtered_kwargs)
-        except Exception:
-            res = None
+        except Exception as bounded_exc:
+            # 仅在接口/签名不兼容时回退到 StealthyFetcher.fetch；
+            # 真实浏览器超时或网络错误不再重复拉起第二次无界浏览器，避免拖垮 65s 预算。
+            if isinstance(bounded_exc, (ImportError, AttributeError, TypeError)):
+                res = None
+            else:
+                print(f"[Scrapling] 有界会话抓取未完成，跳过重复无界重试: {bounded_exc}")
+                return ""
         if res is not None:
             html = getattr(res, "html_content", None) or getattr(res, "text", None)
             if html:
                 return html
+            return ""
 
     def _call_with_graceful_strip(fn, target_url, kwargs_dict):
         cur = dict(kwargs_dict)
@@ -3563,12 +4086,41 @@ def extract_tables_via_scrapling(url, table_idx="all", force_headed=False, cance
         print(f"Querying Scrapling StealthyFetcher for {url} (force_headed={force_headed})...")
         used_headless = not force_headed
         domain_cookies = _collect_domain_cookies_for_scrapling(url)
+        browser_supp_dfs = []
+        browser_supp_attempted = [False]
+
+        def _scrapling_action_with_supp(page):
+            _scrapling_page_action(page)
+            if str(table_idx).lower() == "all" and not (cancel_event is not None and cancel_event.is_set()):
+                try:
+                    cur_u = getattr(page, "url", None) or url
+                    cur_html = page.content() or ""
+                    if cur_html and not is_anti_bot_blocked("", cur_html):
+                        req_api = getattr(getattr(page, "context", None), "request", None) or getattr(page, "request", None)
+                        if req_api is not None:
+                            browser_supp_attempted[0] = True
+                            got_supp = _download_supp_via_browser_context(
+                                req_api,
+                                cur_u,
+                                cur_html,
+                                cancel_event=cancel_event,
+                                max_files=4,
+                                max_timeout=10.0,
+                                strong_only=True,
+                            )
+                            if got_supp:
+                                browser_supp_dfs.extend(got_supp)
+                except Exception:
+                    pass
+            return page
+
         first_kwargs = {
             "headless": used_headless,
             "solve_cloudflare": True,
             "network_idle": False,
-            "wait": 2500 if used_headless else 3000,
-            "page_action": _scrapling_page_action,
+            "timeout": 35000,
+            "wait": 2000 if used_headless else 2500,
+            "page_action": _scrapling_action_with_supp,
         }
         if not used_headless and has_system_chrome():
             first_kwargs["real_chrome"] = True
@@ -3577,16 +4129,19 @@ def extract_tables_via_scrapling(url, table_idx="all", force_headed=False, cance
 
         html = _scrapling_fetch_html(url, first_kwargs)
         if cancel_event is not None and cancel_event.is_set():
-            return []
+            return list(browser_supp_dfs) if browser_supp_dfs else []
         if not force_headed and (not html or is_anti_bot_blocked("", html)):
             print("Scrapling 无头模式受阻，自动切换有头浏览器模式重试...")
             used_headless = False
+            browser_supp_dfs.clear()
+            browser_supp_attempted[0] = False
             headed_kwargs = {
                 "headless": False,
                 "solve_cloudflare": True,
                 "network_idle": False,
-                "wait": 3000,
-                "page_action": _scrapling_page_action,
+                "timeout": 28000,
+                "wait": 2500,
+                "page_action": _scrapling_action_with_supp,
             }
             if has_system_chrome():
                 headed_kwargs["real_chrome"] = True
@@ -3594,7 +4149,7 @@ def extract_tables_via_scrapling(url, table_idx="all", force_headed=False, cance
                 headed_kwargs["cookies"] = domain_cookies
             html = _scrapling_fetch_html(url, headed_kwargs)
             if cancel_event is not None and cancel_event.is_set():
-                return []
+                return list(browser_supp_dfs) if browser_supp_dfs else []
 
         if (not html or is_anti_bot_blocked("", html)) and try_fetch_html_via_browserskill:
             bsk_html, _bsk_status, _bsk_final = try_fetch_html_via_browserskill(url, timeout=30.0)
@@ -3623,6 +4178,13 @@ def extract_tables_via_scrapling(url, table_idx="all", force_headed=False, cance
                     lambda su: ("" if (cancel_event is not None and cancel_event.is_set()) else _scrapling_fetch_html(su, {"headless": used_headless, "solve_cloudflare": not used_headless, "network_idle": False})),
                     table_idx,
                     cancel_event=cancel_event,
+                )
+            if browser_supp_dfs:
+                dfs = list(dfs) if dfs else []
+                dfs.extend(browser_supp_dfs)
+            elif not browser_supp_attempted[0]:
+                dfs = _append_builtin_supp_if_any(
+                    dfs, url, html, table_idx=table_idx, cancel_event=cancel_event, max_timeout=10
                 )
             if dfs:
                 return dfs
@@ -4032,12 +4594,9 @@ def extract_tables_via_crawl4ai(url, table_idx="all", cancel_event=None):
     cdp_url = _crawl4ai_cdp_url()
 
     sem = _crawl4ai_semaphore()
-    # CDP 模式下通过标签页隔离并发，无需全局排他锁；
-    # 仅在非 CDP 模式且指定了共享磁盘目录时才加锁，防止多子进程冲突。
+    # Crawl4AI 在非 CDP 模式下使用独立隔离的临时浏览器实例（不读写 PLAYWRIGHT_USER_DATA_DIR），
+    # 无需抢占全局跨进程 browser_extraction_lock，避免与 Tier-3 Playwright/CNKI 互相阻塞。
     lock_ctx = None
-    if not cdp_url and config.get("PLAYWRIGHT_USER_DATA_DIR"):
-        lock_ctx = common.browser_extraction_lock("browser_extraction")
-        lock_ctx.__enter__()
 
     sem.acquire()
 
@@ -4227,6 +4786,9 @@ def extract_tables_via_crawl4ai(url, table_idx="all", cancel_event=None):
                         table_idx,
                         cancel_event=cancel_event,
                     )
+                dfs = _append_builtin_supp_if_any(
+                    dfs, url, html, table_idx=table_idx, cancel_event=cancel_event, max_timeout=12
+                )
                 if dfs:
                     print(f"[Crawl4AI] Successfully extracted {len(dfs)} tables from HTML.")
                     return dfs
@@ -4337,7 +4899,28 @@ def extract_tables_via_unpaywall(doi, table_idx="all", cancel_event=None):
             if "application/pdf" in ctype or raw_head == b"%PDF-":
                 is_pdf_response = True
             elif r.status_code == 200 and not is_anti_bot_blocked("", r.text[:4000]):
+                final_u = str(getattr(r, "url", "") or best_url)
                 dfs = [d for d in parse_tables_from_html(r.text, table_idx) if not _is_firecrawl_noise_table(d)]
+                if not dfs:
+                    def _fetch_sub_html(su):
+                        try:
+                            sr = requests.get(su, timeout=10, headers={
+                                "User-Agent": "Mozilla/5.0 (compatible; ZoteroTableExtractor/1.0)"
+                            })
+                            return sr.text if sr.status_code == 200 else ""
+                        except Exception:
+                            return ""
+                    sub_dfs = _follow_table_subpages(final_u, r.text, _fetch_sub_html, table_idx, cancel_event=cancel_event)
+                    dfs = [d for d in sub_dfs if not _is_firecrawl_noise_table(d)]
+                dfs = _append_builtin_supp_if_any(
+                    dfs,
+                    final_u,
+                    r.text,
+                    table_idx=table_idx,
+                    cancel_event=cancel_event,
+                    max_timeout=12,
+                    main_present_cap=12.0,
+                )
                 if dfs:
                     print(f"[Unpaywall] \u901a\u8fc7\u76f4\u63a5 HTTP \u4ece\u5f00\u653e\u7248\u672c\u63d0\u53d6\u5230 {len(dfs)} \u5f20\u8868\u683c\u3002")
                     return dfs

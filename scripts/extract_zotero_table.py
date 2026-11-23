@@ -72,16 +72,17 @@ except ImportError:
 
 # Split-out helpers
 try:
-    from .common import format_table_label
+    from .common import format_table_label, is_supplementary
     from .table_postprocess import parse_structured_vlm_content
     from .excel_export import make_safe_filename, save_tables_to_excel
     from .pdf_tables import get_page_effective_rotation, export_crops_to_excel, bake_pdf_rotations
     from .pdf_table_extractor import extract_tables_from_pdf
 except ImportError:
     try:
-        from common import format_table_label
+        from common import format_table_label, is_supplementary
     except ImportError:
         format_table_label = lambda x: str(x).strip() if x else ""
+        is_supplementary = lambda x: False
     from table_postprocess import parse_structured_vlm_content
     from excel_export import make_safe_filename, save_tables_to_excel
     from pdf_tables import get_page_effective_rotation, export_crops_to_excel, bake_pdf_rotations
@@ -382,9 +383,11 @@ def process_single_pdf(pdf_path, args, is_batch=False, plan=None):
     target_pdf_path = pdf_path
     temps_to_clean = []
     cand_pages = None
-    was_remediated = False
+    was_remediated = None
     try:
-        if os.path.exists(pdf_path) and os.path.isfile(pdf_path):
+        # --online-only 模式永不执行本地 PDF 方向模型与候选页预处理；
+        # 正常模式下亦延后至真正回退 Step 2 本地 PDF 提取时按需执行，节省 2-5s/篇。
+        if getattr(args, 'pdf_only', False) and os.path.exists(pdf_path) and os.path.isfile(pdf_path):
             target_pdf_path, cand_pages, was_remediated = _preprocess_local_pdf(pdf_path, temps_to_clean)
 
         return _do_process_single_pdf(
@@ -405,18 +408,46 @@ def process_single_pdf(pdf_path, args, is_batch=False, plan=None):
                     pass
 
 
+def _extract_language_probe_text(pdf_path: str, plan: dict = None) -> str:
+    """
+    提取用于中英文语种判定的标题文本：
+    优先使用元数据中的真实标题；退化到文件名时，剥离中文版 Zotero 的
+    `作者1和作者2 - 年份 - ` / `作者 等 - 年份 - ` 前缀及独立 `等`/`和` 连接词，
+    杜绝将 `Pavlova和Borisenko - 2008 - The age...pdf` 误判为中文文献。
+    """
+    if plan and plan.get('title'):
+        return str(plan.get('title')).strip()
+
+    filename = os.path.basename(str(pdf_path or ""))
+    stem = os.path.splitext(filename)[0].strip()
+    if not stem:
+        return ""
+
+    # 匹配 Zotero 标准命名: "Author 等 - 2008 - Title..." 或 "Author1和Author2 - 2008 - Title..."
+    m_zot = re.match(r'^.+?\s*[-–—]\s*(?:19\d{2}|20\d{2})\s*[-–—]\s*(.+)$', stem)
+    if m_zot:
+        return m_zot.group(1).strip()
+
+    # 若无 "- YYYY -" 分隔符，剥离夹在拉丁字母/空格间的 Zotero 中文作者连接词 ("等" / "和")
+    cleaned = re.sub(r'(?<=[A-Za-zÀ-ÿ])\s*(?:等|和)\s*(?=[A-Za-zÀ-ÿ\s\-_\d]|$)', ' ', stem)
+    return cleaned.strip()
+
+
 def is_pre_2020_chinese_paper(pdf_path: str, plan: dict = None) -> bool:
     """
     判断文献是否为 2020 年之前的中文文献。
     此类文献在知网/万方上绝大多数无在线 HTML 结构（仅有扫描版或纯 PDF），
     应直接进入本地/PaddleOCR PDF 提取管线，跳过无谓的网页请求以大幅提高效率。
     """
-    filename = os.path.basename(pdf_path)
-    title = (plan.get('title') or filename) if plan else filename
+    filename = os.path.basename(str(pdf_path or ""))
+    probe_text = _extract_language_probe_text(pdf_path, plan)
 
-    # 1. 中文字符检测
-    has_chinese = bool(re.search(r'[\u4e00-\u9fa5]', title))
-    if not has_chinese:
+    # 1. 严格中文语种检测（避免单汉字 "等"/"和" 误杀英文文献）
+    cjk_cnt = len(re.findall(r'[\u4e00-\u9fa5]', probe_text))
+    if cjk_cnt < 2:
+        return False
+    latin_cnt = len(re.findall(r'[A-Za-z]', probe_text))
+    if cjk_cnt < 4 and (cjk_cnt / max(1, cjk_cnt + latin_cnt)) < 0.15:
         return False
 
     # 2. 年份提取（优先采用预解析元数据中的出版年份，避免文件名中的观测年代区间如 1990-2024 劫持判定）
@@ -997,12 +1028,56 @@ def _do_process_single_pdf_impl(pdf_path, orig_pdf_path, args, is_batch=False, p
     online_labels = set()
     online_skip_labels = set()
 
-    # 1. 检查是否为 2020 年之前的中文文献 -> 直接跳过网页抓取，直通 PDF 管线
-    if is_pre_2020_chinese_paper(orig_pdf_path, plan):
+    # 1. 先从 Zotero DB 补全轻量元数据（单文件 CLI 未传 --title 时避免误用含 "等"/"和" 的文件名做门控判定）
+    effective_plan = dict(plan) if isinstance(plan, dict) else {}
+    if not pdf_only and online is not None and isinstance(orig_pdf_path, str) and os.path.isfile(orig_pdf_path):
+        if not effective_plan.get('title') or not effective_plan.get('item_type'):
+            try:
+                try:
+                    from .online.doi_resolver import get_zotero_item_metadata as _get_zot_meta
+                except ImportError:
+                    from online.doi_resolver import get_zotero_item_metadata as _get_zot_meta
+                _zmeta = _get_zot_meta(orig_pdf_path, db_path=getattr(args, 'db_path', None))
+                if isinstance(_zmeta, dict):
+                    for _mk in ('doi', 'title', 'url', 'year', 'item_type'):
+                        _val = _zmeta.get(_mk)
+                        if _mk == 'url' and _val and not _is_remote_url(str(_val).strip()):
+                            _val = None
+                        if _val and not effective_plan.get(_mk):
+                            effective_plan[_mk] = _val
+            except Exception:
+                pass
+
+    _is_cnki_thesis = False
+    if not pdf_only and online is not None:
+        try:
+            try:
+                from .online.doi_resolver import is_cnki_thesis_metadata as _check_thesis
+            except ImportError:
+                from online.doi_resolver import is_cnki_thesis_metadata as _check_thesis
+            _is_cnki_thesis = _check_thesis(
+                doi=effective_plan.get('doi'),
+                url=effective_plan.get('url') or (orig_pdf_path if _is_remote_url(orig_pdf_path) else None),
+                item_type=effective_plan.get('item_type'),
+                title=effective_plan.get('title'),
+            ) is True
+        except Exception:
+            _is_cnki_thesis = False
+
+    # 检查是否为 2020 年前中文文献或知网硕博论文 -> 直接跳过网页抓取，直通 PDF 管线
+    if is_pre_2020_chinese_paper(orig_pdf_path, effective_plan or plan):
         print(f"[Online] 检测到 2020 年前中文文献，知网/万方无在线 HTML 结构，直接进入 PDF 提取管线")
+    elif _is_cnki_thesis:
+        print(f"[Online] 检测到知网硕博学位论文（CNKI 仅提供 CAJ/PDF，无 HTML 阅读页），直接进入 PDF 提取管线")
     elif not pdf_only and online is not None:
         try:
             print("[Online] Attempting online HTML table extraction...")
+            _pre_for_online = None
+            if plan is not None:
+                _pre_for_online = effective_plan
+            elif effective_plan.get('doi') or effective_plan.get('url') or effective_plan.get('item_type') or effective_plan.get('title'):
+                _pre_for_online = dict(effective_plan)
+                _pre_for_online['_partial_meta'] = True
             res = online.extract_tables_online(
                 pdf_path=orig_pdf_path,
                 table_idx=getattr(args, 'table_idx', 'all'),
@@ -1011,7 +1086,7 @@ def _do_process_single_pdf_impl(pdf_path, orig_pdf_path, args, is_batch=False, p
                 cnki_strategy=getattr(args, 'cnki_strategy', 'auto'),
                 headed=getattr(args, 'headed', False),
                 user_data_dir=getattr(args, 'user_data_dir', None),
-                pre_resolved=plan,
+                pre_resolved=_pre_for_online,
                 race=not getattr(args, 'sequential', False),
                 cancel_event=None,
             )
@@ -1066,34 +1141,117 @@ def _do_process_single_pdf_impl(pdf_path, orig_pdf_path, args, is_batch=False, p
                 except ImportError:
                     _TBL_RE = None
 
+                def _add_lbl_variant(val):
+                    if not val:
+                        return
+                    online_labels.add(val)
+                    online_skip_labels.add(make_safe_filename(val))
+
+                def _register_supp_family(num_str):
+                    num_clean = re.sub(r'^[sS]', '', str(num_str or '').strip())
+                    if not num_clean:
+                        return
+                    for v in (
+                        f"Table S{num_clean}",
+                        f"Supplementary Table S{num_clean}",
+                        f"Supplementary Table {num_clean}",
+                        f"Supplemental Table S{num_clean}",
+                        f"Supplemental Table {num_clean}",
+                        f"附表{num_clean}",
+                        f"附表S{num_clean}",
+                        f"补充表{num_clean}",
+                        f"补充表S{num_clean}",
+                    ):
+                        _add_lbl_variant(v)
+
+                def _register_appendix_family(num_str):
+                    num_clean = re.sub(r'^[aA]', '', str(num_str or '').strip())
+                    if not num_clean:
+                        return
+                    for v in (
+                        f"Table A{num_clean}",
+                        f"Appendix Table A{num_clean}",
+                        f"Appendix Table {num_clean}",
+                        f"附录表{num_clean}",
+                        f"附录表A{num_clean}",
+                    ):
+                        _add_lbl_variant(v)
+
                 def _register_online_label(raw_lbl_str):
                     if not raw_lbl_str:
                         return
-                    candidates_lbl = [format_table_label(raw_lbl_str)]
+                    raw_s = str(raw_lbl_str)
+                    is_supp_raw = is_supplementary(raw_s)
+                    candidates_lbl = [format_table_label(raw_s)]
                     if _TBL_RE is not None:
-                        for m_emb in _TBL_RE.finditer(str(raw_lbl_str)):
-                            candidates_lbl.append(format_table_label(m_emb.group(0)))
+                        for m_emb in _TBL_RE.finditer(raw_s):
+                            fmt_emb = format_table_label(m_emb.group(0))
+                            # 若原始字符串属于附表（如 "Supplementary Table from sheet 'Table 4' of 'mmc2.xlsx'"），
+                            # 将其中嵌入的 "Table 4" 提升为 "Supplementary Table 4"，杜绝误覆盖正文 Table 4
+                            if is_supp_raw and fmt_emb and not is_supplementary(fmt_emb):
+                                m_plain = re.match(r'^(?:Table\s+|表\s*)(\d+(?:[-.]\d+)*[a-zA-Z]?)$', fmt_emb, re.IGNORECASE)
+                                if m_plain:
+                                    fmt_emb = f"Supplementary Table {m_plain.group(1)}"
+                            candidates_lbl.append(fmt_emb)
+
+                    # Elsevier Object API mmcN 附表编号映射（如 Supplementary Table mmc2-Sheet1 -> Table S2）
+                    for m_mmc in re.finditer(r'\bmmc(\d+)\b', raw_s, re.IGNORECASE):
+                        _register_supp_family(m_mmc.group(1))
+
                     for check_lbl in candidates_lbl:
                         if not check_lbl:
                             continue
-                        online_labels.add(check_lbl)
-                        online_skip_labels.add(make_safe_filename(check_lbl))
+                        _add_lbl_variant(check_lbl)
+
+                        # 附表等价族：Table S1 <-> Supplementary Table S1 <-> Supplementary Table 1 <-> 附表1
+                        m_supp = re.match(
+                            r'^(?:(?:Supplementary|Supplemental)\s+Table\s+S?|Table\s+S|附表\s*S?|补充表\s*S?)(\d+(?:[-.]\d+)*[a-zA-Z]?)$',
+                            check_lbl,
+                            re.IGNORECASE,
+                        )
+                        if m_supp:
+                            _register_supp_family(m_supp.group(1))
+                            continue
+
+                        # 附录表等价族：Table A1 <-> Appendix Table A1 <-> Appendix Table 1 <-> 附录表1
+                        m_app = re.match(
+                            r'^(?:Appendix\s+Table\s+A?|Table\s+A|附录表\s*A?)(\d+(?:[-.]\d+)*[a-zA-Z]?)$',
+                            check_lbl,
+                            re.IGNORECASE,
+                        )
+                        if m_app:
+                            _register_appendix_family(m_app.group(1))
+                            continue
+
+                        m_ext = re.match(r'^(?:Extended\s+Data\s+Table\s+|Table\s+E)(\d+(?:[-.]\d+)*[a-zA-Z]?)$', check_lbl, re.IGNORECASE)
+                        if m_ext:
+                            _add_lbl_variant(f"Extended Data Table {m_ext.group(1)}")
+                            _add_lbl_variant(f"Table E{m_ext.group(1)}")
+                            continue
+
                         m_cn = re.match(r'^表\s*([A-Za-z]?\d+(?:[-.]\d+)*[a-zA-Z]?)$', check_lbl)
                         if m_cn:
-                            en_equiv = f"Table {m_cn.group(1)}"
-                            online_labels.add(en_equiv)
-                            online_skip_labels.add(make_safe_filename(en_equiv))
+                            _add_lbl_variant(f"Table {m_cn.group(1)}")
                         m_en = re.match(r'^Table\s+([A-Za-z]?\d+(?:[-.]\d+)*[a-zA-Z]?)$', check_lbl, re.IGNORECASE)
                         if m_en:
-                            cn_equiv = f"表{m_en.group(1)}"
-                            online_labels.add(cn_equiv)
-                            online_skip_labels.add(make_safe_filename(cn_equiv))
+                            _add_lbl_variant(f"表{m_en.group(1)}")
 
                 for o_df in online_dfs:
                     _register_online_label(o_df.attrs.get('label'))
                     _register_online_label(o_df.attrs.get('table_title'))
 
                 missing_labels = (expected_labels - online_labels) if expected_labels else set()
+                # 若缺失集合仅包含附表号，且在线已提取的附表总数（如 Elsevier mmc/MOESM 多工作表）>= 预期附表数，
+                # 视为已通过附表工作簿覆盖，避免触发伪漏检
+                if missing_labels:
+                    supp_missing = {lbl for lbl in missing_labels if is_supplementary(lbl)}
+                    expected_supp = {lbl for lbl in expected_labels if is_supplementary(lbl)}
+                    supp_online_cnt = sum(
+                        1 for o_df in online_dfs
+                        if is_supplementary(o_df.attrs.get('label') or o_df.attrs.get('table_title'))
+                    )
+                    if supp_missing and supp_online_cnt >= max(len(expected_supp), len(supp_missing)):
+                        missing_labels = missing_labels - supp_missing
 
                 # 检查本地 PDF 是否为扫描件/含扫描页，以及是否有潜在表格线框或矢量结构
                 # --online-only 模式下不回退本地 PDF，跳过昂贵的逐页 find_tables() 扫描
@@ -1156,7 +1314,8 @@ def _do_process_single_pdf_impl(pdf_path, orig_pdf_path, args, is_batch=False, p
                     else:
                         print(f"[Online Warning] 在线提取获得 {len(online_dfs)} 个表，但 PDF 中检测到矢量表格线索（未识别到明确表号声明），将由本地管线补充核查。")
                 else:
-                    print(f"[Online] Got {len(online_dfs)} tables via online HTML source (覆盖全部 {len(online_labels)} 个预期表号). Saving...")
+                    cov_cnt = len(expected_labels) if expected_labels else len(online_dfs)
+                    print(f"[Online] Got {len(online_dfs)} tables via online HTML source (覆盖全部 {cov_cnt} 个预期表号). Saving...")
 
                 if is_complete or online_only:
                     save_ok = save_tables_to_excel(
@@ -1169,6 +1328,8 @@ def _do_process_single_pdf_impl(pdf_path, orig_pdf_path, args, is_batch=False, p
                         print(f"[Online] Successfully extracted tables via online HTML source -> {target_output}")
                         _trigger_zotero_sync(raw_orig_pdf_path, target_output, online_dfs, args)
                         return True
+                    else:
+                        print(f"[Online Warning] 在线提取的 {len(online_dfs)} 个候选表格在导出质量校验中全部被过滤。")
                 else:
                     # 暂不提前落盘至 target_output，避免第一次写出追加脚注/转换上下标后在合并阶段二次读盘自相冲突产生 _p{N}/_v2 重复文件
                     extracted_online = True
@@ -1204,6 +1365,11 @@ def _do_process_single_pdf_impl(pdf_path, orig_pdf_path, args, is_batch=False, p
             pdf_path = proc_pdf
             candidate_pages = dl_cand_pages
             remediated = dl_remediated
+        elif remediated is None and isinstance(pdf_path, str) and os.path.isfile(pdf_path):
+            proc_pdf, local_cand_pages, local_remediated = _preprocess_local_pdf(pdf_path, remote_temps)
+            pdf_path = proc_pdf
+            candidate_pages = local_cand_pages
+            remediated = local_remediated
 
     is_remote_non_pdf_input = _is_remote_url(pdf_path)
     if is_remote_non_pdf_input and not (structured and os.path.exists(structured)):

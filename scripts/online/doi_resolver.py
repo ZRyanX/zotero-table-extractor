@@ -252,6 +252,163 @@ def get_doi_from_zotero_db(pdf_path, db_path=None):
     return None, None, None
 
 
+def get_zotero_item_metadata(pdf_path, db_path=None):
+    """
+    Lightweight Zotero SQLite lookup returning a dict:
+    {'doi': str|None, 'title': str|None, 'url': str|None, 'year': str|None, 'item_type': str|None}.
+    Safe on live Zotero DBs (WAL snapshot copy) and always closes connections.
+    """
+    meta = {"doi": None, "title": None, "url": None, "year": None, "item_type": None}
+    if not pdf_path or not isinstance(pdf_path, str):
+        return meta
+
+    if not db_path:
+        try:
+            from system_detector import get_zotero_db_path
+            db_path = get_zotero_db_path()
+        except ImportError:
+            try:
+                from ..system_detector import get_zotero_db_path
+                db_path = get_zotero_db_path()
+            except ImportError:
+                cfg = load_config() if callable(load_config) else {}
+                db_path = cfg.get("ZOTERO_DB_PATH") or os.path.join(os.path.expanduser('~'), 'Zotero', 'zotero.sqlite')
+
+    if not db_path or not os.path.exists(db_path):
+        return meta
+
+    temp_db_path = None
+    conn = None
+    wal_exists = os.path.exists(db_path + "-wal") and os.path.getsize(db_path + "-wal") > 0
+    if not wal_exists:
+        try:
+            abs_db = os.path.abspath(db_path)
+            uri = f"file:{urllib.request.pathname2url(abs_db)}?mode=ro"
+            conn = sqlite3.connect(uri, uri=True, timeout=2.0)
+            conn.execute("SELECT 1 FROM sqlite_master LIMIT 1")
+        except Exception:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                conn = None
+
+    if conn is None:
+        import tempfile
+        temp_db_path = os.path.join(tempfile.gettempdir(), f'zotero_meta_{os.getpid()}_{uuid.uuid4().hex[:6]}.sqlite')
+        try:
+            common.copy_sqlite_snapshot(db_path, temp_db_path)
+            conn = sqlite3.connect(temp_db_path)
+        except Exception:
+            try:
+                temp_db_path = db_path
+                conn = sqlite3.connect(db_path)
+            except Exception:
+                return meta
+
+    try:
+        cursor = conn.cursor()
+        parent_id = None
+        norm_path = os.path.abspath(pdf_path).replace('\\', '/')
+        parts = norm_path.split('/')
+        if len(parts) >= 2:
+            key_cand = parts[-2]
+            if len(key_cand) == 8 and key_cand.isalnum():
+                cursor.execute("""
+                    SELECT ia.parentItemID
+                    FROM itemAttachments ia
+                    JOIN items i ON ia.itemID = i.itemID
+                    WHERE i.key = ?
+                """, (key_cand.upper(),))
+                row = cursor.fetchone()
+                if row:
+                    parent_id = row[0]
+
+        if not parent_id:
+            filename = os.path.basename(pdf_path)
+            cursor.execute("""
+                SELECT parentItemID
+                FROM itemAttachments
+                WHERE path LIKE ?
+            """, (f'%{filename}',))
+            row = cursor.fetchone()
+            if row:
+                parent_id = row[0]
+
+        if parent_id:
+            cursor.execute("""
+                SELECT f.fieldName, idv.value
+                FROM itemData id
+                JOIN fields f ON id.fieldID = f.fieldID
+                JOIN itemDataValues idv ON id.valueID = idv.valueID
+                WHERE id.itemID = ? AND f.fieldName IN ('DOI', 'title', 'url', 'date')
+            """, (parent_id,))
+            for field_name, value in cursor.fetchall():
+                if not value:
+                    continue
+                if field_name == 'DOI':
+                    meta["doi"] = value.strip()
+                elif field_name == 'title':
+                    meta["title"] = re.sub(r'<[^>]+>', '', value).strip()
+                elif field_name == 'url':
+                    meta["url"] = value.strip()
+                elif field_name == 'date':
+                    m_yr = re.search(r'(?:^|[\D_])(19\d{2}|20\d{2})(?:[\D_]|$)', str(value))
+                    if m_yr:
+                        meta["year"] = m_yr.group(1)
+
+            try:
+                cursor.execute("""
+                    SELECT it.typeName
+                    FROM items i
+                    JOIN itemTypes it ON i.itemTypeID = it.itemTypeID
+                    WHERE i.itemID = ?
+                """, (parent_id,))
+                trow = cursor.fetchone()
+                if trow and trow[0]:
+                    meta["item_type"] = str(trow[0]).strip().lower()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        if temp_db_path and temp_db_path != db_path:
+            common.cleanup_sqlite_snapshot(temp_db_path)
+
+    return meta
+
+
+_CNKI_THESIS_DOI_RE = re.compile(r'^10\.27\d{3}/d\.cnki\.', re.IGNORECASE)
+_CNKI_THESIS_URL_RE = re.compile(r'(?:dbcode|dbname)=(?:cmfd|cdfd)|/cdmd/', re.IGNORECASE)
+
+
+def is_cnki_thesis_metadata(doi=None, url=None, item_type=None, title=None) -> bool:
+    """
+    Detect CNKI master's/doctoral dissertations (CMFD/CDFD).
+    CNKI theses only provide CAJ/PDF downloads and do NOT have an HTML reading view;
+    skipping online scraping avoids 30-40s of guaranteed Playwright/AcademicSearch misses.
+    """
+    if doi and _CNKI_THESIS_DOI_RE.match(str(doi).strip()):
+        return True
+    u_low = str(url or "").lower()
+    if ("cnki.net" in u_low or "cnki.com.cn" in u_low) and _CNKI_THESIS_URL_RE.search(u_low):
+        return True
+    if str(item_type or "").strip().lower() == "thesis":
+        if "cnki.net" in u_low or "cnki.com.cn" in u_low:
+            return True
+        # Chinese-language thesis without a non-CNKI international journal URL
+        if title and len(re.findall(r'[\u4e00-\u9fa5]', str(title))) >= 4:
+            if not u_low or "cnki" in u_low or "wanfang" in u_low or "chndoi" in u_low:
+                return True
+    return False
+
+
 def get_doi_from_pdf_content(pdf_path):
     """
     Fallback method using PyMuPDF (fitz) to extract DOI from PDF metadata/text.

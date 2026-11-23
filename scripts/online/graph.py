@@ -50,13 +50,14 @@ browser_extraction_lock = common.browser_extraction_lock
 
 
 @contextlib.contextmanager
-def browser_task_concurrency_guard(user_data_dir=None, config=None):
+def browser_task_concurrency_guard(user_data_dir=None, config=None, timeout=None, cancel_event=None):
     """
     智能浏览器任务并发调度（吸收 web-access 单物理实例 + Tab 隔离机制）：
     - 若探测到活动 CDP 端点（DevToolsActivePort 动态端口或 9222），说明复用已存在的物理浏览器实例：
       跳过全局粗粒度跨进程锁，采用 Tab 级轻量并发信号量，允许多任务并行在各自后台 Tab 中抽取；
     - 若未探测到 CDP 端点，需要自启独立持久化浏览器实例并占用磁盘 user_data_dir：
-      获取全局 browser_extraction_lock，防止 SingletonLock 冲突与数据损坏。
+      获取全局 browser_extraction_lock，防止 SingletonLock 冲突与数据损坏；
+      支持传递 timeout 与 cancel_event，确保锁等待严格服从单篇在线总预算。
     """
     has_cdp = False
     try:
@@ -72,7 +73,11 @@ def browser_task_concurrency_guard(user_data_dir=None, config=None):
             yield True
         return
 
-    with browser_extraction_lock():
+    try:
+        lock_ctx = browser_extraction_lock(timeout=timeout, cancel_event=cancel_event)
+    except TypeError:
+        lock_ctx = browser_extraction_lock()
+    with lock_ctx:
         yield False
 
 
@@ -85,6 +90,7 @@ from .doi_resolver import (
     get_doi_from_pdf_content,
     get_doi_from_zotero_db,
     is_chinese_doi,
+    is_cnki_thesis_metadata,
     normalize_title,
     resolve_chinese_doi,
     resolve_doi_canonical_url,
@@ -189,18 +195,30 @@ class ExtractionGraph:
 
 
 def _normalize_publisher_url(url: str) -> str:
-    """Normalize bare DOI host typos and upgrade Atypon Literatum /doi/abs/ URLs to /doi/full/."""
+    """Normalize bare DOI host typos and upgrade Atypon Literatum /doi/abs/ or bare /doi/ URLs to /doi/full/."""
     if not url:
         return url
     m_bare = re.match(r"^https?://(10\.\d{4,9})/([^\s]+)$", url.strip(), re.IGNORECASE)
     if m_bare:
         url = f"https://doi.org/{m_bare.group(1)}/{m_bare.group(2)}"
-    if "/doi/abs/" in url and any(dom in url.lower() for dom in (
+    low_u = url.lower()
+    if "/doi/abs/" in url and any(dom in low_u for dom in (
         "onlinelibrary.wiley.com", "tandfonline.com", "sagepub.com",
         "geoscienceworld.org", "lyellcollection.org", "agu.onlinelibrary.wiley.com",
         "pubs.acs.org",
     )):
         return url.replace("/doi/abs/", "/doi/full/", 1)
+    if any(dom in low_u for dom in (
+        "onlinelibrary.wiley.com", "agu.onlinelibrary.wiley.com",
+        "tandfonline.com", "lyellcollection.org",
+    )):
+        m_bare_doi = re.match(
+            r"^(https?://[^/]+/doi/)(10\.\d{4,9}/[^\s?#]+)([?#].*)?$",
+            url.strip(),
+            re.IGNORECASE,
+        )
+        if m_bare_doi:
+            return f"{m_bare_doi.group(1)}full/{m_bare_doi.group(2)}{m_bare_doi.group(3) or ''}"
     return url
 
 
@@ -649,9 +667,31 @@ class PlaywrightCNKINode(ExtractionNode):
             else:
                 user_data_dir = get_domain_profile_dir(url)
             
+        cancel_event = state.get("cancel_event")
+        if cancel_event is not None and cancel_event.is_set():
+            return state, None
+        _lock_timeout = None
+        _deadline = state.get("_online_deadline")
+        if _deadline is not None:
+            import time as _t
+            _rem = _deadline - _t.monotonic()
+            if _rem <= 2.0:
+                print("[知网自动化] 在线总预算剩余不足，跳过 PlaywrightCNKI 锁等待。")
+                return state, self.fallback_node
+            _lock_timeout = max(2.0, _rem)
+
         # 共享浏览器状态调度：若已有 CDP 实例则免全局锁走 Tab 隔离并发，否则全局加锁保护 profile
-        with browser_task_concurrency_guard(user_data_dir=user_data_dir, config=config):
-            res = extract_cnki_tables_via_playwright(url, table_idx, headed, user_data_dir, cookies_path)
+        try:
+            with browser_task_concurrency_guard(
+                user_data_dir=user_data_dir,
+                config=config,
+                timeout=_lock_timeout,
+                cancel_event=cancel_event,
+            ):
+                res = extract_cnki_tables_via_playwright(url, table_idx, headed, user_data_dir, cookies_path)
+        except TimeoutError as _lock_to:
+            print(f"[知网自动化] 等待浏览器互斥锁超时/取消，跳过 PlaywrightCNKI: {_lock_to}")
+            return state, self.fallback_node
         if isinstance(res, tuple):
             dfs, resolved_title = res
             if resolved_title:
@@ -708,30 +748,49 @@ class PlaywrightGeneralNode(ExtractionNode):
         if cancel_event is not None and cancel_event.is_set():
             return state, None
             
+        _lock_timeout = None
+        _deadline = state.get("_online_deadline")
+        if _deadline is not None:
+            import time as _t
+            _rem = _deadline - _t.monotonic()
+            if _rem <= 2.0:
+                print("[在线提取] 在线总预算剩余不足，跳过 PlaywrightGeneral 锁等待。")
+                return state, self.fallback_node
+            _lock_timeout = max(2.0, _rem)
+
         # 共享浏览器状态调度：若已有 CDP 实例则免全局锁走 Tab 隔离并发，否则全局加锁保护 profile
         _pw_meta = {}
-        with browser_task_concurrency_guard(user_data_dir=user_data_dir, config=config):
-            try:
-                res = general_html_extractor.extract_general_html_tables(
-                    url,
-                    table_idx,
-                    headed,
-                    user_data_dir,
-                    api_key,
-                    cancel_event=cancel_event,
-                    skip_stealth_fallback=bool(state.get("_skip_stealth_fallback", False)),
-                    meta_out=_pw_meta,
-                )
-            except TypeError:
-                res = general_html_extractor.extract_general_html_tables(
-                    url,
-                    table_idx,
-                    headed,
-                    user_data_dir,
-                    api_key,
-                    cancel_event=cancel_event,
-                    skip_stealth_fallback=bool(state.get("_skip_stealth_fallback", False)),
-                )
+        try:
+            with browser_task_concurrency_guard(
+                user_data_dir=user_data_dir,
+                config=config,
+                timeout=_lock_timeout,
+                cancel_event=cancel_event,
+            ):
+                try:
+                    res = general_html_extractor.extract_general_html_tables(
+                        url,
+                        table_idx,
+                        headed,
+                        user_data_dir,
+                        api_key,
+                        cancel_event=cancel_event,
+                        skip_stealth_fallback=bool(state.get("_skip_stealth_fallback", False)),
+                        meta_out=_pw_meta,
+                    )
+                except TypeError:
+                    res = general_html_extractor.extract_general_html_tables(
+                        url,
+                        table_idx,
+                        headed,
+                        user_data_dir,
+                        api_key,
+                        cancel_event=cancel_event,
+                        skip_stealth_fallback=bool(state.get("_skip_stealth_fallback", False)),
+                    )
+        except TimeoutError as _lock_to:
+            print(f"[在线提取] 等待浏览器互斥锁超时/取消，跳过 PlaywrightGeneral: {_lock_to}")
+            return state, self.fallback_node
         _reroute_cnki = _pw_meta.get("reroute_cnki_url")
         if _reroute_cnki:
             print(f"[在线提取] 检测到 chndoi/跳转落地知网 ({_reroute_cnki})，动态重路由至 CNKI 专用抽取器...")
@@ -763,6 +822,16 @@ class PlaywrightGeneralNode(ExtractionNode):
             return state, None
             
         def _run_supp(timeout_s):
+            if _pw_meta.get("supp_already_extracted"):
+                return []
+            import time as _t
+            _deadline = state.get("_online_deadline")
+            if _deadline is not None:
+                rem = _deadline - _t.monotonic()
+                if rem <= 2.0:
+                    print("[在线提取] 在线总预算剩余不足，跳过补充材料抓取。")
+                    return []
+                timeout_s = min(timeout_s, max(5, int(rem)))
             _pw_html = _pw_meta.get("html_content")
             if _pw_html:
                 try:
@@ -864,21 +933,24 @@ class AcademicSearchGraphNode(ExtractionNode):
         if cancel_event is not None and cancel_event.is_set():
             return state, None
         
-        # 1. Unpaywall fallback
+        # 1. Unpaywall fallback (skip if Tier-1 already queried Unpaywall for this DOI)
         if doi:
-            print("[AcademicSearchGraph] Querying Unpaywall for open-access URLs...")
-            dfs = extract_tables_via_unpaywall(doi, table_idx, cancel_event=cancel_event)
-            if dfs:
-                state["dfs"] = dfs
-                return state, None
-            if cancel_event is not None and cancel_event.is_set():
-                return state, None
+            if not state.get("_unpaywall_tried"):
+                print("[AcademicSearchGraph] Querying Unpaywall for open-access URLs...")
+                dfs = extract_tables_via_unpaywall(doi, table_idx, cancel_event=cancel_event)
+                if dfs:
+                    state["dfs"] = dfs
+                    return state, None
+                if cancel_event is not None and cancel_event.is_set():
+                    return state, None
+            else:
+                print("[AcademicSearchGraph] 跳过 Unpaywall（Tier-1 已查询过）。")
                 
             # 2. Europe PMC search
             print(f"[AcademicSearchGraph] Querying Europe PMC for DOI: {doi}")
             try:
                 epmc_url = f"https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=DOI:{doi}&format=json"
-                r = requests.get(epmc_url, timeout=10)
+                r = requests.get(epmc_url, timeout=6)
                 if r.status_code == 200:
                     data = r.json()
                     results = data.get("resultList", {}).get("result", [])
@@ -1047,6 +1119,35 @@ class Crawl4AICNKINode(ExtractionNode):
 # 并行竞速管线（race pipeline）
 # ---------------------------------------------------------------------------
 
+def _filter_exportable_online_dfs(dfs):
+    """Filter out empty or multi-cell metadata junk tables before declaring a race winner."""
+    if not dfs:
+        return []
+    kept = []
+    for df in dfs:
+        if df is None:
+            continue
+        if hasattr(df, "empty") and df.empty:
+            continue
+        try:
+            vals = df.values.flatten()
+            has_non_empty = any(
+                v is not None and str(v).strip().lower() not in ("", "nan", "none")
+                for v in vals
+            )
+            if not has_non_empty:
+                continue
+            # Keep 1x1 synthetic/summary tables (also avoids rejecting minimal test stubs),
+            # while rejecting genuine multi-cell citation/metadata/paywall junk blocks.
+            if (df.shape[0] >= 2 or df.shape[1] >= 2) and hasattr(common, "is_metadata_table"):
+                if common.is_metadata_table(df):
+                    continue
+        except Exception:
+            pass
+        kept.append(df)
+    return kept
+
+
 def _race_candidates(candidates, cancel_event=None, authoritative_names=None, grace_timeout=6.0):
     """
     并发执行一组候选抓取渠道，优先权威 XML/LaTeXML 全文数据源并取表格更完整的结果。
@@ -1105,11 +1206,19 @@ def _race_candidates(candidates, cancel_event=None, authoritative_names=None, gr
             if err is not None:
                 print(f"[Race] 渠道 {name} 异常: {err}")
                 dfs = []
+            else:
+                raw_cnt = len(dfs) if dfs else 0
+                dfs = _filter_exportable_online_dfs(dfs)
+                if raw_cnt and not dfs:
+                    print(f"[Race] 渠道 {name} 返回的 {raw_cnt} 个候选表全部为元数据/空表，不作为胜出结果，继续等待其他渠道。")
             if not dfs:
                 continue
             if name in auth_set or not any(p in auth_set for p in pending):
-                if best_fast is not None and len(best_fast[0]) > len(dfs) and name not in auth_set:
-                    print(f"[Race] 渠道 {best_fast[1]} 保留更多表格 ({len(best_fast[0])} >= {len(dfs)})。")
+                _xml_peers = {"NCBIPMC", "ArxivHTML", "SpringerTDM", "ElsevierXML"}
+                if best_fast is not None and len(best_fast[0]) > len(dfs) and (
+                    name not in auth_set or best_fast[1] in _xml_peers
+                ):
+                    print(f"[Race] 渠道 {best_fast[1]} 保留更多表格 ({len(best_fast[0])} > {len(dfs)})。")
                     return best_fast
                 print(f"[Race] 渠道 {name} 竞速获胜，提取到 {len(dfs)} 个表格。")
                 return dfs, name
@@ -1204,6 +1313,11 @@ def _hedged_race_candidates(primary_candidates, hedged_candidates, hedge_delay_s
             if err is not None:
                 print(f"[HedgedRace] 渠道 {name} 异常: {err}")
                 dfs = []
+            else:
+                raw_cnt = len(dfs) if dfs else 0
+                dfs = _filter_exportable_online_dfs(dfs)
+                if raw_cnt and not dfs:
+                    print(f"[HedgedRace] 渠道 {name} 返回的 {raw_cnt} 个候选表全部为元数据/空表，不作为胜出结果，继续等待其他渠道。")
             if dfs:
                 print(f"[HedgedRace] 渠道 {name} 竞速获胜，提取到 {len(dfs)} 个表格。")
                 return dfs, name
@@ -1220,21 +1334,125 @@ def _run_node_locked(node, state):
     return node.execute(state)
 
 
+class _CompositeCancelEvent:
+    """Read-only cancel event view that fires when either outer or budget event is set."""
+    def __init__(self, outer_event, inner_event):
+        self._outer = outer_event
+        self._inner = inner_event
+
+    def is_set(self) -> bool:
+        return bool(
+            (self._outer is not None and self._outer.is_set())
+            or (self._inner is not None and self._inner.is_set())
+        )
+
+    def wait(self, timeout=None) -> bool:
+        import time as _t
+        if self.is_set():
+            return True
+        if timeout is None:
+            while not self.is_set():
+                if self._inner is not None:
+                    self._inner.wait(0.05)
+                else:
+                    _t.sleep(0.05)
+            return True
+        end = _t.monotonic() + max(0.0, float(timeout))
+        while not self.is_set():
+            rem = end - _t.monotonic()
+            if rem <= 0:
+                return self.is_set()
+            step = min(0.05, rem)
+            if self._inner is not None:
+                self._inner.wait(step)
+            else:
+                _t.sleep(step)
+        return True
+
+
 def _race_extract(state, cancel_event=None):
     """
     分层竞速提取管线。state 需已包含 url/doi/title/is_cnki。
     返回 (dfs, history)。
     """
+    import time as _time
+
     url = state.get("url")
     doi = state.get("doi")
     title = state.get("title")
+    item_type = state.get("item_type")
     table_idx = state.get("table_idx", "all")
     api_key = state.get("api_key")
     history = []
 
-    def cancelled():
-        return cancel_event is not None and cancel_event.is_set()
+    if is_cnki_thesis_metadata(doi=doi, url=url, item_type=item_type, title=title):
+        print("[Race] 检测到知网硕博学位论文（CNKI 仅提供 CAJ/PDF，无 HTML 阅读页），快速跳过在线抓取。")
+        history.append("skip:cnki-thesis")
+        return [], history
 
+    cfg = load_config() if callable(load_config) else {}
+    try:
+        raw_budget = os.getenv("ONLINE_EXTRACTION_BUDGET_S")
+        if raw_budget is None or raw_budget.strip() == "":
+            raw_budget = cfg.get("ONLINE_EXTRACTION_BUDGET_S", 65.0)
+        budget_s = float(raw_budget)
+    except (TypeError, ValueError):
+        budget_s = 65.0
+
+    deadline = (_time.monotonic() + budget_s) if budget_s > 0 else None
+    budget_timer = None
+    eff_cancel = cancel_event
+    if deadline is not None:
+        state["_online_deadline"] = deadline
+        budget_event = threading.Event()
+
+        def _expire_budget():
+            budget_event.set()
+
+        budget_timer = threading.Timer(budget_s, _expire_budget)
+        budget_timer.daemon = True
+        budget_timer.start()
+        eff_cancel = budget_event if cancel_event is None else _CompositeCancelEvent(cancel_event, budget_event)
+        state["cancel_event"] = eff_cancel
+
+    def cancelled():
+        if eff_cancel is not None and eff_cancel.is_set():
+            return True
+        if deadline is not None and _time.monotonic() >= deadline:
+            return True
+        return False
+
+    def budget_exhausted(min_remaining: float = 2.0) -> bool:
+        if deadline is None:
+            return False
+        if (_time.monotonic() + min_remaining) >= deadline:
+            print(f"[Race] 在线提取总预算 ({budget_s:.0f}s) 已耗尽，快速结束在线阶段并回退本地 PDF。")
+            return True
+        return False
+
+    try:
+        return _race_extract_body(
+            state=state,
+            cfg=cfg,
+            url=url,
+            doi=doi,
+            title=title,
+            table_idx=table_idx,
+            api_key=api_key,
+            history=history,
+            cancel_event=eff_cancel,
+            cancelled=cancelled,
+            budget_exhausted=budget_exhausted,
+        )
+    finally:
+        if budget_timer is not None:
+            try:
+                budget_timer.cancel()
+            except Exception:
+                pass
+
+
+def _race_extract_body(state, cfg, url, doi, title, table_idx, api_key, history, cancel_event, cancelled, budget_exhausted):
     def _is_elsevier():
         return (
             url and ("sciencedirect.com" in url or "elsevier.com" in url)
@@ -1266,7 +1484,7 @@ def _race_extract(state, cancel_event=None):
         )
 
     def _academic_search():
-        if cancel_event is not None and cancel_event.is_set():
+        if cancelled():
             return []
         s, _n = AcademicSearchGraphNode().execute(dict(state))
         return s.get("dfs") or []
@@ -1300,7 +1518,7 @@ def _race_extract(state, cancel_event=None):
         history.append(f"cnki-tier1:{winner or 'none'}")
         if dfs:
             return dfs, history
-        if cancelled():
+        if cancelled() or budget_exhausted():
             return [], history
 
         # Tier-2: Playwright CNKI（共享浏览器，锁内串行）
@@ -1312,7 +1530,7 @@ def _race_extract(state, cancel_event=None):
                 return s["dfs"], history
             if s.get("title") and not state.get("title"):
                 state["title"] = s["title"]
-            if cancelled():
+            if cancelled() or budget_exhausted():
                 return [], history
 
         # Tier-3: 学术搜索尾流 + BrowserAct
@@ -1320,7 +1538,7 @@ def _race_extract(state, cancel_event=None):
         history.append(f"cnki-tail:{winner or 'none'}")
         if dfs:
             return dfs, history
-        if cancelled():
+        if cancelled() or budget_exhausted():
             return [], history
 
         s, _n = BrowserActBypassNode().execute(state)
@@ -1335,7 +1553,6 @@ def _race_extract(state, cancel_event=None):
 
     # Tier-1: 纯 HTTP / API 渠道并发竞速
     tier1 = []
-    cfg = load_config() if callable(load_config) else {}
     arxiv_enabled = cfg.get("ARXIV_HTML_ENABLED", True)
     pmc_enabled = cfg.get("NCBI_PMC_ENABLED", True)
 
@@ -1347,10 +1564,20 @@ def _race_extract(state, cancel_event=None):
         tier1.append(("NCBIPMC", lambda: extract_tables_via_ncbi_pmc(pmc_cand or doi, table_idx)))
     if url:
         def _direct_then_impersonated():
-            res = extract_tables_via_direct_http(url, table_idx, cancel_event=cancel_event, doi=doi)
+            direct_meta = {}
+            try:
+                res = extract_tables_via_direct_http(url, table_idx, cancel_event=cancel_event, doi=doi, meta_out=direct_meta)
+            except TypeError:
+                res = extract_tables_via_direct_http(url, table_idx, cancel_event=cancel_event, doi=doi)
             if res:
                 return res
             if cancelled():
+                return []
+            if direct_meta.get("was_dead_http"):
+                print("[Race] DirectHTTP 返回 HTTP 404/410 死链，跳过 ImpersonatedHTTP 重试。")
+                return []
+            if direct_meta.get("used_impersonate") and direct_meta.get("status_code") == 200 and not direct_meta.get("was_blocked"):
+                print("[Race] DirectHTTP 已通过 TLS 模拟获取 200 正文页（无表），跳过重复 ImpersonatedHTTP 请求。")
                 return []
             if callable(is_negatively_cached):
                 hit = is_negatively_cached("direct_http", url=url, doi=doi, config=cfg)
@@ -1362,16 +1589,23 @@ def _race_extract(state, cancel_event=None):
             return _impersonated(config=cfg)
 
         tier1.append(("DirectHTTP", _direct_then_impersonated))
-    if _is_elsevier():
+    _is_els_target = bool(_is_elsevier())
+    if _is_els_target:
         tier1.append(("ElsevierXML", _elsevier_xml))
     if doi and is_springer_nature_target(doi=doi, url=url):
         tier1.append(("SpringerTDM", lambda: extract_tables_via_springer_tdm(doi, table_idx, cancel_event=cancel_event)))
     if doi:
+        state["_unpaywall_tried"] = True
         tier1.append(("Unpaywall", lambda: extract_tables_via_unpaywall(doi, table_idx, cancel_event=cancel_event)))
+    # For Elsevier targets, ElsevierXML is uniquely authoritative (includes mmc* supplementary attachments),
+    # so NCBIPMC/Unpaywall should not preempt ElsevierXML mid-download of supplementary PDF/Excel tables.
+    _tier1_auth = {"ElsevierXML"} if _is_els_target else {"ArxivHTML", "NCBIPMC", "ElsevierXML", "SpringerTDM"}
+    _tier1_grace = 20.0 if _is_els_target else 6.0
     dfs, winner = _race_candidates(
         tier1,
         cancel_event,
-        authoritative_names={"ArxivHTML", "NCBIPMC", "ElsevierXML", "SpringerTDM"},
+        authoritative_names=_tier1_auth,
+        grace_timeout=_tier1_grace,
     )
 
     history.append(f"general-tier1:{winner or 'none'}")
@@ -1392,7 +1626,7 @@ def _race_extract(state, cancel_event=None):
     if dfs and not _tier1_incomplete_hint:
         return dfs, history
     best_partial = dfs if _tier1_incomplete_hint else []
-    if cancelled():
+    if cancelled() or budget_exhausted():
         return best_partial, history
 
     # Tier-2: Hedged Cascade（先启动低成本本地渠道 Crawl4AI/Scrapling；延迟或快速全失败后再对冲触发云端 Firecrawl）
@@ -1429,7 +1663,7 @@ def _race_extract(state, cancel_event=None):
     history.append(f"general-tier2:{winner or 'none'}")
     if dfs and len(dfs) > len(best_partial):
         return dfs, history
-    if cancelled():
+    if cancelled() or budget_exhausted():
         return best_partial, history
 
     # Tier-3: 共享浏览器 Playwright（锁内串行，含补充材料下载）
@@ -1443,7 +1677,7 @@ def _race_extract(state, cancel_event=None):
             return s["dfs"], history
         if s.get("title") and not state.get("title"):
             state["title"] = s["title"]
-        if cancelled():
+        if cancelled() or budget_exhausted():
             return best_partial, history
 
     if best_partial:
@@ -1454,7 +1688,7 @@ def _race_extract(state, cancel_event=None):
     history.append(f"general-tail:{winner or 'none'}")
     if dfs:
         return dfs, history
-    if cancelled():
+    if cancelled() or budget_exhausted():
         return [], history
 
     s, _n = BrowserActBypassNode().execute(state)
@@ -1488,11 +1722,19 @@ def extract_tables_online(pdf_path, table_idx="all", db_path=None, api_key=None,
     }
 
     # 0. 预分析结果直接注入，跳过元数据解析（"先分析、后提取"）
+    _is_partial_meta = False
     if pre_resolved:
-        state["url"] = pre_resolved.get("url")
+        _raw_u = pre_resolved.get("url")
+        if isinstance(_raw_u, str) and _raw_u.strip().startswith(("http://", "https://")):
+            state["url"] = _raw_u.strip()
+        else:
+            state["url"] = None
         state["doi"] = pre_resolved.get("doi")
         state["title"] = pre_resolved.get("title")
         state["is_cnki"] = pre_resolved.get("is_cnki", False)
+        if pre_resolved.get("item_type"):
+            state["item_type"] = pre_resolved.get("item_type")
+        _is_partial_meta = bool(pre_resolved.get("_partial_meta"))
 
     if state.get("url"):
         orig_url = state["url"]
@@ -1514,8 +1756,17 @@ def extract_tables_online(pdf_path, table_idx="all", db_path=None, api_key=None,
                     state["is_cnki"] = ("cnki.net" in low_res or "cnki.com.cn" in low_res)
 
     if race:
-        # 并行竞速管线（url 缺失时仍进解析节点做 URL 解析；节点对已有 doi 幂等）
-        if not state.get("url"):
+        # 并行竞速管线（url 缺失，或仅从轻量 Zotero 预查拿到 url 但尚未解析出本地 PDF DOI 时，仍进解析节点补全 DOI；节点对已有 doi/url 幂等）
+        _need_resolve = (
+            not state.get("url")
+            or (
+                _is_partial_meta
+                and not state.get("doi")
+                and isinstance(pdf_path, str)
+                and os.path.isfile(pdf_path)
+            )
+        )
+        if _need_resolve:
             node_state, _n = ResolveMetadataNode().execute(state)
             state.update({k: node_state.get(k) for k in ("url", "doi", "title", "is_cnki")})
         else:
@@ -1552,7 +1803,16 @@ def extract_tables_online(pdf_path, table_idx="all", db_path=None, api_key=None,
     graph.add_node("FirecrawlNode", FirecrawlNode())
 
     # Set entry point & initial state
-    if pre_resolved and state.get("url"):
+    _serial_need_resolve = (
+        not state.get("url")
+        or (
+            _is_partial_meta
+            and not state.get("doi")
+            and isinstance(pdf_path, str)
+            and os.path.isfile(pdf_path)
+        )
+    )
+    if pre_resolved and not _serial_need_resolve:
         # 跳过元数据解析节点，从已解析状态直接进入对应分支
         # （url 缺失时仍从 ResolveMetadataNode 进入做 URL 解析，节点对已有 doi 幂等）
         cfg = load_config() if callable(load_config) else {}

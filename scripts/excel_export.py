@@ -291,25 +291,30 @@ def save_tables_to_excel(dataframes, output_path, headers=None, single_file=True
         active_dfs.append(df)
 
     if not active_dfs:
+        print(f"[Export Warning] 输入 {len(norm_dfs)} 个候选表格全部被隔离为付费墙/登录警告表 (paywall={paywall_rej_count})，跳过导出。")
         return False
 
     # 1. 预先合并跨页未命名续表/同名续表，避免未命名 1 行续表被 postprocess 当作空表过滤
     merged_raw_dfs = merge_continuation_tables(active_dfs)
 
     cleaned_dfs = []
+    drop_stats = {"empty": 0, "supplementary": 0, "skip_labels": 0, "paywall": paywall_rej_count, "postprocess_empty": 0, "metadata": 0}
     for df in merged_raw_dfs:
         if df is None or df.empty:
+            drop_stats["empty"] += 1
             continue
         label = df.attrs.get('label')
         title = df.attrs.get('table_title')
         if skip_supplementary and is_supplementary(label or title):
             print(f"[Filter] 跳过附表: {label or title or '未命名'}")
+            drop_stats["supplementary"] += 1
             continue
         if skip_labels and (label or title):
             check_label = format_table_label(label or title)
             safe_check = make_safe_filename(check_label)
             if safe_check in skip_labels:
                 print(f"[Filter] 表格 {safe_check} 已由先前步骤提取，跳过以避免重复")
+                drop_stats["skip_labels"] += 1
                 continue
         proc = postprocess_dataframe(df, headers, preserve_scripts=True)
         if proc is not None and proc.attrs.get('rejected_reason') == 'paywall':
@@ -329,15 +334,21 @@ def save_tables_to_excel(dataframes, output_path, headers=None, single_file=True
                     print(f"Isolated paywall table to: {rej_path}")
                 except Exception as e_rej:
                     print(f"Failed to isolate paywall table: {e_rej}")
+            drop_stats["paywall"] += 1
             continue
 
         if proc is not None and not proc.empty:
             if is_metadata_table(proc):
                 print(f"[Filter] 过滤非数据表/元数据表: {proc.attrs.get('table_title') or proc.attrs.get('label') or '未命名'}")
+                drop_stats["metadata"] += 1
                 continue
             cleaned_dfs.append(proc)
+        else:
+            drop_stats["postprocess_empty"] += 1
 
     if not cleaned_dfs:
+        reasons_str = ", ".join(f"{k}={v}" for k, v in drop_stats.items() if v > 0) or "unknown"
+        print(f"[Export Warning] 输入 {len(norm_dfs)} 个候选表格经导出质量过滤后剩余 0 个有效表格 ({reasons_str})。")
         return False
         
     if single_file:
@@ -575,6 +586,14 @@ def save_tables_to_excel(dataframes, output_path, headers=None, single_file=True
                 
             # 若全文包含多级章节表号（如 表1-1 或 表1.1），过滤掉伪单数字表号（如 表1、表2、Table 1）
             is_supp = is_supplementary(label or title)
+            # 防止附表 Excel 中名为 "Table 1" 的工作表覆盖正文 Table 1.xlsx
+            if is_supp and extracted_label and not is_supplementary(extracted_label):
+                m_plain_en = re.match(r'^Table\s+(\d+(?:[-.]\d+)?[a-z]?)$', extracted_label, re.IGNORECASE)
+                m_plain_cn = re.match(r'^表\s*(\d+(?:[-.]\d+)?[a-z]?)$', extracted_label)
+                if m_plain_en:
+                    extracted_label = f"Supplementary Table {m_plain_en.group(1)}"
+                elif m_plain_cn:
+                    extracted_label = f"附表{m_plain_cn.group(1)}"
             if extracted_label:
                 file_label = extracted_label
             else:

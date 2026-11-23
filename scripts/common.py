@@ -515,54 +515,115 @@ def get_polite_email(config=None, service="unpaywall"):
 # ---------------------------------------------------------------------------
 
 _BROWSER_THREAD_LOCK = threading.Lock()
+_BROWSER_THREAD_LOCKS_GUARD = threading.Lock()
+_BROWSER_THREAD_LOCKS = {"browser_extraction": _BROWSER_THREAD_LOCK}
+
+
+def _get_browser_thread_lock(name: str) -> threading.Lock:
+    with _BROWSER_THREAD_LOCKS_GUARD:
+        lk = _BROWSER_THREAD_LOCKS.get(name)
+        if lk is None:
+            lk = threading.Lock()
+            _BROWSER_THREAD_LOCKS[name] = lk
+        return lk
 
 
 @contextlib.contextmanager
-def browser_extraction_lock(name="browser_extraction"):
+def browser_extraction_lock(name="browser_extraction", timeout: float = 120.0, cancel_event=None):
     """
     浏览器类提取（Playwright 调试 Chrome / 共享 user-data-dir）的全局互斥锁。
 
     并行提取时（HTML ∥ Paddle 竞速、批量多论文并发），基于共享浏览器状态的
-    渠道（调试端口 9222、共享 profile 目录）不能同时运行，否则会出现端口冲突、
-    profile 文件锁竞争甚至互相 killall 浏览器的问题。
+    渠道（共享 profile 目录）不能同时运行，否则会出现 profile 文件锁竞争
+    与崩溃。
 
     本锁提供两层保护：
       1. 进程内 threading.Lock —— 保护同进程内多线程并发；
-      2. 跨进程文件锁（fcntl / msvcrt）—— 保护 batch_run.py 多子进程并发。
+      2. 跨进程文件锁（fcntl / Windows msvcrt LK_NBLCK 有界重试）—— 保护
+         多子进程并发，修复 Windows 下 msvcrt.LK_LOCK 仅等 10s 抛出 Errno 36
+         后静默放行的并发崩溃问题；支持 cancel_event 提前退出等待。
 
     非浏览器类渠道（HTTP 直连 / curl_cffi / Firecrawl / Scrapling / Crawl4AI
     独立浏览器实例）无需此锁，可自由并行。
     """
+    import time as _time
+
     lock_path = os.path.join(tempfile.gettempdir(), f"zotero_table_extractor_{name}.lock")
-    _BROWSER_THREAD_LOCK.acquire()
+    thread_lock = _get_browser_thread_lock(name)
+    wait_s = max(0.5, float(120.0 if timeout is None else timeout))
+    deadline = _time.monotonic() + wait_s
+
+    while True:
+        if cancel_event is not None and cancel_event.is_set():
+            raise TimeoutError(f"Cancelled waiting for in-process browser lock '{name}'")
+        rem = deadline - _time.monotonic()
+        if rem <= 0:
+            raise TimeoutError(f"Timed out waiting for in-process browser lock '{name}' after {wait_s:.1f}s")
+        if thread_lock.acquire(timeout=min(0.1, rem)):
+            break
+
     f = None
+    file_locked = False
     try:
         try:
             f = open(lock_path, "a+")
+        except OSError:
+            f = None
+
+        if f is not None:
             if os.name == "nt":
                 import msvcrt
-                f.seek(0)
-                msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+                while True:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise TimeoutError(f"Cancelled waiting for cross-process browser lock '{name}'")
+                    try:
+                        f.seek(0)
+                        msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+                        file_locked = True
+                        break
+                    except OSError:
+                        if _time.monotonic() >= deadline:
+                            raise TimeoutError(
+                                f"Timed out waiting for cross-process browser lock '{name}' after {wait_s:.1f}s"
+                            )
+                        _time.sleep(0.05)
             else:
                 import fcntl
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-        except Exception:
-            pass
+                while True:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise TimeoutError(f"Cancelled waiting for cross-process browser lock '{name}'")
+                    try:
+                        fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        file_locked = True
+                        break
+                    except BlockingIOError:
+                        if _time.monotonic() >= deadline:
+                            raise TimeoutError(
+                                f"Timed out waiting for cross-process browser lock '{name}' after {wait_s:.1f}s"
+                            )
+                        _time.sleep(0.05)
+                    except OSError:
+                        # Filesystems without flock support: fall back gracefully
+                        break
         yield
     finally:
-        try:
-            if f:
-                if os.name == "nt":
-                    import msvcrt
-                    f.seek(0)
-                    msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
-                else:
-                    import fcntl
-                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        if f is not None:
+            try:
+                if file_locked:
+                    if os.name == "nt":
+                        import msvcrt
+                        f.seek(0)
+                        msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+            try:
                 f.close()
-        except Exception:
-            pass
-        _BROWSER_THREAD_LOCK.release()
+            except Exception:
+                pass
+        thread_lock.release()
 
 
 # ---------------------------------------------------------------------------
@@ -998,6 +1059,9 @@ def format_table_label(raw_label: str) -> str:
         return ""
     trans_fw = str.maketrans('０１２３４５６７８９', '0123456789')
     s = raw_label.strip().replace('\xa0', ' ').replace('\u3000', ' ').translate(trans_fw)
+    # 折叠小型大写字母导致的拆字空格（如 GeoScienceWorld/Silverchair 的 "T ABLE 1" / "T A B L E 2"）
+    s = re.sub(r'(?<![A-Za-z])T\s*A\s*B\s*L\s*E(?![A-Za-z])', 'Table', s, flags=re.IGNORECASE)
+    s = re.sub(r'(?<![A-Za-z])T\s*A\s*B\s*\.(?![A-Za-z])', 'Tab.', s, flags=re.IGNORECASE)
     
     # 截断紧随在表号后面的标题部分（如 "Table 1. Description", "Table 1: Geological", "Table 1 - Summary", "Tab 1: Description"）
     prefix_pat = r'^((?:Supplementary\s+Table|Supplemental\s+Table|Extended\s+Data\s+Table|Appendix\s+Table|TABLE|Table|Tab(?:\.|\b)|附表|附录表|补充表|表)\s*(?:' + TABLE_NUM_PART + r'(?:' + TABLE_SUB_SEP + TABLE_NUM_PART + r')*(?:\([a-zA-Z0-9]\)|（[a-zA-Z0-9]）|[a-zA-Z]\b)?))(?:[\.\:\：\—\–\s]+.*)?$'
@@ -1619,5 +1683,33 @@ def is_anti_bot_blocked(title: str = "", html_or_text: str = "") -> bool:
     t_low = (title or "").strip().lower()
     if t_low in ("sciencedirect", "cloudflare", "error", "403", "page not found", "security verification"):
         return True
-    sample = f"{t_low}\n{(html_or_text or '')[:12000].lower()}"
-    return any(marker in sample for marker in _ANTI_BOT_MARKERS)
+    if t_low and any(marker in t_low for marker in _ANTI_BOT_MARKERS):
+        return True
+
+    raw = html_or_text or ""
+    if not raw:
+        return False
+
+    raw_head = raw[:12000].lower()
+    # Genuine full-text academic HTML pages (with citation_doi/citation_title metadata or large article HTML)
+    # may embed GDPR consent text ("your privacy, your choice") or JS strings ("there was a problem").
+    # Do not false-positive them as challenge shells when their <title> is not an anti-bot page.
+    has_article_meta = (
+        'name="citation_doi"' in raw_head
+        or "name='citation_doi'" in raw_head
+        or 'name="citation_title"' in raw_head
+        or "name='citation_title'" in raw_head
+        or 'name="dc.identifier"' in raw_head
+        or (len(raw) > 30000 and ("<article" in raw_head or "<table" in raw[:40000].lower()))
+    )
+    if has_article_meta:
+        m_title = re.search(r"<title[^>]*>(.*?)</title>", raw_head, re.IGNORECASE | re.DOTALL)
+        html_title = re.sub(r"\s+", " ", m_title.group(1)).strip() if m_title else ""
+        if html_title and (
+            html_title in ("sciencedirect", "cloudflare", "error", "403", "page not found", "security verification")
+            or any(m in html_title for m in _ANTI_BOT_MARKERS)
+        ):
+            return True
+        return False
+
+    return any(marker in raw_head for marker in _ANTI_BOT_MARKERS)

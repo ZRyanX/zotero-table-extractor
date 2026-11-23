@@ -172,7 +172,13 @@ def scan_pdf_table_declarations(pdf_path: str) -> Dict[int, List[Dict[str, Any]]
                             continue
                         if re.search(r'(?:所示|可知|可见|看出|表明|显示|如下|为此|因此|列出了|给出了|汇总了)$', before_dot.strip()):
                             continue
-                    if any(title_part.startswith(p) for p in [')', '）', '中', '可以', '所示', '可知', '看出', '见', '综合表达', '显示', '表明', '为', '是', '由', '在中', '对于', '根据', '列出了', '给出了', '汇总了', '统计了', '总结了', '展示了', '反映了', '提供了', '对比了', '分析了', 'shown', 'listed', 'summarized']):
+                    if any(title_part.startswith(p) for p in [')', '）', ';', '；', ',', '，', '中', '可以', '所示', '可知', '看出', '见', '综合表达', '显示', '表明', '为', '是', '由', '在中', '对于', '根据', '列出了', '给出了', '汇总了', '统计了', '总结了', '展示了', '反映了', '提供了', '对比了', '分析了', 'shown', 'listed', 'summarized']):
+                        continue
+                    # 排除跨行括号引用残片（如 "(see ... \n Table 2–3; Fig. 5), precluding..."）
+                    _tp_head = title_part[:45]
+                    if ')' in _tp_head and ('(' not in _tp_head or _tp_head.find(')') < _tp_head.find('(')):
+                        continue
+                    if '）' in _tp_head and ('（' not in _tp_head or _tp_head.find('）') < _tp_head.find('（')):
                         continue
                     if any(title_part.endswith(p) for p in ['所示', '可以看出', '表明', '可知', '见表', '来自表', '列入表', 'shown in', 'listed in']):
                         continue
