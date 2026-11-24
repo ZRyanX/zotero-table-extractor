@@ -300,12 +300,30 @@ def _download_remote_pdf(url: str, temps_to_clean: list) -> Optional[str]:
 
 
 def _preprocess_local_pdf(local_pdf_path: str, temps_to_clean: list) -> Tuple[str, Optional[List[int]], bool]:
-    """Run Tier-1 lossless orientation remediation, candidate detection, and scanned rotation baking."""
+    """Run Tier-1 lossless orientation remediation and scanned rotation baking.
+
+    Note: `quick_detect_candidate_pages()` is a loose orientation-remediation probe
+    (e.g. `drawings >= 15` / low-word scan heuristic) and is used strictly for
+    `remediate_pdf_pages_lossless()`. It must NOT be returned as `caller_candidate`
+    table pages for `extract_tables_from_pdf()`, where it would pollute `target_pages`
+    and `step3_pages` with non-table pages; hence the second tuple element is `None`.
+    """
     import pymupdf as fitz
 
     target_pdf_path = local_pdf_path
-    cand_pages = None
+    ori_cand_pages = None
     was_remediated = False
+
+    # Fail-Fast：空文件 / 0 页 / 损坏 PDF 直接跳过 Doc-Ori 与方向重绘，避免无意义加载 ONNX 模型
+    if isinstance(local_pdf_path, str) and os.path.isfile(local_pdf_path):
+        try:
+            if local_pdf_path.lower().endswith(".pdf") and os.path.getsize(local_pdf_path) == 0:
+                return target_pdf_path, None, False
+            with fitz.open(local_pdf_path) as _chk_doc:
+                if len(_chk_doc) == 0:
+                    return target_pdf_path, None, False
+        except Exception:
+            return target_pdf_path, None, False
 
     # Tier 1: 页面级无损顺时针方向校准 (Lossless Page Rotation Remediation)
     try:
@@ -319,13 +337,13 @@ def _preprocess_local_pdf(local_pdf_path: str, temps_to_clean: list) -> Tuple[st
                 from .pdf_table_extractor import quick_detect_candidate_pages
             except ImportError:
                 from pdf_table_extractor import quick_detect_candidate_pages
-            cand_pages = quick_detect_candidate_pages(target_pdf_path)
+            ori_cand_pages = quick_detect_candidate_pages(target_pdf_path)
         except Exception:
             pass
 
         lossless_path, was_rotated, tmp_lossless = remediate_pdf_pages_lossless(
             target_pdf_path,
-            candidate_pages=cand_pages
+            candidate_pages=ori_cand_pages
         )
         if was_rotated and tmp_lossless:
             target_pdf_path = lossless_path
@@ -354,7 +372,7 @@ def _preprocess_local_pdf(local_pdf_path: str, temps_to_clean: list) -> Tuple[st
         doc.close()
     except Exception as e_fitz:
         print(f"[Doc-Ori Tier 1] 打开 PDF 失败: {e_fitz}")
-        return target_pdf_path, cand_pages, was_remediated
+        return target_pdf_path, None, was_remediated
 
     # 全页像素光栅化烘焙 (baking) 会把页面栅格化为位图图片并彻底抹除原生矢量文本层与 Tagged 结构树。
     # 因此仅对纯扫描版 PDF 执行旋转烘焙 (以兼容外部 OCR 工具)；
@@ -369,7 +387,7 @@ def _preprocess_local_pdf(local_pdf_path: str, temps_to_clean: list) -> Tuple[st
     elif has_rotation and is_native:
         print(f"[PDF] Native PDF 存在旋转页面 (保留原生矢量文本层与 Tagged 结构，视口与视觉切图走正向渲染，矢量几何通过 rotation_matrix 归一化)")
 
-    return target_pdf_path, cand_pages, was_remediated
+    return target_pdf_path, None, was_remediated
 
 
 def process_single_pdf(pdf_path, args, is_batch=False, plan=None):
@@ -1240,7 +1258,29 @@ def _do_process_single_pdf_impl(pdf_path, orig_pdf_path, args, is_batch=False, p
                     _register_online_label(o_df.attrs.get('label'))
                     _register_online_label(o_df.attrs.get('table_title'))
 
-                missing_labels = (expected_labels - online_labels) if expected_labels else set()
+                try:
+                    try:
+                        from .common import canonicalize_table_label_key as _canon_tbl_key
+                    except ImportError:
+                        from common import canonicalize_table_label_key as _canon_tbl_key
+                except ImportError:
+                    _canon_tbl_key = None
+
+                online_canon_keys = set()
+                if _canon_tbl_key is not None:
+                    for ol in online_labels:
+                        ck = _canon_tbl_key(ol)
+                        if ck is not None:
+                            online_canon_keys.add(ck)
+
+                if expected_labels:
+                    missing_labels = {
+                        lbl for lbl in expected_labels
+                        if lbl not in online_labels
+                        and not (_canon_tbl_key is not None and _canon_tbl_key(lbl) in online_canon_keys)
+                    }
+                else:
+                    missing_labels = set()
                 # 若缺失集合仅包含附表号，且在线已提取的附表总数（如 Elsevier mmc/MOESM 多工作表）>= 预期附表数，
                 # 视为已通过附表工作簿覆盖，避免触发伪漏检
                 if missing_labels:
@@ -1253,39 +1293,115 @@ def _do_process_single_pdf_impl(pdf_path, orig_pdf_path, args, is_batch=False, p
                     if supp_missing and supp_online_cnt >= max(len(expected_supp), len(supp_missing)):
                         missing_labels = missing_labels - supp_missing
 
+                # 若剩余缺失表号全部属于外部补充材料 (Table S* / 附表*) 且正文 PDF 对应页上不存在实际表格线框，
+                # 说明该表位于外部独立补充附件（如 MDPI /s1 ZIP、ESM）而非正文 PDF 中，跳过无意义的 120s 本地 PDF 补漏
+                if missing_labels and is_local_orig_pdf and all(is_supplementary(lbl) for lbl in missing_labels):
+                    try:
+                        import pymupdf as _fitz_supp_chk
+                        try:
+                            from .table_validator import scan_pdf_table_declarations as _scan_supp_decls
+                        except ImportError:
+                            from table_validator import scan_pdf_table_declarations as _scan_supp_decls
+                        _supp_decls_map = _scan_supp_decls(orig_pdf_path) or {}
+                        _supp_pages = set()
+                        _miss_canon = {_canon_tbl_key(m) for m in missing_labels if _canon_tbl_key is not None and _canon_tbl_key(m)}
+                        for _p_idx_s, _decls_s in _supp_decls_map.items():
+                            for _d_s in _decls_s:
+                                _dl_s = format_table_label(_d_s.get('label', '')) or _d_s.get('label', '')
+                                if _dl_s in missing_labels or (
+                                    _canon_tbl_key is not None and _canon_tbl_key(_dl_s) in _miss_canon
+                                ):
+                                    _supp_pages.add(_p_idx_s)
+                        if _supp_pages:
+                            _has_supp_grid_in_pdf = False
+                            with _fitz_supp_chk.open(orig_pdf_path) as _sdoc:
+                                for _sp in _supp_pages:
+                                    if 0 <= _sp < len(_sdoc):
+                                        _stabs = _sdoc[_sp].find_tables()
+                                        if _stabs and getattr(_stabs, 'tables', None):
+                                            if any(getattr(tb, 'row_count', 0) >= 2 and getattr(tb, 'col_count', 0) >= 2 for tb in _stabs.tables):
+                                                _has_supp_grid_in_pdf = True
+                                                break
+                            if not _has_supp_grid_in_pdf:
+                                print(
+                                    f"[Online] 缺失表号 {sorted(list(missing_labels))} 仅为外部补充材料引用（本地正文 PDF 对应页无表格结构），"
+                                    f"直接采纳在线结果跳过冗余本地 PDF 补漏。"
+                                )
+                                missing_labels = set()
+                                expected_count = min(expected_count, len(online_dfs))
+                    except Exception:
+                        pass
+
                 # 检查本地 PDF 是否为扫描件/含扫描页，以及是否有潜在表格线框或矢量结构
                 # --online-only 模式下不回退本地 PDF，跳过昂贵的逐页 find_tables() 扫描
                 has_pdf_table_cues = False
                 has_scanned_page = False
+                scan_info = {}
                 if is_local_orig_pdf and not online_only:
                     try:
                         try:
-                            from .pdf_table_extractor import has_text_layer
+                            from .table_validator import classify_pdf_scanned_pages
                         except ImportError:
-                            from pdf_table_extractor import has_text_layer
-                        if not has_text_layer(orig_pdf_path):
-                            has_scanned_page = True
+                            from table_validator import classify_pdf_scanned_pages
+                        scan_info = classify_pdf_scanned_pages(orig_pdf_path) or {}
                     except Exception:
-                        pass
+                        scan_info = {'open_failed': True}
 
-                    try:
-                        import pymupdf as fitz
-                        doc = fitz.open(orig_pdf_path)
-                        need_table_cues = (not expected_labels and expected_count == 0)
-                        for page in doc:
-                            txt = page.get_text("text").strip()
-                            imgs = page.get_images()
-                            # 扫描页缺少文本层，无法通过字符排查表格，属于“完整性未知”
-                            if len(txt) <= 50 and (len(imgs) > 0 or not txt):
+                    local_pdf_corrupt_or_empty = bool(
+                        scan_info.get('open_failed') or scan_info.get('total_pages', 0) == 0
+                    )
+                    if not local_pdf_corrupt_or_empty:
+                        try:
+                            try:
+                                from .pdf_table_extractor import has_text_layer
+                            except ImportError:
+                                from pdf_table_extractor import has_text_layer
+                            if not has_text_layer(orig_pdf_path):
                                 has_scanned_page = True
-                            if need_table_cues and not has_pdf_table_cues:
+                        except Exception:
+                            pass
+
+                        scanned_list = list(scan_info.get('scanned_pages') or [])
+                        if scanned_list:
+                            # 文本型现代 PDF 若在线已覆盖 100% 预期表声明，1-2 页孤立无文本图页不应拖入本地 OCR
+                            online_covered_all_declared = bool(
+                                expected_labels
+                                and len(missing_labels) == 0
+                                and len(online_dfs) >= expected_count
+                            )
+                            if not (
+                                scan_info.get('is_text_based_pdf')
+                                and online_covered_all_declared
+                                and len(scanned_list) <= 2
+                            ):
+                                has_scanned_page = True
+
+                    need_table_cues = (
+                        not local_pdf_corrupt_or_empty
+                        and not expected_labels
+                        and expected_count == 0
+                        and not has_scanned_page
+                    )
+                    if need_table_cues:
+                        try:
+                            import pymupdf as fitz
+                            doc = fitz.open(orig_pdf_path)
+                            online_tbl_cnt = len(online_dfs)
+                            detected_pdf_tables = 0
+                            for page in doc:
                                 tabs = page.find_tables()
-                                text_tabs = page.find_tables(strategy="text") if not (tabs and tabs.tables) else None
-                                if (tabs and tabs.tables) or (text_tabs and text_tabs.tables) or len(page.get_drawings()) > 5:
-                                    has_pdf_table_cues = True
-                        doc.close()
-                    except Exception:
-                        has_scanned_page = True
+                                valid_tabs = [
+                                    tb for tb in (tabs.tables if (tabs and tabs.tables) else [])
+                                    if getattr(tb, 'row_count', 0) >= 2 and getattr(tb, 'col_count', 0) >= 2
+                                ]
+                                if valid_tabs:
+                                    detected_pdf_tables += len(valid_tabs)
+                                    if detected_pdf_tables > online_tbl_cnt:
+                                        has_pdf_table_cues = True
+                                        break
+                            doc.close()
+                        except Exception:
+                            pass
 
                 is_complete = False
 
@@ -1363,12 +1479,14 @@ def _do_process_single_pdf_impl(pdf_path, orig_pdf_path, args, is_batch=False, p
             orig_pdf_path = downloaded_remote_pdf
             proc_pdf, dl_cand_pages, dl_remediated = _preprocess_local_pdf(downloaded_remote_pdf, remote_temps)
             pdf_path = proc_pdf
-            candidate_pages = dl_cand_pages
+            if candidate_pages is None:
+                candidate_pages = dl_cand_pages
             remediated = dl_remediated
         elif remediated is None and isinstance(pdf_path, str) and os.path.isfile(pdf_path):
             proc_pdf, local_cand_pages, local_remediated = _preprocess_local_pdf(pdf_path, remote_temps)
             pdf_path = proc_pdf
-            candidate_pages = local_cand_pages
+            if candidate_pages is None:
+                candidate_pages = local_cand_pages
             remediated = local_remediated
 
     is_remote_non_pdf_input = _is_remote_url(pdf_path)
@@ -1404,16 +1522,137 @@ def _do_process_single_pdf_impl(pdf_path, orig_pdf_path, args, is_batch=False, p
         except Exception as e:
             print(f"[PDF -> Structured Warning] Failed to parse structured file: {e}")
 
-    # 使用结构化提取管线
+    # 使用结构化提取管线（带全局时间预算护栏与在线保底回退）
     pdf_extracted = False
     if extract_tables_from_pdf is not None:
+        import threading as _th_pdf_b
         try:
-            results, logs = extract_tables_from_pdf(
-                pdf_path,
-                use_ocr_fallback=True,
-                candidate_pages=candidate_pages,
-                remediated=remediated,
-            )
+            _cfg_pdf = load_config() if callable(load_config) else {}
+        except Exception:
+            _cfg_pdf = {}
+        try:
+            _raw_pdf_budget = os.getenv("PDF_EXTRACTION_BUDGET_S") or (_cfg_pdf or {}).get("PDF_EXTRACTION_BUDGET_S")
+            if _raw_pdf_budget:
+                local_pdf_budget_s = max(0.05, float(_raw_pdf_budget))
+            else:
+                local_pdf_budget_s = 150.0
+                # 超长学位论文/专著 (>80 页) 且无在线表格时，适度放宽本地预算至 195s（仍远低于 300s 外部上限）
+                if not (extracted_online and online_dfs) and isinstance(pdf_path, str) and os.path.isfile(pdf_path):
+                    try:
+                        import pymupdf as _fitz_b
+                        with _fitz_b.open(pdf_path) as _bdoc:
+                            if len(_bdoc) > 80:
+                                local_pdf_budget_s = 195.0
+                    except Exception:
+                        pass
+        except Exception:
+            local_pdf_budget_s = 150.0
+        if extracted_online and online_dfs:
+            # 已有在线保底表格时收紧本地补漏预算，确保在线+本地总耗时稳控在 300s 护栏内
+            local_pdf_budget_s = min(local_pdf_budget_s, 120.0)
+
+        pdf_cancel_event = _th_pdf_b.Event()
+        pdf_budget_timer = _th_pdf_b.Timer(local_pdf_budget_s, pdf_cancel_event.set)
+        pdf_budget_timer.daemon = True
+        pdf_budget_timer.start()
+
+        _partial_pdf_results = []
+
+        def _invoke_pdf_pipeline():
+            try:
+                return extract_tables_from_pdf(
+                    pdf_path,
+                    use_ocr_fallback=True,
+                    candidate_pages=candidate_pages,
+                    remediated=remediated,
+                    time_budget_s=local_pdf_budget_s,
+                    cancel_event=pdf_cancel_event,
+                    partial_results_sink=_partial_pdf_results,
+                )
+            except TypeError:
+                try:
+                    return extract_tables_from_pdf(
+                        pdf_path,
+                        use_ocr_fallback=True,
+                        candidate_pages=candidate_pages,
+                        remediated=remediated,
+                        time_budget_s=local_pdf_budget_s,
+                        cancel_event=pdf_cancel_event,
+                    )
+                except TypeError:
+                    return extract_tables_from_pdf(
+                        pdf_path,
+                        use_ocr_fallback=True,
+                        candidate_pages=candidate_pages,
+                        remediated=remediated,
+                    )
+
+        try:
+            _pipe_box = {"out": None, "err": None}
+
+            def _run_pipe():
+                try:
+                    _pipe_box["out"] = _invoke_pdf_pipeline()
+                except Exception as _ep:
+                    _pipe_box["err"] = _ep
+
+            _pipe_th = _th_pdf_b.Thread(target=_run_pipe, daemon=True)
+            _pipe_th.start()
+            # 给予协作式取消收口宽限；若底层 C 扩展仍未返回则强制接管并落盘已得局部/在线表
+            _grace_s = min(15.0, max(0.15, local_pdf_budget_s * 0.2))
+            _pipe_th.join(timeout=local_pdf_budget_s + _grace_s)
+
+            if _pipe_th.is_alive():
+                pdf_cancel_event.set()
+                _b_label = f"{int(local_pdf_budget_s)}s" if local_pdf_budget_s >= 1.0 else f"{local_pdf_budget_s:.2f}s"
+                try:
+                    recovered_partial = [
+                        r for r in list(_partial_pdf_results)
+                        if isinstance(r, dict) and r.get('df') is not None and not getattr(r['df'], 'empty', True)
+                    ]
+                except Exception:
+                    recovered_partial = []
+                if recovered_partial:
+                    try:
+                        try:
+                            from .pdf_table_extractor import _dedup_same_page_tables as _dedup_partial
+                        except ImportError:
+                            from pdf_table_extractor import _dedup_same_page_tables as _dedup_partial
+                        recovered_partial = _dedup_partial(recovered_partial, pdf_path=None)
+                    except Exception:
+                        pass
+                    try:
+                        from table_postprocess import merge_continuation_tables as _merge_partial
+                        _rec_dfs = [r['df'] for r in recovered_partial if r.get('df') is not None]
+                        _merged_rec = _merge_partial(_rec_dfs)
+                        if _merged_rec and len(_merged_rec) < len(_rec_dfs):
+                            recovered_partial = [
+                                {
+                                    'df': _mdf,
+                                    'page_idx': _mdf.attrs.get('page_idx', 0) if hasattr(_mdf, 'attrs') else 0,
+                                    'table_idx': _mi,
+                                    'bbox': None,
+                                }
+                                for _mi, _mdf in enumerate(_merged_rec)
+                            ]
+                    except Exception:
+                        pass
+                    print(
+                        f"[PDF Budget Guard] 本地 PDF 管线达到总预算上限 ({_b_label})，"
+                        f"优雅回收已提取的 {len(recovered_partial)} 个表格！"
+                    )
+                    results, logs = recovered_partial, []
+                elif extracted_online and online_dfs:
+                    print(f"[PDF Budget Guard] 本地 PDF 补漏达到总预算上限 ({_b_label})，立即收口并保底落盘已提取的 {len(online_dfs)} 个在线表格！")
+                    results, logs = [], []
+                else:
+                    print(f"[PDF Budget Guard] 本地 PDF 管线达到总预算上限 ({_b_label})，强制收口返回。")
+                    results, logs = [], []
+            elif _pipe_box["err"] is not None:
+                raise _pipe_box["err"]
+            else:
+                results, logs = _pipe_box["out"] or ([], [])
+
             for log_line in logs:
                 print(f"  [Pipeline] {log_line}")
 
@@ -1435,6 +1674,9 @@ def _do_process_single_pdf_impl(pdf_path, orig_pdf_path, args, is_batch=False, p
                 print("[PDF] 结构化管线未提取到表格，尝试 OCR/切图备用管线...")
         except Exception as e:
             print(f"[PDF] 管线异常: {e}，尝试 OCR/切图备用管线...")
+        finally:
+            pdf_budget_timer.cancel()
+            pdf_cancel_event.set()
 
     # 当原生结构化管线不可用时，触发 OCR / 切图兜底回退（若 extract_tables_from_pdf 已带 OCR 兜底运行过则不再整本重复提交）
     if not pdf_extracted and extract_tables_from_pdf is None:

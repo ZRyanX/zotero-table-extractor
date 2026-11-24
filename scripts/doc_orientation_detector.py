@@ -776,8 +776,10 @@ def remediate_pdf_pages_lossless(
                 continue
             try:
                 page_obj = doc[p_idx]
-                words = page_obj.get_text("words")
-                num_words = len(words)
+                words = page_obj.get_text("words") or []
+                raw_words = len(words)
+                cjk_cnt = sum(1 for w in words for ch in str(w[4]) if '\u4e00' <= ch <= '\u9fff')
+                num_words = max(raw_words, cjk_cnt // 2)
 
                 # 扫描页 / 全图页特征：文本词数少 (< 80) 且含有图像资源，或纯扫描页 (< 10 词)
                 if num_words < 80:

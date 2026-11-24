@@ -189,6 +189,53 @@ def _select_onnx_providers() -> List[str]:
         return ["CPUExecutionProvider"]
 
 
+def _build_onnx_session_options():
+    """
+    构建受控线程数的 ONNX Runtime SessionOptions，防止多进程并发提取时 CPU 核争抢导致死锁/抖动。
+    默认单进程 intra_op_num_threads 为 2..4（可通过 DOCLAYOUT_ONNX_THREADS / ONNX_INTRA_OP_THREADS 覆盖），
+    inter_op_num_threads 固定为 1。
+    """
+    if ort is None or not hasattr(ort, "SessionOptions"):
+        return None
+    try:
+        opts = ort.SessionOptions()
+        raw_threads = os.getenv("DOCLAYOUT_ONNX_THREADS") or os.getenv("ONNX_INTRA_OP_THREADS")
+        if raw_threads:
+            intra = max(1, min(8, int(raw_threads)))
+        else:
+            cpu_cnt = os.cpu_count() or 4
+            intra = max(1, min(4, cpu_cnt // 4 if cpu_cnt >= 8 else 2))
+        opts.intra_op_num_threads = intra
+        opts.inter_op_num_threads = 1
+        if hasattr(ort, "ExecutionMode") and hasattr(ort.ExecutionMode, "ORT_SEQUENTIAL"):
+            opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        if hasattr(ort, "GraphOptimizationLevel") and hasattr(ort.GraphOptimizationLevel, "ORT_ENABLE_ALL"):
+            opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        return opts
+    except Exception:
+        return None
+
+
+def _create_onnx_session(model_path: str, providers: List[str]):
+    """创建带受控线程配置的安全 ONNX InferenceSession，兼容被 mock 的测试会话签名。"""
+    sess_opts = _build_onnx_session_options()
+    if sess_opts is not None:
+        try:
+            return ort.InferenceSession(model_path, sess_options=sess_opts, providers=providers)
+        except TypeError:
+            pass
+        except Exception:
+            if providers != ["CPUExecutionProvider"]:
+                try:
+                    return ort.InferenceSession(model_path, sess_options=sess_opts, providers=["CPUExecutionProvider"])
+                except TypeError:
+                    pass
+    try:
+        return ort.InferenceSession(model_path, providers=providers)
+    except Exception:
+        return ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+
+
 class DocLayoutYoloDetector:
     _session = None
     _loaded_model_path = None
@@ -206,14 +253,7 @@ class DocLayoutYoloDetector:
         if DocLayoutYoloDetector._session is None or DocLayoutYoloDetector._loaded_model_path != model_path:
             print(f"[DocLayout-YOLO] 正在初始化 ONNX 推理会话: {os.path.basename(model_path)}")
             providers = _select_onnx_providers()
-            try:
-                DocLayoutYoloDetector._session = ort.InferenceSession(
-                    model_path, providers=providers
-                )
-            except Exception:
-                DocLayoutYoloDetector._session = ort.InferenceSession(
-                    model_path, providers=["CPUExecutionProvider"]
-                )
+            DocLayoutYoloDetector._session = _create_onnx_session(model_path, providers)
             DocLayoutYoloDetector._loaded_model_path = model_path
 
             in_w, in_h = 1280, 1280
@@ -863,10 +903,7 @@ class PPDocLayoutV3Detector:
                         self.model_path = p
                         try:
                             providers = _select_onnx_providers()
-                            try:
-                                self._session = ort.InferenceSession(self.model_path, providers=providers)
-                            except Exception:
-                                self._session = ort.InferenceSession(self.model_path, providers=['CPUExecutionProvider'])
+                            self._session = _create_onnx_session(self.model_path, providers)
                             self._available = True
                             break
                         except Exception as e_s:

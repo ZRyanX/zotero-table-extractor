@@ -9,6 +9,7 @@ import hashlib
 import urllib.parse
 import requests
 import io
+from typing import Any, Dict
 import pandas as pd
 
 try:
@@ -995,6 +996,46 @@ def _diagnose_elsevier_403(resp, doi, headers, proxies=None, cancel_event=None):
     return diag
 
 
+def _detect_elsevier_soft_degradation(resp) -> Dict[str, Any]:
+    """
+    检测 Elsevier HTTP 200 响应中的配额软降级 / META 视图截断特征：
+    - `quota_exhausted`: X-RateLimit-Remaining == 0 或 X-ELS-Status 明确指示配额/限流耗尽；
+    - `meta_only`: 响应包含 <coredata> 但完全缺少 <originalText>/<ce:table>/<xocs:rawtext>/<body>。
+    """
+    info = {
+        "quota_exhausted": False,
+        "meta_only": False,
+        "els_status": "",
+        "rate_remaining": "",
+    }
+    if resp is None:
+        return info
+    hdrs = getattr(resp, "headers", None) or {}
+    lower_hdrs = {str(k).lower(): v for k, v in hdrs.items()} if hasattr(hdrs, "items") else {}
+    raw_els_status = lower_hdrs.get("x-els-status")
+    raw_rate_rem = lower_hdrs.get("x-ratelimit-remaining")
+    els_status = "" if raw_els_status is None else str(raw_els_status).strip()
+    rate_rem = "" if raw_rate_rem is None else str(raw_rate_rem).strip()
+    info["els_status"] = els_status
+    info["rate_remaining"] = rate_rem
+
+    low_status = els_status.lower()
+    if rate_rem == "0" or any(k in low_status for k in ("quota", "rate limit", "ratelimit", "exceeded", "too many")):
+        info["quota_exhausted"] = True
+
+    body = str(getattr(resp, "text", "") or "")
+    if body:
+        low_body = body.lower()
+        has_coredata = ("<coredata" in low_body) or ("<full-text-retrieval-response" in low_body)
+        has_fulltext = any(
+            marker in low_body
+            for marker in ("<originaltext", "<ce:table", "<xocs:rawtext", "<xocs:doc", "<body")
+        )
+        if has_coredata and not has_fulltext:
+            info["meta_only"] = True
+    return info
+
+
 def extract_tables_via_elsevier_api(doi, table_idx="all", cancel_event=None):
     """
     Extracts tables from Elsevier articles using the Elsevier Full-Text Retrieval API.
@@ -1002,7 +1043,8 @@ def extract_tables_via_elsevier_api(doi, table_idx="all", cancel_event=None):
     Returns XOCS XML containing <ce:table> elements — no browser needed.
     Requires ELSEVIER_API_KEY in config.json, companion config, or environment.
     Automatically attaches X-ELS-InstToken when ELSEVIER_INSTTOKEN is configured.
-    Supports 429 Retry-After backoff, NETWORK_PROXY passthrough, and 403 view=META diagnostics.
+    Supports 429 Retry-After backoff, NETWORK_PROXY passthrough, HTTP 200 META soft-degradation
+    diagnostics, and 403 view=META diagnostics.
     """
     if cancel_event is not None and cancel_event.is_set():
         return []
@@ -1015,7 +1057,20 @@ def extract_tables_via_elsevier_api(doi, table_idx="all", cancel_event=None):
         insttoken = headers.get("X-ELS-InstToken", "")
         proxies = get_requests_proxies(config)
 
+        try:
+            from .negative_cache import is_negatively_cached, record_negative_cache
+        except Exception:
+            is_negatively_cached = None
+            record_negative_cache = None
+
         api_url = f"https://api.elsevier.com/content/article/doi/{doi}"
+        if is_negatively_cached:
+            hit = is_negatively_cached("elsevier_api", url=api_url, doi=doi, config=config)
+            if hit:
+                neg_reason = hit.get("reason") if isinstance(hit, dict) else str(hit)
+                print(f"[Elsevier API] 命中短期配额熔断缓存 ({neg_reason})，跳过无效请求: {doi}")
+                return []
+
         print(f"[Elsevier API] \u6b63\u5728\u83b7\u53d6 XOCS XML: {doi}")
         resp = _elsevier_api_get(
             api_url,
@@ -1030,8 +1085,27 @@ def extract_tables_via_elsevier_api(doi, table_idx="all", cancel_event=None):
             print(f"[Elsevier API] \u8bf7\u6c42\u5931\u8d25: HTTP {resp.status_code}")
             if resp.status_code == 403:
                 _diagnose_elsevier_403(resp, doi, headers, proxies=proxies, cancel_event=cancel_event)
+            elif resp.status_code == 429 and record_negative_cache:
+                record_negative_cache("elsevier_api", url=api_url, doi=doi, status_code=429, config=config)
             return []
-        
+
+        soft_deg = _detect_elsevier_soft_degradation(resp)
+        if soft_deg["quota_exhausted"]:
+            print(
+                f"[Elsevier API Warning] 检测到 API 配额耗尽/限流软降级 "
+                f"(X-RateLimit-Remaining={soft_deg['rate_remaining'] or 'unknown'}, "
+                f"X-ELS-Status={soft_deg['els_status'] or 'none'})，跳过冗余 Object API 请求并启用短期熔断。"
+            )
+            if record_negative_cache:
+                record_negative_cache("elsevier_api", url=api_url, doi=doi, status_code=429, config=config)
+            return []
+        if soft_deg["meta_only"]:
+            print(
+                f"[Elsevier API Warning] HTTP 200 响应仅包含元数据 (<coredata>) 且缺少正文 (<originalText>)，"
+                f"疑似 API Key 触发配额软降级或缺少该文献全文机构权限 "
+                f"(X-ELS-Status={soft_deg['els_status'] or 'none'}, X-RateLimit-Remaining={soft_deg['rate_remaining'] or 'unknown'})。"
+            )
+
         tables = _parse_elsevier_xocs_tables(resp.text, table_idx)
         tables.extend(
             extract_elsevier_supplementary_tables(
@@ -1334,8 +1408,23 @@ def _parse_supplementary_bytes(content_bytes, filename, content_type="", _depth=
     ):
         try:
             excel_data = pd.read_excel(io.BytesIO(content_bytes), sheet_name=None)
+            _cover_sheet_re = re.compile(
+                r"^(?:title|cover|readme|read\s*me|info|notes?|metadata|contents?|instructions?|about|summary\s*info|说明|封面|目录|备注)$",
+                re.IGNORECASE,
+            )
             for sheet_name, df in excel_data.items():
                 if not df.empty and df.shape[0] >= 1 and df.shape[1] >= 1:
+                    # 多工作表补充 Excel 中跳过单列纯文字封面/说明页（如 Springer MOESM*-ESM-Title）
+                    if len(excel_data) > 1 and _cover_sheet_re.match(str(sheet_name or "").strip()):
+                        non_empty_cols = sum(
+                            1 for col_i in range(df.shape[1])
+                            if any(
+                                v is not None and str(v).strip() not in ("", "nan", "none")
+                                for v in df.iloc[:, col_i].tolist()
+                            )
+                        )
+                        if non_empty_cols <= 1:
+                            continue
                     tbl_label = _format_supp_excel_label(filename_no_ext, sheet_name, len(excel_data) > 1)
                     df.attrs["label"] = tbl_label
                     df.attrs["table_title"] = f"Supplementary Table ({tbl_label}) from sheet '{sheet_name}' in file '{fname}'"
@@ -1806,7 +1895,7 @@ def extract_builtin_supplementary_tables(
     return all_dfs
 
 
-def _download_blocked_supp_via_browser(base_url, blocked_items, max_timeout=18.0, cancel_event=None):
+def _download_blocked_supp_via_browser(base_url, blocked_items, max_timeout=22.0, cancel_event=None):
     """
     当强特征补充材料链接（如 MDPI /s1 ZIP）在纯 HTTP 下触发 Akamai 403 / bm-verify HTML 壳时，
     使用无头有界 StealthySession 通过验证并复用该浏览器会话直接下载解析附件。
@@ -1819,8 +1908,9 @@ def _download_blocked_supp_via_browser(base_url, blocked_items, max_timeout=18.0
         return []
 
     collected = []
-    cap_ms = max(8000, min(int(float(max_timeout or 18.0) * 1000), 20000))
-    dl_deadline = time.monotonic() + float(max_timeout or 18.0)
+    eff_max_t = max(18.0, float(max_timeout or 22.0))
+    cap_ms = max(15000, min(int(eff_max_t * 1000), 25000))
+    dl_deadline = time.monotonic() + eff_max_t + 8.0
 
     def _fetch_supp_action(page):
         if cancel_event is not None and cancel_event.is_set():
@@ -1841,7 +1931,7 @@ def _download_blocked_supp_via_browser(base_url, blocked_items, max_timeout=18.0
                 break
             dl_url = item["url"]
             try:
-                resp = req_api.get(dl_url, timeout=min(12000, max(3000, int(rem_s * 1000))))
+                resp = req_api.get(dl_url, timeout=min(18000, max(10000, int(rem_s * 1000))))
                 if getattr(resp, "status", 0) != 200:
                     continue
                 hdrs = {str(k).lower(): str(v) for k, v in (getattr(resp, "headers", None) or {}).items()}
@@ -1897,7 +1987,7 @@ def _download_supp_via_browser_context(
     html_text,
     cancel_event=None,
     max_files=4,
-    max_timeout=15.0,
+    max_timeout=22.0,
     strong_only=True,
 ):
     """
@@ -1920,7 +2010,7 @@ def _download_supp_via_browser_context(
     if not candidates:
         return []
 
-    deadline = time.monotonic() + max(4.0, float(max_timeout or 15.0))
+    deadline = time.monotonic() + max(15.0, float(max_timeout or 22.0))
     all_dfs = []
     max_bytes = 25 * 1024 * 1024
     print(f"[Browser Supp] 发现 {len(candidates)} 个强特征补充材料链接，复用当前浏览器会话下载解析...")
@@ -1935,7 +2025,7 @@ def _download_supp_via_browser_context(
             resp = request_api.get(
                 dl_url,
                 headers={"Referer": base_url},
-                timeout=int(min(rem, 12.0) * 1000),
+                timeout=int(min(rem, 18.0) * 1000),
             )
             status = getattr(resp, "status", 0)
             if status != 200:

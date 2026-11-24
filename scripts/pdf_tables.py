@@ -13,6 +13,7 @@ import io
 import os
 import re
 import sys
+import time
 import logging
 import tempfile
 from typing import List, Dict, Any, Optional, Tuple
@@ -323,6 +324,7 @@ def extract_table_crops_from_pdf(
     cancel_event = None,
     pages: Optional[List[int]] = None,
     config: Optional[Dict[str, Any]] = None,
+    time_budget_s: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     """
     从本地 PDF 文件中提取所有表格及相关上下文（Caption/Footnote）的图像区域 Crop。
@@ -345,8 +347,46 @@ def extract_table_crops_from_pdf(
         print(f"[PDF-Tables] 文件不存在: {pdf_path}")
         return []
 
+    if cancel_event is not None and cancel_event.is_set():
+        return []
+
     if config is None:
         config = load_config() if load_config else {}
+
+    t0 = time.monotonic()
+    pp_structure_attempted = False
+
+    def _rem_budget() -> Optional[float]:
+        if time_budget_s is None:
+            return None
+        return max(0.0, float(time_budget_s) - (time.monotonic() - t0))
+
+    def _call_pp_structure(target_pages_arg):
+        nonlocal pp_structure_attempted
+        if cancel_event is not None and cancel_event.is_set():
+            return []
+        rem = _rem_budget()
+        if rem is not None and rem < 10.0:
+            print(f"[PDF-Tables] 剩余预算不足 ({rem:.1f}s)，跳过 PP-StructureV3 云端补扫")
+            return []
+        pp_structure_attempted = True
+        if rem is not None:
+            try:
+                return extract_pp_structure_table_crops(
+                    pdf_path,
+                    config=config,
+                    cancel_event=cancel_event,
+                    pages=target_pages_arg,
+                    timeout=int(max(15, min(120, rem))),
+                )
+            except TypeError:
+                pass
+        return extract_pp_structure_table_crops(
+            pdf_path,
+            config=config,
+            cancel_event=cancel_event,
+            pages=target_pages_arg,
+        )
 
     # 1. 优先使用本地超快 DocLayout-YOLO 目标检测
     yolo_enabled = config.get("DOCLAYOUT_YOLO_ENABLED", True)
@@ -387,15 +427,28 @@ def extract_table_crops_from_pdf(
             doc = fitz.open(pdf_path)
             extracted_crops = []
             total_pages = len(doc)
+            if total_pages == 0:
+                doc.close()
+                print("[PDF-Tables] PDF 页数为 0，跳过版面定位与云端回退。")
+                return []
 
             zoom = dpi / 72.0
             mat = fitz.Matrix(zoom, zoom)
 
             target_pages = [p for p in pages if 0 <= p < total_pages] if pages is not None else list(range(total_pages))
+            max_yolo_pages = int(os.getenv("DOCLAYOUT_MAX_PAGES", "20") or 20)
+            if len(target_pages) > max_yolo_pages:
+                print(f"[PDF-Tables] DocLayout-YOLO 候选页过多 ({len(target_pages)} > {max_yolo_pages})，收敛至前 {max_yolo_pages} 页防超时")
+                target_pages = target_pages[:max_yolo_pages]
+            yolo_stage_budget = min(45.0, float(time_budget_s) * 0.5) if time_budget_s is not None else float(os.getenv("DOCLAYOUT_YOLO_BUDGET_SEC", "60") or 60)
+            yolo_t0 = time.monotonic()
             native_signal_counts = {}
 
             for page_idx in target_pages:
                 if cancel_event is not None and cancel_event.is_set():
+                    break
+                if (time.monotonic() - yolo_t0) >= yolo_stage_budget:
+                    print(f"[PDF-Tables] DocLayout-YOLO 达到单阶段预算上限 ({int(yolo_stage_budget)}s)，提前结束剩余页面检测")
                     break
                 page = doc[page_idx]
                 page_text = page.get_text("text")
@@ -473,19 +526,24 @@ def extract_table_crops_from_pdf(
                 if (has_caption_deficit or has_native_multitable_deficit) and p not in missing_pages:
                     missing_pages.append(p)
 
-            print(f"[PDF-Tables] 本地 DocLayout-YOLO 从 {total_pages} 页 PDF 中定位并提取出 {len(extracted_crops)} 个表格区域 Crop (已覆盖页面: {sorted(list(yolo_covered_pages))})。")
+            print(f"[PDF-Tables] 本地 DocLayout-YOLO 从 {total_pages} 页 PDF 中定位并提取出 {len(extracted_crops)} 个表格区域 Crop (已覆盖页面: {[p+1 for p in sorted(yolo_covered_pages)]})。")
 
             # 若目标页面全部已被 YOLO 充分覆盖，直接返回
             if extracted_crops and not missing_pages:
                 return extracted_crops
 
-            # 若部分页面遗漏，或者 YOLO 未检出切图，触发 PP-Structure 补扫缺失区域
-            if config.get("USE_PP_STRUCTURE", True) and extract_pp_structure_table_crops is not None:
+            # 若部分页面遗漏，或者 YOLO 未检出切图，触发 PP-Structure 补扫缺失区域（最多 1 次）
+            if (
+                config.get("USE_PP_STRUCTURE", True)
+                and extract_pp_structure_table_crops is not None
+                and not (cancel_event is not None and cancel_event.is_set())
+                and (_rem_budget() is None or _rem_budget() >= 10.0)
+            ):
                 pages_to_supplement = missing_pages if extracted_crops else target_pages
                 if pages_to_supplement:
                     try:
                         print(f"[PDF-Tables] YOLO 覆盖不足 (待补扫页面: {[p+1 for p in sorted(pages_to_supplement)]})，正在调用 PP-StructureV3 补扫缺失区域...")
-                        pp_crops = extract_pp_structure_table_crops(pdf_path, config=config, cancel_event=cancel_event, pages=sorted(pages_to_supplement))
+                        pp_crops = _call_pp_structure(sorted(pages_to_supplement))
                         if pp_crops:
                             for p_sup in pages_to_supplement:
                                 pp_on_p = [c for c in pp_crops if c.get("page_index") == p_sup]
@@ -542,16 +600,16 @@ def extract_table_crops_from_pdf(
 
             if extracted_crops:
                 return extracted_crops
-            else:
+            elif not pp_structure_attempted:
                 print("[PDF-Tables] 本地 DocLayout-YOLO 未在目标页检出表格，尝试云端版面分析回退...")
         except Exception as e:
             print(f"[PDF-Tables] 本地 DocLayout-YOLO 视觉检测异常: {e}，尝试云端版面分析回退...")
 
-    # 2. 回退：云端 PP-StructureV3 在线版面定位与表格切图
-    if config.get("USE_PP_STRUCTURE", True) and extract_pp_structure_table_crops is not None:
+    # 2. 回退：云端 PP-StructureV3 在线版面定位与表格切图（若第 1 步已执行过补扫则严禁二次重复提交）
+    if not pp_structure_attempted and config.get("USE_PP_STRUCTURE", True) and extract_pp_structure_table_crops is not None:
         try:
             print("[PDF-Tables] 正在使用 PP-StructureV3 进行在线版面定位与表格切图回退...")
-            pp_crops = extract_pp_structure_table_crops(pdf_path, config=config, cancel_event=cancel_event, pages=pages)
+            pp_crops = _call_pp_structure(pages)
             if pp_crops:
                 return pp_crops
         except Exception as e:

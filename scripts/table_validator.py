@@ -20,6 +20,7 @@ try:
         TABLE_LABEL_PATTERN,
         TABLE_LABEL_RE,
         format_table_label,
+        canonicalize_table_label_key,
         clean_text,
         clean_latex_and_ocr,
         is_table_low_quality,
@@ -31,6 +32,7 @@ except ImportError:
         TABLE_LABEL_PATTERN,
         TABLE_LABEL_RE,
         format_table_label,
+        canonicalize_table_label_key,
         clean_text,
         clean_latex_and_ocr,
         is_table_low_quality,
@@ -148,10 +150,11 @@ def scan_pdf_table_declarations(pdf_path: str) -> Dict[int, List[Dict[str, Any]]
                     continue
 
                 # 2. 检查正规表标题
-                m = re.match(r'^[ \t]*(' + TABLE_LABEL_PATTERN + r')[ \t\.\:：,\-—–]*(.*)', line_clean, re.IGNORECASE)
+                m = re.match(r'^[ \t]*(' + TABLE_LABEL_PATTERN + r')([ \t\.\:：,\-—–]*)(.*)', line_clean, re.IGNORECASE)
                 if m:
                     raw_lbl = m.group(1).strip()
-                    title_part = m.group(2).strip()
+                    sep_part = m.group(2)
+                    title_part = m.group(3).strip()
 
                     # 排除目录和特殊谓语引导 (Table of contents, Table of figures, Table shows, etc.)
                     if re.match(r'^(?:of\s+contents|of\s+figures|of\s+tables|shows|lists|contains|presents)\b', title_part, re.IGNORECASE):
@@ -172,7 +175,13 @@ def scan_pdf_table_declarations(pdf_path: str) -> Dict[int, List[Dict[str, Any]]
                             continue
                         if re.search(r'(?:所示|可知|可见|看出|表明|显示|如下|为此|因此|列出了|给出了|汇总了)$', before_dot.strip()):
                             continue
-                    if any(title_part.startswith(p) for p in [')', '）', ';', '；', ',', '，', '中', '可以', '所示', '可知', '看出', '见', '综合表达', '显示', '表明', '为', '是', '由', '在中', '对于', '根据', '列出了', '给出了', '汇总了', '统计了', '总结了', '展示了', '反映了', '提供了', '对比了', '分析了', 'shown', 'listed', 'summarized']):
+                    # 注意：单字助词/介词 ('中','为','是','由') 仅在紧贴表号无分隔符（如 "表1中列出"、"表1为..."）
+                    # 或明确构成正文引用短语（如 "表1 中的数据"）时排除，严禁误杀 "表3 中国..."、"表1 中生代..." 等正规中文表题
+                    if any(title_part.startswith(p) for p in [')', '）', ';', '；', ',', '，', '可以', '所示', '可知', '看出', '见', '综合表达', '显示', '表明', '在中', '对于', '根据', '列出了', '给出了', '汇总了', '统计了', '总结了', '展示了', '反映了', '提供了', '对比了', '分析了', 'shown', 'listed', 'summarized']):
+                        continue
+                    if not sep_part and any(title_part.startswith(p) for p in ['中', '为', '是', '由']):
+                        continue
+                    if re.match(r'^中(?:的|所|列|给|可|显|表|汇|统|展|反|提|包|含|各|[，。；,\s]|$)', title_part):
                         continue
                     # 排除跨行括号引用残片（如 "(see ... \n Table 2–3; Fig. 5), precluding..."）
                     _tp_head = title_part[:45]
@@ -196,12 +205,34 @@ def scan_pdf_table_declarations(pdf_path: str) -> Dict[int, List[Dict[str, Any]]
                     full_title = f"{lbl} {title_part}".strip() if title_part else lbl
                     full_title = clean_latex_and_ocr(full_title)
 
-                    page_caps.append({
-                        'label': lbl,
-                        'title': full_title,
-                        'raw_line': line_clean,
-                        'is_continuation': False,
-                    })
+                    # 双语同页表题去重（如中文期刊同页同时印有 "表3 ..." 与 "Table 3 ..."，或 "表3.13" 与 "Table 3.13"）
+                    new_canon = canonicalize_table_label_key(lbl)
+                    merged_bilingual = False
+                    if new_canon is not None:
+                        for prev_cap in page_caps:
+                            if prev_cap.get('is_continuation'):
+                                continue
+                            prev_lbl = prev_cap.get('label', '')
+                            if canonicalize_table_label_key(prev_lbl) == new_canon:
+                                aliases = prev_cap.setdefault('aliases', [])
+                                if lbl and lbl != prev_lbl and lbl not in aliases:
+                                    aliases.append(lbl)
+                                # 若前序为英文而当前为中文，以中文表号为主标签并保留英文别名
+                                if not re.search(r'[\u4e00-\u9fa5]', prev_lbl) and re.search(r'[\u4e00-\u9fa5]', lbl):
+                                    if prev_lbl and prev_lbl not in aliases:
+                                        aliases.append(prev_lbl)
+                                    prev_cap['label'] = lbl
+                                    prev_cap['title'] = full_title
+                                merged_bilingual = True
+                                break
+
+                    if not merged_bilingual:
+                        page_caps.append({
+                            'label': lbl,
+                            'title': full_title,
+                            'raw_line': line_clean,
+                            'is_continuation': False,
+                        })
 
             if page_caps:
                 page_declarations[p_idx] = page_caps
@@ -393,9 +424,11 @@ def validate_native_extraction_pipeline(
             if p_idx - 1 >= 0:
                 pages_requiring_ocr.add(p_idx - 1)
 
-    # 4. 检验文献全局表号连续性与空间匹配
+    # 4. 检验文献全局表号连续性与空间匹配（兼容中英文双语与中文数字规范键等价匹配）
     extracted_labels = set()
+    extracted_canon_keys = set()
     bound_table_ids = set()
+    declared_canon_keys = {k for lbl in all_declared_labels if (k := canonicalize_table_label_key(lbl)) is not None}
     for r in valid_native_results:
         df = r.get('df')
         lbl = (df.attrs.get('label') if df is not None and hasattr(df, 'attrs') else None) or r.get('label')
@@ -403,11 +436,15 @@ def validate_native_extraction_pipeline(
             fmt_lbl = format_table_label(lbl)
             if fmt_lbl:
                 extracted_labels.add(fmt_lbl)
-                if fmt_lbl in all_declared_labels:
+                ck = canonicalize_table_label_key(fmt_lbl)
+                if ck is not None:
+                    extracted_canon_keys.add(ck)
+                if fmt_lbl in all_declared_labels or (ck is not None and ck in declared_canon_keys):
                     bound_table_ids.add(id(r))
 
     for lbl in all_declared_labels:
-        if lbl not in extracted_labels:
+        lbl_ck = canonicalize_table_label_key(lbl)
+        if lbl not in extracted_labels and (lbl_ck is None or lbl_ck not in extracted_canon_keys):
             decl_p = label_to_declared_page.get(lbl, 0)
             decl_info = next((d for d in page_declarations.get(decl_p, []) if format_table_label(d.get('label')) == lbl), None)
             decl_title = (decl_info.get('title') or "") if decl_info else ""
@@ -859,6 +896,197 @@ def verify_table_numeric_integrity(
     return is_valid, info_dict
 
 
+_FIGURE_PLATE_CAPTION_RE = re.compile(
+    r'(?:^|\n|\s)(?:Fig\.?\s*\d+|Figure\s*\d+|Plate\s*[IVX\d]+|Scheme\s*\d+|Map\s*\d+|Photo\s*\d+|'
+    r'Graphical\s+abstract|图\s*\d+|图版\s*[一二三四五六七八九十\d]+)',
+    re.IGNORECASE,
+)
+
+
+def _max_page_image_coverage(page) -> float:
+    """估算单页中最大单张光栅图像占页面可视面积的比例 (0.0~1.0)。"""
+    try:
+        rect = getattr(page, "rect", None)
+        page_area = float(rect.width * rect.height) if rect is not None else 0.0
+        if page_area <= 0:
+            return 0.0
+        imgs = page.get_images(full=True)
+        if not imgs:
+            return 0.0
+        max_cov = 0.0
+        for img_info in imgs:
+            xref = img_info[0] if isinstance(img_info, (list, tuple)) and img_info else None
+            if xref is None:
+                continue
+            try:
+                rects = page.get_image_rects(xref)
+                for r in rects or []:
+                    area = max(0.0, float(r.width)) * max(0.0, float(r.height))
+                    max_cov = max(max_cov, min(1.0, area / page_area))
+            except Exception:
+                pass
+        return max_cov
+    except Exception:
+        return 0.0
+
+
+def classify_pdf_scanned_pages(pdf_path: str) -> Dict[str, Any]:
+    """
+    区分「真正的扫描页/无文本层页」与「现代文本型期刊 PDF 中的纯插图页/地质图版页」。
+
+    判定原则：
+    - 整本扫描件或超短文档 (<=3 页，或富文本页占比 <40%)：保守保持既有规则 (`len(images) > 0 and len(words) < 80`)，
+      确保真实扫描页（含扫描插表）必被检出；
+    - 文本型现代 PDF (总页数 >=4 且富文本页占比 >=40%)：
+      1. 含图注/图版声明 (Fig./Figure/Plate/图N/图版) 且无表题声明的页面 → 判定为纯插图页，不标为扫描页；
+      2. 含可读可选中文本层 (`len(words) >= 12` 或 `len(words) >= 8` 且最大单图面积占比 <70%) 且无表题 → 不标为扫描页；
+      3. 仅真正无文本 (`len(words) < 8`) 且大幅光栅图像 (`max_img_cov >= 0.70`) 才归为扫描页；
+         若其位于文档尾部图版区 (全部在最后富文本页之后且位于文档后 40%)，单独标记于 `trailing_plate_pages`。
+    """
+    result = {
+        'scanned_pages': [],
+        'pure_image_pages': [],
+        'figure_plate_pages': [],
+        'trailing_plate_pages': [],
+        'total_pages': 0,
+        'text_rich_pages': 0,
+        'is_text_based_pdf': False,
+        'open_failed': False,
+    }
+    if not pdf_path or not os.path.exists(pdf_path):
+        return result
+
+    doc = None
+    try:
+        doc = fitz.open(pdf_path)
+        total_pages = len(doc)
+        result['total_pages'] = total_pages
+        if total_pages == 0:
+            return result
+
+        page_stats = []
+        page_texts = {}
+        page_has_fig = {}
+        page_has_tbl = {}
+        text_rich_pages = 0
+        last_text_rich_idx = -1
+        for p_idx, page in enumerate(doc):
+            words = page.get_text("words") or []
+            images = page.get_images() or []
+            raw_word_cnt = len(words)
+            # CJK 文本在 get_text("words") 中往往按整行合并为单个词元，需按汉字数折算等效词数
+            cjk_cnt = sum(1 for w in words for ch in str(w[4]) if '\u4e00' <= ch <= '\u9fff')
+            word_cnt = max(raw_word_cnt, cjk_cnt // 2)
+            if word_cnt >= 80:
+                text_rich_pages += 1
+                last_text_rich_idx = p_idx
+            page_stats.append((p_idx, page, word_cnt, len(images)))
+
+        result['text_rich_pages'] = text_rich_pages
+        is_text_based = (total_pages >= 4 and (text_rich_pages / total_pages) >= 0.40)
+        result['is_text_based_pdf'] = is_text_based
+
+        doc_has_fig_captions = False
+        low_text_img_indices = set()
+        if is_text_based:
+            for p_idx, page, word_cnt, img_cnt in page_stats:
+                txt = (page.get_text("text") or "").strip()
+                page_texts[p_idx] = txt
+                has_fig = bool(txt and _FIGURE_PLATE_CAPTION_RE.search(txt))
+                has_tbl = bool(txt and TABLE_LABEL_RE.search(txt))
+                page_has_fig[p_idx] = has_fig
+                page_has_tbl[p_idx] = has_tbl
+                if has_fig:
+                    doc_has_fig_captions = True
+                if img_cnt > 0 and word_cnt < 80 and not has_tbl:
+                    low_text_img_indices.add(p_idx)
+
+        text_rich_prefix = [0] * (total_pages + 1)
+        for p_idx, _, word_cnt, _ in page_stats:
+            text_rich_prefix[p_idx + 1] = text_rich_prefix[p_idx] + (1 if word_cnt >= 80 else 0)
+
+        for p_idx, page, word_cnt, img_cnt in page_stats:
+            if img_cnt == 0 or word_cnt >= 80:
+                continue
+
+            if not is_text_based:
+                result['scanned_pages'].append(p_idx)
+                if word_cnt < 25:
+                    result['pure_image_pages'].append(p_idx)
+                continue
+
+            # 文本型现代 PDF：精细区分纯插图页/图版页 vs 真正无文本层扫描页
+            has_table_lbl = page_has_tbl.get(p_idx, False)
+            has_fig_cap = page_has_fig.get(p_idx, False)
+
+            if has_fig_cap and not has_table_lbl:
+                result['figure_plate_pages'].append(p_idx)
+                continue
+
+            if has_table_lbl:
+                # 该页已有明确文字表题声明，由声明总账追踪，不归类为“未知扫描页”
+                if word_cnt < 25:
+                    result['pure_image_pages'].append(p_idx)
+                continue
+
+            max_cov = _max_page_image_coverage(page)
+            if word_cnt >= 12 or (word_cnt >= 8 and max_cov < 0.70):
+                result['figure_plate_pages'].append(p_idx)
+                continue
+
+            # 相邻页带有图注（如 Springer 整页地质图/显微照片页，图注排在上一页或下一页）
+            adj_has_fig = page_has_fig.get(p_idx - 1, False) or page_has_fig.get(p_idx + 1, False)
+            if adj_has_fig and text_rich_pages >= 4:
+                result['figure_plate_pages'].append(p_idx)
+                continue
+
+            # 位于文本型现代论文后半部的纯图版/稿件附页 (含 Elsevier 稿件 Figures 在 Tables 之前排布的情形)
+            is_trailing_plate = (
+                text_rich_pages >= 5
+                and last_text_rich_idx >= 0
+                and p_idx > last_text_rich_idx
+                and p_idx >= int(total_pages * 0.55)
+            )
+            in_multi_plate_run = ((p_idx - 1) in low_text_img_indices) or ((p_idx + 1) in low_text_img_indices)
+            is_manuscript_fig_block = (
+                text_rich_pages >= 5
+                and text_rich_prefix[p_idx] >= 5
+                and p_idx >= int(total_pages * 0.50)
+                and doc_has_fig_captions
+                and in_multi_plate_run
+            )
+            if is_trailing_plate or is_manuscript_fig_block:
+                result['trailing_plate_pages'].append(p_idx)
+                result['figure_plate_pages'].append(p_idx)
+                continue
+
+            # 高度文本化现代期刊论文中的零星孤立整页插图（例如 15-24 页期刊中仅 1-2 页整页地图/图版）
+            if (
+                total_pages >= 8
+                and (text_rich_pages / total_pages) >= 0.75
+                and len(low_text_img_indices) <= 2
+                and doc_has_fig_captions
+            ):
+                result['figure_plate_pages'].append(p_idx)
+                continue
+
+            if max_cov >= 0.70 or word_cnt == 0:
+                result['scanned_pages'].append(p_idx)
+                if word_cnt < 25:
+                    result['pure_image_pages'].append(p_idx)
+            else:
+                result['figure_plate_pages'].append(p_idx)
+    except Exception:
+        result['open_failed'] = True
+    finally:
+        if doc is not None:
+            try:
+                doc.close()
+            except Exception:
+                pass
+    return result
+
+
 def cross_check_missed_tables(
     extracted_tables: List[Any],
     pdf_path: str,
@@ -877,6 +1105,7 @@ def cross_check_missed_tables(
                 lbl = format_table_label(d.get('label', ''))
                 declared_tables.append({
                     'label': lbl or d.get('label'),
+                    'canon_key': canonicalize_table_label_key(lbl or d.get('label', '')),
                     'title': d.get('title', ''),
                     'page_idx': p_idx,
                     'raw_line': d.get('raw_line', ''),
@@ -913,6 +1142,7 @@ def cross_check_missed_tables(
         extracted_info.append({
             'index': idx,
             'label': fmt_lbl or raw_lbl,
+            'canon_key': canonicalize_table_label_key(fmt_lbl or raw_lbl),
             'title': title,
             'page_idx': p_idx,
             'covered_pages': list(df.attrs.get('covered_pages', [])) if df is not None else [],
@@ -921,28 +1151,26 @@ def cross_check_missed_tables(
     missed_tables = []
     for d in declared_tables:
         lbl = d['label']
-        matching = [info for info in extracted_info if info['label'] == lbl]
+        d_ck = d.get('canon_key')
+        matching = [
+            info for info in extracted_info
+            if info['label'] == lbl or (d_ck is not None and info.get('canon_key') == d_ck)
+        ]
         # Unique labels remain usable for sources without page provenance.
         # Reused labels, however, require independent page coverage.
-        repeated = sum(other['label'] == lbl for other in declared_tables) > 1
+        repeated = sum(
+            other['label'] == lbl or (d_ck is not None and other.get('canon_key') == d_ck)
+            for other in declared_tables
+        ) > 1
         covered = bool(matching) and (not repeated or any(
             d['page_idx'] == info['page_idx'] or d['page_idx'] in info['covered_pages']
             for info in matching))
         if lbl and not covered:
             missed_tables.append(d)
 
-    # 扫描页检测（低字符量且含图像的页面，其表格无法由文本声明检出，属于“覆盖度未知”）
-    scanned_pages = []
-    if os.path.exists(pdf_path):
-        try:
-            with fitz.open(pdf_path) as doc:
-                for p_idx, page in enumerate(doc):
-                    words = page.get_text("words")
-                    images = page.get_images()
-                    if len(images) > 0 and len(words) < 80:
-                        scanned_pages.append(p_idx)
-        except Exception:
-            pass
+    # 扫描页检测（精准区分整本扫描页与文本型现代 PDF 的纯插图页/图版页）
+    scan_info = classify_pdf_scanned_pages(pdf_path)
+    scanned_pages = list(scan_info.get('scanned_pages', []))
 
     extracted_pages = set()
     for info in extracted_info:
@@ -967,6 +1195,8 @@ def cross_check_missed_tables(
         'coverage_unknown': coverage_unknown,
         'scanned_pages': scanned_pages,
         'uncovered_scanned_pages': uncovered_scanned_pages,
+        'is_text_based_pdf': scan_info.get('is_text_based_pdf', False),
+        'figure_plate_pages': scan_info.get('figure_plate_pages', []),
     }
     if missed_tables:
         missed_summary = [f"{m['label']} (Page {m['page_idx']+1})" for m in missed_tables]

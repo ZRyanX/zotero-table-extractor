@@ -19,6 +19,7 @@ import json
 import tempfile
 import threading
 import contextlib
+from typing import Optional, Tuple
 
 try:
     from .models import ExtractedTable, TableCell
@@ -1041,7 +1042,7 @@ def clean_table_filename(raw_title, index):
 
 HYPHEN_CHARS = r'[\-\u2010\u2011\u2012\u2013\u2014\u2015—–._~]'
 TABLE_SUB_SEP = r'(?:\s*[\-\u2010\u2011\u2012\u2013\u2014\u2015—–_~]\s*|\.(?!\s))'
-CHINESE_DIGITS = r'[一二三四五六七八九十百千万零壹贰叁肆伍陆柒捌玖拾]'
+CHINESE_DIGITS = r'[一二三四五六七八九十百千万零〇两壹贰叁肆伍陆柒捌玖拾佰仟]'
 ROMAN_DIGITS = r'[\u2160-\u217fIVXLCDMivxlcdm]'
 FULLWIDTH_DIGITS = r'[\uff10-\uff19]'
 ROMAN_NUM_PATTERN = r'(?:[\u2160-\u217f]+|\b(?=[MDCLXVI])M*(?:C[MD]|D?C{0,3})(?:X[CL]|L?X{0,3})(?:I[XV]|V?I{0,3})(?<=[MDCLXVI])\b)'
@@ -1050,10 +1051,136 @@ TABLE_LABEL_PATTERN = r'(?:附表|附录表|补充表|表|Supplementary\s+Table|
 TABLE_LABEL_RE = re.compile(TABLE_LABEL_PATTERN, re.IGNORECASE)
 
 
+_CN_DIGIT_MAP = {
+    '零': 0, '〇': 0,
+    '一': 1, '壹': 1,
+    '二': 2, '贰': 2, '两': 2,
+    '三': 3, '叁': 3,
+    '四': 4, '肆': 4,
+    '五': 5, '伍': 5,
+    '六': 6, '陆': 6,
+    '七': 7, '柒': 7,
+    '八': 8, '捌': 8,
+    '九': 9, '玖': 9,
+}
+_CN_UNIT_MAP = {'十': 10, '拾': 10, '百': 100, '佰': 100, '千': 1000, '仟': 1000}
+
+
+def chinese_numeral_to_arabic(cn_str: str) -> Optional[int]:
+    """将中文数字（如 '一', '三', '十', '十二', '二十三', '壹', '拾贰'）转换为正整数。"""
+    if not cn_str:
+        return None
+    s = cn_str.strip()
+    if not s or not all(ch in _CN_DIGIT_MAP or ch in _CN_UNIT_MAP for ch in s):
+        return None
+    total = 0
+    current = 0
+    has_unit = False
+    for ch in s:
+        if ch in _CN_DIGIT_MAP:
+            current = _CN_DIGIT_MAP[ch]
+        elif ch in _CN_UNIT_MAP:
+            unit = _CN_UNIT_MAP[ch]
+            has_unit = True
+            if current == 0:
+                current = 1
+            total += current * unit
+            current = 0
+    if not has_unit and len(s) > 1:
+        # 逐位中文数字（如 '一二' -> 12）
+        val = 0
+        for ch in s:
+            val = val * 10 + _CN_DIGIT_MAP[ch]
+        return val if val > 0 else None
+    total += current
+    return total if total > 0 else None
+
+
+def _normalize_cn_numeral_segments(num_str: str) -> str:
+    """将表号中纯中文数字段（如 '三', '二-三', '十二'）规范化为阿拉伯数字（'3', '2-3', '12'）。"""
+    if not num_str:
+        return num_str
+
+    def _repl(match):
+        token = match.group(0)
+        val = chinese_numeral_to_arabic(token)
+        return str(val) if val is not None else token
+
+    return re.sub(r'[零〇一二两三四五六七八九十百千壹贰叁肆伍陆柒捌玖拾佰仟]+', _repl, num_str)
+
+
+_ROMAN_NUMERAL_MAP = {
+    'i': 1, 'ii': 2, 'iii': 3, 'iv': 4, 'v': 5,
+    'vi': 6, 'vii': 7, 'viii': 8, 'ix': 9, 'x': 10,
+    'xi': 11, 'xii': 12, 'xiii': 13, 'xiv': 14, 'xv': 15,
+    'xvi': 16, 'xvii': 17, 'xviii': 18, 'xix': 19, 'xx': 20,
+    'xxi': 21, 'xxii': 22, 'xxiii': 23, 'xxiv': 24, 'xxv': 25,
+    'xxvi': 26, 'xxvii': 27, 'xxviii': 28, 'xxix': 29, 'xxx': 30,
+}
+
+
+def _normalize_roman_key(num_str: str) -> str:
+    """将纯罗马数字表号 (如 'ii', 'iv', 'xii') 映射为阿拉伯数字字符串，用于跨格式表号匹配。"""
+    s = (num_str or "").strip().lower()
+    if s in _ROMAN_NUMERAL_MAP:
+        return str(_ROMAN_NUMERAL_MAP[s])
+    return s
+
+
+def canonicalize_table_label_key(raw_label: str) -> Optional[Tuple[str, str]]:
+    """
+    将中英文、中文数字及罗马数字表号映射为统一规范键 `(category, num_key)`，用于双语同页去重与跨语言表号核验。
+    示例：
+      - '表3' / 'Table 3' / '表三' / 'Table III' -> ('main', '3')
+      - '表3.13' / 'Table 3.13' -> ('main', '3.13')
+      - '表3-13' / 'Table 3-13' -> ('main', '3-13')
+      - '附表1' / 'Table S1' / 'Supplementary Table 1' -> ('supp', '1')
+      - '附录表1' / 'Table A1' / 'Appendix Table 1' -> ('app', '1')
+    """
+    fmt = format_table_label(raw_label)
+    if not fmt:
+        return None
+    s = fmt.strip()
+
+    m_supp = re.match(
+        r'^(?:(?:Supplementary|Supplemental)\s+Table\s+S?|Table\s+S|附表\s*S?|补充表\s*S?)(.+)$',
+        s,
+        re.IGNORECASE,
+    )
+    if m_supp:
+        num = _normalize_roman_key(re.sub(r'\s+', '', m_supp.group(1)).lower())
+        return ('supp', num)
+
+    m_app = re.match(
+        r'^(?:Appendix\s+Table\s+A?|Table\s+A|附录表\s*A?)(.+)$',
+        s,
+        re.IGNORECASE,
+    )
+    if m_app:
+        num = _normalize_roman_key(re.sub(r'\s+', '', m_app.group(1)).lower())
+        return ('app', num)
+
+    m_ext = re.match(
+        r'^(?:Extended\s+Data\s+Table\s+E?|Table\s+E)(.+)$',
+        s,
+        re.IGNORECASE,
+    )
+    if m_ext:
+        num = _normalize_roman_key(re.sub(r'\s+', '', m_ext.group(1)).lower())
+        return ('ext', num)
+
+    m_main = re.match(r'^(?:Table\s+|表\s*)(.+)$', s, re.IGNORECASE)
+    if m_main:
+        num = _normalize_roman_key(re.sub(r'\s+', '', m_main.group(1)).lower())
+        return ('main', num)
+
+    return None
+
+
 def format_table_label(raw_label: str) -> str:
     """
     规范化表号名称，严密保留并标准化文中的所有真实命名形式。
-    支持罗马数字 (Table I/IV)、S-附表 (Table S1)、中文汉字 (表一/附表一)、章节多级表号以及严格剥离标题首词。
+    支持罗马数字 (Table I/IV)、S-附表 (Table S1)、中文汉字 (表一/表三 -> 表1/表3)、章节多级表号以及严格剥离标题首词。
     """
     if not raw_label:
         return ""
@@ -1063,16 +1190,17 @@ def format_table_label(raw_label: str) -> str:
     s = re.sub(r'(?<![A-Za-z])T\s*A\s*B\s*L\s*E(?![A-Za-z])', 'Table', s, flags=re.IGNORECASE)
     s = re.sub(r'(?<![A-Za-z])T\s*A\s*B\s*\.(?![A-Za-z])', 'Tab.', s, flags=re.IGNORECASE)
     
-    # 截断紧随在表号后面的标题部分（如 "Table 1. Description", "Table 1: Geological", "Table 1 - Summary", "Tab 1: Description"）
-    prefix_pat = r'^((?:Supplementary\s+Table|Supplemental\s+Table|Extended\s+Data\s+Table|Appendix\s+Table|TABLE|Table|Tab(?:\.|\b)|附表|附录表|补充表|表)\s*(?:' + TABLE_NUM_PART + r'(?:' + TABLE_SUB_SEP + TABLE_NUM_PART + r')*(?:\([a-zA-Z0-9]\)|（[a-zA-Z0-9]）|[a-zA-Z]\b)?))(?:[\.\:\：\—\–\s]+.*)?$'
+    # 截断紧随在表号后面的标题部分（如 "Table 1. Description", "Table 1: Geological", "Table 1 - Summary", "Tab 1: Description", "表三、标题"）
+    prefix_pat = r'^((?:Supplementary\s+Table|Supplemental\s+Table|Extended\s+Data\s+Table|Appendix\s+Table|TABLE|Table|Tab(?:\.|\b)|附表|附录表|补充表|表)\s*(?:' + TABLE_NUM_PART + r'(?:' + TABLE_SUB_SEP + TABLE_NUM_PART + r')*(?:\([a-zA-Z0-9]\)|（[a-zA-Z0-9]）|[a-zA-Z]\b)?))(?:[\.\:\：\—\–\、\s]+.*)?$'
     s = re.sub(prefix_pat, r'\1', s, flags=re.IGNORECASE).strip()
 
-    # 1. 中文表号规范化
-    m_cn = re.match(r'^(附表|附录表|补充表|表)\s*([A-Za-z0-9\u4e00-\u9fa5\u2160-\u217fIVXLCDMivxlcdm]+(?:\s*' + HYPHEN_CHARS + r'\s*[A-Za-z0-9\u4e00-\u9fa5\u2160-\u217fIVXLCDMivxlcdm]+)*(?:\([a-zA-Z0-9]\)|（[a-zA-Z0-9]）|[a-zA-Z])?)$', s, re.IGNORECASE)
+    # 1. 中文表号规范化（含中文大写/小写数字转阿拉伯数字：表一 -> 表1, 表三 -> 表3, 表一〇 -> 表10, 附表二 -> 附表2）
+    m_cn = re.match(r'^(附表|附录表|补充表|表)\s*([A-Za-z0-9\u3007\u4e00-\u9fa5\u2160-\u217fIVXLCDMivxlcdm]+(?:\s*' + HYPHEN_CHARS + r'\s*[A-Za-z0-9\u3007\u4e00-\u9fa5\u2160-\u217fIVXLCDMivxlcdm]+)*(?:\([a-zA-Z0-9]\)|（[a-zA-Z0-9]）|[a-zA-Z])?)$', s, re.IGNORECASE)
     if m_cn:
         prefix, num = m_cn.groups()
         num_clean = re.sub(r'[\s\u2010\u2011\u2012\u2013\u2014\u2015—–_]', '-', num)
         num_clean = re.sub(r'-{2,}', '-', num_clean).strip('-')
+        num_clean = _normalize_cn_numeral_segments(num_clean)
         return f"{prefix}{num_clean}"
 
     # 1b. 纯数字章节表号（如 4.9, 4.10, 4.11）
@@ -1234,6 +1362,47 @@ def is_table_low_quality(df) -> bool:
         if not has_named_header and df.shape[0] <= 10 and (non_empty / max(1, total_cells)) < 0.45:
             return True
 
+    # 6. 单列坍缩多列表检测：保留合法单列参数/序列清单（如 ["Param1", "Param2", "Param3"]），
+    #    仅拦截明显由多列科学表格坍缩为 1 列的畸形提取（每行塞入多个空白分隔列/数值字段或整行表题+多列数据）
+    if df.shape[1] == 1 and df.shape[0] >= 3:
+        col0_vals = [
+            str(df.iat[r, 0]).strip()
+            for r in range(df.shape[0])
+            if str(df.iat[r, 0]).strip() not in ('', 'nan', 'none')
+        ]
+        if len(col0_vals) >= 3:
+            if is_table_squeezed(df):
+                return True
+            collapsed_rows = sum(
+                1 for v in col0_vals
+                if (len(v.split()) >= 5 and len(v) >= 28)
+                or (len(re.findall(r'(?<![A-Za-z0-9_])[-+]?\d+(?:\.\d+)?(?![A-Za-z0-9_])', v)) >= 2 and len(v.split()) >= 3)
+            )
+            if collapsed_rows >= 3 and (collapsed_rows / len(col0_vals)) >= 0.45:
+                return True
+            hdr0_str = str(df.columns[0]).strip()
+            if (
+                re.match(r'^(?:Table|Tab\.?|表)\s*\d+', hdr0_str, re.IGNORECASE)
+                and len(hdr0_str) >= 25
+                and sum(1 for v in col0_vals if len(v) >= 25 or len(v.split()) >= 4) >= max(2, int(len(col0_vals) * 0.4))
+            ):
+                return True
+
+    # 7. 图注 / 图例伪表过滤（如表头或首行直接为 "Fig. 3 A" / "Histograms of ..." / "Photomicrographs of ..." 且几乎无数据列）
+    if df.shape[0] <= 8:
+        hdr_first = " ".join(
+            [str(c).strip() for c in df.columns[:3]]
+            + ([str(df.iat[0, c]).strip() for c in range(min(3, df.shape[1]))] if df.shape[0] >= 1 else [])
+        )
+        if re.search(
+            r'(?:^|\b)(?:Fig\.?\s*\d+\s*[A-Za-z]?|Figure\s*\d+|Histograms?\s+of|Photomicrographs?\s+of|Back-?scattered\s+electron\s+image)',
+            hdr_first,
+            re.IGNORECASE,
+        ):
+            num_cells = sum(1 for v in all_cells_flat if re.fullmatch(r'[-+]?\d+(?:\.\d+)?%?', v))
+            if (num_cells / max(1, len(all_cells_flat))) < 0.15:
+                return True
+
     return False
 
 
@@ -1318,6 +1487,26 @@ def is_metadata_table(df):
         flat_lower = " ".join(str(v).lower() for v in df.values.flatten() if v is not None)
         if ("doi:" in flat_lower or "引用" in flat_lower) and ("复制" in flat_lower or "copy" in flat_lower or len(df) == 1):
             return True
+
+    # 参考文献列表伪表拦截（如单/双列内连续出现 "[1]包民伟... [J]" 或 "Author et al., 2015, 123-145"）
+    if df.shape[1] <= 2 and df.shape[0] >= 2:
+        row_texts = [
+            " ".join(
+                str(df.iat[r, c]).strip()
+                for c in range(df.shape[1])
+                if str(df.iat[r, c]).strip() not in ("", "nan", "none")
+            )
+            for r in range(df.shape[0])
+        ]
+        non_empty_rows = [rt for rt in row_texts if rt]
+        if len(non_empty_rows) >= 2:
+            bib_re = re.compile(
+                r'(?:^\s*\[\d+\]\s*\S|\[[JMCDRP](?:/OL)?\]|et\s+al\.,?\s*(?:19|20)\d{2}.*\d+[-–]\d+)',
+                re.IGNORECASE,
+            )
+            bib_hits = sum(1 for rt in non_empty_rows if bib_re.search(rt))
+            if bib_hits >= 2 and (bib_hits / len(non_empty_rows)) >= 0.40:
+                return True
 
     # 作者-单位角标映射表（如 ['邓昌州', '1'] / ['张嘉玮', '2,3,4 *']）
     if df.shape[1] == 2 and not any(
