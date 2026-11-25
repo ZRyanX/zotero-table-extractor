@@ -32,6 +32,7 @@ try:
         extract_browser_pid,
         close_browser_safely,
         get_thread_browser_pool,
+        apply_browser_user_agent,
     )
 except ImportError:
     try:
@@ -41,6 +42,7 @@ except ImportError:
             extract_browser_pid,
             close_browser_safely,
             get_thread_browser_pool,
+            apply_browser_user_agent,
         )
     except ImportError:
         find_playwright_chromium = lambda: None
@@ -48,6 +50,7 @@ except ImportError:
         extract_browser_pid = lambda **kwargs: None
         close_browser_safely = lambda **kwargs: None
         get_thread_browser_pool = None
+        apply_browser_user_agent = lambda target_kwargs, engine_name="playwright", launch_kwargs=None, **kw: target_kwargs
 
 
 # Aliases to shared helpers (kept as bare names so call sites are unchanged)
@@ -278,10 +281,9 @@ def interactive_cnki_cookie_capture():
                 print(f"[Playwright] 使用自动识别的 Chromium 路径: {exec_path}")
             browser = p.chromium.launch(headless=False, executable_path=exec_path)
             _cnki_pid = extract_browser_pid(browser=browser, playwright_obj=p)
-            context = browser.new_context(
-                viewport={"width": 1280, "height": 800},
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-            )
+            _cnki_ctx_kwargs = {"viewport": {"width": 1280, "height": 800}}
+            apply_browser_user_agent(_cnki_ctx_kwargs, engine_name=_cnki_eng)
+            context = browser.new_context(**_cnki_ctx_kwargs)
             page = context.new_page()
             
             # Go to CNKI
@@ -4325,14 +4327,13 @@ def extract_tables_via_playwright(url, table_idx="all"):
         if use_pool:
             exec_path = find_playwright_chromium()
             pool = get_thread_browser_pool()
+            pool_ctx_kwargs = apply_browser_user_agent({}, engine_name=_pw_engine)
             with pool.acquire_context(
                 _pw_factory,
                 engine_name=_pw_engine,
                 headless=True,
                 exec_path=exec_path,
-                context_kwargs={
-                    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
-                },
+                context_kwargs=pool_ctx_kwargs,
             ) as (_browser, context):
                 page = context.new_page()
                 install_cdp_port_guard(page)
@@ -4377,9 +4378,8 @@ def extract_tables_via_playwright(url, table_idx="all"):
                     print(f"[Playwright] 使用自动识别的 Chromium 路径: {exec_path}")
                 browser = p.chromium.launch(headless=True, executable_path=exec_path)
                 _self_pid = extract_browser_pid(browser=browser, playwright_obj=p)
-                page = browser.new_page(
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
-                )
+                _page_kwargs = apply_browser_user_agent({}, engine_name=_pw_engine)
+                page = browser.new_page(**_page_kwargs)
                 install_cdp_port_guard(page)
 
             install_slow_tracker_route_blocker(page, url)

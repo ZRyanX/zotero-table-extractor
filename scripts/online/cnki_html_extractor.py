@@ -12,6 +12,7 @@ try:
         resolve_sync_playwright,
         extract_browser_pid,
         close_browser_safely,
+        apply_browser_user_agent,
     )
 except ImportError:
     try:
@@ -20,6 +21,7 @@ except ImportError:
             resolve_sync_playwright,
             extract_browser_pid,
             close_browser_safely,
+            apply_browser_user_agent,
         )
     except ImportError:
         find_playwright_chromium = lambda: None
@@ -28,6 +30,7 @@ except ImportError:
         close_browser_safely = lambda browser=None, context=None, proc_pid=None, force_kill_on_error=True: (
             browser.close() if browser is not None else (context.close() if context is not None else None)
         )
+        apply_browser_user_agent = lambda target_kwargs, engine_name="playwright", launch_kwargs=None, **kw: target_kwargs
 
 
 # Shared helpers (text cleaning, table filtering, cookie parsing)
@@ -361,13 +364,13 @@ def extract_cnki_html_tables(url, cookies_path=None, table_idx="all", headed=Fal
             _persistent_ok = False
             if user_data_dir:
                 try:
-                    context = p.chromium.launch_persistent_context(
-                        user_data_dir,
-                        headless=headless,
-                        executable_path=exec_path,
-                        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-                        viewport={"width": 1280, "height": 800}
-                    )
+                    lp_kwargs = {
+                        "headless": headless,
+                        "executable_path": exec_path,
+                        "viewport": {"width": 1280, "height": 800},
+                    }
+                    apply_browser_user_agent(lp_kwargs, engine_name=_pw_engine)
+                    context = p.chromium.launch_persistent_context(user_data_dir, **lp_kwargs)
                     _self_launched_pid = extract_browser_pid(context=context, playwright_obj=p)
                     page = context.pages[0] if context.pages else context.new_page()
                     if install_cdp_port_guard:
@@ -382,10 +385,9 @@ def extract_cnki_html_tables(url, cookies_path=None, table_idx="all", headed=Fal
             if not _persistent_ok:
                 browser = p.chromium.launch(headless=headless, executable_path=exec_path)
                 _self_launched_pid = extract_browser_pid(browser=browser, playwright_obj=p)
-                context = browser.new_context(
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-                    viewport={"width": 1280, "height": 800}
-                )
+                ctx_kwargs = {"viewport": {"width": 1280, "height": 800}}
+                apply_browser_user_agent(ctx_kwargs, engine_name=_pw_engine)
+                context = browser.new_context(**ctx_kwargs)
                 page = context.new_page()
                 if install_cdp_port_guard:
                     install_cdp_port_guard(context)

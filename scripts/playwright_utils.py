@@ -110,6 +110,48 @@ def find_playwright_chromium():
     return None
 
 
+DEFAULT_BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/136.0.0.0 Safari/537.36"
+)
+
+
+def should_use_native_user_agent(engine_name: str = "playwright", launch_kwargs=None) -> bool:
+    """
+    判断是否应保留浏览器原生 User-Agent（不手动覆写 `user_agent`）：
+    - Patchright 官方反检测最佳实践要求不覆写 UA，避免与真实内核的 `Sec-CH-UA` Client Hints
+      和 `navigator.userAgentData` 产生版本/平台指纹不一致；
+    - 通过 `channel="chrome"` / `channel="msedge"` 启动系统日常浏览器时同样应保留原生 UA。
+    """
+    if str(engine_name or "").strip().lower() == "patchright":
+        return True
+    if isinstance(launch_kwargs, dict) and launch_kwargs.get("channel"):
+        return True
+    return False
+
+
+def apply_browser_user_agent(
+    target_kwargs: dict,
+    engine_name: str = "playwright",
+    launch_kwargs=None,
+    fallback_ua: str = DEFAULT_BROWSER_USER_AGENT,
+) -> dict:
+    """
+    按浏览器引擎决定是否写入兜底 `user_agent`：
+    - Patchright 或系统浏览器 channel：保持原生 UA（不写入 `user_agent`）；
+    - 普通 Playwright Chromium：若未显式指定，则写入统一的现代兜底 UA。
+    """
+    if target_kwargs is None:
+        target_kwargs = {}
+    if "user_agent" not in target_kwargs and not should_use_native_user_agent(
+        engine_name=engine_name,
+        launch_kwargs=launch_kwargs,
+    ):
+        target_kwargs["user_agent"] = fallback_ua
+    return target_kwargs
+
+
 def resolve_sync_playwright(
     module_sync_pw=None,
     default_playwright_sync=None,

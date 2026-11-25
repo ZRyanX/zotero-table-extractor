@@ -384,6 +384,61 @@ class TestP1BrowserStealthAndLifecycle(unittest.TestCase):
         pool.close_all()
         self.assertTrue(b1.closed)
 
+    def test_native_user_agent_preserved_for_patchright_and_channels(self):
+        self.assertTrue(playwright_utils.should_use_native_user_agent("patchright"))
+        self.assertTrue(playwright_utils.should_use_native_user_agent("playwright", {"channel": "chrome"}))
+        self.assertFalse(playwright_utils.should_use_native_user_agent("playwright"))
+        self.assertFalse(playwright_utils.should_use_native_user_agent("custom"))
+
+        pr_kwargs = playwright_utils.apply_browser_user_agent({"viewport": {"width": 1280, "height": 800}}, engine_name="patchright")
+        self.assertNotIn("user_agent", pr_kwargs)
+
+        ch_kwargs = playwright_utils.apply_browser_user_agent({}, engine_name="playwright", launch_kwargs={"channel": "msedge"})
+        self.assertNotIn("user_agent", ch_kwargs)
+
+        pw_kwargs = playwright_utils.apply_browser_user_agent({}, engine_name="playwright")
+        self.assertEqual(pw_kwargs.get("user_agent"), playwright_utils.DEFAULT_BROWSER_USER_AGENT)
+
+        explicit_kwargs = playwright_utils.apply_browser_user_agent({"user_agent": "CustomUA/1.0"}, engine_name="patchright")
+        self.assertEqual(explicit_kwargs.get("user_agent"), "CustomUA/1.0")
+
+    def test_general_launch_context_or_browser_omits_ua_for_patchright(self):
+        import tempfile
+        from scripts.online import general_html_extractor as ghe
+
+        seen_persistent = []
+        seen_context = []
+
+        class FakeBrowser:
+            def new_context(self, **kwargs):
+                seen_context.append(dict(kwargs))
+                return SimpleNamespace(pages=[])
+
+        class FakeChromium:
+            def launch_persistent_context(self, user_data_dir, **kwargs):
+                seen_persistent.append(dict(kwargs))
+                return SimpleNamespace(pages=[])
+
+            def launch(self, **kwargs):
+                return FakeBrowser()
+
+        fake_p = SimpleNamespace(chromium=FakeChromium())
+
+        # Ephemeral Patchright context keeps native UA
+        ghe._launch_context_or_browser(fake_p, None, True, None, engine_name="patchright")
+        self.assertNotIn("user_agent", seen_context[-1])
+
+        # Ephemeral plain Playwright context receives modern fallback UA
+        ghe._launch_context_or_browser(fake_p, None, True, None, engine_name="playwright")
+        self.assertEqual(seen_context[-1].get("user_agent"), playwright_utils.DEFAULT_BROWSER_USER_AGENT)
+
+        # Persistent Patchright context keeps native UA
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ghe._launch_context_or_browser(fake_p, tmpdir, True, None, engine_name="patchright")
+            self.assertNotIn("user_agent", seen_persistent[-1])
+            ghe._launch_context_or_browser(fake_p, tmpdir, True, None, engine_name="playwright")
+            self.assertEqual(seen_persistent[-1].get("user_agent"), playwright_utils.DEFAULT_BROWSER_USER_AGENT)
+
 
 class TestP1HedgedCascadeAndNegativeCache(unittest.TestCase):
     def test_negative_cache_strict_classification_rejects_404_and_paywall(self):

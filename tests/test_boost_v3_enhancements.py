@@ -264,6 +264,103 @@ class TestMinerUContinuationRules(unittest.TestCase):
         self.assertEqual(len(merged_b), 1)
         self.assertEqual(merged_b.iloc[0]["Sample"], "SMP-03")
 
+    def test_popo_column_wise_cell_merge_vector_brackets_cjk_and_repeated_group(self):
+        """借鉴 MinerU-Popo Q_i 列级合并向量：未闭合括号、中文无缝续接、重复分组键与数值冲突保护。"""
+        # 1. 中文未闭合括号 + 中文续行（不插多余英文空格）
+        df_cn_a = pd.DataFrame({
+            "样品": ["ZK01"],
+            "岩性描述": ["黑云母花岗岩（含少量石英、"],
+            "品位": ["1.25"],
+        })
+        df_cn_b = pd.DataFrame({
+            "样品": ["", "ZK02"],
+            "岩性描述": ["长石及绿泥石）", "闪长岩"],
+            "品位": ["", "0.85"],
+        })
+        q_cn = table_postprocess.predict_cross_page_cell_merge_vector(df_cn_a, df_cn_b)
+        self.assertEqual(q_cn, [0, 1, 0])
+        m_a, m_b = table_postprocess.merge_cross_page_split_cells(df_cn_a, df_cn_b)
+        self.assertEqual(m_a.iloc[-1]["岩性描述"], "黑云母花岗岩（含少量石英、长石及绿泥石）")
+        self.assertEqual(len(m_b), 1)
+        self.assertEqual(m_b.iloc[0]["样品"], "ZK02")
+
+        # 2. 跨页首列重复分组键（rowspan 重复）+ 第 2 列未闭合括号续接：保留单份分组键，不拼成 "Granite Granite"
+        df_grp_a = pd.DataFrame({
+            "Unit": ["Granite"],
+            "Mineralogy": ["Quartz + K-feldspar (minor"],
+        })
+        df_grp_b = pd.DataFrame({
+            "Unit": ["Granite", "Basalt"],
+            "Mineralogy": ["biotite and zircon)", "Plagioclase + pyroxene"],
+        })
+        q_grp = table_postprocess.predict_cross_page_cell_merge_vector(df_grp_a, df_grp_b)
+        self.assertEqual(q_grp, [1, 1])
+        mg_a, mg_b = table_postprocess.merge_cross_page_split_cells(df_grp_a, df_grp_b)
+        self.assertEqual(mg_a.iloc[-1]["Unit"], "Granite")
+        self.assertEqual(mg_a.iloc[-1]["Mineralogy"], "Quartz + K-feldspar (minor biotite and zircon)")
+        self.assertEqual(len(mg_b), 1)
+        self.assertEqual(mg_b.iloc[0]["Unit"], "Basalt")
+
+        # 3. 即使首列重复，若存在数值列冲突，硬否决合并（返回全 0 向量）
+        df_num_a = pd.DataFrame({"Unit": ["Granite"], "SiO2": ["71.2"], "Notes": ["altered (see"]})
+        df_num_b = pd.DataFrame({"Unit": ["Granite"], "SiO2": ["72.8"], "Notes": ["text)"]})
+        self.assertEqual(table_postprocess.predict_cross_page_cell_merge_vector(df_num_a, df_num_b), [0, 0, 0])
+
+    def test_popo_multipage_anchor_sync_and_footnote_aggregation(self):
+        """借鉴 MinerU-Popo 全局锚点同步与表注聚合：3页长表中间页表头漂移仍同步，且末页脚注不丢失。"""
+        p1 = pd.DataFrame({
+            "Sample": ["S1", "S2"],
+            "SiO2": ["70.1", "71.2"],
+            "Al2O3": ["14.2", "13.9"],
+        })
+        p1.attrs = {"label": "Table 1", "page_idx": 1, "footnotes": ["a: Major elements in wt%."]}
+
+        # 第 2 页无表头，列名被当成数据首行
+        p2 = pd.DataFrame([["S4", "69.8", "14.5"]], columns=["S3", "70.5", "14.1"])
+        p2.attrs = {"page_idx": 2}
+
+        # 第 3 页重新出现标准表头且页底附带最终脚注（与 p2 列名不同但与 p1 锚点一致）
+        p3 = pd.DataFrame({
+            "Sample": ["S5", "S6"],
+            "SiO2": ["72.0", "68.9"],
+            "Al2O3": ["13.5", "15.0"],
+        })
+        p3.attrs = {"page_idx": 3, "footnotes": ["b.d.l. = below detection limit."]}
+
+        merged = table_postprocess.merge_continuation_tables([p1, p2, p3])
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(len(merged[0]), 6)
+        self.assertEqual(merged[0].attrs.get("covered_pages"), [1, 2, 3])
+        fns = merged[0].attrs.get("footnotes")
+        self.assertIn("a: Major elements in wt%.", fns)
+        self.assertIn("b.d.l. = below detection limit.", fns)
+
+    def test_popo_geometry_boundary_guard_and_untitled_appendix_continuation(self):
+        """借鉴 MinerU-Popo 跨页几何边界护栏与无题附录表列类型画像合并。"""
+        # 1. 双栏左栏表 vs 下一页右栏表（同宽但水平完全错列），无续表标记时拒绝合并
+        left_col = pd.DataFrame({"Sample": ["S1", "S2"], "Val": ["1.1", "2.2"]})
+        left_col.attrs = {"label": "Table 2", "page_idx": 1, "bbox": [50, 700, 280, 920], "bbox_format": "1000"}
+        right_col = pd.DataFrame({"Sample": ["S3", "S4"], "Val": ["3.3", "4.4"]})
+        right_col.attrs = {"page_idx": 2, "bbox": [520, 60, 750, 260], "bbox_format": "1000"}
+        self.assertEqual(len(table_postprocess.merge_continuation_tables([left_col, right_col])), 2)
+
+        # 2. 前表在页顶 (<0.35H) + 后表在下一页页底 (>0.65H)，中间隔整页正文，无标记时拒绝合并
+        top_tbl = pd.DataFrame({"Sample": ["S1", "S2"], "Val": ["1.1", "2.2"]})
+        top_tbl.attrs = {"label": "Table 3", "page_idx": 1, "bbox": [80, 80, 900, 280], "bbox_format": "1000"}
+        bottom_tbl = pd.DataFrame({"Sample": ["S3", "S4"], "Val": ["3.3", "4.4"]})
+        bottom_tbl.attrs = {"page_idx": 2, "bbox": [80, 720, 900, 920], "bbox_format": "1000"}
+        self.assertEqual(len(table_postprocess.merge_continuation_tables([top_tbl, bottom_tbl])), 2)
+
+        # 3. 无表题连续附录跨页长表（页底->页顶 + 列类型画像一致 + 续页无表头），正确合并
+        app1 = pd.DataFrame({"Sample": ["A1", "A2"], "U_ppm": ["12.3", "14.5"], "Th_ppm": ["8.1", "9.2"]})
+        app1.attrs = {"page_idx": 10, "bbox": [80, 620, 920, 940], "bbox_format": "1000"}
+        app2 = pd.DataFrame([["A4", "16.0", "10.1"]], columns=["A3", "15.2", "9.8"])
+        app2.attrs = {"page_idx": 11, "bbox": [80, 60, 920, 340], "bbox_format": "1000"}
+        app_merged = table_postprocess.merge_continuation_tables([app1, app2])
+        self.assertEqual(len(app_merged), 1)
+        self.assertEqual(len(app_merged[0]), 4)
+        self.assertEqual(app_merged[0].attrs.get("covered_pages"), [10, 11])
+
 
 class TestOmniDocBenchMetrics(unittest.TestCase):
     """特性 6: OmniDocBench (CVPR 2025) 标准化度量体系。"""

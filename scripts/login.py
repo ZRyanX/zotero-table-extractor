@@ -38,15 +38,28 @@ get_cnki_cookies_path = common.get_cnki_cookies_path
 get_crawl4ai_cookies_path = common.get_crawl4ai_cookies_path
 
 try:
-    from .playwright_utils import find_playwright_chromium, resolve_sync_playwright, extract_browser_pid, close_browser_safely
+    from .playwright_utils import (
+        find_playwright_chromium,
+        resolve_sync_playwright,
+        extract_browser_pid,
+        close_browser_safely,
+        apply_browser_user_agent,
+    )
 except ImportError:
     try:
-        from playwright_utils import find_playwright_chromium, resolve_sync_playwright, extract_browser_pid, close_browser_safely
+        from playwright_utils import (
+            find_playwright_chromium,
+            resolve_sync_playwright,
+            extract_browser_pid,
+            close_browser_safely,
+            apply_browser_user_agent,
+        )
     except ImportError:
         find_playwright_chromium = lambda: None
         resolve_sync_playwright = None
         extract_browser_pid = lambda **kwargs: None
         close_browser_safely = lambda **kwargs: None
+        apply_browser_user_agent = lambda target_kwargs, engine_name="playwright", launch_kwargs=None, **kw: target_kwargs
 
 try:
     from .online.cdp_detector import find_active_cdp_endpoint
@@ -371,15 +384,18 @@ def publishers_main():
         _login_pid = None
         context = None
         try:
+            _lp_kwargs = {
+                "headless": False,
+                "executable_path": exec_path,
+                "args": _STEALTH_ARGS,
+                "ignore_default_args": ["--enable-automation"],
+                "viewport": {"width": 1280, "height": 800},
+            }
+            apply_browser_user_agent(_lp_kwargs, engine_name=_login_engine)
             try:
                 context = p.chromium.launch_persistent_context(
                     default_profile_dir,
-                    headless=False,
-                    executable_path=exec_path,
-                    args=_STEALTH_ARGS,
-                    ignore_default_args=["--enable-automation"],
-                    viewport={"width": 1280, "height": 800},
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+                    **_lp_kwargs,
                 )
                 _login_pid = extract_browser_pid(context=context, playwright_obj=p)
             except Exception as e:
@@ -387,12 +403,7 @@ def publishers_main():
                 print("尝试不使用缓存目录启动...")
                 context = p.chromium.launch_persistent_context(
                     "",
-                    headless=False,
-                    executable_path=exec_path,
-                    args=_STEALTH_ARGS,
-                    ignore_default_args=["--enable-automation"],
-                    viewport={"width": 1280, "height": 800},
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+                    **_lp_kwargs,
                 )
                 _login_pid = extract_browser_pid(context=context, playwright_obj=p)
 

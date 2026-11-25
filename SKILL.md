@@ -197,6 +197,7 @@ zotero-table-extractor/
     ├── verify_tables.py              # 表格产物批量校验与空表/坏表清理
     ├── login.py                      # 期刊出版社 Cookie 注入、CDP 桥接与 CNKI 登录向导
     ├── llm_reasoner.py               # LLM 辅助结构重构与语义等价性门禁 (arXiv 2603.18652)
+    ├── mineru_popo.py                # 可选 MinerU-Popo 4B 文档级后处理钩子（默认关闭，auto 自动探测 CUDA / Apple M）
     ├── zotero_sync.py                # 🔄 PyZotero 与 Better-Notes 生态联动（附件挂载与笔记生成）
     ├── agent_bridge.py               # Agent 交互桥接与进度事件通知
     ├── package_release.py            # Release 资产安全打包与 SHA256 校验工具
@@ -255,6 +256,8 @@ python scripts/extract_zotero_table.py --pdf /path/to/pdfs_dir --output /path/to
 | `--skip-supplementary` | 标志 | `False` | 跳过 Supplementary Material / 附录表格 |
 | `--single-file` | 标志 | `False` | 将提取到的所有表格汇聚写入单个 `.xlsx` 文件（多个 Sheet） |
 | `--enable-llm` | 标志 | `False` | 启用大模型语义推理，纠正深层多级复合表头并执行语义等价门禁 |
+| `--mineru-popo` | 字符串 | `None` | 可选 MinerU-Popo 后处理钩子模式：`off`（默认关闭）、`auto`（检测到 CUDA / Apple Silicon M 系列时自动开启）、`on`（强制开启） |
+| `--enable-popo` | 标志 | `False` | 快捷开启硬件感知版 MinerU-Popo 后处理钩子（等效 `--mineru-popo auto`） |
 | `--sync-zotero` | 标志 | `False` | 启用 PyZotero 与 Better-Notes 生态联动（挂载 `.xlsx` 附件并生成预览笔记） |
 | `--zotero-api-key` | 字符串 | `None` | 覆盖 Zotero Web API 访问密钥 |
 | `--zotero-user-id` | 字符串 | `None` | 覆盖 Zotero 用户/库 ID |
@@ -400,6 +403,16 @@ python scripts/login.py crawl4ai    # Crawl4AI 免检测登录与 Cookie 导出
 | `MINERU_AGENT_BACKEND` | string | `"vlm"` | MinerU 零 Token Agent 备用接口优先后端 (`vlm`, `pipeline`) |
 | `MINERU_ENABLE_FLASH_EXTRACT` | boolean | `true` | 无 Token 小文件优先尝试 `flash-extract`，未出表自动回退 Agent API |
 | `MINERU_TABLE_MERGE_ENABLE` | boolean | `true` | 是否启用 MinerU 4-way 联合判定与小表保护跨页续表合并 |
+| `MINERU_POPO_ENABLED` | boolean / string | `false` | 可选 MinerU-Popo 文档级后处理钩子：`false`（默认关闭）、`"auto"`（识别到 CUDA / Apple Silicon M 系列时自动开启）、`true`（显式开启） |
+| `MINERU_POPO_AUTO_HARDWARE` | boolean | `true` | 本地推理硬件保护：未配置远端 vLLM 时仅允许在 CUDA 或 Apple Silicon M 系列上加载本地 4B 模型 |
+| `MINERU_POPO_BACKEND` | string | `"auto"` | MinerU-Popo 推理后端：`auto`、`vllm`、`native_repo`、`transformers`（兼容 `POPO_INFERENCE_BACKEND`） |
+| `MINERU_POPO_MODEL_PATH` | string | `"DreamEternal/MinerU-Popo"` | MinerU-Popo 本地权重路径或 HuggingFace 仓库 ID（兼容 `POPO_MODEL_PATH`） |
+| `MINERU_POPO_VLLM_URL` | string | `""` | MinerU-Popo vLLM / OpenAI-Compatible 服务地址（兼容 `POPO_VLLM_URL`） |
+| `MINERU_POPO_VLLM_API_KEY` | string | `""` | MinerU-Popo vLLM 鉴权密钥（兼容 `POPO_VLLM_API_KEY`） |
+| `MINERU_POPO_MODEL_NAME` | string | `"Popo"` | vLLM 服务端模型名称（兼容 `POPO_MODEL_NAME`） |
+| `MINERU_POPO_REPO_PATH` | string | `""` | 可选本地克隆的 `opendatalab/MinerU-Popo` 仓库路径 |
+| `MINERU_POPO_TIMEOUT` | int | `60` | MinerU-Popo 单次推理超时秒数 |
+| `MINERU_POPO_ALLOW_DOWNLOAD` | boolean | `false` | 本地 `transformers` 模式是否允许自动联网下载 4B 权重 |
 | `TELEOCR_API_BASE` | string | `""` | TeleOCR vLLM / OpenAI-compatible 视觉推理服务 URL |
 | `TELEOCR_MODEL` | string | `"TeleOCR"` | TeleOCR 模型标识符 |
 | `TELEOCR_API_KEY` | string | `""` | TeleOCR API 鉴权密钥 |

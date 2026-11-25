@@ -384,6 +384,26 @@ def load_config():
         data["NEGATIVE_CACHE_ENABLED"] = True
     if "NEGATIVE_CACHE_TTL_S" not in data:
         data["NEGATIVE_CACHE_TTL_S"] = 1800
+    if "MINERU_POPO_ENABLED" not in data:
+        data["MINERU_POPO_ENABLED"] = False
+    if "MINERU_POPO_AUTO_HARDWARE" not in data:
+        data["MINERU_POPO_AUTO_HARDWARE"] = True
+    if "MINERU_POPO_BACKEND" not in data:
+        data["MINERU_POPO_BACKEND"] = "auto"
+    if "MINERU_POPO_MODEL_PATH" not in data:
+        data["MINERU_POPO_MODEL_PATH"] = "DreamEternal/MinerU-Popo"
+    if "MINERU_POPO_VLLM_URL" not in data:
+        data["MINERU_POPO_VLLM_URL"] = ""
+    if "MINERU_POPO_VLLM_API_KEY" not in data:
+        data["MINERU_POPO_VLLM_API_KEY"] = ""
+    if "MINERU_POPO_MODEL_NAME" not in data:
+        data["MINERU_POPO_MODEL_NAME"] = "Popo"
+    if "MINERU_POPO_REPO_PATH" not in data:
+        data["MINERU_POPO_REPO_PATH"] = ""
+    if "MINERU_POPO_TIMEOUT" not in data:
+        data["MINERU_POPO_TIMEOUT"] = 60
+    if "MINERU_POPO_ALLOW_DOWNLOAD" not in data:
+        data["MINERU_POPO_ALLOW_DOWNLOAD"] = False
 
     # 环境变量覆盖敏感配置
     env_overrides = {
@@ -411,6 +431,15 @@ def load_config():
         'MINERU_USE_CLI': 'MINERU_USE_CLI',
         'MINERU_CLI_PATH': 'MINERU_CLI_PATH',
         'MINERU_MODEL': 'MINERU_MODEL',
+        'MINERU_POPO_ENABLED': 'MINERU_POPO_ENABLED',
+        'MINERU_POPO_AUTO_HARDWARE': 'MINERU_POPO_AUTO_HARDWARE',
+        'MINERU_POPO_BACKEND': 'MINERU_POPO_BACKEND',
+        'MINERU_POPO_MODEL_PATH': 'MINERU_POPO_MODEL_PATH',
+        'MINERU_POPO_VLLM_URL': 'MINERU_POPO_VLLM_URL',
+        'MINERU_POPO_VLLM_API_KEY': 'MINERU_POPO_VLLM_API_KEY',
+        'MINERU_POPO_MODEL_NAME': 'MINERU_POPO_MODEL_NAME',
+        'MINERU_POPO_REPO_PATH': 'MINERU_POPO_REPO_PATH',
+        'MINERU_POPO_ALLOW_DOWNLOAD': 'MINERU_POPO_ALLOW_DOWNLOAD',
         'OCR_ENGINE': 'OCR_ENGINE',
         'DOCLING_ENABLED': 'DOCLING_ENABLED',
         'DOCLING_OFFLINE_FALLBACK': 'DOCLING_OFFLINE_FALLBACK',
@@ -440,7 +469,19 @@ def load_config():
     if not data.get("CARSI_IDP") and os.getenv("CARSI_IDP_NAME"):
         data["CARSI_IDP"] = os.getenv("CARSI_IDP_NAME").strip()
 
-    for _num_key, _cast in (("TIER2_HEDGE_DELAY_S", float), ("NEGATIVE_CACHE_TTL_S", int)):
+    # 兼容 opendatalab/MinerU-Popo 官方 POPO_* 环境变量别名
+    for _popo_cfg_k, _popo_env_k in (
+        ("MINERU_POPO_BACKEND", "POPO_INFERENCE_BACKEND"),
+        ("MINERU_POPO_MODEL_PATH", "POPO_MODEL_PATH"),
+        ("MINERU_POPO_VLLM_URL", "POPO_VLLM_URL"),
+        ("MINERU_POPO_VLLM_API_KEY", "POPO_VLLM_API_KEY"),
+        ("MINERU_POPO_MODEL_NAME", "POPO_MODEL_NAME"),
+    ):
+        _pv = os.getenv(_popo_env_k)
+        if _pv and _pv.strip():
+            data[_popo_cfg_k] = _pv.strip()
+
+    for _num_key, _cast in (("TIER2_HEDGE_DELAY_S", float), ("NEGATIVE_CACHE_TTL_S", int), ("MINERU_POPO_TIMEOUT", int)):
         _env_num = os.getenv(_num_key)
         if _env_num is not None and _env_num.strip() != "":
             try:

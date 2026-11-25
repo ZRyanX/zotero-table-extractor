@@ -1780,6 +1780,17 @@ def main():
     parser.add_argument("--skip-supplementary", action="store_true", help="Skip extraction of supplementary/appendix tables")
     parser.add_argument("--single-file", action="store_true", help="Save all extracted tables into a single Excel file with multiple sheets")
     parser.add_argument("--enable-llm", action="store_true", help="Enable LLM table reasoner for complex hierarchical headers and recovery")
+    parser.add_argument(
+        "--mineru-popo",
+        choices=["off", "auto", "on"],
+        default=None,
+        help="Optional MinerU-Popo post-processing hook (default off; 'auto' enables when CUDA or Apple Silicon M-series is detected)",
+    )
+    parser.add_argument(
+        "--enable-popo",
+        action="store_true",
+        help="Shorthand to enable optional MinerU-Popo post-processing hook (hardware-aware auto mode unless MINERU_POPO_ENABLED=on)",
+    )
     
     # 生态与增强引擎联动选项 (可选开关，默认关闭或自动)
     parser.add_argument("--sync-zotero", action="store_true", help="Enable PyZotero & Zotero-Better-Notes ecosystem sync (attach .xlsx and create preview note, default disabled)")
@@ -1804,6 +1815,11 @@ def main():
 
     if getattr(args, 'ocr_engine', None) and args.ocr_engine != 'auto':
         os.environ["OCR_ENGINE"] = args.ocr_engine
+
+    if getattr(args, 'mineru_popo', None):
+        os.environ["MINERU_POPO_ENABLED"] = args.mineru_popo
+    elif getattr(args, 'enable_popo', False):
+        os.environ["MINERU_POPO_ENABLED"] = "auto"
 
     pdf_input = args.pdf
     pdf_list = []

@@ -34,7 +34,12 @@ docling>=2.0.0
 # pyzotero>=1.15.0
 
 # Optional / Extended Scrapers & External Binaries:
+# patchright>=1.49.0  # Recommended stealth Playwright drop-in (auto-preferred for self-launched browsers)
 # scrapling>=0.2.0
 # crawl4ai>=0.3.0
+# Optional MinerU-Popo 4B post-processing runtime (disabled by default; hardware-auto CUDA/Apple Silicon):
+# transformers>=4.49.0
+# accelerate>=1.0.0
+# qwen-vl-utils>=0.0.8
 # External CLI (optional): mineru-open-api (recommended for MinerU extract/flash-extract)
 

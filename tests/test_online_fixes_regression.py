@@ -1731,9 +1731,17 @@ class TestRound2FixesRegression(unittest.TestCase):
         self.assertIn("os", report)
         self.assertIn("modules", report)
         self.assertIn("onnxruntime", report["modules"])
+        self.assertIn("patchright", report["modules"])
+        self.assertIn("patchright_available", report)
+        self.assertIn(report.get("stealth_browser_engine"), ("patchright", "playwright"))
+        self.assertTrue(any(p.startswith("patchright") for p in setup_env.ONLINE_EXT_PACKAGES))
         res = setup_env.install_python_deps(with_all=True, dry_run=True)
         self.assertEqual(res["failed"], [])
         self.assertGreaterEqual(len(res["installed"]), 10)
+        self.assertTrue(any(p.startswith("patchright") for p in res["installed"]))
+        self.assertTrue(setup_env.install_patchright_chromium(dry_run=True))
+        with patch.object(setup_env.importlib.util, "find_spec", return_value=None):
+            self.assertFalse(setup_env.install_patchright_chromium(dry_run=False))
 
     def test_mineru_usable_unverified_table_skips_rapidtable_and_step2(self):
         import tempfile

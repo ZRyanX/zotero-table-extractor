@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import importlib.metadata
+import importlib.util
 import json
 import os
 import platform
@@ -67,6 +68,7 @@ PDF_ENGINE_PACKAGES = [
 ]
 
 ONLINE_EXT_PACKAGES = [
+    "patchright>=1.49.0",
     "scrapling>=0.2.0",
     "crawl4ai>=0.3.0",
     "pyzotero>=1.5.0",
@@ -81,6 +83,12 @@ HEAVY_OPTIONAL_PACKAGES = [
     "camelot-py[cv]>=0.11.0",
 ]
 
+POPO_OPTIONAL_PACKAGES = [
+    "transformers>=4.49.0",
+    "accelerate>=1.0.0",
+    "qwen-vl-utils>=0.0.8",
+]
+
 # Preload onnxruntime before torch/gmft in check_readiness to avoid Windows DLL init 0xC0000005
 CHECK_MODULES: List[Tuple[str, str, str]] = [
     ("onnxruntime", "onnxruntime", "core"),
@@ -93,6 +101,7 @@ CHECK_MODULES: List[Tuple[str, str, str]] = [
     ("lxml", "lxml", "core"),
     ("playwright", "playwright", "online"),
     ("curl_cffi", "curl_cffi", "online"),
+    ("patchright", "patchright", "online-ext"),
     ("scrapling", "scrapling", "online-ext"),
     ("crawl4ai", "crawl4ai", "online-ext"),
     ("pdfplumber", "pdfplumber", "pdf-engine"),
@@ -166,6 +175,7 @@ def install_python_deps(
     with_all: bool = False,
     with_docling: bool = False,
     with_camelot: bool = False,
+    with_popo: bool = False,
     with_online_ext: bool = True,
     fix_streamlit: bool = False,
     use_uv: bool = True,
@@ -190,6 +200,8 @@ def install_python_deps(
         heavy.append("camelot-py[cv]>=0.11.0")
     if heavy:
         batches.append(("Heavy optional engines", heavy, False))
+    if with_popo:
+        batches.append(("Optional MinerU-Popo 4B post-processing runtime", POPO_OPTIONAL_PACKAGES, False))
 
     for label, pkgs, required in batches:
         print(f"\n[setup_env] Installing {label}: {', '.join(pkgs)}")
@@ -230,6 +242,19 @@ def install_playwright_chromium(dry_run: bool = False) -> bool:
         print("DRY-RUN:", " ".join(cmd))
         return True
     print("\n[setup_env] Ensuring Playwright Chromium runtime is installed...")
+    proc = subprocess.run(cmd, cwd=str(ROOT_DIR))
+    return proc.returncode == 0
+
+
+def install_patchright_chromium(dry_run: bool = False) -> bool:
+    cmd = [sys.executable, "-m", "patchright", "install", "chromium"]
+    if dry_run:
+        print("DRY-RUN:", " ".join(cmd))
+        return True
+    if importlib.util.find_spec("patchright") is None:
+        print("\n[setup_env] Patchright is not installed; skipping Patchright Chromium runtime setup.")
+        return False
+    print("\n[setup_env] Ensuring Patchright Chromium runtime is installed...")
     proc = subprocess.run(cmd, cwd=str(ROOT_DIR))
     return proc.returncode == 0
 
@@ -289,13 +314,17 @@ def check_readiness() -> Dict[str, object]:
         except Exception as exc:
             modules[mod_name] = {"ok": False, "error": str(exc), "tier": tier, "package": pkg_label}
 
-    # Check Playwright Chromium binary via repo helper
+    # Check Playwright Chromium binary & active self-launched stealth browser engine
     chromium_path = None
+    patchright_available = bool(modules.get("patchright", {}).get("ok"))
+    stealth_engine = "playwright"
     try:
-        from scripts.playwright_utils import find_playwright_chromium
+        from scripts.playwright_utils import find_playwright_chromium, resolve_sync_playwright
         chromium_path = find_playwright_chromium()
+        _, stealth_engine = resolve_sync_playwright(prefer_patchright=True)
     except Exception:
-        pass
+        disable_pr = (os.environ.get("ZTE_DISABLE_PATCHRIGHT") or "").strip().lower() in ("1", "true", "yes")
+        stealth_engine = "patchright" if (patchright_available and not disable_pr) else "playwright"
 
     # Check local ONNX models
     models_dir = ROOT_DIR / "models"
@@ -325,6 +354,12 @@ def check_readiness() -> Dict[str, object]:
             pass
 
     sys_tools = check_or_install_system_deps(install=False)
+    popo_status: Dict[str, object] = {}
+    try:
+        from scripts.mineru_popo import get_popo_readiness
+        popo_status = get_popo_readiness()
+    except Exception:
+        popo_status = {"mode": "off", "enabled": False, "hardware_eligible": False, "accelerator": "cpu"}
     core_ok = all(v["ok"] for v in modules.values() if v["tier"] == "core")
     pdf_ok = all(v["ok"] for v in modules.values() if v["tier"] == "pdf-engine")
 
@@ -336,6 +371,9 @@ def check_readiness() -> Dict[str, object]:
         "pdf_engines_ready": pdf_ok,
         "playwright_chromium": bool(chromium_path),
         "playwright_chromium_path": chromium_path,
+        "patchright_available": patchright_available,
+        "stealth_browser_engine": stealth_engine,
+        "mineru_popo": popo_status,
         "models": models,
         "config_exists": cfg_path.exists(),
         "credentials_configured": creds,
@@ -349,6 +387,12 @@ def _print_readiness(report: Dict[str, object]) -> None:
     print(f"Executable : {report['executable']}")
     print(f"Core Ready : {report['core_ready']} | PDF Engines Ready: {report['pdf_engines_ready']}")
     print(f"Chromium   : {report['playwright_chromium']} ({report.get('playwright_chromium_path') or 'not found'})")
+    print(f"Stealth    : {report.get('stealth_browser_engine', 'playwright')} (patchright_available={report.get('patchright_available', False)})")
+    popo_info = report.get("mineru_popo") or {}
+    print(
+        f"MinerU-Popo: mode={popo_info.get('mode', 'off')}, active={popo_info.get('enabled', False)}, "
+        f"hw={popo_info.get('accelerator', 'cpu')} ({popo_info.get('device_name', 'CPU')}, eligible={popo_info.get('hardware_eligible', False)})"
+    )
     print(f"Models     : {report['models']}")
     print(f"config.json: {report['config_exists']} | Credentials: {report['credentials_configured']}")
     print(f"System     : {report['system_tools']}")
@@ -368,10 +412,11 @@ def main() -> int:
     parser.add_argument("--all", action="store_true", help="Install heavy optional engines too (docling, camelot-py[cv])")
     parser.add_argument("--with-docling", action="store_true", help="Also install IBM Docling")
     parser.add_argument("--with-camelot", action="store_true", help="Also install Camelot")
-    parser.add_argument("--no-online-ext", action="store_true", help="Skip optional online scrapers (scrapling/crawl4ai/pyzotero)")
+    parser.add_argument("--with-popo", action="store_true", help="Also install optional MinerU-Popo runtime (transformers/accelerate/qwen-vl-utils)")
+    parser.add_argument("--no-online-ext", action="store_true", help="Skip optional online scrapers (patchright/scrapling/crawl4ai/pyzotero)")
     parser.add_argument("--fix-streamlit", action="store_true", help="Upgrade streamlit & pillow together to resolve pillow<12 conflict")
     parser.add_argument("--system-deps", action="store_true", help="Install OS-level helpers where supported (e.g. macOS brew ghostscript/tesseract)")
-    parser.add_argument("--skip-browser", action="store_true", help="Skip `playwright install chromium`")
+    parser.add_argument("--skip-browser", action="store_true", help="Skip Playwright/Patchright Chromium runtime installation")
     parser.add_argument("--skip-models", action="store_true", help="Skip ONNX model verification/download")
     parser.add_argument("--init-config", action="store_true", help="Run `setup_paths.py --auto` if config.json does not exist")
     parser.add_argument("--mirror", default="", help="Custom PyPI index URL (overrides UV_INDEX_URL / config.json)")
@@ -392,6 +437,7 @@ def main() -> int:
         with_all=args.all,
         with_docling=args.with_docling,
         with_camelot=args.with_camelot,
+        with_popo=args.with_popo,
         with_online_ext=not args.no_online_ext,
         fix_streamlit=args.fix_streamlit,
         use_uv=not args.no_uv,
@@ -401,6 +447,8 @@ def main() -> int:
 
     if not args.skip_browser:
         install_playwright_chromium(dry_run=args.dry_run)
+        if not args.no_online_ext:
+            install_patchright_chromium(dry_run=args.dry_run)
 
     if not args.skip_models:
         install_onnx_models(dry_run=args.dry_run)

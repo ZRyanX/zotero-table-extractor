@@ -13,6 +13,7 @@ try:
         resolve_sync_playwright,
         extract_browser_pid,
         close_browser_safely,
+        apply_browser_user_agent,
     )
 except ImportError:
     try:
@@ -21,6 +22,7 @@ except ImportError:
             resolve_sync_playwright,
             extract_browser_pid,
             close_browser_safely,
+            apply_browser_user_agent,
         )
     except ImportError:
         find_playwright_chromium = lambda: None
@@ -29,6 +31,7 @@ except ImportError:
         close_browser_safely = lambda browser=None, context=None, proc_pid=None, force_kill_on_error=True: (
             browser.close() if browser is not None else (context.close() if context is not None else None)
         )
+        apply_browser_user_agent = lambda target_kwargs, engine_name="playwright", launch_kwargs=None, **kw: target_kwargs
 
 # Shared helpers (text cleaning, table filtering, config)
 try:
@@ -1317,8 +1320,8 @@ _GATED_PUBLISHER_DOMAINS = (
 )
 
 
-def _launch_context_or_browser(p, user_data_dir, headless, exec_path):
-    """Launch persistent or ephemeral Playwright context, preferring real Chrome/Edge when headed."""
+def _launch_context_or_browser(p, user_data_dir, headless, exec_path, engine_name="playwright"):
+    """Launch persistent or ephemeral Playwright/Patchright context, preserving native UA for Patchright & browser channels."""
     launch_variants = []
     if headless is False:
         launch_variants.append({"channel": "chrome"})
@@ -1338,9 +1341,8 @@ def _launch_context_or_browser(p, user_data_dir, headless, exec_path):
                     "viewport": {"width": 1280, "height": 900},
                 }
                 kwargs.update(extra)
-                # Preserve native Chrome/Edge UA when launching everyday browser channel
-                if "channel" not in extra:
-                    kwargs["user_agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+                # Preserve native UA for Patchright and everyday Chrome/Edge channels
+                apply_browser_user_agent(kwargs, engine_name=engine_name, launch_kwargs=extra)
                 context = p.chromium.launch_persistent_context(user_data_dir, **kwargs)
                 return None, context
             except Exception as e:
@@ -1360,8 +1362,7 @@ def _launch_context_or_browser(p, user_data_dir, headless, exec_path):
             launch_kwargs.update(extra)
             browser = p.chromium.launch(**launch_kwargs)
             ctx_kwargs = {"viewport": {"width": 1280, "height": 900}, "locale": "en-US"}
-            if "channel" not in extra:
-                ctx_kwargs["user_agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+            apply_browser_user_agent(ctx_kwargs, engine_name=engine_name, launch_kwargs=extra)
             context = browser.new_context(**ctx_kwargs)
             return browser, context
         except Exception:
@@ -1848,7 +1849,7 @@ def _extract_general_html_tables_impl(url, table_idx="all", headed=False, user_d
             user_data_dir = None
 
         if not connected_via_cdp:
-            browser, context = _launch_context_or_browser(p, user_data_dir, headless, exec_path)
+            browser, context = _launch_context_or_browser(p, user_data_dir, headless, exec_path, engine_name=_pw_engine)
             _self_launched_pid = extract_browser_pid(browser=browser, context=context, playwright_obj=p)
             if browser is not None:
                 user_data_dir = None

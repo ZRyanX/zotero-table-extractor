@@ -1877,74 +1877,218 @@ def is_pure_data_value(s_in):
     return False
 
 
+_CJK_CHAR_RE = re.compile(r'[\u4e00-\u9fff]')
+_UNCLOSED_DELIM_PAIRS = (
+    ('(', ')'),
+    ('（', '）'),
+    ('[', ']'),
+    ('【', '】'),
+    ('{', '}'),
+    ('“', '”'),
+)
+_CONTINUATION_TAIL_WORDS = (
+    'and', 'or', 'with', 'of', 'in', 'to', 'for', 'from', 'by', 'the',
+    '与', '和', '及', '含', '由',
+)
+_CONTINUATION_TAIL_CHARS = ('-', '—', '–', ',', '，', '、', ';', '；', '+', '±', '~', '(', '（', '[', '【', '“')
+_NON_SPLIT_LOWER_TOKENS = frozenset({'b.d.', 'b.d.l.', 'n.d.', 'nd', 'na', 'n/a', 'wt%', 'ppm', 'ppb', 'tr', 'nil'})
+
+
+def _closes_unbalanced_delimiter(p_val: str, n_val: str) -> bool:
+    """检测上一页单元格是否存在未闭合括号/引号并在下一页单元格中被闭合。"""
+    if not p_val or not n_val:
+        return False
+    for open_ch, close_ch in _UNCLOSED_DELIM_PAIRS:
+        if p_val.count(open_ch) > p_val.count(close_ch) and n_val.count(close_ch) > n_val.count(open_ch):
+            return True
+    return False
+
+
+def _is_cell_text_truncated(p_val: str, n_val: str) -> bool:
+    """判断单列跨页单元格 (p_val, n_val) 是否存在明显的语义/标点截断特征。"""
+    if not p_val or not n_val:
+        return False
+    if is_pure_data_value(p_val) or is_pure_data_value(n_val):
+        return False
+    if _closes_unbalanced_delimiter(p_val, n_val):
+        return True
+    if p_val.endswith(_CONTINUATION_TAIL_CHARS):
+        return True
+    p_low = p_val.lower()
+    for word in _CONTINUATION_TAIL_WORDS:
+        if len(word) == 1 and _CJK_CHAR_RE.match(word):
+            if p_val.endswith(word):
+                return True
+        elif re.search(rf'(?:^|\s){re.escape(word)}$', p_low):
+            return True
+    n_low = n_val.lower()
+    if n_val[0].islower() and n_low not in _NON_SPLIT_LOWER_TOKENS:
+        return True
+    if n_val[0] in (')', '）', ']', '】', '}', '”', ',', '，', ';', '；', '、', '%', '‰'):
+        return True
+    return False
+
+
+def _join_split_cell_text(p_val: str, n_val: str) -> str:
+    """智能拼接跨页截断单元格文本：处理连字符去杠与中英文空格规则。"""
+    if not p_val:
+        return n_val
+    if not n_val:
+        return p_val
+    if p_val.endswith(('-', '—', '–')):
+        return p_val[:-1] + n_val
+    if (
+        _CJK_CHAR_RE.search(p_val[-1])
+        or _CJK_CHAR_RE.search(n_val[0])
+        or p_val[-1] in ('(', '（', '[', '【', '“', '、', '，', '；', '/')
+        or n_val[0] in (')', '）', ']', '】', '”', ',', '，', ';', '；', '、', '.', '。', '%', '‰')
+    ):
+        return p_val + n_val
+    return p_val + " " + n_val
+
+
+def predict_cross_page_cell_merge_vector(prev_df: pd.DataFrame, next_df: pd.DataFrame) -> List[int]:
+    """
+    借鉴 MinerU-Popo 列级单元格合并策略 Q_i = {q_1, ..., q_x} ∈ {0, 1}^x：
+    逐列判定跨页边界行 (prev_df.iloc[-1], next_df.iloc[0]) 中哪些列发生了垂直截断需合并。
+    严守安全门禁：任意列存在独立数值冲突时整行否决（返回全 0 向量），杜绝数据误并。
+    """
+    if prev_df is None or next_df is None or prev_df.empty or next_df.empty:
+        return []
+    n_cols = min(prev_df.shape[1], next_df.shape[1])
+    if n_cols <= 0:
+        return []
+
+    last_row = [str(x).strip() if pd.notna(x) else "" for x in prev_df.iloc[-1].values[:n_cols]]
+    first_row = [str(x).strip() if pd.notna(x) else "" for x in next_df.iloc[0].values[:n_cols]]
+
+    # 硬否决 1：任意列两行各自包含独立纯数值/检出限，绝不可盲目合并
+    for i in range(n_cols):
+        if last_row[i] and first_row[i] and is_pure_data_value(last_row[i]) and is_pure_data_value(first_row[i]):
+            return [0] * n_cols
+
+    col0_empty_in_next = not first_row[0] or first_row[0].lower() in ('nan', 'none', '-', '—')
+    col0_hard_split = (
+        not col0_empty_in_next
+        and bool(last_row[0])
+        and (
+            (last_row[0].endswith(('-', '—', '–')) and first_row[0][0].islower())
+            or _closes_unbalanced_delimiter(last_row[0], first_row[0])
+        )
+    )
+    # 跨页重复分组键（rowspan 在下一页首行重复出现同一分组名，且其余列存在明确文本截断）
+    col0_repeated_group_key = (
+        not col0_empty_in_next
+        and bool(last_row[0])
+        and not is_pure_data_value(last_row[0])
+        and last_row[0] == first_row[0]
+        and any(_is_cell_text_truncated(last_row[j], first_row[j]) for j in range(1, n_cols))
+    )
+
+    if not col0_empty_in_next and not col0_hard_split and not col0_repeated_group_key:
+        return [0] * n_cols
+
+    q_vec = [0] * n_cols
+    has_strong_signal = False
+
+    for j in range(n_cols):
+        p_val, n_val = last_row[j], first_row[j]
+        if j == 0 and col0_repeated_group_key:
+            q_vec[j] = 1
+            continue
+        if p_val and n_val:
+            if _is_cell_text_truncated(p_val, n_val):
+                q_vec[j] = 1
+                has_strong_signal = True
+            else:
+                # 某列两行均为独立非截断文本/数值，不可将该整行折叠合并
+                return [0] * n_cols
+        elif n_val and not p_val:
+            # 互补稀疏断行：上页末行该列为空、下页首行有补充内容
+            if col0_empty_in_next or col0_hard_split or col0_repeated_group_key:
+                q_vec[j] = 1
+                if col0_empty_in_next and j > 0:
+                    has_strong_signal = True
+
+    if not has_strong_signal:
+        return [0] * n_cols
+    return q_vec
+
+
 def merge_cross_page_split_cells(prev_df: pd.DataFrame, next_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
-    MinerU 跨页断裂单元格合并检测与拼接 (Cross-Page Broken Cell / Split Row Merge)。
-    当跨页换行导致最后一行数据被切为两半时（例如：上一页末行文本未完或仅有前几列，下一页首行无键名且仅为续接描述），
-    将拆分的单元格内容无损合并至上一页末行，并剔除下一页冗余残行。
+    MinerU / MinerU-Popo 跨页断裂单元格列级检测与拼接 (Cross-Page Broken Cell / Split Row Merge)。
+    基于列级合并向量 Q_i ∈ {0, 1}^x，在确认无独立数值冲突与新样本键的前提下，
+    将跨页被截断的单元格（含未闭合括号、连字符、中英文续行、互补残行及重复分组键续行）无损并入上一页末行。
     """
     if prev_df.empty or next_df.empty or len(prev_df) < 1 or len(next_df) < 1:
         return prev_df, next_df
 
+    q_vec = predict_cross_page_cell_merge_vector(prev_df, next_df)
+    if not any(q_vec):
+        return prev_df, next_df
+
+    n_cols = len(q_vec)
     last_row = [str(x).strip() if pd.notna(x) else "" for x in prev_df.iloc[-1].values]
     first_row = [str(x).strip() if pd.notna(x) else "" for x in next_df.iloc[0].values]
 
-    # 判定特征 1: 下表首行第一列为空白/无新键名，而后序列存在内容
-    col0_empty_in_next = not first_row[0] or first_row[0].lower() in ('nan', 'none', '-', '—')
-    
-    # 若下表首列具有独立的键名/样本名（且上表末行首列未以连字符截断），则绝对是完整独立数据行，不得误并
-    if not col0_empty_in_next:
-        if not (last_row[0].endswith(('-', '—')) and first_row[0] and first_row[0][0].islower()):
-            return prev_df, next_df
+    merged_last = list(last_row)
+    for i in range(n_cols):
+        if not q_vec[i]:
+            continue
+        p_val = merged_last[i]
+        n_val = first_row[i]
+        if not n_val:
+            continue
+        if i == 0 and p_val and p_val == n_val:
+            # 重复分组键保留单份，避免拼接为 "Granite Granite"
+            merged_last[i] = p_val
+        elif p_val:
+            if is_pure_data_value(p_val) or is_pure_data_value(n_val):
+                return prev_df, next_df
+            merged_last[i] = _join_split_cell_text(p_val, n_val)
+        else:
+            merged_last[i] = n_val
 
-    # 判定特征 2: 上表末行文本以连字符 '-' 或逗号等未完标点结尾，或下表首行文本以小写字母/连续词开头
-    text_split = False
-    for c_i in range(min(len(last_row), len(first_row))):
-        c_prev, c_next = last_row[c_i], first_row[c_i]
-        if c_prev and c_next:
-            if c_prev.endswith(('-', '—', ',', 'and', 'with', 'of', 'in', '±', '~', '(', '（')):
-                text_split = True
-                break
-            if len(c_next) > 0 and c_next[0].islower() and c_next not in ('b.d.', 'n.d.', 'wt%', 'ppm', 'ppb'):
-                text_split = True
-                break
+    prev_df_copy = prev_df.copy()
+    prev_df_copy.iloc[-1] = merged_last
+    next_df_copy = next_df.iloc[1:].reset_index(drop=True)
+    return prev_df_copy, next_df_copy
 
-    # 判定特征 3: 上表末行部分列为空，下表首行相应列有填充（互补断行）
-    complementary = False
-    if col0_empty_in_next and any(first_row[1:]):
-        complementary = True
 
-    if text_split or (col0_empty_in_next and complementary):
-        # 严禁将两行各自包含独立有效数值的行进行盲目拼合（如 12.5 与 13.5 拼成 "12.5 13.5" 并丢弃行 2）
-        numeric_conflicts = 0
-        for i in range(min(len(last_row), len(first_row))):
-            p_val = last_row[i]
-            n_val = first_row[i]
-            if p_val and n_val and is_pure_data_value(p_val) and is_pure_data_value(n_val):
-                numeric_conflicts += 1
-        if numeric_conflicts > 0:
-            return prev_df, next_df
+def _aggregate_group_footnotes(group: List[pd.DataFrame], target_attrs: Dict[str, Any]) -> None:
+    """
+    跨页续表脚注与元信息聚合（借鉴 MinerU-Popo 文档级表注关联思想）：
+    学术长表的表注通常印在末页底部，聚合所有分块的 footnotes / table_footnote 并去重，防止首表 attrs 覆盖丢失末页表注。
+    """
+    collected: List[str] = []
+    seen = set()
 
-        merged_last = list(last_row)
-        for i in range(min(len(merged_last), len(first_row))):
-            p_val = merged_last[i]
-            n_val = first_row[i]
-            if n_val:
-                if p_val and p_val.endswith(('-', '—')):
-                    merged_last[i] = p_val[:-1] + n_val
-                elif p_val:
-                    if is_pure_data_value(p_val) or is_pure_data_value(n_val):
-                        return prev_df, next_df
-                    merged_last[i] = p_val + " " + n_val
-                else:
-                    merged_last[i] = n_val
+    def _add_note(val):
+        if not val:
+            return
+        if isinstance(val, (list, tuple)):
+            for item in val:
+                _add_note(item)
+            return
+        s = str(val).strip()
+        if s and s not in seen:
+            seen.add(s)
+            collected.append(s)
 
-        prev_df_copy = prev_df.copy()
-        prev_df_copy.iloc[-1] = merged_last
-        next_df_copy = next_df.iloc[1:].reset_index(drop=True)
-        return prev_df_copy, next_df_copy
+    for g in group:
+        attrs = getattr(g, 'attrs', None) or {}
+        _add_note(attrs.get('footnotes'))
+        _add_note(attrs.get('table_footnote'))
 
-    return prev_df, next_df
+    if collected:
+        existing_fn = target_attrs.get('footnotes')
+        if isinstance(existing_fn, str):
+            target_attrs['footnotes'] = "\n".join(collected)
+        else:
+            target_attrs['footnotes'] = list(collected)
+        if any((getattr(g, 'attrs', None) or {}).get('table_footnote') for g in group):
+            target_attrs['table_footnote'] = "\n".join(collected)
 
 
 def combine_df_group(group):
@@ -2000,6 +2144,7 @@ def combine_df_group(group):
             next_renamed[first_col] = next_renamed[first_col].astype(str)
             merged = pd.merge(merged, next_renamed, on=first_col, how='outer', validate='one_to_one')
         merged.attrs = base_df.attrs.copy()
+        _aggregate_group_footnotes(group, merged.attrs)
         return merged
         
     concat_rows = [base_df.reset_index(drop=True)]
@@ -2120,6 +2265,7 @@ def combine_df_group(group):
         safe_obj_rows = [make_df_columns_unique(d.astype(object)) for d in concat_rows]
         res = pd.concat(safe_obj_rows, ignore_index=True)
     res.attrs = base_df.attrs.copy()
+    _aggregate_group_footnotes(group, res.attrs)
     return res
 
 
@@ -2359,6 +2505,120 @@ def is_conflicting_or_distinct_version(df1, df2) -> bool:
     return False
 
 
+def _infer_page_height_for_bbox(bbox, attrs: Optional[Dict[str, Any]] = None) -> Optional[float]:
+    """推断 bbox 坐标系对应的页面高度（用于 MinerU-Popo 页底/页顶边界连续性判定）。"""
+    if not bbox or len(bbox) < 4:
+        return None
+    attrs = attrs or {}
+    ps = attrs.get('page_size')
+    if isinstance(ps, (list, tuple)) and len(ps) >= 2:
+        try:
+            h = float(ps[1])
+            if h > 0:
+                return h
+        except Exception:
+            pass
+    ph = attrs.get('page_height')
+    if ph is not None:
+        try:
+            h = float(ph)
+            if h > 0:
+                return h
+        except Exception:
+            pass
+    bf = str(attrs.get('bbox_format') or '').lower()
+    if bf in ('1000', 'norm1000', 'mineru_1000', '0-1000'):
+        return 1000.0
+    return None
+
+
+def _check_cross_page_geometry(prev_df: pd.DataFrame, curr_df: pd.DataFrame, is_next_page: bool = False) -> Dict[str, Any]:
+    """
+    借鉴 MinerU-Popo 跨页几何连续性判定：
+    1. width_aligned: 宽度比 >= 0.60；
+    2. x_misaligned: 水平投影完全错列（如双栏左栏与右栏两个独立窄表，x 重叠比 < 0.25）；
+    3. at_page_boundary / far_from_boundary: 当具备明确页面高度或 0-1000 归一化坐标时，
+       识别“前表落于页底 + 后表起于页顶”的强边界信号，并拦截“前表在页顶 + 后表在页底”的中间隔正文假续表。
+    """
+    prev_bbox = (getattr(prev_df, 'attrs', None) or {}).get('bbox')
+    curr_bbox = (getattr(curr_df, 'attrs', None) or {}).get('bbox')
+    res = {
+        "width_aligned": True,
+        "x_misaligned": False,
+        "at_page_boundary": False,
+        "far_from_boundary": False,
+    }
+    if not (prev_bbox and curr_bbox and len(prev_bbox) >= 4 and len(curr_bbox) >= 4):
+        return res
+    try:
+        px0, py0, px1, py1 = [float(v) for v in prev_bbox[:4]]
+        cx0, cy0, cx1, cy1 = [float(v) for v in curr_bbox[:4]]
+    except Exception:
+        return res
+
+    w_prev = abs(px1 - px0)
+    w_curr = abs(cx1 - cx0)
+    max_w = max(w_prev, w_curr)
+    if max_w > 0:
+        if min(w_prev, w_curr) / max_w < 0.60:
+            res["width_aligned"] = False
+        # 仅当两侧坐标系量级一致时计算水平投影重叠（避免 points 与 0-1000 混比）
+        prev_h = _infer_page_height_for_bbox(prev_bbox, getattr(prev_df, 'attrs', None))
+        curr_h = _infer_page_height_for_bbox(curr_bbox, getattr(curr_df, 'attrs', None))
+        same_scale = (
+            (prev_h is None and curr_h is None)
+            or (prev_h is not None and curr_h is not None and min(prev_h, curr_h) / max(prev_h, curr_h) >= 0.8)
+        )
+        if same_scale:
+            x_overlap = max(0.0, min(max(px0, px1), max(cx0, cx1)) - max(min(px0, px1), min(cx0, cx1)))
+            if x_overlap / max_w < 0.25:
+                res["x_misaligned"] = True
+
+        if is_next_page and prev_h and curr_h:
+            prev_y1_norm = max(py0, py1) / prev_h
+            curr_y0_norm = min(cy0, cy1) / curr_h
+            if 0.0 <= prev_y1_norm <= 1.05 and 0.0 <= curr_y0_norm <= 1.05:
+                if prev_y1_norm >= 0.55 and curr_y0_norm <= 0.45:
+                    res["at_page_boundary"] = True
+                elif prev_y1_norm < 0.35 and curr_y0_norm > 0.65:
+                    res["far_from_boundary"] = True
+    return res
+
+
+def _column_type_signature_similarity(df1: pd.DataFrame, df2: pd.DataFrame) -> float:
+    """计算两张表格逐列值类型画像（numeric / text / empty）的对齐相似度，辅助无表题跨页续表判定。"""
+    if df1 is None or df2 is None or df1.empty or df2.empty:
+        return 0.0
+    n_cols = min(df1.shape[1], df2.shape[1])
+    if n_cols <= 0:
+        return 0.0
+
+    def _col_kind(df: pd.DataFrame, col_idx: int) -> str:
+        vals = [
+            str(v).strip()
+            for v in df.iloc[:20, col_idx].values
+            if pd.notna(v) and str(v).strip() and str(v).strip().lower() not in ('nan', 'none')
+        ]
+        if not vals:
+            return "empty"
+        num_cnt = sum(1 for v in vals if is_pure_data_value(v))
+        return "numeric" if (num_cnt / len(vals)) >= 0.5 else "text"
+
+    matched = 0
+    compared = 0
+    for c_i in range(n_cols):
+        k1 = _col_kind(df1, c_i)
+        k2 = _col_kind(df2, c_i)
+        if k1 == "empty" or k2 == "empty":
+            continue
+        compared += 1
+        if k1 == k2:
+            matched += 1
+    if compared == 0:
+        return 0.0
+    return matched / compared
+
+
 def merge_continuation_tables(dfs):
     """
     Merges contiguous or matching continuation DataFrames into single DataFrames per table.
@@ -2474,11 +2734,16 @@ def merge_continuation_tables(dfs):
             continue
 
         prev_df = current_group[-1]
+        anchor_df = current_group[0]
         prev_raw_lbl = prev_df.attrs.get('label')
         if not prev_raw_lbl and prev_df.attrs.get('table_title'):
             m_p = TABLE_LABEL_RE.search(str(prev_df.attrs.get('table_title')))
             prev_raw_lbl = m_p.group(0) if m_p else prev_df.attrs.get('table_title')
-        prev_lbl = norm_label(prev_raw_lbl)
+        anchor_raw_lbl = anchor_df.attrs.get('label')
+        if not anchor_raw_lbl and anchor_df.attrs.get('table_title'):
+            m_a = TABLE_LABEL_RE.search(str(anchor_df.attrs.get('table_title')))
+            anchor_raw_lbl = m_a.group(0) if m_a else anchor_df.attrs.get('table_title')
+        prev_lbl = norm_label(prev_raw_lbl) or norm_label(anchor_raw_lbl)
         prev_page = prev_df.attrs.get('page_idx')
         curr_page = df.attrs.get('page_idx')
         
@@ -2502,7 +2767,7 @@ def merge_continuation_tables(dfs):
         combined_hint = f"{raw_lbl} {title_str}"
         is_explicit_cont = bool(re.search(r'(?:续表|接上表|续上表|（续）|\(续\)|continued|cont\'?d|\(cont\b|cont\.)', combined_hint) or df.attrs.get('is_continuation')) and page_nearby
         
-        # MinerU 跨页续表判定 1: 列名归一化与集合重合度 (Jaccard)
+        # MinerU / MinerU-Popo 跨页续表判定 1: 列名归一化与全局锚点同步重合度 (prev_df + anchor_df)
         def _is_placeholder_col(c_val) -> bool:
             s_val = str(c_val).strip()
             return (
@@ -2512,13 +2777,24 @@ def merge_continuation_tables(dfs):
 
         norm_curr_cols = set(_normalize_col_name(c) for c in df.columns if c is not None and not _is_placeholder_col(c))
         norm_prev_cols = set(_normalize_col_name(c) for c in prev_df.columns if c is not None and not _is_placeholder_col(c))
-        inter_cols = norm_curr_cols & norm_prev_cols
-        union_cols = norm_curr_cols | norm_prev_cols
-        col_jaccard = len(inter_cols) / max(1, len(union_cols)) if union_cols else 0.0
+        norm_anchor_cols = set(_normalize_col_name(c) for c in anchor_df.columns if c is not None and not _is_placeholder_col(c))
 
-        min_col_cnt = min(df.shape[1], prev_df.shape[1]) if df.shape[1] > 0 and prev_df.shape[1] > 0 else 0
+        inter_prev = norm_curr_cols & norm_prev_cols
+        union_prev = norm_curr_cols | norm_prev_cols
+        jaccard_prev = len(inter_prev) / max(1, len(union_prev)) if union_prev else 0.0
+
+        inter_anchor = norm_curr_cols & norm_anchor_cols
+        union_anchor = norm_curr_cols | norm_anchor_cols
+        jaccard_anchor = len(inter_anchor) / max(1, len(union_anchor)) if union_anchor else 0.0
+
+        inter_cols = inter_anchor if len(inter_anchor) > len(inter_prev) else inter_prev
+        col_jaccard = max(jaccard_prev, jaccard_anchor)
+
+        ref_col_cnt = anchor_df.shape[1] if len(inter_anchor) > len(inter_prev) else prev_df.shape[1]
+        min_col_cnt = min(df.shape[1], ref_col_cnt) if df.shape[1] > 0 and ref_col_cnt > 0 else 0
         common_col_thresh = 1 if min_col_cnt == 1 else 2
         has_common_cols = len(inter_cols) >= common_col_thresh
+        min_col_diff = min(abs(df.shape[1] - prev_df.shape[1]), abs(df.shape[1] - anchor_df.shape[1]))
 
         # 小表安全防护：若续表列名实质上是数据行（如检出限、误差、纯数值），则确系续表首行（保护 RangeIndex）
         is_seq_int = (
@@ -2528,15 +2804,14 @@ def merge_continuation_tables(dfs):
         )
         cols_are_data = df.attrs.get('header_source') != 'explicit' and (not is_seq_int) and (sum(1 for c in df.columns if is_pure_data_value(c)) / max(1, len(df.columns)) >= 0.3)
 
-        # MinerU 跨页续表判定 2: 表格页宽/宽度比例对齐 (Page Width Ratio Alignment)
+        # MinerU / MinerU-Popo 跨页续表判定 2: 几何对齐（宽度比 + 水平投影防跨栏误并 + 页底/页顶边界连续性）
         prev_bbox = prev_df.attrs.get('bbox')
         curr_bbox = df.attrs.get('bbox')
-        width_aligned = True
-        if prev_bbox and curr_bbox and len(prev_bbox) >= 4 and len(curr_bbox) >= 4:
-            w_prev = abs(prev_bbox[2] - prev_bbox[0])
-            w_curr = abs(curr_bbox[2] - curr_bbox[0])
-            if max(w_prev, w_curr) > 0 and (min(w_prev, w_curr) / max(w_prev, w_curr) < 0.60):
-                width_aligned = False
+        geom_prev = _check_cross_page_geometry(prev_df, df, is_next_page=is_next_page)
+        geom_anchor = _check_cross_page_geometry(anchor_df, df, is_next_page=is_next_page) if anchor_df is not prev_df else geom_prev
+        width_aligned = geom_prev["width_aligned"] or geom_anchor["width_aligned"]
+        x_misaligned = geom_prev["x_misaligned"] and geom_anchor["x_misaligned"]
+        far_from_boundary = geom_prev["far_from_boundary"]
 
         # MinerU 跨页续表判定 3: 表头独立性与联合条件判定
         has_placeholder_or_seq_cols = is_seq_int or all(_is_placeholder_col(c) for c in df.columns)
@@ -2545,9 +2820,9 @@ def merge_continuation_tables(dfs):
             cols_match = False
         else:
             if is_explicit_cont or cols_are_data or has_placeholder_or_seq_cols:
-                cols_match = has_common_cols or (abs(df.shape[1] - prev_df.shape[1]) <= (1 if has_placeholder_or_seq_cols and not is_explicit_cont else 2) and width_aligned)
+                cols_match = has_common_cols or (min_col_diff <= (1 if has_placeholder_or_seq_cols and not is_explicit_cont else 2) and width_aligned)
             else:
-                cols_match = (col_jaccard >= 0.35 or has_common_cols) and width_aligned and (abs(df.shape[1] - prev_df.shape[1]) <= 2)
+                cols_match = (col_jaccard >= 0.35 or has_common_cols) and width_aligned and (min_col_diff <= 2)
 
         # MinerU 跨页续表判定 4: 小表独立性保护——仅当后表带有独立真实表头且列集合与前表不重合时才独立保留；
         # 若为无表头/占位列/重复同构表头的续表尾段（<6行），允许并入前表避免尾部数据丢失
@@ -2559,12 +2834,41 @@ def merge_continuation_tables(dfs):
             (col_jaccard < 0.40 or not has_common_cols)
         )
 
+        # MinerU-Popo 启发式增强：无表题相邻跨页续表（如连续附录无题长表，prev_lbl 与 lbl 均为空）
+        # 严格要求相邻页 + 几何对齐 + 列数高度一致 + 列值类型画像高度吻合，避免误并独立无题表
+        type_sim = max(
+            _column_type_signature_similarity(prev_df, df),
+            _column_type_signature_similarity(anchor_df, df) if anchor_df is not prev_df else 0.0,
+        )
+        is_untitled_adjacent_cont = (
+            not prev_lbl
+            and not lbl
+            and is_next_page
+            and width_aligned
+            and not x_misaligned
+            and not far_from_boundary
+            and min_col_diff <= 1
+            and cols_match
+            and not is_small_unlabeled_independent
+            and (cols_are_data or has_placeholder_or_seq_cols or col_jaccard >= 0.50 or is_explicit_cont)
+            and (type_sim >= 0.70 or col_jaccard >= 0.60 or is_explicit_cont)
+        )
+
+        # 对无标签续表应用几何防误并护栏（双栏左右完全错列或上下页间明显隔开一整页正文时拒绝盲目合并）
+        geom_blocks_unlabeled = (not is_explicit_cont) and (not is_same_label) and (x_misaligned or far_from_boundary)
+
         is_unlabeled_cont = (
-            (not lbl or is_explicit_cont or cols_are_data) and
-            (is_next_page or is_block_sequence or (page_dist is not None and 1 <= page_dist <= 2)) and
-            prev_lbl and
-            cols_match and
-            not is_small_unlabeled_independent
+            not geom_blocks_unlabeled
+            and (
+                (
+                    (not lbl or is_explicit_cont or cols_are_data)
+                    and (is_next_page or is_block_sequence or (page_dist is not None and 1 <= page_dist <= 2))
+                    and bool(prev_lbl)
+                    and cols_match
+                    and not is_small_unlabeled_independent
+                )
+                or is_untitled_adjacent_cont
+            )
         )
 
         def _extract_table_id(label_or_title):
@@ -2676,6 +2980,19 @@ def merge_continuation_tables(dfs):
         combined = _finalize_merged_group(current_group)
         if combined is not None:
             merged_dfs.append(combined)
+
+    # 可选 MinerU-Popo 文档级后处理钩子（默认关闭；配置为 auto 时检测到 CUDA / Apple Silicon M 系列自动开启）
+    if len(merged_dfs) >= 2:
+        try:
+            try:
+                from . import mineru_popo as _popo_mod
+            except ImportError:
+                import mineru_popo as _popo_mod
+            _popo_on, _ = _popo_mod.should_enable_mineru_popo(config=cfg)
+            if _popo_on:
+                merged_dfs = _popo_mod.run_popo_postprocess_hook(merged_dfs, config=cfg)
+        except Exception:
+            pass
 
     return merged_dfs
 
